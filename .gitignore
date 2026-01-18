@@ -1,0 +1,13 @@
+/**/.zed/
+/**/.idea/
+/**/.vscode/
+
+/**/.cache/
+/**/build/
+/**/cmake-*/
+
+/**/compile_commands.json
+/**/*.user
+
+/**/*.ini
+/**/*.log

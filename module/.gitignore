@@ -1,0 +1,9 @@
+/**/.cache/
+/**/build/
+/**/compile_commands.json
+
+/**/.zed/
+/**/.idea/
+/**/.vscode/
+
+/lib/module/

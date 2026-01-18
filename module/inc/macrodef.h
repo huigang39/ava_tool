@@ -1,0 +1,168 @@
+#ifndef MACRODEF_H
+#define MACRODEF_H
+
+#include <stddef.h>
+#include <string.h>
+
+#include "errdef.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define SIZE_1KB    (0x400)
+#define SIZE_2KB    (0x800)
+#define SIZE_4KB    (0x1000)
+#define SIZE_6KB    (0x1800)
+#define SIZE_8KB    (0x2000)
+#define SIZE_14KB   (0x3800)
+#define SIZE_24KB   (0x6000)
+#define SIZE_64KB   (0x10000)
+
+#define AT(name)    __attribute__((section(name)))
+#define OPTNONE     __attribute__((optnone))
+#define TYPEOF(var) __typeof__(var)
+
+#define ATOMIC_EXEC(code)                               \
+        do {                                            \
+                volatile u32 primask = __get_PRIMASK(); \
+                __disable_irq();                        \
+                {code};                                 \
+                __set_PRIMASK(primask);                 \
+        } while (0)
+
+#define HAPI            static inline
+
+#define ARG_UNUSED(arg) (void)(arg)
+
+#define ARG_CHECK(arg)                   \
+        do {                             \
+                if (!(arg))              \
+                        return -MEINVAL; \
+        } while (0)
+
+#define CFG_INIT(ptr, config)          \
+        do {                           \
+                (ptr)->cfg = (config); \
+        } while (0)
+
+#define CFG_CHECK(ptr, f_init)                                                          \
+        do {                                                                            \
+                if (memcmp(&((ptr)->cfg), &((ptr)->lo.cfg), sizeof((ptr)->cfg)) != 0) { \
+                        (ptr)->lo.cfg = (ptr)->cfg;                                     \
+                        f_init((ptr), (ptr)->cfg);                                      \
+                }                                                                       \
+        } while (0)
+
+#define RENAME(ptr, name)         \
+        TYPEOF((ptr)) name = ptr; \
+        ARG_UNUSED(name);
+
+#define RUN_FUNC_PTR(func_ptr, ...)                          ((func_ptr) != NULL ? ((func_ptr)(__VA_ARGS__), 1) : 0)
+
+#define GET_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, NAME, ...) NAME
+
+#define DECL_1(ptr, a1)                     \
+        TYPEOF((ptr)->a1) *a1 = &(ptr)->a1; \
+        ARG_UNUSED(a1);
+#define DECL_2(ptr, a1, a2)                         DECL_1(ptr, a1) DECL_1(ptr, a2)
+#define DECL_3(ptr, a1, a2, a3)                     DECL_2(ptr, a1, a2) DECL_1(ptr, a3)
+#define DECL_4(ptr, a1, a2, a3, a4)                 DECL_3(ptr, a1, a2, a3) DECL_1(ptr, a4)
+#define DECL_5(ptr, a1, a2, a3, a4, a5)             DECL_4(ptr, a1, a2, a3, a4) DECL_1(ptr, a5)
+#define DECL_6(ptr, a1, a2, a3, a4, a5, a6)         DECL_5(ptr, a1, a2, a3, a4, a5) DECL_1(ptr, a6)
+#define DECL_7(ptr, a1, a2, a3, a4, a5, a6, a7)     DECL_6(ptr, a1, a2, a3, a4, a5, a6) DECL_1(ptr, a7)
+#define DECL_8(ptr, a1, a2, a3, a4, a5, a6, a7, a8) DECL_7(ptr, a1, a2, a3, a4, a5, a6, a7) DECL_1(ptr, a8)
+
+#define DECL(ptr, ...)                                                                              \
+        GET_MACRO(__VA_ARGS__, DECL_8, DECL_7, DECL_6, DECL_5, DECL_4, DECL_3, DECL_2, DECL_1, ...) \
+        (ptr, __VA_ARGS__)
+
+#define RESET_1(ptr, a1)                             memset(&(ptr)->a1, 0, sizeof((ptr)->a1));
+#define RESET_2(ptr, a1, a2)                         RESET_1(ptr, a1) RESET_1(ptr, a2)
+#define RESET_3(ptr, a1, a2, a3)                     RESET_2(ptr, a1, a2) RESET_1(ptr, a3)
+#define RESET_4(ptr, a1, a2, a3, a4)                 RESET_3(ptr, a1, a2, a3) RESET_1(ptr, a4)
+#define RESET_5(ptr, a1, a2, a3, a4, a5)             RESET_4(ptr, a1, a2, a3, a4) RESET_1(ptr, a5)
+#define RESET_6(ptr, a1, a2, a3, a4, a5, a6)         RESET_5(ptr, a1, a2, a3, a4, a5) RESET_1(ptr, a6)
+#define RESET_7(ptr, a1, a2, a3, a4, a5, a6, a7)     RESET_6(ptr, a1, a2, a3, a4, a5, a6) RESET_1(ptr, a7)
+#define RESET_8(ptr, a1, a2, a3, a4, a5, a6, a7, a8) RESET_7(ptr, a1, a2, a3, a4, a5, a6, a7) RESET_1(ptr, a8)
+
+#define RESET(ptr, ...)                                                                                     \
+        GET_MACRO(__VA_ARGS__, RESET_8, RESET_7, RESET_6, RESET_5, RESET_4, RESET_3, RESET_2, RESET_1, ...) \
+        (ptr, __VA_ARGS__)
+
+#define SPINLOCK_BACKOFF_MIN (4)
+#define SPINLOCK_BACKOFF_MAX (128)
+#if defined(__x86_64__)
+#define SPINLOCK_BACKOFF_HOOK __asm volatile("pause" ::: "memory")
+#else
+#define SPINLOCK_BACKOFF_HOOK
+#endif
+#define SPINLOCK_BACKOFF(cnt)                      \
+        do {                                       \
+                for (usize i = (cnt); i != 0; i--) \
+                        SPINLOCK_BACKOFF_HOOK;     \
+                if ((cnt) < SPINLOCK_BACKOFF_MAX)  \
+                        (cnt) += (cnt);            \
+        } while (0);
+
+#define SPIN_LOCK(lock_ptr)                                                                                                 \
+        do {                                                                                                                \
+                u8    expected;                                                                                             \
+                usize backoff = SPINLOCK_BACKOFF_MIN;                                                                       \
+                for (;;) {                                                                                                  \
+                        expected = 0;                                                                                       \
+                        if (ATOMIC_CAS_WEAK_EXPLICIT((lock_ptr), &expected, 1, memory_order_acquire, memory_order_relaxed)) \
+                                break;                                                                                      \
+                        SPINLOCK_BACKOFF(backoff);                                                                          \
+                }                                                                                                           \
+        } while (0)
+
+#define SPIN_UNLOCK(lock_ptr) ATOMIC_STORE_EXPLICIT((lock_ptr), 0, memory_order_release)
+
+#ifdef __cplusplus
+#define IS_SAME_TYPE(a, b) std::is_same_v<decltype(a), decltype(b)>
+#else
+#define IS_SAME_TYPE(a, b) __builtin_types_compatible_p(TYPEOF(a), TYPEOF(b))
+#endif
+
+#ifdef __cplusplus
+#define BUILD_BUG_ON_ZERO(e) ((sizeof(char[1 - 2 * !!(e)])) - 1)
+#else
+#define BUILD_BUG_ON_ZERO(e) (sizeof(struct { int : -!!(e); }))
+#endif
+
+#define MUST_BE_ARRAY(arr)              BUILD_BUG_ON_ZERO(IS_SAME_TYPE((arr), &(arr)[0]))
+#define ARRAY_LEN(arr)                  (sizeof(arr) / sizeof(arr[0]) + MUST_BE_ARRAY(arr))
+
+#define CONTAINER_OF(ptr, type, member) (type *)((char *)(ptr) - offsetof(type, member))
+
+/* ---------------------------------- 原子操作 ---------------------------------- */
+#ifndef __cplusplus
+#include <stdatomic.h>
+#define ATOMIC(type)                              _Atomic type
+#define ATOMIC_LOAD(a)                            atomic_load(a)
+#define ATOMIC_LOAD_EXPLICIT(a, m)                atomic_load_explicit(a, m)
+#define ATOMIC_STORE(a, v)                        atomic_store(a, v)
+#define ATOMIC_STORE_EXPLICIT(a, v, m)            atomic_store_explicit(a, v, m)
+#define ATOMIC_CAS_WEAK_EXPLICIT(a, o, n, s, f)   atomic_compare_exchange_weak_explicit(a, o, n, s, f)
+#define ATOMIC_CAS_STRONG_EXPLICIT(a, o, n, s, f) atomic_compare_exchange_strong_explicit(a, o, n, s, f)
+#define ATOMIC_EXCHANGE(a, v)                     atomic_exchange(a, v)
+#else
+}
+#include <atomic>
+#define ATOMIC(type)                              std::atomic<type>
+#define ATOMIC_LOAD(a)                            std::atomic_load(a)
+#define ATOMIC_LOAD_EXPLICIT(a, m)                std::atomic_load_explicit(a, m)
+#define ATOMIC_STORE(a, v)                        std::atomic_store(a, v)
+#define ATOMIC_STORE_EXPLICIT(a, v, m)            std::atomic_store_explicit(a, v, m)
+#define ATOMIC_CAS_WEAK_EXPLICIT(a, o, n, s, f)   std::atomic_compare_exchange_weak_explicit(a, o, n, s, f)
+#define ATOMIC_CAS_STRONG_EXPLICIT(a, o, n, s, f) std::atomic_compare_exchange_strong_explicit(a, o, n, s, f)
+#define ATOMIC_EXCHANGE(a, v)                     std::atomic_exchange(a, v)
+constexpr auto memory_order_relaxed = std::memory_order_relaxed;
+constexpr auto memory_order_acquire = std::memory_order_acquire;
+constexpr auto memory_order_release = std::memory_order_release;
+constexpr auto memory_order_acq_rel = std::memory_order_acq_rel;
+#endif
+/* ---------------------------------- 原子操作 ---------------------------------- */
+
+#endif // !MACRODEF_H
