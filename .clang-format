@@ -1,0 +1,68 @@
+# author: Huigang Wang
+# email: huigang39@outlook.com
+# version: 0.6
+# date: 2026-01-03
+
+Language: Cpp
+TabWidth: 8
+IndentWidth: 8
+# BasedOnStyle: GNU
+# UseTab: ForIndentation
+
+# 最大行宽
+ColumnLimit: 128
+
+# case 缩进
+IndentCaseLabels: true
+
+# 将函数调用参数放到一行
+BinPackArguments: false
+
+# 将函数声明参数放到一行
+BinPackParameters: false
+
+# 左大括号位置
+BreakBeforeBraces: Linux
+
+# 左圆括号前是否有空格
+SpaceBeforeParens: ControlStatements
+
+# 短函数是否写在一行
+AllowShortFunctionsOnASingleLine: Inline
+
+# 函数定义返回类型断行
+AlwaysBreakAfterDefinitionReturnType: TopLevel
+
+# 指针对齐方式
+PointerAlignment: Right
+
+# 对齐换行反斜杠
+AlignEscapedNewlines: Left
+
+# 对齐行尾注释
+AlignTrailingComments: true
+
+# 对齐连续声明
+AlignConsecutiveDeclarations:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+
+# 对齐赋值操作符
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+  AlignCompound: true
+
+# 对齐连续宏
+AlignConsecutiveMacros:
+  Enabled: true
+  AcrossEmptyLines: true
+  AcrossComments: true
+
+# 对齐连续位域
+AlignConsecutiveBitFields:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false

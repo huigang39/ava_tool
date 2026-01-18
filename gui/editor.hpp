@@ -10,67 +10,68 @@
 
 #include "cJSON.h"
 
-class Editor {
-public:
-  enum class DataType {
-    UNKNOWN,
-    F32,
-    U32,
-    I32,
-    ARRAY,
-  };
+class Editor
+{
+      public:
+        enum class DataType {
+                UNKNOWN,
+                F32,
+                U32,
+                I32,
+                ARRAY,
+        };
 
-  struct DataTree {
-    std::string name;
-    DataType type;
-    std::variant<f32, u32, i32> val;
-    std::vector<DataTree> children;
-  };
+        struct DataTree {
+                std::string                 name;
+                DataType                    type;
+                std::variant<f32, u32, i32> val;
+                std::vector<DataTree>       children;
+        };
 
-private:
-  std::string name_{};
-  std::string cfgPath_{}, binPath_{};
-  DataTree dataTree_{
-      .name = "CFG",
-      .type = DataType::ARRAY,
-  };
-  int toastDismissTime_{2000};
+      private:
+        std::string name_{};
+        std::string cfgPath_{}, binPath_{};
+        DataTree    dataTree_{
+               .name = "CFG",
+               .type = DataType::ARRAY,
+        };
+        int toastDismissTime_{2000};
 
-  enum class EditorState {
-    None,
-    LoadCfg,
-    LoadBin,
-    StoreCfg,
-    StoreBin,
-  };
-  EditorState state_ = EditorState::None;
+        enum class EditorState {
+                None,
+                LoadCfg,
+                LoadBin,
+                StoreCfg,
+                StoreBin,
+        };
 
-  void menu();
-  void draw();
+        EditorState state_ = EditorState::None;
 
-  static bool readFile(const std::string &filename, std::string &outContent);
+        void menu();
+        void draw();
 
-  static void parseCfg(const cJSON *jsonNode, DataTree &node);
-  bool loadCfg(const std::string &cfgPath);
-  [[nodiscard]] bool storeCfg(const std::string &cfgPath) const;
+        static bool readFile(const std::string &filename, std::string &outContent);
 
-  static bool parseBin(std::ifstream &ifs, DataTree &node);
-  bool loadBin(const std::string &binPath);
-  [[nodiscard]] bool storeBin(const std::string &binPath) const;
+        static void        parseCfg(const cJSON *jsonNode, DataTree &node);
+        bool               loadCfg(const std::string &cfgPath);
+        [[nodiscard]] bool storeCfg(const std::string &cfgPath) const;
 
-  static const char *dataTypeToStr(DataType type);
-  static DataType strToDataType(const std::string &str);
+        static bool        parseBin(std::ifstream &ifs, DataTree &node);
+        bool               loadBin(const std::string &binPath);
+        [[nodiscard]] bool storeBin(const std::string &binPath) const;
 
-  static void drawDataTree(DataTree &node, int indentLevel = 0);
+        static const char *dataTypeToStr(DataType type);
+        static DataType    strToDataType(const std::string &str);
 
-public:
-  explicit Editor(std::string eidtorName) : name_(std::move(eidtorName)) {
-    print_info(true, "Editor()");
-  }
-  Editor() { print_info(true, "Editor()"); };
-  ~Editor() { print_info(true, "~Editor()"); };
+        static void drawDataTree(DataTree &node, int indentLevel = 0);
 
-  void updateDisplay();
+      public:
+        explicit Editor(std::string eidtorName) : name_(std::move(eidtorName)) { print_info(true, "Editor()"); }
+
+        Editor() { print_info(true, "Editor()"); };
+        ~Editor() { print_info(true, "~Editor()"); };
+
+        void updateDisplay();
 };
 
 #endif // !EDITOR_HPP

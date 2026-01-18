@@ -20,7 +20,7 @@ class MonitorChannel
       private:
         std::string name_{};
         std::string type_{};
-        usize         addr_{};
+        usize       addr_{};
         f32         rVal_{}, wVal_{};
         std::string device_{};
 
@@ -37,7 +37,7 @@ class MonitorChannel
         void         setName(const std::string &name) { name_ = name; }
         std::string &getType() { return type_; }
         void         setType(const std::string &type) { type_ = type; }
-        usize         &getAddr() { return addr_; }
+        usize       &getAddr() { return addr_; }
         void         setAddr(const usize addr) { addr_ = addr; }
         std::string &getDevice() { return device_; }
         void         setDevice(const std::string &device) { device_ = device; }
@@ -114,9 +114,9 @@ class Monitor
         void menu();
 
       public:
-        explicit Monitor(std::string monitorName) : name_(std::move(monitorName)) { print_info(true,"Monitor()"); }
-        Monitor() { print_info(true,"Monitor()"); };
-        ~Monitor() { print_info(true,"~Monitor()"); };
+        explicit Monitor(std::string monitorName) : name_(std::move(monitorName)) { print_info(true, "Monitor()"); }
+        Monitor() { print_info(true, "Monitor()"); };
+        ~Monitor() { print_info(true, "~Monitor()"); };
 
         void updateDisplay();
 

@@ -11,23 +11,23 @@
 void
 Gui::glfwErrCb(const int err, const char *desc)
 {
-        print_error(true,"Glfw Error %d: %s", err, desc);
+        print_error(true, "Glfw Error %d: %s", err, desc);
 }
 
 Gui::Gui()
 {
-        print_info(true,"Gui()");
+        print_info(true, "Gui()");
 
         glfwSetErrorCallback(glfwErrCb);
         if (!glfwInit())
-                print_error(true,"Failed to init GLFW");
+                print_error(true, "Failed to init GLFW");
 
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
         window_ = glfwCreateWindow(windowWidth_, windowWidth_, windowTitle_.c_str(), nullptr, nullptr);
         if (window_ == nullptr)
-                print_error(true,"Failed to create GLFW window");
+                print_error(true, "Failed to create GLFW window");
 
         glfwMakeContextCurrent(window_);
         glfwSwapInterval(1);
@@ -53,7 +53,7 @@ Gui::Gui()
 
 Gui::~Gui()
 {
-        print_info(true,"~Gui()");
+        print_info(true, "~Gui()");
 
         ImPlot::DestroyContext();
 
@@ -73,12 +73,12 @@ Gui::drawBar()
                         if (ImGui::MenuItem("Add Monitor")) {
                                 std::string monitorName = "Monitor_" + std::to_string(monitors_.size());
                                 monitors_[monitorName]  = std::make_unique<Monitor>(monitorName);
-                                print_info(true,"Add Monitor: %s", monitorName.c_str());
+                                print_info(true, "Add Monitor: %s", monitorName.c_str());
                         }
                         if (ImGui::MenuItem("Add Editor")) {
                                 std::string editorName = "Editor_" + std::to_string(editors_.size());
                                 editors_[editorName]   = std::make_unique<Editor>(editorName);
-                                print_info(true,"Add Editor: %s", editorName.c_str());
+                                print_info(true, "Add Editor: %s", editorName.c_str());
                         }
                         ImGui::EndMenu();
                 }

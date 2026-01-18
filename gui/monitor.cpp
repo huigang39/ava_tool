@@ -119,7 +119,7 @@ MonitorScope::addChannel(const std::string &chName)
 }
 
 int
-MonitorScope::setValue(const std::string &chName, f32 val)
+MonitorScope::setValue(const std::string &chName, const f32 val)
 {
         if (const auto it = chs_.find(chName); it != chs_.end()) {
                 it->second->setRVal(val);
