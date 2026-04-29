@@ -87,6 +87,12 @@ private:
         ~Editor() { print_info(true, "~Editor()"); };
 
         void updateDisplay();
+
+        const std::string &getName() const { return name_; }
+        const std::string &getCfgPath() const { return cfgPath_; }
+        const std::string &getBinPath() const { return binPath_; }
+        const std::string &getElfPath() const { return elfPath_; }
+        void               restoreFromPaths(const std::string &cfg, const std::string &bin, const std::string &elf);
 };
 
 #endif // !EDITOR_HPP

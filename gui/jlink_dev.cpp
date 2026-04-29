@@ -171,7 +171,7 @@ JLinkDev::drawUI()
                 deviceName_ = nameBuf;
         }
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(80.0f);
+        ImGui::SetNextItemWidth(140.0f);
         bool speedCommitted = false;
         {
                 std::lock_guard lk(mtx_);
@@ -207,11 +207,11 @@ JLinkDev::drawUI()
                             hssRunning_ ? "+HSS" : "");
 
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(80.0f);
+        ImGui::SetNextItemWidth(110.0f);
         {
                 std::lock_guard lk(mtx_);
                 int hz = (hssPeriodUs_ > 0) ? (1000000 / hssPeriodUs_) : 1000;
-                if (ImGui::DragInt("Hz##hsshz", &hz, 10.0f, 10, 100000, "%d Hz")) {
+                if (ImGui::DragInt("##hsshz", &hz, 10.0f, 10, 100000, "%d Hz")) {
                         if (hz < 10)
                                 hz = 10;
                         hssPeriodUs_ = 1000000 / hz;

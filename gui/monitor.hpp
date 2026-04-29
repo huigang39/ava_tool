@@ -147,10 +147,10 @@ class MonitorScope
         void plotDraw() const;
         void plotMenu();
 
-        static void shmInit(MonitorChannel &ch);
-        void        drawTableRow(const std::string &chName, std::unique_ptr<MonitorChannel> &ch);
+        void drawTableRow(const std::string &chName, std::unique_ptr<MonitorChannel> &ch);
 
       public:
+        static void shmInit(MonitorChannel &ch);
         explicit MonitorScope(std::string scopeName) : name_(std::move(scopeName)) {}
         MonitorScope()  = default;
         ~MonitorScope() = default;
@@ -163,6 +163,8 @@ class MonitorScope
 
         std::string     getName() { return name_; }
         ChannelMapType &getChannels() { return chs_; }
+        DrawEnum       &getDraw() { return e_draw; }
+        void            setDraw(const DrawEnum d) { e_draw = d; }
         MonitorChannel *findChannel(const std::string &chName);
 };
 

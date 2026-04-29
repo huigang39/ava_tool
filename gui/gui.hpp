@@ -36,7 +36,11 @@ class Gui
         MonitorMapType monitors_{};
         EditorMapType  editors_{};
 
+        static constexpr const char *sessionPath_ = "session.json";
+
         void drawBar();
+        void loadSession();
+        void saveSession() const;
 
       public:
         Gui();

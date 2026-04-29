@@ -217,6 +217,17 @@ Editor::loadElf(const std::string &elfPath)
 }
 
 void
+Editor::restoreFromPaths(const std::string &cfg, const std::string &bin, const std::string &elf)
+{
+        if (!cfg.empty() && loadCfg(cfg))
+                cfgPath_ = cfg;
+        if (!bin.empty() && loadBin(bin))
+                binPath_ = bin;
+        if (!elf.empty() && loadElf(elf))
+                elfPath_ = elf;
+}
+
+void
 Editor::handleDroppedFile(const std::string &path)
 {
         const auto dot = path.find_last_of('.');
