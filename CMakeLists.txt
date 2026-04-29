@@ -40,6 +40,9 @@ set(SRC
         ${DIR_GUI}/gui.cpp
         ${DIR_GUI}/monitor.cpp
         ${DIR_GUI}/editor.cpp
+        ${DIR_GUI}/elf_parser.cpp
+        ${DIR_GUI}/dwarf_parser.cpp
+        ${DIR_GUI}/jlink_dev.cpp
 )
 
 set(MODULE_MAKE_TARGET all)

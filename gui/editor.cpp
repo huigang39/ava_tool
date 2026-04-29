@@ -1,8 +1,13 @@
+#include <algorithm>
+#include <cctype>
+
 #include "ImGuiFileDialog.h"
 #include "ImGuiNotify.hpp"
 #include "imgui.h"
 
 #include "editor.hpp"
+#include "gui.hpp"
+#include "monitor.hpp"
 
 const char *
 Editor::dataTypeToStr(const DataType type)
@@ -203,6 +208,51 @@ Editor::loadBin(const std::string &binPath)
 }
 
 bool
+Editor::loadElf(const std::string &elfPath)
+{
+        if (!ElfParser::parse(elfPath, elfInfo_))
+                return false;
+        dwarf::parse(elfInfo_, dwarfInfo_);
+        return true;
+}
+
+void
+Editor::handleDroppedFile(const std::string &path)
+{
+        const auto dot = path.find_last_of('.');
+        std::string ext = (dot == std::string::npos) ? "" : path.substr(dot);
+        std::ranges::transform(ext, ext.begin(), [](const unsigned char c) { return std::tolower(c); });
+
+        if (ext == ".elf" || ext == ".axf" || ext == ".out") {
+                elfPath_ = path;
+                if (loadElf(elfPath_))
+                        ImGui::InsertNotification({ImGuiToastType::Success,
+                                                   toastDismissTime_,
+                                                   "load ELF success: %zu symbols",
+                                                   elfInfo_.symbols.size()});
+                else
+                        ImGui::InsertNotification({ImGuiToastType::Error, toastDismissTime_, "load ELF failure"});
+        } else if (ext == ".json") {
+                cfgPath_ = path;
+                if (loadCfg(cfgPath_))
+                        ImGui::InsertNotification(
+                            {ImGuiToastType::Success, toastDismissTime_, "load CFG success: %s", cfgPath_.c_str()});
+                else
+                        ImGui::InsertNotification({ImGuiToastType::Error, toastDismissTime_, "load CFG failure"});
+        } else if (ext == ".bin") {
+                binPath_ = path;
+                if (loadBin(binPath_))
+                        ImGui::InsertNotification(
+                            {ImGuiToastType::Success, toastDismissTime_, "load BIN success: %s", binPath_.c_str()});
+                else
+                        ImGui::InsertNotification({ImGuiToastType::Error, toastDismissTime_, "load BIN failure"});
+        } else {
+                ImGui::InsertNotification(
+                    {ImGuiToastType::Warning, toastDismissTime_, "unsupported file: %s", path.c_str()});
+        }
+}
+
+bool
 Editor::storeBin(const std::string &binPath) const
 {
         std::ofstream ofs(binPath, std::ios::binary);
@@ -240,6 +290,314 @@ Editor::storeBin(const std::string &binPath) const
                 writeNode(n);
 
         return static_cast<bool>(ofs);
+}
+
+// Follow typedef / const / volatile / restrict to the underlying type.
+static const dwarf::Type *
+resolveAlias(const dwarf::Info &info, u64 typeOff)
+{
+        for (int guard = 0; guard < 32; ++guard) {
+                const auto it = info.types.find(typeOff);
+                if (it == info.types.end())
+                        return nullptr;
+                const dwarf::Type &t = it->second;
+                if (t.kind == dwarf::TypeKind::TYPEDEF || t.kind == dwarf::TypeKind::MODIFIER) {
+                        if (t.inner == 0)
+                                return &t;
+                        typeOff = t.inner;
+                        continue;
+                }
+                return &t;
+        }
+        return nullptr;
+}
+
+// Pretty-print a type as it would appear in C (best-effort, for the Type column).
+static std::string
+prettyType(const dwarf::Info &info, u64 typeOff, int depth = 0)
+{
+        if (depth > 16 || typeOff == 0)
+                return "void";
+        const auto it = info.types.find(typeOff);
+        if (it == info.types.end())
+                return "?";
+        const dwarf::Type &t = it->second;
+
+        switch (t.kind) {
+                case dwarf::TypeKind::BASE:
+                case dwarf::TypeKind::TYPEDEF:
+                        return t.name.empty() ? "?" : t.name;
+                case dwarf::TypeKind::POINTER:
+                        return prettyType(info, t.inner, depth + 1) + " *";
+                case dwarf::TypeKind::MODIFIER:
+                        return prettyType(info, t.inner, depth + 1);
+                case dwarf::TypeKind::ARRAY: {
+                        std::string s = prettyType(info, t.inner, depth + 1);
+                        for (const u64 d : t.dims) {
+                                s += "[";
+                                if (d > 0)
+                                        s += std::to_string(d);
+                                s += "]";
+                        }
+                        return s;
+                }
+                case dwarf::TypeKind::STRUCT:
+                        return "struct " + (t.name.empty() ? std::string("{...}") : t.name);
+                case dwarf::TypeKind::UNION:
+                        return "union " + (t.name.empty() ? std::string("{...}") : t.name);
+                case dwarf::TypeKind::ENUM:
+                        return "enum " + (t.name.empty() ? std::string("{...}") : t.name);
+                case dwarf::TypeKind::SUBROUTINE:
+                        return "func";
+                default:
+                        return "?";
+        }
+}
+
+// Returns "F32" / "U32" / "I32" if this resolves to a scalar (base, enum, or pointer);
+// nullptr for struct / union / array (not directly droppable as one channel).
+static const char *
+scalarPayloadType(const dwarf::Info &info, u64 typeOff)
+{
+        const dwarf::Type *t = resolveAlias(info, typeOff);
+        if (!t)
+                return nullptr;
+        if (t->kind == dwarf::TypeKind::BASE) {
+                switch (t->encoding) {
+                        case 0x04: // DW_ATE_float
+                                return "F32";
+                        case 0x05: // DW_ATE_signed
+                        case 0x06: // DW_ATE_signed_char
+                                return "I32";
+                        case 0x02: // DW_ATE_boolean
+                        case 0x07: // DW_ATE_unsigned
+                        case 0x08: // DW_ATE_unsigned_char
+                        default:
+                                return "U32";
+                }
+        }
+        if (t->kind == dwarf::TypeKind::ENUM)
+                return "I32";
+        if (t->kind == dwarf::TypeKind::POINTER)
+                return "U32";
+        return nullptr;
+}
+
+static u64
+typeSize(const dwarf::Info &info, u64 typeOff)
+{
+        const dwarf::Type *t = resolveAlias(info, typeOff);
+        if (!t)
+                return 0;
+        if (t->kind == dwarf::TypeKind::ARRAY) {
+                if (t->size > 0)
+                        return t->size;
+                u64 elem = typeSize(info, t->inner);
+                u64 total = elem ? elem : 1;
+                for (const u64 d : t->dims)
+                        total *= (d ? d : 1);
+                return total;
+        }
+        return t->size;
+}
+
+void
+Editor::drawVarRow(const std::string &displayName, const std::string &fullPath, const u64 addr, const u64 typeOff,
+                   const int depth)
+{
+        if (depth > 16)
+                return;
+
+        ImGui::TableNextRow();
+        ImGui::PushID(static_cast<int>(addr ^ (static_cast<u64>(depth) << 32) ^ typeOff));
+
+        const dwarf::Type *t            = resolveAlias(dwarfInfo_, typeOff);
+        const bool         isStruct     = t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION);
+        const bool         isArray      = t && t->kind == dwarf::TypeKind::ARRAY;
+        const bool         isEnum       = t && t->kind == dwarf::TypeKind::ENUM;
+        const bool         expandable   = (isStruct && !t->members.empty()) || (isArray && !t->dims.empty()) || isEnum;
+        const char        *scalarKind   = scalarPayloadType(dwarfInfo_, typeOff);
+
+        ImGui::TableSetColumnIndex(0);
+        bool open = false;
+        if (expandable) {
+                ImGuiTreeNodeFlags flags = (depth == 0) ? 0 : ImGuiTreeNodeFlags_None;
+                open                     = ImGui::TreeNodeEx("##node", flags, "%s", displayName.c_str());
+        } else {
+                ImGui::TreeNodeEx(displayName.c_str(),
+                                  ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen
+                                      | ImGuiTreeNodeFlags_SpanAvailWidth);
+        }
+        if (scalarKind && ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                ChannelDropPayload p{};
+                snprintf(p.name, sizeof(p.name), "%s", fullPath.c_str());
+                p.addr = addr;
+                snprintf(p.type, sizeof(p.type), "%s", scalarKind);
+                snprintf(p.device, sizeof(p.device), "%s", "JLINK");
+                ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
+                ImGui::Text("Dragging %s [%s @ 0x%08llX]", fullPath.c_str(), scalarKind,
+                            static_cast<unsigned long long>(addr));
+                ImGui::EndDragDropSource();
+        }
+
+        ImGui::TableSetColumnIndex(1);
+        ImGui::Text("0x%08llX", static_cast<unsigned long long>(addr));
+
+        ImGui::TableSetColumnIndex(2);
+        ImGui::Text("%llu", static_cast<unsigned long long>(typeSize(dwarfInfo_, typeOff)));
+
+        ImGui::TableSetColumnIndex(3);
+        const std::string typeStr = prettyType(dwarfInfo_, typeOff);
+        ImGui::TextUnformatted(typeStr.c_str());
+        if (isEnum && t && ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::Text("enum %s", t->name.empty() ? "" : t->name.c_str());
+                ImGui::Separator();
+                for (const auto &e : t->enums)
+                        ImGui::Text("%s = %lld", e.name.c_str(), static_cast<long long>(e.value));
+                ImGui::EndTooltip();
+        }
+
+        if (open && expandable) {
+                if (isStruct) {
+                        for (const auto &m : t->members) {
+                                const std::string childName = m.name.empty() ? "<anon>" : m.name;
+                                const std::string childPath = fullPath + "." + childName;
+                                drawVarRow(childName, childPath, addr + m.offset, m.type, depth + 1);
+                        }
+                } else if (isArray) {
+                        const u64 elemSize  = typeSize(dwarfInfo_, t->inner);
+                        const u64 dim       = t->dims.empty() ? 0 : t->dims.front();
+                        const u64 cap       = static_cast<u64>(elfArrayMaxElems_);
+                        const u64 displayed = (dim == 0) ? 0 : (dim < cap ? dim : cap);
+                        for (u64 i = 0; i < displayed; ++i) {
+                                char idx[24];
+                                snprintf(idx, sizeof(idx), "[%llu]", static_cast<unsigned long long>(i));
+                                const std::string childPath = fullPath + idx;
+                                drawVarRow(idx, childPath, addr + i * elemSize, t->inner, depth + 1);
+                        }
+                        if (dim > displayed) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextDisabled("... %llu more (raise limit)",
+                                                    static_cast<unsigned long long>(dim - displayed));
+                        }
+                } else if (isEnum) {
+                        for (const auto &e : t->enums) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TreeNodeEx(e.name.c_str(),
+                                                  ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen);
+                                ImGui::TableSetColumnIndex(3);
+                                ImGui::Text("= %lld", static_cast<long long>(e.value));
+                        }
+                }
+                ImGui::TreePop();
+        }
+
+        ImGui::PopID();
+}
+
+void
+Editor::drawElfSymbols()
+{
+        ImGui::Text("File: %s", elfPath_.empty() ? "(none)" : elfPath_.c_str());
+        if (!elfPath_.empty()) {
+                ImGui::SameLine();
+                ImGui::TextDisabled("| %s | %s | %zu sym | %s %zu vars",
+                                    elfInfo_.is64 ? "ELF64" : "ELF32",
+                                    ElfParser::machineStr(elfInfo_.machine),
+                                    elfInfo_.symbols.size(),
+                                    dwarfInfo_.present ? "DWARF" : "no-dwarf",
+                                    dwarfInfo_.variables.size());
+        }
+
+        ImGui::SetNextItemWidth(240.0f);
+        ImGui::InputTextWithHint("##elf_filter", "filter by name...", elfFilter_, sizeof(elfFilter_));
+        ImGui::SameLine();
+        ImGui::Checkbox("OBJECT only", &elfFilterObjectsOnly_);
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80.0f);
+        ImGui::InputInt("array cap", &elfArrayMaxElems_);
+        if (elfArrayMaxElems_ < 1)
+                elfArrayMaxElems_ = 1;
+
+        const std::string filter = elfFilter_;
+
+        constexpr ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable
+                                          | ImGuiTableFlags_ScrollY;
+
+        if (dwarfInfo_.present && !dwarfInfo_.variables.empty()) {
+                if (ImGui::BeginTable("ElfVarTable", 4, flags, ImVec2(0, 0))) {
+                        ImGui::TableSetupScrollFreeze(0, 1);
+                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableHeadersRow();
+
+                        for (const auto &v : dwarfInfo_.variables) {
+                                if (!filter.empty() && v.name.find(filter) == std::string::npos)
+                                        continue;
+                                drawVarRow(v.name, v.name, v.addr, v.type, 0);
+                        }
+
+                        ImGui::EndTable();
+                }
+                return;
+        }
+
+        if (elfInfo_.symbols.empty())
+                return;
+
+        if (ImGui::BeginTable("ElfSymbolTable", 6, flags, ImVec2(0, 0))) {
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableSetupColumn("Bind", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableSetupColumn("Section", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                ImGui::TableHeadersRow();
+
+                int rowId = 0;
+                for (const auto &s : elfInfo_.symbols) {
+                        if (elfFilterObjectsOnly_ && s.type != 1)
+                                continue;
+                        if (!filter.empty() && s.name.find(filter) == std::string::npos)
+                                continue;
+
+                        ImGui::TableNextRow();
+                        ImGui::PushID(rowId++);
+
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::Selectable(s.name.c_str(), false, ImGuiSelectableFlags_AllowDoubleClick);
+                        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                                ImGui::SetDragDropPayload("CHANNEL", s.name.c_str(), s.name.size() + 1);
+                                ImGui::Text("Dragging %s", s.name.c_str());
+                                ImGui::EndDragDropSource();
+                        }
+
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::Text("0x%08llX", static_cast<unsigned long long>(s.addr));
+
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::Text("%llu", static_cast<unsigned long long>(s.size));
+
+                        ImGui::TableSetColumnIndex(3);
+                        ImGui::TextUnformatted(ElfParser::typeStr(s.type));
+
+                        ImGui::TableSetColumnIndex(4);
+                        ImGui::TextUnformatted(ElfParser::bindStr(s.bind));
+
+                        ImGui::TableSetColumnIndex(5);
+                        ImGui::TextUnformatted(s.section.c_str());
+
+                        ImGui::PopID();
+                }
+
+                ImGui::EndTable();
+        }
 }
 
 void
@@ -396,6 +754,18 @@ Editor::menu()
                         ImGuiFileDialog::Instance()->OpenDialog("StoreBinFile", "save BIN file", ".bin", bin);
                 }
 
+                if (ImGui::MenuItem("Load ELF/AXF")) {
+                        state_ = EditorState::LoadElf;
+
+                        const IGFD::FileDialogConfig elf = {
+                            .fileName     = "ELF",
+                            .filePathName = ".",
+                        };
+
+                        ImGuiFileDialog::Instance()->OpenDialog(
+                            "ChooseElfFile", "choose ELF/AXF file", ".elf,.axf,.out,.*", elf);
+                }
+
                 ImGui::EndPopup();
         }
 
@@ -476,6 +846,25 @@ Editor::menu()
                         }
                         break;
                 }
+                case EditorState::LoadElf: {
+                        if (ImGuiFileDialog::Instance()->Display("ChooseElfFile")) {
+                                if (ImGuiFileDialog::Instance()->IsOk()) {
+                                        elfPath_ = ImGuiFileDialog::Instance()->GetFilePathName();
+
+                                        if (loadElf(elfPath_))
+                                                ImGui::InsertNotification({ImGuiToastType::Success,
+                                                                           toastDismissTime_,
+                                                                           "load ELF success: %zu symbols",
+                                                                           elfInfo_.symbols.size()});
+                                        else
+                                                ImGui::InsertNotification(
+                                                    {ImGuiToastType::Error, toastDismissTime_, "load ELF failure"});
+                                }
+                                state_ = EditorState::None;
+                                ImGuiFileDialog::Instance()->Close();
+                        }
+                        break;
+                }
                 default:
                         break;
         }
@@ -484,17 +873,31 @@ Editor::menu()
 void
 Editor::draw()
 {
-        if (ImGui::BeginTable(
-                "DataEditorTable", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
-                ImGui::TableSetupColumn("Name");
-                ImGui::TableSetupColumn("Type");
-                ImGui::TableSetupColumn("Value");
-                ImGui::TableHeadersRow();
+        if (ImGui::BeginTabBar("EditorTabs", ImGuiTabBarFlags_None)) {
+                if (ImGui::BeginTabItem("CFG")) {
+                        if (ImGui::BeginTable("DataEditorTable",
+                                              3,
+                                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg
+                                                  | ImGuiTableFlags_Resizable)) {
+                                ImGui::TableSetupColumn("Name");
+                                ImGui::TableSetupColumn("Type");
+                                ImGui::TableSetupColumn("Value");
+                                ImGui::TableHeadersRow();
 
-                for (auto &child : dataTree_.children)
-                        drawDataTree(child);
+                                for (auto &child : dataTree_.children)
+                                        drawDataTree(child);
 
-                ImGui::EndTable();
+                                ImGui::EndTable();
+                        }
+                        ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem("ELF Symbols")) {
+                        drawElfSymbols();
+                        ImGui::EndTabItem();
+                }
+
+                ImGui::EndTabBar();
         }
 }
 
@@ -502,6 +905,11 @@ void
 Editor::updateDisplay()
 {
         if (ImGui::Begin(name_.c_str())) {
+                if (ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows)) {
+                        for (const auto &drops = Gui::getDroppedFiles(); const auto &p : drops)
+                                handleDroppedFile(p);
+                }
+
                 menu();
                 draw();
                 ImGui::End();

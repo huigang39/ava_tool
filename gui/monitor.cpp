@@ -1,11 +1,15 @@
+#include <atomic>
 #include <charconv>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "imgui.h"
 #include "implot.h"
 
 #include "monitor.hpp"
+
+std::atomic<bool> g_monitorPaused{false};
 
 /* -------------------------------------------------------------------------- */
 /*                                MonitorScope                                */
@@ -46,8 +50,20 @@ MonitorScope::draw()
 
         if (ImGui::BeginDragDropTarget()) {
                 if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("CHANNEL")) {
-                        const auto droppedChName = static_cast<const char *>(payload->Data);
-                        addChannel(droppedChName);
+                        if (payload->DataSize == sizeof(ChannelDropPayload)) {
+                                const auto *p = static_cast<const ChannelDropPayload *>(payload->Data);
+                                if (addChannel(p->name) == 0) {
+                                        if (auto *ch = findChannel(p->name)) {
+                                                ch->setAddr(static_cast<usize>(p->addr));
+                                                if (p->type[0])
+                                                        ch->getType() = p->type;
+                                                if (p->device[0])
+                                                        ch->setDevice(p->device);
+                                        }
+                                }
+                        } else {
+                                addChannel(static_cast<const char *>(payload->Data));
+                        }
                 }
                 ImGui::EndDragDropTarget();
         }
@@ -72,13 +88,14 @@ MonitorScope::tableMenu()
 void
 MonitorScope::tableDraw()
 {
-        if (ImGui::BeginTable((name_ + "##table").c_str(), 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+        if (ImGui::BeginTable((name_ + "##table").c_str(), 7, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
                 ImGui::TableSetupColumn("Name");
                 ImGui::TableSetupColumn("RValue");
                 ImGui::TableSetupColumn("WValue");
                 ImGui::TableSetupColumn("Addr");
                 ImGui::TableSetupColumn("Type");
                 ImGui::TableSetupColumn("Device");
+                ImGui::TableSetupColumn("Hz");
                 ImGui::TableHeadersRow();
 
                 for (auto &[chName, ch] : chs_)
@@ -107,8 +124,46 @@ MonitorScope::plotMenu()
 void
 MonitorScope::plotDraw() const
 {
-        if (ImPlot::BeginPlot((name_ + "##plot").c_str(), ImVec2(-1, -1)))
+        std::string title = name_;
+        if (g_monitorPaused.load())
+                title += " [PAUSED]";
+
+        if (ImPlot::BeginPlot((title + "##plot").c_str(), ImVec2(-1, -1))) {
+                ImPlot::SetupAxes("samples", "value", ImPlotAxisFlags_AutoFit, ImPlotAxisFlags_AutoFit);
+
+                std::vector<f32> snapshot;
+                for (auto &[chName, ch] : chs_) {
+                        ch->copyRVals(snapshot);
+                        if (snapshot.empty())
+                                continue;
+
+                        const f32   *col = ch->getColor();
+                        const ImVec4 colVec = ch->useAutoColor() ? IMPLOT_AUTO_COL
+                                                                 : ImVec4(col[0], col[1], col[2], col[3]);
+                        ImPlot::SetNextLineStyle(colVec, ch->getLineWeight());
+                        if (ch->getPlotStyle() == 1)
+                                ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 3.0f);
+
+                        const int n = static_cast<int>(snapshot.size());
+                        ImPlot::PlotLine(chName.c_str(), snapshot.data(), n);
+
+                        if (ImPlot::BeginLegendPopup(chName.c_str())) {
+                                ImGui::Text("Channel: %s", chName.c_str());
+                                ImGui::Text("Hz: %.1f", ch->getHz());
+                                ImGui::Separator();
+                                ImGui::Checkbox("Auto color", &ch->useAutoColor());
+                                if (!ch->useAutoColor()) {
+                                        ImGui::SameLine();
+                                        ImGui::ColorEdit3("##color", ch->getColor(),
+                                                          ImGuiColorEditFlags_NoInputs);
+                                }
+                                ImGui::SliderFloat("Weight", &ch->getLineWeight(), 0.5f, 5.0f, "%.1f");
+                                ImGui::Combo("Style", &ch->getPlotStyle(), "Line\0Line+Markers\0");
+                                ImPlot::EndLegendPopup();
+                        }
+                }
                 ImPlot::EndPlot();
+        }
 }
 
 int
@@ -175,7 +230,12 @@ MonitorScope::drawTableRow(const std::string &chName, std::unique_ptr<MonitorCha
                 }
         }
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
-                ImGui::SetDragDropPayload("CHANNEL", chName.c_str(), chName.size() + 1);
+                ChannelDropPayload p{};
+                snprintf(p.name, sizeof(p.name), "%s", ch->getName().c_str());
+                p.addr = static_cast<u64>(ch->getAddr());
+                snprintf(p.type, sizeof(p.type), "%s", ch->getType().c_str());
+                snprintf(p.device, sizeof(p.device), "%s", ch->getDevice().c_str());
+                ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                 ImGui::Text("Dragging %s", chName.c_str());
                 ImGui::EndDragDropSource();
         }
@@ -192,7 +252,7 @@ MonitorScope::drawTableRow(const std::string &chName, std::unique_ptr<MonitorCha
         ImGui::TableSetColumnIndex(3);
         const u64 addr = ch->getAddr();
         char      buf[32];
-        snprintf(buf, sizeof(buf), "0x%016llX", (u64)addr);
+        snprintf(buf, sizeof(buf), "0x%08llX", (u64)addr);
         if (ImGui::InputText(("##addr" + name_ + chName).c_str(),
                              buf,
                              sizeof(buf),
@@ -218,7 +278,7 @@ MonitorScope::drawTableRow(const std::string &chName, std::unique_ptr<MonitorCha
         // 绘制 Device 列
         ImGui::TableSetColumnIndex(5);
         if (ImGui::BeginCombo(("##device" + name_ + chName).c_str(), ch->getDevice().c_str())) {
-                for (const char *devices[] = {"LOCAL", "FSA"}; auto &device : devices) {
+                for (const char *devices[] = {"LOCAL", "FSA", "JLINK"}; auto &device : devices) {
                         const bool is_selected = (ch->getDevice() == device);
                         if (ImGui::Selectable(device, is_selected))
                                 ch->setDevice(device);
@@ -227,6 +287,10 @@ MonitorScope::drawTableRow(const std::string &chName, std::unique_ptr<MonitorCha
                 }
                 ImGui::EndCombo();
         }
+
+        // 绘制 Hz 列
+        ImGui::TableSetColumnIndex(6);
+        ImGui::Text("%.1f", ch->getHz());
 }
 
 /* -------------------------------------------------------------------------- */

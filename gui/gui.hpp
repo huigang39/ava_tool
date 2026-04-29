@@ -2,6 +2,8 @@
 #define GUI_HPP
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "module.h"
 
@@ -18,6 +20,9 @@ class Gui
 
       private:
         static void glfwErrCb(int err, const char *desc);
+        static void glfwDropCb(GLFWwindow *window, int count, const char **paths);
+
+        static std::vector<std::string> sDroppedFiles_;
 
         static constexpr char *glslVer_ = (char *)"#version 130";
 
@@ -40,6 +45,8 @@ class Gui
         void loop();
 
         MonitorMapType &getMonitors() { return monitors_; }
+
+        static std::vector<std::string> &getDroppedFiles() { return sDroppedFiles_; }
 };
 
 #endif // !GUI_HPP

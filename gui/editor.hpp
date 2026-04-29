@@ -9,6 +9,8 @@
 #include "module.h"
 
 #include "cJSON.h"
+#include "dwarf_parser.hpp"
+#include "elf_parser.hpp"
 
 class Editor
 {
@@ -28,24 +30,30 @@ class Editor
                 std::vector<DataTree>       children;
         };
 
-      private:
-        std::string name_{};
-        std::string cfgPath_{}, binPath_{};
-        DataTree    dataTree_{
-               .name = "CFG",
-               .type = DataType::ARRAY,
-        };
-        int toastDismissTime_{2000};
+private:
+  std::string name_{};
+  std::string cfgPath_{}, binPath_{}, elfPath_{};
+  DataTree dataTree_{
+      .name = "CFG",
+      .type = DataType::ARRAY,
+  };
+  int toastDismissTime_{2000};
 
-        enum class EditorState {
-                None,
-                LoadCfg,
-                LoadBin,
-                StoreCfg,
-                StoreBin,
-        };
+  ElfInfo elfInfo_{};
+  dwarf::Info dwarfInfo_{};
+  char elfFilter_[128]{};
+  bool elfFilterObjectsOnly_{true};
+  int elfArrayMaxElems_{64};
 
-        EditorState state_ = EditorState::None;
+  enum class EditorState {
+    None,
+    LoadCfg,
+    LoadBin,
+    StoreCfg,
+    StoreBin,
+    LoadElf,
+  };
+  EditorState state_ = EditorState::None;
 
         void menu();
         void draw();
@@ -56,9 +64,16 @@ class Editor
         bool               loadCfg(const std::string &cfgPath);
         [[nodiscard]] bool storeCfg(const std::string &cfgPath) const;
 
-        static bool        parseBin(std::ifstream &ifs, DataTree &node);
-        bool               loadBin(const std::string &binPath);
-        [[nodiscard]] bool storeBin(const std::string &binPath) const;
+  static bool parseBin(std::ifstream &ifs, DataTree &node);
+  bool loadBin(const std::string &binPath);
+  [[nodiscard]] bool storeBin(const std::string &binPath) const;
+
+  bool loadElf(const std::string &elfPath);
+  void drawElfSymbols();
+  void drawVarRow(const std::string &displayName, const std::string &fullPath, u64 addr, u64 typeOff,
+                  int depth);
+
+  void handleDroppedFile(const std::string &path);
 
         static const char *dataTypeToStr(DataType type);
         static DataType    strToDataType(const std::string &str);

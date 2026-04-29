@@ -7,11 +7,22 @@
 #include "implot.h"
 
 #include "gui.hpp"
+#include "jlink_dev.hpp"
+#include "monitor.hpp"
+
+std::vector<std::string> Gui::sDroppedFiles_{};
 
 void
 Gui::glfwErrCb(const int err, const char *desc)
 {
         print_error(true, "Glfw Error %d: %s", err, desc);
+}
+
+void
+Gui::glfwDropCb(GLFWwindow * /*window*/, const int count, const char **paths)
+{
+        for (int i = 0; i < count; ++i)
+                sDroppedFiles_.emplace_back(paths[i]);
 }
 
 Gui::Gui()
@@ -31,6 +42,8 @@ Gui::Gui()
 
         glfwMakeContextCurrent(window_);
         glfwSwapInterval(1);
+
+        glfwSetDropCallback(window_, glfwDropCb);
 
         glfwGetWindowContentScale(window_, &xScale_, &yScale_);
 
@@ -82,6 +95,21 @@ Gui::drawBar()
                         }
                         ImGui::EndMenu();
                 }
+
+                ImGui::Separator();
+                JLinkDev::instance().drawUI();
+
+                ImGui::Separator();
+                const bool paused = g_monitorPaused.load();
+                if (ImGui::SmallButton(paused ? "Resume" : "Pause"))
+                        g_monitorPaused.store(!paused);
+                if (paused) {
+                        ImGui::SameLine();
+                        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.0f, 1.0f), "[PAUSED]");
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("(space)");
+
                 ImGui::EndMainMenuBar();
         }
 }
@@ -98,6 +126,10 @@ Gui::loop()
 
                 drawBar();
 
+                if (const ImGuiIO &io = ImGui::GetIO();
+                    !io.WantTextInput && ImGui::IsKeyPressed(ImGuiKey_Space, false))
+                        g_monitorPaused.store(!g_monitorPaused.load());
+
                 ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
 
                 {
@@ -107,6 +139,8 @@ Gui::loop()
                         for (const auto &editor : editors_ | std::views::values)
                                 editor->updateDisplay();
                 }
+
+                sDroppedFiles_.clear();
 
                 ImGui::Render();
                 int display_w, display_h;
