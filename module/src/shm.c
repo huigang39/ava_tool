@@ -27,8 +27,8 @@ shm_init(shm_t *shm, const shm_cfg_t shm_cfg)
         } else
                 lo->is_creator = 0;
 
-        lo->base = mmap(NULL, cfg->cap, cfg->access, MAP_SHARED, lo->fd, 0);
-        if (lo->base == MAP_FAILED) {
+        lo->addr = mmap(NULL, cfg->cap, cfg->access, MAP_SHARED, lo->fd, 0);
+        if (lo->addr == MAP_FAILED) {
                 close(lo->fd);
                 if (lo->is_creator)
                         shm_unlink(cfg->name);
@@ -54,19 +54,19 @@ shm_init(shm_t *shm, const shm_cfg_t shm_cfg)
                 lo->is_creator = 0;
 
         // 映射到进程地址空间
-        lo->base = MapViewOfFile(lo->fd,              // 文件映射句柄
+        lo->addr = MapViewOfFile(lo->fd,              // 文件映射句柄
                                  FILE_MAP_ALL_ACCESS, // 读写权限
                                  0,
                                  0,         // 偏移量
                                  cfg->cap); // 映射大小
-        if (lo->base == NULL) {
-                UnmapViewOfFile(lo->base);
+        if (lo->addr == NULL) {
+                UnmapViewOfFile(lo->addr);
                 CloseHandle(lo->fd);
                 return -MEACCES;
         }
 #endif
 
-        lo->spsc = (spsc_t *)lo->base;
+        lo->spsc = (spsc_t *)lo->addr;
         if (lo->is_creator)
                 spsc_init_buf(lo->spsc, cfg->cap >> 1, SPSC_POLICY_REJECT);
 
@@ -78,7 +78,7 @@ shm_read(shm_t *shm, void *dst, const usize size)
 {
         DECL(shm, lo);
 
-        spsc_read_buf(lo->spsc, (u8 *)lo->base + sizeof(*lo->spsc), dst, size);
+        spsc_read_buf(lo->spsc, (u8 *)lo->addr + sizeof(*lo->spsc), dst, size);
 }
 
 void
@@ -86,5 +86,5 @@ shm_write(shm_t *shm, const void *src, const usize size)
 {
         DECL(shm, lo);
 
-        spsc_write_buf(lo->spsc, (u8 *)lo->base + sizeof(*lo->spsc), src, size);
+        spsc_write_buf(lo->spsc, (u8 *)lo->addr + sizeof(*lo->spsc), src, size);
 }

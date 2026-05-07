@@ -1,24 +1,21 @@
 #ifndef TYPEDEF_H
 #define TYPEDEF_H
 
-#include <stdint.h>
-
 #include "macrodef.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-typedef uint8_t u8;
-typedef int8_t  i8;
+typedef unsigned char u8;
+typedef signed char   i8;
 
-typedef uint16_t u16;
-typedef int16_t  i16;
+typedef unsigned short u16;
+typedef signed short   i16;
 
-typedef uint32_t u32;
-typedef int32_t  i32;
+typedef unsigned int u32;
+typedef signed int   i32;
 
-//* on Windows, (unsigned long) is 32bit
 typedef unsigned long long u64;
 typedef signed long long   i64;
 
@@ -32,6 +29,14 @@ typedef i32 isize;
 #else
 typedef u64 usize;
 typedef i64 isize;
+#endif
+
+#ifndef TRUE
+#define TRUE (1)
+#endif
+
+#ifndef FALSE
+#define FALSE (0)
 #endif
 
 typedef struct u32_uvw {
@@ -62,6 +67,12 @@ typedef struct f32_dq {
         f32 q;
 } f32_dq_t;
 
+typedef enum dir {
+        DIR_NONE    = 0,
+        DIR_FORWARD = 1,
+        DIR_REVERSE = -1,
+} dir_e;
+
 typedef struct motor_cfg {
         u32 npp;
         f32 ld;
@@ -69,9 +80,30 @@ typedef struct motor_cfg {
         f32 rs;
         f32 psi; // Wb
         f32 j;   // 转子惯量
-        f32 vel_max, cur_rated, cur_max, tor_rated, tor_max;
+        f32 vel_rated;
+        f32 vel_peak;
+        f32 cur_rated;
+        f32 cur_peak;
+        f32 tor_rated;
+        f32 tor_peak;
         f32 cur2tor[4], tor2cur[4];
 } motor_cfg_t;
+
+typedef struct periph_cfg {
+        /* ADC */
+        u32 adc_full_cnt;
+        f32 cur_max, vbus_max;
+        f32 adc2cur, adc2vbus, adc2volt;
+        f32 volt_tau;
+        u32 cur_gain;
+
+        /* PWM */
+        u32 timer_freq;
+        u32 pwm_freq;
+        u32 pwm_full_cnt;
+        f32 f32_pwm_duty_min;
+        f32 f32_pwm_duty_max;
+} periph_cfg_t;
 
 HAPI void
 void_null_func(void)

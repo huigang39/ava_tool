@@ -96,7 +96,7 @@ typedef struct net_async_req {
         void          *buf;
         usize          size;
         net_async_cb_f f_cb;
-        ATOMIC(bool) processed;
+        ATOMIC(u8) processed;
 #ifdef _WIN32
         OVERLAPPED  ov;
         u64         timeout_us;
@@ -108,7 +108,7 @@ typedef u64 (*net_get_ts_f)(void);
 
 typedef struct net_cfg {
         net_type_e   e_type;
-        mempool_t   *mp;
+        mempool_t   *mempool;
         u32          ring_len;
         log_cfg_t    log_cfg;
         net_get_ts_f f_get_ts;
@@ -138,7 +138,7 @@ typedef struct net {
  * @brief 将 socket 设置为非阻塞模式
  *
  * @param fd socket 文件描述符
- * @return   状态码
+ * @return   错误码
  */
 int net_set_nonblock(sockfd_t fd);
 
@@ -147,7 +147,7 @@ int net_set_nonblock(sockfd_t fd);
  *
  * @param net     net 结构体
  * @param net_cfg net 配置
- * @return        状态码
+ * @return        错误码
  */
 int net_init(net_t *net, net_cfg_t net_cfg);
 
@@ -155,7 +155,7 @@ int net_init(net_t *net, net_cfg_t net_cfg);
  * @brief 清理 net 相关 socket
  *
  * @param net net 结构体
- * @return    状态码
+ * @return    错误码
  */
 void net_destroy(net_t *net);
 
@@ -174,7 +174,7 @@ net_ch_t net_cfg_ch(u32 det_ip, u16 dst_port, net_mode_e e_mode);
  *
  * @param net net 结构体
  * @param ch  通道
- * @return    状态码
+ * @return    错误码
  */
 int net_add_ch(net_t *net, net_ch_t *ch);
 
@@ -184,7 +184,7 @@ int net_add_ch(net_t *net, net_ch_t *ch);
  * @param ch     通道
  * @param tx_buf 发送缓冲区
  * @param size   发送字节数
- * @return       成功返回发送的字节数, 失败返回状态码
+ * @return       成功返回发送的字节数, 失败返回错误码
  */
 isize net_sync_send(const net_ch_t *ch, const void *tx_buf, usize size);
 
@@ -195,7 +195,7 @@ isize net_sync_send(const net_ch_t *ch, const void *tx_buf, usize size);
  * @param rx_buf     接收缓冲区
  * @param cap        接收缓冲区容量字节数
  * @param timeout_us 超时时间(微秒)
- * @return           成功返回接收的字节数, 失败返回状态码
+ * @return           成功返回接收的字节数, 失败返回错误码
  */
 isize net_sync_recv_yield(const net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us);
 
@@ -206,7 +206,7 @@ isize net_sync_recv_yield(const net_ch_t *ch, void *rx_buf, usize cap, u32 timeo
  * @param rx_buf     接收缓冲区
  * @param cap        接收缓冲区容量字节数
  * @param timeout_us 超时时间(微秒)
- * @return           成功返回接收的字节数, 失败返回状态码
+ * @return           成功返回接收的字节数, 失败返回错误码
  */
 isize net_sync_recv_spin(const net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us);
 
@@ -217,7 +217,7 @@ isize net_sync_recv_spin(const net_ch_t *ch, void *rx_buf, usize cap, u32 timeou
  * @param ch     通道
  * @param tx_buf 发送缓冲区
  * @param size   发送字节数
- * @return       成功返回发送的字节数, 失败返回状态码
+ * @return       成功返回发送的字节数, 失败返回错误码
  */
 isize net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size);
 
@@ -229,7 +229,7 @@ isize net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size);
  * @param rx_buf     接收缓冲区
  * @param cap        接收缓冲区容量字节数
  * @param timeout_us 超时时间(微秒)
- * @return           成功返回接收的字节数, 失败返回状态码
+ * @return           成功返回接收的字节数, 失败返回错误码
  */
 isize net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us);
 
@@ -237,7 +237,7 @@ isize net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 time
  * @brief 轮询处理异步请求
  *
  * @param net net 结构体
- * @return    状态码
+ * @return    错误码
  */
 int net_poll(net_t *net);
 
@@ -248,7 +248,7 @@ int net_poll(net_t *net);
  * @param ch     通道
  * @param tx_buf 发送缓冲区
  * @param size   发送字节数
- * @return       成功返回发送的字节数, 失败返回状态码
+ * @return       成功返回发送的字节数, 失败返回错误码
  */
 isize net_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size);
 
@@ -260,7 +260,7 @@ isize net_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size);
  * @param rx_buf     接收缓冲区
  * @param cap        接收缓冲区容量字节数
  * @param timeout_us 超时时间(微秒)
- * @return           成功返回接收的字节数, 失败返回状态码
+ * @return           成功返回接收的字节数, 失败返回错误码
  */
 isize net_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us);
 
@@ -274,7 +274,7 @@ isize net_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
  * @param rx_buf     接收缓冲区
  * @param cap        接收缓冲区容量字节数
  * @param timeout_us 超时时间(微秒)
- * @return           成功返回接收的字节数, 失败返回状态码
+ * @return           成功返回接收的字节数, 失败返回错误码
  */
 isize net_send_recv(net_t *net, net_ch_t *ch, void *tx_buf, usize size, void *rx_buf, usize cap, u32 timeout_us);
 
@@ -287,7 +287,7 @@ isize net_send_recv(net_t *net, net_ch_t *ch, void *tx_buf, usize size, void *rx
  * @param size       发送字节数
  * @param resps      回复内容数组
  * @param timeout_us 超时时间(微秒)
- * @return           成功返回回复的 IP 个数, 失败返回状态码
+ * @return           成功返回回复的 IP 个数, 失败返回错误码
  */
 int net_broadcast(u32 ip, u16 port, const void *tx_buf, usize size, net_resp_t *resps, u32 timeout_us);
 

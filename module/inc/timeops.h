@@ -16,10 +16,6 @@
 extern "C" {
 #endif
 
-#define NANO_PER_SEC      (1000000000) // 10^9
-#define MICRO_PER_SEC     (1000000)    // 10^6
-#define MILLI_PER_SEC     (1000)       // 10^3
-
 #define WIN_TO_UNIX_EPOCH (116444736000000000ULL)
 
 #define NS2US(ns)         ((ns) / 1000.0F)
@@ -39,19 +35,19 @@ extern "C" {
 #define HZ2MS(hz)         (1.0F / (hz) * 1000)
 #define HZ2US(hz)         (1.0F / (hz) * 1000000)
 
-#define S2CNT(s, hz)      ((s) / HZ2S(hz))
-#define MS2CNT(ms, hz)    ((ms) / HZ2MS(hz))
+#define S2CNT(s, hz)      ((s) * (hz))
+#define MS2CNT(ms, hz)    ((ms) * (hz) / 1000.0F)
 
-#define TIMED_EXEC(ret, period_us, code)                             \
-        do {                                                         \
-                const u64 start = get_mono_ts_us();                  \
-                {code};                                              \
-                const u64 elapsed = get_mono_ts_us() - start;        \
-                ret               = (int)elapsed;                    \
-                if (elapsed < (period_us)) {                         \
-                        const u64 remaining = (period_us) - elapsed; \
-                        delay_us(remaining);                         \
-                }                                                    \
+#define TIMED_EXEC(ret, period_us, code)                               \
+        do {                                                           \
+                const u64 __start = get_mono_ts_us();                  \
+                {code};                                                \
+                const u64 __elapsed = get_mono_ts_us() - __start;      \
+                ret                 = (int)elapsed;                    \
+                if (__elapsed < (period_us)) {                         \
+                        const u64 remaining = (period_us) - __elapsed; \
+                        delay_us(remaining);                           \
+                }                                                      \
         } while (0)
 
 HAPI u64
@@ -127,8 +123,8 @@ get_real_ts_s(void)
 }
 
 typedef enum {
-        SPIN,
-        YIELD,
+        DELAY_SPIN,
+        DELAY_YIELD,
 } delay_e;
 
 HAPI void
@@ -136,14 +132,14 @@ spin(u32 us)
 {
         u64 start = get_mono_ts_us();
         while ((get_mono_ts_us() - start) < us)
-                asm volatile("nop" ::: "memory");
+                ;
 }
 
 #ifdef __linux__
 HAPI void
 yield(const u32 ms)
 {
-        usleep(1000 * ms);
+        usleep(K(ms));
 }
 #elif defined(_WIN32)
 #include <windows.h>
@@ -170,11 +166,11 @@ HAPI void
 delay_ms(const u64 ms, const delay_e e_delay)
 {
         switch (e_delay) {
-                case SPIN: {
+                case DELAY_SPIN: {
                         spin(MS2US(ms));
                         break;
                 }
-                case YIELD: {
+                case DELAY_YIELD: {
                         yield(ms);
                         break;
                 }
@@ -187,11 +183,11 @@ HAPI void
 delay_s(const u64 s, const delay_e e_delay)
 {
         switch (e_delay) {
-                case SPIN: {
+                case DELAY_SPIN: {
                         spin(S2US(s));
                         break;
                 }
-                case YIELD: {
+                case DELAY_YIELD: {
                         yield(S2MS(s));
                         break;
                 }

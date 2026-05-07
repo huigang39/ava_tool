@@ -17,7 +17,7 @@ EXCLUDE_PATTERNS          :=
 
 space                     := $(subst ,, )
 FMT_EXTENSIONS            := .c .cpp .h .hpp
-FMT_DIRS                  := src inc test script
+FMT_DIRS                  := src inc test tool script
 FMT_EXCLUDE_DIRS          :=
 
 ifeq ($(OS),Windows_NT)
@@ -175,7 +175,7 @@ endif
 
 OBJ_FILES                 := $(SRC_FILES:$(SRC_DIR)/%.c=$(OUTPUT_BUILD_DIR)/%.o)
 
-.PHONY: all tool test clean fmt list help info gcc-linux gcc-win gcc-mcu ac5-mcu ac6-mcu
+.PHONY: all tool test clean fmt list help info ac5-mcu ac6-mcu gcc-mcu gcc-linux gcc-win
 
 all: $(OUTPUT_STATIC_LIB) $(if $(SHARED_LIB),$(OUTPUT_SHARED_LIB),)
 	@$(ECHO_NL)
@@ -265,8 +265,6 @@ ifeq ($(PLATFORM),win)
 else
 	@find $(SRC_DIR) -type f -name "*.c" 2>/dev/null | sort | awk '{printf "  %2d. %s\n", NR, $$0}'
 endif
-	@$(ECHO_NL)
-	@echo "make list complete."
 
 info:
 	@$(ECHO_NL)
@@ -301,26 +299,26 @@ help:
 	@$(ECHO_NL)
 	@echo "examples:"
 	@echo "  make           - build with default settings (gcc/linux)"
-	@echo "  make gcc-linux - build libraries for Linux with gcc"
-	@echo "  make gcc-win   - build libraries for Windows with gcc"
-	@echo "  make gcc-mcu   - build static library for MCU with gcc"
 	@echo "  make ac5-mcu   - build for MCU with ac5"
 	@echo "  make ac6-mcu   - build for MCU with ac6"
-
-gcc-linux:
-	@$(MAKE) COMPILER=gcc PLATFORM=linux all
-
-gcc-win:
-	@$(MAKE) COMPILER=gcc PLATFORM=win all
-
-gcc-mcu:
-	@$(MAKE) COMPILER=gcc PLATFORM=mcu all
+	@echo "  make gcc-mcu   - build static library for MCU with gcc"
+	@echo "  make gcc-linux - build libraries for Linux with gcc"
+	@echo "  make gcc-win   - build libraries for Windows with gcc"
 
 ac5-mcu:
 	@$(MAKE) COMPILER=ac5 PLATFORM=mcu all
 
 ac6-mcu:
 	@$(MAKE) COMPILER=ac6 PLATFORM=mcu all
+
+gcc-mcu:
+	@$(MAKE) COMPILER=gcc PLATFORM=mcu all
+
+gcc-linux:
+	@$(MAKE) COMPILER=gcc PLATFORM=linux all
+
+gcc-win:
+	@$(MAKE) COMPILER=gcc PLATFORM=win all
 
 $(OUTPUT_STATIC_LIB): $(OBJ_FILES) | $(OUTPUT_LIB_DIR)
 	@$(ECHO_NL)

@@ -1,14 +1,15 @@
 #include <stdlib.h>
 
 #include "module.h"
+
 int
 main()
 {
-        shm_t     shm     = {0};
-        shm_cfg_t shm_cfg = {
+        shm_t           shm     = {0};
+        const shm_cfg_t shm_cfg = {
             .name   = "ch1",
             .access = SHM_READWRITE,
-            .cap    = 1024,
+            .cap    = SIZE_1KB,
         };
 
         const int ret = shm_init(&shm, shm_cfg);
@@ -17,7 +18,7 @@ main()
                 exit(-1);
         }
 
-        printf("shm_addr: 0x%p, buf_addr: 0x%p\n", shm.lo.base, shm.lo.spsc->buf);
+        printf("shm_addr: 0x%p, buf_addr: 0x%p\n", shm.lo.addr, shm.lo.spsc->buf);
 
         u64 cnt = 0;
         for (;;) {

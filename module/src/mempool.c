@@ -65,7 +65,7 @@ mempool_insert_free_block_ordered(const mempool_t *mp, mempool_blk_t *blk)
         while (pos != &mp->blk_root && (u8 *)CONTAINER_OF(pos, mempool_blk_t, blk_node) < (u8 *)blk)
                 pos = pos->next;
 
-        __list_add(&blk->blk_node, pos->prev, pos);
+        list_add_tail(&blk->blk_node, pos);
 }
 
 /**

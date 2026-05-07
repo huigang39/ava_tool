@@ -11,19 +11,66 @@
 #include <utility>
 #include <vector>
 
-#include "module.h"
+#include "jlink_dev.hpp"
 
 extern std::atomic<bool> g_monitorPaused;
 
 struct ChannelDropPayload {
-        char name[128];
-        u64  addr;
-        char type[8];   // "F32" / "U32" / "I32"
-        char device[8]; // "LOCAL" / "FSA" / "JLINK"
+        static constexpr int kMaxEnums = 16;
+        struct EnumEntry {
+                char name[64];
+                i64  value;
+        };
+
+        char      name[128];
+        u64       addr;
+        char      type[8];   // "F32"/"F64"/"I8"/"I16"/"I32"/"I64"/"U8"/"U16"/"U32"/"U64"
+        char      device[8]; // "LOCAL" / "FSA" / "JLINK"
+        u8        numBytes;  // 1/2/4/8 - 派生自 type
+        u8        numEnums;  // 0 表示不是枚举
+        u8        pad[6];
+        EnumEntry enums[kMaxEnums];
 };
+
+// type 字符串 → 字节数. 默认 4B.
+inline u32
+typeBytes(const std::string &t)
+{
+        if (t == "F64" || t == "I64" || t == "U64")
+                return 8;
+        if (t == "I16" || t == "U16")
+                return 2;
+        if (t == "I8" || t == "U8")
+                return 1;
+        return 4; // F32 / I32 / U32 / 空 / 未知
+}
+
+// 全局会话时间戳: 进程内首次调用为 0 时刻, 单调递增, 单位秒.
+// 所有 setRVal 调用点共享, 保证多通道时间轴一致.
+// 全局会话起始点
+inline std::chrono::steady_clock::time_point& getSessionStartPoint()
+{
+        static auto start = std::chrono::steady_clock::now();
+        return start;
+}
+
+inline double sessionTimeSec()
+{
+        using clock = std::chrono::steady_clock;
+        auto now = clock::now();
+        auto elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(now - getSessionStartPoint()).count();
+        return static_cast<double>(elapsedUs) / 1000000.0;
+}
+
+inline void resetSessionTime()
+{
+        getSessionStartPoint() = std::chrono::steady_clock::now();
+}
 
 class MonitorChannel
 {
+        friend class MonitorScope;
+
       public:
         enum class DeviceEnum {
                 LOCAL,
@@ -31,17 +78,28 @@ class MonitorChannel
                 JLINK,
         };
 
+        struct EnumEntry {
+                std::string name;
+                i64         value;
+        };
+
         static constexpr usize kMaxSamples = 4096;
 
       private:
-        std::string name_{};
-        std::string type_{};
-        usize       addr_{};
-        f32         rVal_{}, wVal_{};
-        std::string device_{};
+        std::string       name_{};
+        std::string       type_{};
+        usize             addr_{};
+        std::string       symbolName_{};
+        u32               numBytes_{4};
+        f32               rVal_{}, wVal_{};
+        std::string       device_{};
+        std::atomic<bool> wValDirty_{false};
+        std::atomic<bool> pendingDelete_{false};
 
-        std::deque<f32>    rVals_{}, wVals_{};
-        mutable std::mutex valMutex_{};
+        std::deque<f32>        rVals_{};
+        std::deque<f32>        rTs_{}; // 与 rVals_ 一一对应的时间戳 (秒, 相对 session start)
+        mutable std::mutex     valMutex_{};
+        std::vector<EnumEntry> enums_{};
 
         u64                                   sampleCount_{0};
         u64                                   lastRateCount_{0};
@@ -52,51 +110,106 @@ class MonitorChannel
         f32  color_[4]{1.0f, 1.0f, 1.0f, 1.0f};
         bool useAutoColor_{true};
         f32  lineWeight_{1.5f};
-        int  plotStyle_{0}; // 0 = Line, 1 = Line+Markers
+        int  plotStyle_{0}; // 0 = Line, 1 = Stairs
+        bool showMarkers_{false};
+        bool show_{true};
 
         shm_t shm_{};
 
       public:
-        explicit MonitorChannel(std::string chName) : name_(std::move(chName)) {}
+        explicit MonitorChannel(std::string chName) : name_(std::move(chName))
+        {
+                // Default wave config: 1000Hz sample rate, 1Hz Sine wave, 1.0 Amp
+                wave_cfg_t cfg = {1000.0f, WAVE_TYPE_SINE, 1.0f, 1.0f, 0.0f, 0.0f, 0.5f, 1.0f};
+                wave_init(&wave_, cfg);
+        }
         MonitorChannel()  = default;
         ~MonitorChannel() = default;
 
         std::string &getName() { return name_; }
         void         setName(const std::string &name) { name_ = name; }
         std::string &getType() { return type_; }
-        void         setType(const std::string &type) { type_ = type; }
+        void         setType(const std::string &type)
+        {
+                type_     = type;
+                numBytes_ = typeBytes(type);
+        }
         usize       &getAddr() { return addr_; }
+        std::string &getSymbolName() { return symbolName_; }
         void         setAddr(const usize addr) { addr_ = addr; }
         std::string &getDevice() { return device_; }
         void         setDevice(const std::string &device) { device_ = device; }
         shm_t       &getShm() { return shm_; }
 
         f32 &getRVal() { return rVal_; }
-        void setRVal(const f32 val)
+        bool &show() { return show_; }
+        void  setShow(bool s) { show_ = s; }
+        bool &selected() { return selected_; }
+        bool  selected_{false};
+
+        // Wave generator
+        bool               waveEnable_{false};
+        wave_t             wave_{};
+        mutable std::mutex waveMtx_{};
+        // 每个采样点都带一个绝对时间戳 (相对 session start), 多通道按帧时间戳同步.
+        void setRVal(f32 val, double ts)
         {
                 std::lock_guard lk(valMutex_);
-                rVal_ = val;
+                f32 fts = static_cast<f32>(ts);
+                if (!rTs_.empty() && fts <= rTs_.back()) {
+                        fts = rTs_.back() + 0.000001f; // Enforce strict monotonicity (1us)
+                }
+                rTs_.push_back(fts);
                 rVals_.push_back(val);
-                if (rVals_.size() > kMaxSamples)
-                        rVals_.pop_front();
+                rVal_ = val;
+                sampleCount_++;
+                updateRate_();
 
-                ++sampleCount_;
-                using clock     = std::chrono::steady_clock;
-                const auto now  = clock::now();
-                if (!rateInited_) {
-                        lastRateTime_  = now;
-                        lastRateCount_ = sampleCount_;
-                        rateInited_    = true;
-                } else {
-                        const auto dtMs =
-                            std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRateTime_).count();
-                        if (dtMs >= 500) {
-                                const u64 dCount = sampleCount_ - lastRateCount_;
-                                sampleHz_        = static_cast<f32>(dCount * 1000.0 / static_cast<double>(dtMs));
-                                lastRateTime_    = now;
-                                lastRateCount_   = sampleCount_;
+                // History pruning
+                if (historySeconds_ > 0.0f) {
+                        while (!rTs_.empty() && (fts - rTs_.front()) > historySeconds_) {
+                                rTs_.pop_front();
+                                rVals_.pop_front();
                         }
                 }
+        }
+
+        // 批量插入: 一次锁内完成所有 push + 裁剪, 大幅减少锁竞争.
+        void pushBatch(const f32 *vals, const f32 *ts, const size_t count)
+        {
+                if (count == 0)
+                        return;
+                std::lock_guard lk(valMutex_);
+                for (size_t i = 0; i < count; ++i) {
+                        rVals_.push_back(vals[i]);
+                        f32 fts = ts[i];
+                        if (!rTs_.empty() && fts <= rTs_.back()) {
+                                fts = rTs_.back() + 0.000001f;
+                        }
+                        rTs_.push_back(fts);
+                }
+                rVal_ = vals[count - 1];
+
+                // Optimized block pruning: find the first element to keep
+                if (historySeconds_ > 0.0f) {
+                        const f32 cutoff = ts[count - 1] - historySeconds_;
+                        auto itTs = rTs_.begin();
+                        auto itVal = rVals_.begin();
+                        size_t popCount = 0;
+                        while(itTs != rTs_.end() && *itTs < cutoff) {
+                                ++itTs;
+                                ++itVal;
+                                ++popCount;
+                        }
+                        if (popCount > 0) {
+                                rTs_.erase(rTs_.begin(), itTs);
+                                rVals_.erase(rVals_.begin(), itVal);
+                        }
+                }
+
+                sampleCount_ += count;
+                // Only update rate every 100 samples to save CPU
+                if (sampleCount_ % 100 < count) updateRate_();
         }
 
         f32 getHz() const
@@ -109,23 +222,110 @@ class MonitorChannel
         bool &useAutoColor() { return useAutoColor_; }
         f32  &getLineWeight() { return lineWeight_; }
         int  &getPlotStyle() { return plotStyle_; }
+        bool &showMarkers() { return showMarkers_; }
 
         f32 &getWVal() { return wVal_; }
         void setWVal(const f32 val)
         {
                 std::lock_guard lk(valMutex_);
                 wVal_ = val;
-                wVals_.push_back(val);
-                if (wVals_.size() > kMaxSamples)
-                        wVals_.pop_front();
+                // Note: wVals_ is removed as it was unused and inefficient
         }
 
-        void copyRVals(std::vector<f32> &out) const
+        u32  getNumBytes() const { return numBytes_; }
+        void setNumBytes(const u32 nb) { numBytes_ = nb; }
+
+        // 用户在 InputFloat 上按 Enter 后由 UI 标记为 dirty,
+        // threadFunc 一次性消费并真正写到 target.
+        void markWValDirty() { wValDirty_.store(true, std::memory_order_release); }
+        bool consumeWValDirty(f32 &out)
+        {
+                if (!wValDirty_.exchange(false, std::memory_order_acq_rel))
+                        return false;
+                std::lock_guard lk(valMutex_);
+                out = wVal_;
+                return true;
+        }
+
+        // 同时拷出 X (时间) / Y (值) 两条 series, 一一对应.
+        void copyRVals(std::vector<f32> &xs, std::vector<f32> &ys) const
         {
                 std::lock_guard lk(valMutex_);
-                out.assign(rVals_.begin(), rVals_.end());
+                xs.assign(rTs_.begin(), rTs_.end());
+                ys.assign(rVals_.begin(), rVals_.end());
         }
+
+      private:
+        void updateRate_()
+        {
+                using clock    = std::chrono::steady_clock;
+                const auto now = clock::now();
+                if (!rateInited_) {
+                        lastRateTime_  = now;
+                        lastRateCount_ = sampleCount_;
+                        rateInited_    = true;
+                } else {
+                        const auto dtMs =
+                            std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRateTime_).count();
+                        if (dtMs >= 500) {
+                                const u64 dCount = sampleCount_ - lastRateCount_;
+                                sampleHz_ = static_cast<f32>(dCount * 1000.0 / static_cast<double>(dtMs));
+                                lastRateTime_  = now;
+                                lastRateCount_ = sampleCount_;
+                        }
+                }
+        }
+
+      public:
+
+        // 删除标记: UI 设置, threadFunc / Monitor 在安全点真正擦除.
+        void markPendingDelete() { pendingDelete_.store(true, std::memory_order_release); }
+        bool isPendingDelete() const { return pendingDelete_.load(std::memory_order_acquire); }
+
+        const std::vector<EnumEntry> &getEnums() const { return enums_; }
+        void                          setEnums(std::vector<EnumEntry> e) { enums_ = std::move(e); }
+        bool                          isEnum() const { return !enums_.empty(); }
+        // 找到 value 对应的枚举名, 没匹配返回 nullptr
+        const char *findEnumName(const i64 v) const
+        {
+                for (const auto &e : enums_)
+                        if (e.value == v)
+                                return e.name.c_str();
+                return nullptr;
+        }
+
+        // Return number of points currently stored in memory (excluding discarded)
+        size_t storedCount() const
+        {
+                std::lock_guard lk(valMutex_);
+                return rVals_.size();
+        }
+
+        // Return the earliest timestamp in memory, or -1 if empty
+        f32 earliestTs() const
+        {
+                std::lock_guard lk(valMutex_);
+                return rTs_.empty() ? -1.0f : rTs_.front();
+        }
+        f32 latestTs() const
+        {
+                std::lock_guard lk(valMutex_);
+                return rTs_.empty() ? -1.0f : rTs_.back();
+        }
+
+        // Clear all stored data points in the channel
+        void clearData()
+        {
+                std::lock_guard lk(valMutex_);
+                rVals_.clear();
+                rTs_.clear();
+        }
+
+        f32 historySeconds_{1.0f};
+        u32 maxDisplayPoints_{5000};
 };
+
+enum class MonitorViewMode { FULL, FOLLOW, MANUAL };
 
 class MonitorScope
 {
@@ -137,17 +337,24 @@ class MonitorScope
         using ChannelMapType = std::unordered_map<std::string, std::unique_ptr<MonitorChannel>>;
 
       private:
-        std::string    name_{};
-        ChannelMapType chs_{};
-        DrawEnum       e_draw{};
+        std::string       name_{};
+        ChannelMapType    chs_{};
+        DrawEnum          e_draw{};
+        float             height_{200.0f};
+        std::atomic<bool> pendingDelete_{false};
+        std::vector<f32>  dxs_{}, dys_{};
+        std::vector<f32>  tempTs_{}, tempVals_{};
+        bool              isManualHeight_{false};
+        bool              paused_{false};
+        int               lastSelectedIndex_{-1};
 
         void tableDraw();
         void tableMenu();
 
-        void plotDraw() const;
+        void plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode);
         void plotMenu();
 
-        void drawTableRow(const std::string &chName, std::unique_ptr<MonitorChannel> &ch);
+        void drawTableRow(const std::string &chName, std::unique_ptr<MonitorChannel> &ch, int idx, const std::vector<std::string> &allKeys);
 
       public:
         static void shmInit(MonitorChannel &ch);
@@ -156,7 +363,8 @@ class MonitorScope
         ~MonitorScope() = default;
 
         void menu();
-        void draw();
+        void draw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode);
+        void dropTarget();
 
         int addChannel(const std::string &chName);
         int setValue(const std::string &chName, f32 val);
@@ -166,6 +374,35 @@ class MonitorScope
         DrawEnum       &getDraw() { return e_draw; }
         void            setDraw(const DrawEnum d) { e_draw = d; }
         MonitorChannel *findChannel(const std::string &chName);
+
+        float &getHeight() { return height_; }
+        void   markPendingDelete() { pendingDelete_.store(true, std::memory_order_release); }
+        bool   isPendingDelete() const { return pendingDelete_.load(std::memory_order_acquire); }
+        bool   isManual() const { return isManualHeight_; }
+        void   setManual(bool m) { isManualHeight_ = m; }
+
+        bool   isPaused() const { return paused_; }
+        void   setPaused(bool p) { paused_ = p; }
+
+        // threadFunc 在每轮迭代结束时调用, 真正擦除被打了删除标记的通道.
+        void purgeDeleted()
+        {
+                for (auto it = chs_.begin(); it != chs_.end();) {
+                        if (it->second && it->second->isPendingDelete())
+                                it = chs_.erase(it);
+                        else
+                                ++it;
+                }
+        }
+
+        void clearData()
+        {
+                for (auto &pair : chs_)
+                        if (pair.second)
+                                pair.second->clearData();
+                // Reset total sampled points counter after clearing data
+                JLinkDev::instance().resetPoints();
+        }
 };
 
 class Monitor
@@ -179,19 +416,110 @@ class Monitor
         bool             paused_{false};
         ScopeMapType     scopes_{};
 
+      public:
+        enum class SamplingMode { HSS, POLL };
+        SamplingMode      samplingMode_{SamplingMode::POLL};
+
+      private:
         void menu();
 
+        MonitorViewMode viewMode_{MonitorViewMode::FULL};
+        bool            needsLayout_{true};
+        float           lastAvailY_{0.0f};
+
       public:
-        explicit Monitor(std::string monitorName) : name_(std::move(monitorName)) { print_info(true, "Monitor()"); }
-        Monitor() { print_info(true, "Monitor()"); };
-        ~Monitor() { print_info(true, "~Monitor()"); };
+        double            linkXMin_{0.0}, linkXMax_{1.0};
+        double            lastNow_{0.0};
+        double            dataStartTime_{0.0};
+        double            pauseXMax_{-1.0};
+        bool              wasPaused_{false};
+        float             historySeconds_{1.0f};
+        u32               maxDisplayPoints_{5000};
+        bool              hssAutoPeriod_{true};
+        int               maxSampleHz_{1000};
+        std::atomic<bool> pendingDelete_{false};
+
+        f32                                   actualHz_{0.0f};
+        u64                                   pointAccum_{0};
+        std::chrono::steady_clock::time_point lastHzTick_{std::chrono::steady_clock::now()};
+        static std::vector<Monitor*> sInstances_;
+        static std::mutex            sMtxInstances_;
+
+      public:
+        explicit Monitor(std::string monitorName) : name_(std::move(monitorName)) { 
+                print_info(true, "Monitor()"); 
+                std::lock_guard lk(sMtxInstances_);
+                sInstances_.push_back(this);
+        }
+        Monitor() { 
+                print_info(true, "Monitor()"); 
+                std::lock_guard lk(sMtxInstances_);
+                sInstances_.push_back(this);
+        };
+        ~Monitor() { 
+                print_info(true, "~Monitor()"); 
+                std::lock_guard lk(sMtxInstances_);
+                auto it = std::find(sInstances_.begin(), sInstances_.end(), this);
+                if (it != sInstances_.end()) sInstances_.erase(it);
+        };
 
         void updateDisplay();
+        void clearData()
+        {
+                for (auto &pair : scopes_)
+                        if (pair.second)
+                                pair.second->clearData();
+                purgeDeletedScopes();
+                needsLayout_   = true;
+                pointAccum_    = 0;
+                actualHz_      = 0.0f;
+        }
+
+        void addPoints(u64 n) { pointAccum_ += n; }
+        f32  getHz() const { return actualHz_; }
+
+        void updateHz()
+        {
+                auto now = std::chrono::steady_clock::now();
+                auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHzTick_).count();
+                if (dtMs >= 500) {
+                        actualHz_ = static_cast<f32>(static_cast<double>(pointAccum_) * 1000.0 / static_cast<double>(dtMs));
+                        pointAccum_ = 0;
+                        lastHzTick_ = now;
+                }
+        }
+
+        void markPendingDelete() { pendingDelete_.store(true, std::memory_order_release); }
+        bool isPendingDelete() const { return pendingDelete_.load(std::memory_order_acquire); }
 
         std::string     getName() { return name_; }
         int             addScope(const std::string &scopeName);
         ScopeMapType   &getScopes() { return scopes_; }
         MonitorChannel *findChannel(const std::string &scopeName, const std::string &chName);
+
+        // 真正擦除被标记删除的 scope (在 threadFunc 安全点调用).
+        void purgeDeletedScopes()
+        {
+                for (auto it = scopes_.begin(); it != scopes_.end();) {
+                        if (it->second && it->second->isPendingDelete())
+                                it = scopes_.erase(it);
+                        else
+                                ++it;
+                }
+        }
+
+        static void clearAll()
+        {
+                std::lock_guard lk(sMtxInstances_);
+                resetSessionTime();
+                for (auto* m : sInstances_) {
+                        m->linkXMin_      = 0.0;
+                        m->linkXMax_      = 1.0;
+                        m->lastNow_       = 0.0;
+                        m->dataStartTime_ = 0.0;
+                        m->clearData();
+                }
+        }
 };
 
 #endif // !MONITOR_HPP

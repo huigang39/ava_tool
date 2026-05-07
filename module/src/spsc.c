@@ -1,5 +1,32 @@
 #include "spsc.h"
+#include "macrodef.h"
 #include "mathdef.h"
+
+/* -------------------------------------------------------------------------- */
+/*                                  内部函数                                  */
+/* -------------------------------------------------------------------------- */
+
+static usize
+spsc_policy(spsc_t *spsc, const usize wp, const usize rp, usize size)
+{
+        const usize free_size = spsc->cap - (wp - rp);
+        if (size <= free_size)
+                return size;
+
+        switch (spsc->e_policy) {
+                case SPSC_POLICY_TRUNCATE: {
+                        size = free_size;
+                        return size;
+                }
+                case SPSC_POLICY_OVERWRITE: {
+                        ATOMIC_FETCH_ADD_EXPLICIT(&spsc->rp, size - free_size, ATOMIC_ACQ_REL);
+                        return size;
+                }
+                case SPSC_POLICY_REJECT:
+                        return 0;
+        }
+        return 0;
+}
 
 /* -------------------------------------------------------------------------- */
 /*                                  接口定义                                  */
@@ -61,28 +88,6 @@ spsc_free(spsc_t *spsc)
 }
 
 usize
-spsc_policy(spsc_t *spsc, const usize wp, const usize rp, usize size)
-{
-        const usize free_size = spsc->cap - (wp - rp);
-        if (size <= free_size)
-                return size;
-
-        switch (spsc->e_policy) {
-                case SPSC_POLICY_TRUNCATE: {
-                        size = free_size;
-                        return size;
-                }
-                case SPSC_POLICY_OVERWRITE: {
-                        atomic_fetch_add_explicit(&spsc->rp, size - free_size, memory_order_acq_rel);
-                        return size;
-                }
-                case SPSC_POLICY_REJECT:
-                        return 0;
-        }
-        return 0;
-}
-
-usize
 spsc_write(spsc_t *spsc, const void *src, const usize size)
 {
         return spsc_write_buf(spsc, spsc->buf, src, size);
@@ -97,8 +102,8 @@ spsc_read(spsc_t *spsc, void *dst, const usize size)
 usize
 spsc_write_buf(spsc_t *spsc, void *buf, const void *src, usize size)
 {
-        const usize wp = ATOMIC_LOAD_EXPLICIT(&spsc->wp, memory_order_relaxed);
-        const usize rp = ATOMIC_LOAD_EXPLICIT(&spsc->rp, memory_order_acquire);
+        const usize wp = ATOMIC_LOAD_EXPLICIT(&spsc->wp, ATOMIC_RELAXED);
+        const usize rp = ATOMIC_LOAD_EXPLICIT(&spsc->rp, ATOMIC_ACQUIRE);
 
         size = spsc_policy(spsc, wp, rp, size);
         if (size == 0)
@@ -110,15 +115,15 @@ spsc_write_buf(spsc_t *spsc, void *buf, const void *src, usize size)
         memcpy((u8 *)buf + offset, src, first);
         memcpy((u8 *)buf, (u8 *)src + first, size - first);
 
-        ATOMIC_STORE_EXPLICIT(&spsc->wp, wp + size, memory_order_release);
+        ATOMIC_STORE_EXPLICIT(&spsc->wp, wp + size, ATOMIC_RELEASE);
         return size;
 }
 
 usize
 spsc_read_buf(spsc_t *spsc, void *buf, void *dst, usize size)
 {
-        const usize rp = ATOMIC_LOAD_EXPLICIT(&spsc->rp, memory_order_relaxed);
-        const usize wp = ATOMIC_LOAD_EXPLICIT(&spsc->wp, memory_order_acquire);
+        const usize rp = ATOMIC_LOAD_EXPLICIT(&spsc->rp, ATOMIC_RELAXED);
+        const usize wp = ATOMIC_LOAD_EXPLICIT(&spsc->wp, ATOMIC_ACQUIRE);
 
         const usize avail_size = wp - rp;
         if (size > avail_size)
@@ -132,6 +137,6 @@ spsc_read_buf(spsc_t *spsc, void *buf, void *dst, usize size)
         memcpy(dst, (u8 *)buf + offset, first);
         memcpy((u8 *)dst + first, (u8 *)buf, size - first);
 
-        ATOMIC_STORE_EXPLICIT(&spsc->rp, rp + size, memory_order_release);
+        ATOMIC_STORE_EXPLICIT(&spsc->rp, rp + size, ATOMIC_RELEASE);
         return size;
 }

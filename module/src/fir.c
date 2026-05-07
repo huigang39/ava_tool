@@ -9,9 +9,9 @@
 int
 fir_init(fir_filter_t *fir, const fir_cfg_t fir_cfg)
 {
+        DECL(fir, cfg, lo);
         ARG_CHECK(fir);
         CFG_INIT(fir, fir_cfg);
-        DECL(fir, cfg, lo);
 
         switch (cfg->order) {
                 case FIR_1: {
@@ -100,8 +100,8 @@ fir_init(fir_filter_t *fir, const fir_cfg_t fir_cfg)
 void
 fir_exec(fir_filter_t *fir)
 {
-        CFG_CHECK(fir, fir_init);
         DECL(fir, cfg, in, out, lo);
+        CFG_CHECK(fir, fir_init);
 
         switch (cfg->order) {
                 case FIR_1: {

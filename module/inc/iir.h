@@ -61,8 +61,30 @@ typedef struct iir_filter {
 /*                                  接口声明                                  */
 /* -------------------------------------------------------------------------- */
 
-int  iir_init(iir_filter_t *iir, iir_cfg_t iir_cfg);
+/**
+ * @brief IIR 滤波器结构体初始化
+ *
+ * @param iir     IIR 滤波器结构体
+ * @param iir_cfg IIR 滤波器配置
+ * @return        int 状态码
+ */
+int iir_init(iir_filter_t *iir, iir_cfg_t iir_cfg);
+
+/**
+ * @brief IIR 滤波器单次执行器计算
+ *
+ * @param iir IIR 滤波器结构体
+ * @return    void
+ */
 void iir_exec(iir_filter_t *iir);
+
+/**
+ * @brief IIR 滤波器单次执行器计算(带输入)
+ *
+ * @param iir IIR 滤波器结构体
+ * @param x   待计算的数据
+ * @return    void
+ */
 void iir_exec_in(iir_filter_t *iir, f32 x);
 
 #ifdef __cplusplus

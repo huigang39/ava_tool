@@ -48,7 +48,7 @@ typedef struct {
  *
  * @param adrc     adrc 结构体
  * @param adrc_cfg adrc 配置
- * @return         NULL
+ * @return         void
  */
 void adrc_init(adrc_ctl_t *adrc, adrc_cfg_t adrc_cfg);
 
@@ -56,7 +56,7 @@ void adrc_init(adrc_ctl_t *adrc, adrc_cfg_t adrc_cfg);
  * @brief adrc 运算
  *
  * @param adrc adrc 结构体
- * @return     NULL
+ * @return     void
  */
 void adrc_exec(adrc_ctl_t *adrc);
 
@@ -66,7 +66,7 @@ void adrc_exec(adrc_ctl_t *adrc);
  * @param adrc adrc 结构体
  * @param ref  参考值
  * @param fdb  反馈值
- * @return     NULL
+ * @return     void
  */
 void adrc_exec_in(adrc_ctl_t *adrc, f32 ref, f32 fdb);
 

@@ -11,14 +11,16 @@ extern "C" {
 /*                                  接口声明                                  */
 /* -------------------------------------------------------------------------- */
 
+u8 crc8(const void *data, usize size);
+
 /**
  * @brief CRC32 计算
  *
  * @param data 待计算的数据
  * @param size 待计算的字节数
- * @return     32bit CRC 值
+ * @return     u32 32bit CRC 值
  */
-u32 crc32(const u8 *data, usize size);
+u32 crc32(const void *data, usize size);
 
 #ifdef __cplusplus
 }

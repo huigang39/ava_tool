@@ -22,7 +22,7 @@ typedef enum color {
         COLOR_MAGENTA,
         COLOR_CYAN,
         COLOR_WHITE
-} color_t;
+} color_e;
 
 // 样式枚举
 typedef enum style {
@@ -34,7 +34,7 @@ typedef enum style {
         STYLE_BLINK,
         STYLE_REVERSE,
         STYLE_HIDDEN
-} style_t;
+} style_e;
 
 // ANSI颜色代码
 #define COLOR_CODE_RESET     "\033[0m"
@@ -57,20 +57,20 @@ typedef enum style {
 #define STYLE_CODE_HIDDEN    "\033[8m"
 
 HAPI int         supports_color(void);
-HAPI const char *get_color_code(color_t color);
-HAPI const char *get_style_code(style_t style);
+HAPI const char *get_color_code(color_e color);
+HAPI const char *get_style_code(style_e style);
 
 HAPI void println(const char *fmt, ...);
 HAPI void vprintln(const char *fmt, va_list args);
-HAPI void cprintf(color_t color, style_t style, const char *fmt, ...);
+HAPI void cprintf(color_e color, style_e style, const char *fmt, ...);
 
-HAPI void print_info(bool with_timestamp, const char *fmt, ...);
-HAPI void print_success(bool with_timestamp, const char *fmt, ...);
-HAPI void print_warn(bool with_timestamp, const char *fmt, ...);
-HAPI void print_error(bool with_timestamp, const char *fmt, ...);
-HAPI void print_debug(bool with_timestamp, const char *fmt, ...);
+HAPI void print_info(u8 enable_ts, const char *fmt, ...);
+HAPI void print_success(u8 enable_ts, const char *fmt, ...);
+HAPI void print_warn(u8 enable_ts, const char *fmt, ...);
+HAPI void print_error(u8 enable_ts, const char *fmt, ...);
+HAPI void print_debug(u8 enable_ts, const char *fmt, ...);
 
-HAPI void print_progress(const int percent, const char *label);
+HAPI void print_progress(int percent, const char *label);
 
 // 检测是否支持颜色输出
 HAPI int
@@ -78,15 +78,15 @@ supports_color(void)
 {
 #ifdef _WIN32
         // Windows下默认不支持ANSI颜色，但可以通过设置支持
-        return 0; // 暂时禁用Windows下的颜色
+        return FALSE; // 暂时禁用Windows下的颜色
 #else
         // Linux/Unix下通常支持
-        return 1;
+        return TRUE;
 #endif
 }
 
 HAPI const char *
-get_color_code(color_t color)
+get_color_code(color_e color)
 {
         switch (color) {
                 case COLOR_BLACK:
@@ -111,7 +111,7 @@ get_color_code(color_t color)
 }
 
 HAPI const char *
-get_style_code(style_t style)
+get_style_code(const style_e style)
 {
         switch (style) {
                 case STYLE_BOLD:
@@ -143,14 +143,14 @@ println(const char *fmt, ...)
 }
 
 HAPI void
-vprintln(const char *fmt, va_list args)
+vprintln(const char *fmt, const va_list args)
 {
         vprintf(fmt, args);
         printf("\n");
 }
 
 HAPI void
-cprintf(color_t color, style_t style, const char *fmt, ...)
+cprintf(const color_e color, const style_e style, const char *fmt, ...)
 {
         va_list args;
         va_start(args, fmt);
@@ -168,52 +168,51 @@ cprintf(color_t color, style_t style, const char *fmt, ...)
 }
 
 HAPI void
-print_info(bool with_timestamp, const char *fmt, ...)
+print_info(const u8 enable_ts, const char *fmt, ...)
 {
         va_list args;
         va_start(args, fmt);
-        cprintf(COLOR_BLUE, STYLE_NONE, with_timestamp ? "[%llu][INFO]" : "[INFO]", with_timestamp ? get_real_ts_ms() : 0);
+        cprintf(COLOR_BLUE, STYLE_NONE, enable_ts ? "[%llu][INFO]" : "[INFO]", enable_ts ? get_real_ts_ms() : 0);
         vprintln(fmt, args);
         va_end(args);
 }
 
 HAPI void
-print_success(bool with_timestamp, const char *fmt, ...)
+print_success(const u8 enable_ts, const char *fmt, ...)
 {
         va_list args;
         va_start(args, fmt);
-        cprintf(
-            COLOR_GREEN, STYLE_NONE, with_timestamp ? "[%llu][SUCCESS]" : "[SUCCESS]", with_timestamp ? get_real_ts_ms() : 0);
+        cprintf(COLOR_GREEN, STYLE_NONE, enable_ts ? "[%llu][SUCCESS]" : "[SUCCESS]", enable_ts ? get_real_ts_ms() : 0);
         vprintln(fmt, args);
         va_end(args);
 }
 
 HAPI void
-print_warn(bool with_timestamp, const char *fmt, ...)
+print_warn(const u8 enable_ts, const char *fmt, ...)
 {
         va_list args;
         va_start(args, fmt);
-        cprintf(COLOR_YELLOW, STYLE_NONE, with_timestamp ? "[%llu][WARN]" : "[WARN]", with_timestamp ? get_real_ts_ms() : 0);
+        cprintf(COLOR_YELLOW, STYLE_NONE, enable_ts ? "[%llu][WARN]" : "[WARN]", enable_ts ? get_real_ts_ms() : 0);
         vprintln(fmt, args);
         va_end(args);
 }
 
 HAPI void
-print_error(bool with_timestamp, const char *fmt, ...)
+print_error(const u8 enable_ts, const char *fmt, ...)
 {
         va_list args;
         va_start(args, fmt);
-        cprintf(COLOR_RED, STYLE_NONE, with_timestamp ? "[%llu][ERROR]" : "[ERROR]", with_timestamp ? get_real_ts_ms() : 0);
+        cprintf(COLOR_RED, STYLE_NONE, enable_ts ? "[%llu][ERROR]" : "[ERROR]", enable_ts ? get_real_ts_ms() : 0);
         vprintln(fmt, args);
         va_end(args);
 }
 
 HAPI void
-print_debug(bool with_timestamp, const char *fmt, ...)
+print_debug(const u8 enable_ts, const char *fmt, ...)
 {
         va_list args;
         va_start(args, fmt);
-        cprintf(COLOR_CYAN, STYLE_NONE, with_timestamp ? "[%llu][DEBUG]" : "[DEBUG]", with_timestamp ? get_real_ts_ms() : 0);
+        cprintf(COLOR_CYAN, STYLE_NONE, enable_ts ? "[%llu][DEBUG]" : "[DEBUG]", enable_ts ? get_real_ts_ms() : 0);
         vprintln(fmt, args);
         va_end(args);
 }

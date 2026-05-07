@@ -19,7 +19,7 @@ extern "C" {
 /*                                  类型定义                                  */
 /* -------------------------------------------------------------------------- */
 
-typedef enum fft_size {
+typedef enum fft_len {
         FFT_POINTS_32      = 32,
         FFT_POINTS_64      = 64,
         FFT_POINTS_128     = 128,
@@ -36,7 +36,7 @@ typedef enum fft_size {
         FFT_POINTS_262144  = 262144,
         FFT_POINTS_524288  = 524288,
         FFT_POINTS_1048576 = 1048576,
-} fft_size_e;
+} fft_len_e;
 
 typedef struct fft_cfg {
         f32   fs;
@@ -90,9 +90,37 @@ typedef struct fft {
 /*                                  接口声明                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * @brief FFT 结构体初始化
+ *
+ * @param fft     FFT 结构体
+ * @param fft_cfg FFT 配置
+ */
 void fft_init(fft_t *fft, fft_cfg_t fft_cfg);
+
+/**
+ * @brief FFT 结构体中的 fftwf_plan 类型变量销毁(仅 linux/win 平台)
+ *
+ * @param fft FFT 结构体
+ * @return    void
+ */
 void fft_destroy(fft_t *fft);
+
+/**
+ * @brief FFT 单次执行计算
+ *
+ * @param fft FFT 结构体
+ * @return    void
+ */
 void fft_exec(fft_t *fft);
+
+/**
+ * @brief FFT 单次执行计算(带输入)
+ *
+ * @param fft FFT 结构体
+ * @param val 待计算的数据
+ * @return    void
+ */
 void fft_exec_in(fft_t *fft, f32 val);
 
 #ifdef __cplusplus

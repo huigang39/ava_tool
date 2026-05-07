@@ -10,25 +10,35 @@
 extern "C" {
 #endif
 
-#define SIZE_1KB    (0x400)
-#define SIZE_2KB    (0x800)
-#define SIZE_4KB    (0x1000)
-#define SIZE_6KB    (0x1800)
-#define SIZE_8KB    (0x2000)
-#define SIZE_14KB   (0x3800)
-#define SIZE_24KB   (0x6000)
-#define SIZE_64KB   (0x10000)
+#define SIZE_128B    (128)
+#define SIZE_256B    (256)
 
-#define AT(name)    __attribute__((section(name)))
-#define OPTNONE     __attribute__((optnone))
-#define TYPEOF(var) __typeof__(var)
+#define SIZE_1KB     (1024)
+#define SIZE_2KB     (2 * SIZE_1KB)
+#define SIZE_4KB     (4 * SIZE_1KB)
+#define SIZE_8KB     (8 * SIZE_1KB)
+#define SIZE_16KB    (16 * SIZE_1KB)
+#define SIZE_32KB    (32 * SIZE_1KB)
+#define SIZE_64KB    (64 * SIZE_1KB)
+#define SIZE_128KB   (128 * SIZE_1KB)
 
-#define ATOMIC_EXEC(code)                               \
-        do {                                            \
-                volatile u32 primask = __get_PRIMASK(); \
-                __disable_irq();                        \
-                {code};                                 \
-                __set_PRIMASK(primask);                 \
+#define SIZE_1MB     (SIZE_1KB * SIZE_1KB)
+#define SIZE_2MB     (2 * SIZE_1MB)
+#define SIZE_4MB     (4 * SIZE_1MB)
+#define SIZE_16MB    (16 * SIZE_1MB)
+
+#define AT(sec)      __attribute__((section(sec)))
+#define OPTNONE      __attribute__((optnone))
+#define ALIGN(align) __attribute__((aligned(align)))
+#define FUNC_UNUSED  __attribute__((unused))
+#define TYPEOF(var)  __typeof__(var)
+
+#define ATOMIC_EXEC(code)                                 \
+        do {                                              \
+                volatile u32 __primask = __get_PRIMASK(); \
+                __disable_irq();                          \
+                {code};                                   \
+                __set_PRIMASK(__primask);                 \
         } while (0)
 
 #define HAPI            static inline
@@ -58,7 +68,11 @@ extern "C" {
         TYPEOF((ptr)) name = ptr; \
         ARG_UNUSED(name);
 
-#define RUN_FUNC_PTR(func_ptr, ...)                          ((func_ptr) != NULL ? ((func_ptr)(__VA_ARGS__), 1) : 0)
+/**
+ * @brief 检查函数指针非空
+ *
+ */
+#define CHECK_FUNC_PTR(func_ptr)                             ((func_ptr) != NULL)
 
 #define GET_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, NAME, ...) NAME
 
@@ -105,19 +119,19 @@ extern "C" {
                         (cnt) += (cnt);            \
         } while (0);
 
-#define SPIN_LOCK(lock_ptr)                                                                                                 \
-        do {                                                                                                                \
-                u8    expected;                                                                                             \
-                usize backoff = SPINLOCK_BACKOFF_MIN;                                                                       \
-                for (;;) {                                                                                                  \
-                        expected = 0;                                                                                       \
-                        if (ATOMIC_CAS_WEAK_EXPLICIT((lock_ptr), &expected, 1, memory_order_acquire, memory_order_relaxed)) \
-                                break;                                                                                      \
-                        SPINLOCK_BACKOFF(backoff);                                                                          \
-                }                                                                                                           \
+#define SPIN_LOCK(lock_ptr)                                                                                          \
+        do {                                                                                                         \
+                u8    __expected;                                                                                    \
+                usize __backoff = SPINLOCK_BACKOFF_MIN;                                                              \
+                for (;;) {                                                                                           \
+                        __expected = FALSE;                                                                          \
+                        if (ATOMIC_CAS_WEAK_EXPLICIT((lock_ptr), &__expected, TRUE, ATOMIC_ACQUIRE, ATOMIC_RELAXED)) \
+                                break;                                                                               \
+                        SPINLOCK_BACKOFF(__backoff);                                                                 \
+                }                                                                                                    \
         } while (0)
 
-#define SPIN_UNLOCK(lock_ptr) ATOMIC_STORE_EXPLICIT((lock_ptr), 0, memory_order_release)
+#define SPIN_UNLOCK(lock_ptr) ATOMIC_STORE_EXPLICIT((lock_ptr), FALSE, ATOMIC_RELEASE)
 
 #ifdef __cplusplus
 #define IS_SAME_TYPE(a, b) std::is_same_v<decltype(a), decltype(b)>
@@ -139,29 +153,71 @@ extern "C" {
 /* ---------------------------------- 原子操作 ---------------------------------- */
 #ifndef __cplusplus
 #include <stdatomic.h>
-#define ATOMIC(type)                              _Atomic type
-#define ATOMIC_LOAD(a)                            atomic_load(a)
-#define ATOMIC_LOAD_EXPLICIT(a, m)                atomic_load_explicit(a, m)
-#define ATOMIC_STORE(a, v)                        atomic_store(a, v)
-#define ATOMIC_STORE_EXPLICIT(a, v, m)            atomic_store_explicit(a, v, m)
-#define ATOMIC_CAS_WEAK_EXPLICIT(a, o, n, s, f)   atomic_compare_exchange_weak_explicit(a, o, n, s, f)
-#define ATOMIC_CAS_STRONG_EXPLICIT(a, o, n, s, f) atomic_compare_exchange_strong_explicit(a, o, n, s, f)
-#define ATOMIC_EXCHANGE(a, v)                     atomic_exchange(a, v)
+#define ATOMIC(type)                                         _Atomic(type)
+
+#define ATOMIC_LOAD(object)                                  atomic_load(object)
+#define ATOMIC_LOAD_EXPLICIT(object, memory_order)           atomic_load_explicit(object, memory_order)
+
+#define ATOMIC_STORE(object, desired)                        atomic_store(object, desired)
+#define ATOMIC_STORE_EXPLICIT(object, desired, memory_order) atomic_store_explicit(object, desired, memory_order)
+
+#define ATOMIC_CAS_WEAK(object, expected, desired)           atomic_compare_exchange_weak(object, expected, desired)
+#define ATOMIC_CAS_WEAK_EXPLICIT(object, expected, desired, memory_order1, memory_order2) \
+        atomic_compare_exchange_weak_explicit(object, expected, desired, memory_order1, memory_order2)
+
+#define ATOMIC_CAS_STRONG(object, expected, desired) atomic_compare_exchange_strong(object, expected, desired)
+#define ATOMIC_CAS_STRONG_EXPLICIT(object, expected, desired, memory_order1, memory_order2) \
+        atomic_compare_exchange_strong_explicit(object, expected, desired, memory_order1, memory_order2)
+
+#define ATOMIC_EXCHANGE(object, desired)                         atomic_exchange(object, desired)
+#define ATOMIC_EXCHANGE_EXPLICIT(object, desired, memory_order)  atomic_exchange_explicit(object, desired, memory_order)
+
+#define ATOMIC_FETCH_ADD(object, operand)                        atomic_fetch_add(object, operand)
+#define ATOMIC_FETCH_ADD_EXPLICIT(object, operand, memory_order) atomic_fetch_add_explicit(object, operand, memory_order)
+
+#define ATOMIC_FETCH_SUB(object, operand)                        atomic_fetch_sub(object, operand)
+#define ATOMIC_FETCH_SUB_EXPLICIT(object, operand, memory_order) atomic_fetch_sub_explicit(object, operand, memory_order)
+
+#define ATOMIC_RELAXED                                           memory_order_relaxed
+#define ATOMIC_CONSUME                                           memory_order_consume
+#define ATOMIC_ACQUIRE                                           memory_order_acquire
+#define ATOMIC_RELEASE                                           memory_order_release
+#define ATOMIC_ACQ_REL                                           memory_order_acq_rel
+#define ATOMIC_SEQ_CST                                           memory_order_seq_cst
 #else
 }
 #include <atomic>
-#define ATOMIC(type)                              std::atomic<type>
-#define ATOMIC_LOAD(a)                            std::atomic_load(a)
-#define ATOMIC_LOAD_EXPLICIT(a, m)                std::atomic_load_explicit(a, m)
-#define ATOMIC_STORE(a, v)                        std::atomic_store(a, v)
-#define ATOMIC_STORE_EXPLICIT(a, v, m)            std::atomic_store_explicit(a, v, m)
-#define ATOMIC_CAS_WEAK_EXPLICIT(a, o, n, s, f)   std::atomic_compare_exchange_weak_explicit(a, o, n, s, f)
-#define ATOMIC_CAS_STRONG_EXPLICIT(a, o, n, s, f) std::atomic_compare_exchange_strong_explicit(a, o, n, s, f)
-#define ATOMIC_EXCHANGE(a, v)                     std::atomic_exchange(a, v)
-constexpr auto memory_order_relaxed = std::memory_order_relaxed;
-constexpr auto memory_order_acquire = std::memory_order_acquire;
-constexpr auto memory_order_release = std::memory_order_release;
-constexpr auto memory_order_acq_rel = std::memory_order_acq_rel;
+#define ATOMIC(type)                                         std::atomic<type>
+
+#define ATOMIC_LOAD(object)                                  std::atomic_load(object)
+#define ATOMIC_LOAD_EXPLICIT(object, memory_order)           std::atomic_load_explicit(object, memory_order)
+
+#define ATOMIC_STORE(object, desired)                        std::atomic_store(object, desired)
+#define ATOMIC_STORE_EXPLICIT(object, desired, memory_order) std::atomic_store_explicit(object, desired, memory_order)
+
+#define ATOMIC_CAS_WEAK(object, expected, desired)           std::atomic_compare_exchange_weak(object, expected, desired)
+#define ATOMIC_CAS_WEAK_EXPLICIT(object, expected, desired, memory_order1, memory_order2) \
+        std::atomic_compare_exchange_weak_explicit(object, expected, desired, memory_order1, memory_order2)
+
+#define ATOMIC_CAS_STRONG(object, expected, desired) std::atomic_compare_exchange_strong(object, expected, desired)
+#define ATOMIC_CAS_STRONG_EXPLICIT(object, expected, desired, memory_order1, memory_order2) \
+        std::atomic_compare_exchange_strong_explicit(object, expected, desired, memory_order1, memory_order2)
+
+#define ATOMIC_EXCHANGE(object, desired)                         std::atomic_exchange(object, desired)
+#define ATOMIC_EXCHANGE_EXPLICIT(object, desired, memory_order)  std::atomic_exchange_explicit(object, desired, memory_order)
+
+#define ATOMIC_FETCH_ADD(object, operand)                        std::atomic_fetch_add(object, operand)
+#define ATOMIC_FETCH_ADD_EXPLICIT(object, operand, memory_order) std::atomic_fetch_add_explicit(object, operand, memory_order)
+
+#define ATOMIC_FETCH_SUB(object, operand)                        std::atomic_fetch_sub(object, operand)
+#define ATOMIC_FETCH_SUB_EXPLICIT(object, operand, memory_order) std::atomic_fetch_sub_explicit(object, operand, memory_order)
+
+#define ATOMIC_RELAXED                                           std::memory_order_relaxed
+#define ATOMIC_CONSUME                                           std::memory_order_consume
+#define ATOMIC_ACQUIRE                                           std::memory_order_acquire
+#define ATOMIC_RELEASE                                           std::memory_order_release
+#define ATOMIC_ACQ_REL                                           std::memory_order_acq_rel
+#define ATOMIC_SEQ_CST                                           std::memory_order_seq_cst
 #endif
 /* ---------------------------------- 原子操作 ---------------------------------- */
 

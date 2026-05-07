@@ -18,22 +18,21 @@ extern "C" {
                 DWT->CTRL        |= DWT_CTRL_CYCCNTENA_Msk;     \
         } while (0)
 
-#define MEASURE_TIME(total_cyccnt, iter_cnt_max, code)             \
-        do {                                                       \
-                u32 cnt = (iter_cnt_max);                          \
-                u32 start, end, single;                            \
-                (total_cyccnt) = 0;                                \
-                for (u32 i = 0; i < cnt; i++) {                    \
-                        DWT->CYCCNT = 0;                           \
-                        start       = DWT->CYCCNT;                 \
-                        {code};                                    \
-                        end = DWT->CYCCNT;                         \
-                        if (end < start)                           \
-                                single = 0xFFFFFFFF - start + end; \
-                        else                                       \
-                                single = end - start;              \
-                        (total_cyccnt) += single;                  \
-                }                                                  \
+#define MEASURE_TIME(total_cyccnt, iter_cnt_max, code)                   \
+        do {                                                             \
+                u32 __start, __end, __single;                            \
+                (total_cyccnt) = 0;                                      \
+                for (u32 i = 0; i < (iter_cnt_max); i++) {               \
+                        DWT->CYCCNT = 0;                                 \
+                        __start     = DWT->CYCCNT;                       \
+                        {code};                                          \
+                        __end = DWT->CYCCNT;                             \
+                        if (__end < __start)                             \
+                                __single = 0xFFFFFFFF - __start + __end; \
+                        else                                             \
+                                __single = __end - __start;              \
+                        (total_cyccnt) += __single;                      \
+                }                                                        \
         } while (0)
 
 #define CYCCNT2US(cyccnt) ((cyccnt) * (1.0F / (HAL_RCC_GetSysClockFreq() / M(1.0F))))
@@ -52,189 +51,211 @@ typedef struct {
                 res.single_cyccnt     = res.total_cyccnt / iter_cnt_max;     \
                 res.total_elapsed_us  = CYCCNT2US(res.total_cyccnt);         \
                 res.single_elapsed_us = res.total_elapsed_us / iter_cnt_max; \
-                cnt++;                                                       \
         } while (0)
 
 /* 整数运算 */
-#define TEST_INT_ADD(res, iter_cnt_max)                                      \
-        do {                                                                 \
-                volatile int a = 123456, b = 789;                            \
-                TEST_OP(res, iter_cnt_max, "int_add", { res.ret = a + b; }); \
+#define TEST_INT_ADD(res, iter_cnt_max)                                          \
+        do {                                                                     \
+                volatile int __a = 123456, __b = 789;                            \
+                TEST_OP(res, iter_cnt_max, "int_add", { res.ret = __a + __b; }); \
         } while (0)
 
-#define TEST_INT_MUL(res, iter_cnt_max)                                      \
-        do {                                                                 \
-                volatile int a = 123456, b = 789;                            \
-                TEST_OP(res, iter_cnt_max, "int_mul", { res.ret = a * b; }); \
+#define TEST_INT_MUL(res, iter_cnt_max)                                          \
+        do {                                                                     \
+                volatile int __a = 123456, __b = 789;                            \
+                TEST_OP(res, iter_cnt_max, "int_mul", { res.ret = __a * __b; }); \
         } while (0)
 
-#define TEST_INT_DIV(res, iter_cnt_max)                                      \
-        do {                                                                 \
-                volatile int a = 123456, b = 789;                            \
-                TEST_OP(res, iter_cnt_max, "int_div", { res.ret = a / b; }); \
+#define TEST_INT_DIV(res, iter_cnt_max)                                          \
+        do {                                                                     \
+                volatile int __a = 123456, __b = 789;                            \
+                TEST_OP(res, iter_cnt_max, "int_div", { res.ret = __a / __b; }); \
         } while (0)
 
 /* 浮点运算 */
-#define TEST_FLOAT_ADD(res, iter_cnt_max)                                      \
-        do {                                                                   \
-                volatile f32 a = 123.456f, b = 7.89f;                          \
-                TEST_OP(res, iter_cnt_max, "float_add", { res.ret = a + b; }); \
+#define TEST_FLOAT_ADD(res, iter_cnt_max)                                          \
+        do {                                                                       \
+                volatile f32 __a = 123.456f, __b = 7.89f;                          \
+                TEST_OP(res, iter_cnt_max, "float_add", { res.ret = __a + __b; }); \
         } while (0)
 
-#define TEST_FLOAT_MUL(res, iter_cnt_max)                                      \
-        do {                                                                   \
-                volatile f32 a = 123.456f, b = 7.89f;                          \
-                TEST_OP(res, iter_cnt_max, "float_mul", { res.ret = a * b; }); \
+#define TEST_FLOAT_MUL(res, iter_cnt_max)                                          \
+        do {                                                                       \
+                volatile f32 __a = 123.456f, __b = 7.89f;                          \
+                TEST_OP(res, iter_cnt_max, "float_mul", { res.ret = __a * __b; }); \
         } while (0)
 
-#define TEST_FLOAT_DIV(res, iter_cnt_max)                                      \
-        do {                                                                   \
-                volatile f32 a = 123.456f, b = 7.89f;                          \
-                TEST_OP(res, iter_cnt_max, "float_div", { res.ret = a / b; }); \
+#define TEST_FLOAT_DIV(res, iter_cnt_max)                                          \
+        do {                                                                       \
+                volatile f32 __a = 123.456f, __b = 7.89f;                          \
+                TEST_OP(res, iter_cnt_max, "float_div", { res.ret = __a / __b; }); \
         } while (0)
 
 /* 三角函数 */
-#define TEST_SINF(res, iter_cnt_max)                                        \
-        do {                                                                \
-                volatile f32 x = 0.785398f;                                 \
-                TEST_OP(res, iter_cnt_max, "sinf", { res.ret = sinf(x); }); \
+#define TEST_SINF(res, iter_cnt_max)                                          \
+        do {                                                                  \
+                volatile f32 __x = 0.785398f;                                 \
+                TEST_OP(res, iter_cnt_max, "sinf", { res.ret = sinf(__x); }); \
         } while (0)
 
-#define TEST_COSF(res, iter_cnt_max)                                        \
-        do {                                                                \
-                volatile f32 x = 0.785398f;                                 \
-                TEST_OP(res, iter_cnt_max, "cosf", { res.ret = cosf(x); }); \
+#define TEST_COSF(res, iter_cnt_max)                                          \
+        do {                                                                  \
+                volatile f32 __x = 0.785398f;                                 \
+                TEST_OP(res, iter_cnt_max, "cosf", { res.ret = cosf(__x); }); \
         } while (0)
 
-#define TEST_TANF(res, iter_cnt_max)                                        \
-        do {                                                                \
-                volatile f32 x = 0.785398f;                                 \
-                TEST_OP(res, iter_cnt_max, "tanf", { res.ret = tanf(x); }); \
+#define TEST_TANF(res, iter_cnt_max)                                          \
+        do {                                                                  \
+                volatile f32 __x = 0.785398f;                                 \
+                TEST_OP(res, iter_cnt_max, "tanf", { res.ret = tanf(__x); }); \
         } while (0)
 
 #ifdef ARM_MATH
-#define TEST_ARM_SINF(res, iter_cnt_max)                                               \
-        do {                                                                           \
-                volatile f32 x = 0.785398f;                                            \
-                TEST_OP(res, iter_cnt_max, "arm_sinf", { res.ret = arm_sin_f32(x); }); \
+#define TEST_ARM_SINF(res, iter_cnt_max)                                                 \
+        do {                                                                             \
+                volatile f32 __x = 0.785398f;                                            \
+                TEST_OP(res, iter_cnt_max, "arm_sinf", { res.ret = arm_sin_f32(__x); }); \
         } while (0)
 
-#define TEST_ARM_COSF(res, iter_cnt_max)                                               \
-        do {                                                                           \
-                volatile f32 x = 0.785398f;                                            \
-                TEST_OP(res, iter_cnt_max, "arm_cosf", { res.ret = arm_cos_f32(x); }); \
+#define TEST_ARM_COSF(res, iter_cnt_max)                                                 \
+        do {                                                                             \
+                volatile f32 __x = 0.785398f;                                            \
+                TEST_OP(res, iter_cnt_max, "arm_cosf", { res.ret = arm_cos_f32(__x); }); \
         } while (0)
 #else
 #define TEST_ARM_SINF(res, iter_cnt_max)
 #define TEST_ARM_COSF(res, iter_cnt_max)
 #endif
 
-#define TEST_FAST_SINF(res, iter_cnt_max)                                             \
-        do {                                                                          \
-                volatile f32 x = 0.785398f;                                           \
-                TEST_OP(res, iter_cnt_max, "fast_sinf", { res.ret = fast_sinf(x); }); \
+#define TEST_FAST_SINF(res, iter_cnt_max)                                               \
+        do {                                                                            \
+                volatile f32 __x = 0.785398f;                                           \
+                TEST_OP(res, iter_cnt_max, "fast_sinf", { res.ret = fast_sinf(__x); }); \
         } while (0)
 
-#define TEST_FAST_COSF(res, iter_cnt_max)                                             \
-        do {                                                                          \
-                volatile f32 x = 0.785398f;                                           \
-                TEST_OP(res, iter_cnt_max, "fast_cosf", { res.ret = fast_cosf(x); }); \
+#define TEST_FAST_COSF(res, iter_cnt_max)                                               \
+        do {                                                                            \
+                volatile f32 __x = 0.785398f;                                           \
+                TEST_OP(res, iter_cnt_max, "fast_cosf", { res.ret = fast_cosf(__x); }); \
         } while (0)
 
-#define TEST_FAST_TANF(res, iter_cnt_max)                                             \
-        do {                                                                          \
-                volatile f32 x = 0.785398f;                                           \
-                TEST_OP(res, iter_cnt_max, "fast_tanf", { res.ret = fast_tanf(x); }); \
+#define TEST_FAST_TANF(res, iter_cnt_max)                                               \
+        do {                                                                            \
+                volatile f32 __x = 0.785398f;                                           \
+                TEST_OP(res, iter_cnt_max, "fast_tanf", { res.ret = fast_tanf(__x); }); \
         } while (0)
 
-#define TEST_ATAN2F_QUAD1(res, iter_cnt_max)                                             \
-        do {                                                                             \
-                volatile f32 y = 1.0f, x = 1.0f;                                         \
-                TEST_OP(res, iter_cnt_max, "atan2f_quad1", { res.ret = atan2f(y, x); }); \
+#define TEST_ATAN2F_QUAD1(res, iter_cnt_max)                                                 \
+        do {                                                                                 \
+                volatile f32 __y = 1.0f, __x = 1.0f;                                         \
+                TEST_OP(res, iter_cnt_max, "atan2f_quad1", { res.ret = atan2f(__y, __x); }); \
         } while (0)
 
-#define TEST_ATAN2F_QUAD2(res, iter_cnt_max)                                             \
-        do {                                                                             \
-                volatile f32 y = 1.0f, x = -1.0f;                                        \
-                TEST_OP(res, iter_cnt_max, "atan2f_quad2", { res.ret = atan2f(y, x); }); \
+#define TEST_ATAN2F_QUAD2(res, iter_cnt_max)                                                 \
+        do {                                                                                 \
+                volatile f32 __y = 1.0f, __x = -1.0f;                                        \
+                TEST_OP(res, iter_cnt_max, "atan2f_quad2", { res.ret = atan2f(__y, __x); }); \
         } while (0)
 
-#define TEST_ATAN2F_QUAD3(res, iter_cnt_max)                                             \
-        do {                                                                             \
-                volatile f32 y = -1.0f, x = -1.0f;                                       \
-                TEST_OP(res, iter_cnt_max, "atan2f_quad3", { res.ret = atan2f(y, x); }); \
+#define TEST_ATAN2F_QUAD3(res, iter_cnt_max)                                                 \
+        do {                                                                                 \
+                volatile f32 __y = -1.0f, __x = -1.0f;                                       \
+                TEST_OP(res, iter_cnt_max, "atan2f_quad3", { res.ret = atan2f(__y, __x); }); \
         } while (0)
 
-#define TEST_ATAN2F_QUAD4(res, iter_cnt_max)                                             \
-        do {                                                                             \
-                volatile f32 y = -1.0f, x = 1.0f;                                        \
-                TEST_OP(res, iter_cnt_max, "atan2f_quad4", { res.ret = atan2f(y, x); }); \
+#define TEST_ATAN2F_QUAD4(res, iter_cnt_max)                                                 \
+        do {                                                                                 \
+                volatile f32 __y = -1.0f, __x = 1.0f;                                        \
+                TEST_OP(res, iter_cnt_max, "atan2f_quad4", { res.ret = atan2f(__y, __x); }); \
         } while (0)
 
 /* 其他数学函数 */
-#define TEST_SQRTF(res, iter_cnt_max)                                         \
+#define TEST_SQRTF(res, iter_cnt_max)                                           \
+        do {                                                                    \
+                volatile f32 __x = 2.0f;                                        \
+                TEST_OP(res, iter_cnt_max, "sqrtf", { res.ret = sqrtf(__x); }); \
+        } while (0)
+
+#define TEST_LOGF(res, iter_cnt_max)                                          \
         do {                                                                  \
-                volatile f32 x = 2.0f;                                        \
-                TEST_OP(res, iter_cnt_max, "sqrtf", { res.ret = sqrtf(x); }); \
+                volatile f32 __x = 2.0f;                                      \
+                TEST_OP(res, iter_cnt_max, "logf", { res.ret = logf(__x); }); \
         } while (0)
 
-#define TEST_LOGF(res, iter_cnt_max)                                        \
-        do {                                                                \
-                volatile f32 x = 2.0f;                                      \
-                TEST_OP(res, iter_cnt_max, "logf", { res.ret = logf(x); }); \
+#define TEST_EXPF(res, iter_cnt_max)                                          \
+        do {                                                                  \
+                volatile f32 __x = 2.0f;                                      \
+                TEST_OP(res, iter_cnt_max, "expf", { res.ret = expf(__x); }); \
         } while (0)
 
-#define TEST_EXPF(res, iter_cnt_max)                                        \
-        do {                                                                \
-                volatile f32 x = 2.0f;                                      \
-                TEST_OP(res, iter_cnt_max, "expf", { res.ret = expf(x); }); \
+#define TEST_FAST_EXPF(res, iter_cnt_max)                                               \
+        do {                                                                            \
+                volatile f32 __x = 2.0f;                                                \
+                TEST_OP(res, iter_cnt_max, "fast_expf", { res.ret = fast_expf(__x); }); \
         } while (0)
 
-#define TEST_FAST_EXPF(res, iter_cnt_max)                                             \
-        do {                                                                          \
-                volatile f32 x = 2.0f;                                                \
-                TEST_OP(res, iter_cnt_max, "fast_expf", { res.ret = fast_expf(x); }); \
+#define TEST_F16_TO_F32(res, iter_cnt_max)                                                          \
+        do {                                                                                        \
+                volatile f16 __x = 114.514f;                                                        \
+                TEST_OP(res, iter_cnt_max, "fast_f16_to_f32", { res.ret = fast_f16_to_f32(__x); }); \
         } while (0)
 
-#define TEST_F16_TO_F32(res, iter_cnt_max)                                                        \
-        do {                                                                                      \
-                volatile f16 x = 114.514f;                                                        \
-                TEST_OP(res, iter_cnt_max, "fast_f16_to_f32", { res.ret = fast_f16_to_f32(x); }); \
+#define TEST_F32_TO_F16(res, iter_cnt_max)                                                          \
+        do {                                                                                        \
+                volatile f32 __x = 114.514f;                                                        \
+                TEST_OP(res, iter_cnt_max, "fast_f32_to_f16", { res.ret = fast_f32_to_f16(__x); }); \
         } while (0)
 
-#define TEST_F32_TO_F16(res, iter_cnt_max)                                                        \
-        do {                                                                                      \
-                volatile f32 x = 114.514f;                                                        \
-                TEST_OP(res, iter_cnt_max, "fast_f32_to_f16", { res.ret = fast_f32_to_f16(x); }); \
-        } while (0)
-
-#define RUN_MATH_BENCHMARK(res, iter_cnt_max)              \
-        do {                                               \
-                volatile u32 cnt = 0;                      \
-                TEST_INT_ADD(res[cnt], iter_cnt_max);      \
-                TEST_INT_MUL(res[cnt], iter_cnt_max);      \
-                TEST_INT_DIV(res[cnt], iter_cnt_max);      \
-                TEST_FLOAT_ADD(res[cnt], iter_cnt_max);    \
-                TEST_FLOAT_MUL(res[cnt], iter_cnt_max);    \
-                TEST_FLOAT_DIV(res[cnt], iter_cnt_max);    \
-                TEST_SINF(res[cnt], iter_cnt_max);         \
-                TEST_COSF(res[cnt], iter_cnt_max);         \
-                TEST_TANF(res[cnt], iter_cnt_max);         \
-                TEST_ARM_SINF(res[cnt], iter_cnt_max);     \
-                TEST_ARM_COSF(res[cnt], iter_cnt_max);     \
-                TEST_FAST_SINF(res[cnt], iter_cnt_max);    \
-                TEST_FAST_COSF(res[cnt], iter_cnt_max);    \
-                TEST_FAST_TANF(res[cnt], iter_cnt_max);    \
-                TEST_ATAN2F_QUAD1(res[cnt], iter_cnt_max); \
-                TEST_ATAN2F_QUAD2(res[cnt], iter_cnt_max); \
-                TEST_ATAN2F_QUAD3(res[cnt], iter_cnt_max); \
-                TEST_ATAN2F_QUAD4(res[cnt], iter_cnt_max); \
-                TEST_SQRTF(res[cnt], iter_cnt_max);        \
-                TEST_LOGF(res[cnt], iter_cnt_max);         \
-                TEST_EXPF(res[cnt], iter_cnt_max);         \
-                TEST_FAST_EXPF(res[cnt], iter_cnt_max);    \
-                TEST_F16_TO_F32(res[cnt], iter_cnt_max);   \
-                TEST_F32_TO_F16(res[cnt], iter_cnt_max);   \
+#define RUN_MATH_BENCHMARK(res, iter_cnt_max)                \
+        do {                                                 \
+                volatile u32 __idx = 0;                      \
+                TEST_INT_ADD(res[__idx], iter_cnt_max);      \
+                __idx++;                                     \
+                TEST_INT_MUL(res[__idx], iter_cnt_max);      \
+                __idx++;                                     \
+                TEST_INT_DIV(res[__idx], iter_cnt_max);      \
+                __idx++;                                     \
+                TEST_FLOAT_ADD(res[__idx], iter_cnt_max);    \
+                __idx++;                                     \
+                TEST_FLOAT_MUL(res[__idx], iter_cnt_max);    \
+                __idx++;                                     \
+                TEST_FLOAT_DIV(res[__idx], iter_cnt_max);    \
+                __idx++;                                     \
+                TEST_SINF(res[__idx], iter_cnt_max);         \
+                __idx++;                                     \
+                TEST_COSF(res[__idx], iter_cnt_max);         \
+                __idx++;                                     \
+                TEST_TANF(res[__idx], iter_cnt_max);         \
+                __idx++;                                     \
+                TEST_ARM_SINF(res[__idx], iter_cnt_max);     \
+                __idx++;                                     \
+                TEST_ARM_COSF(res[__idx], iter_cnt_max);     \
+                __idx++;                                     \
+                TEST_FAST_SINF(res[__idx], iter_cnt_max);    \
+                __idx++;                                     \
+                TEST_FAST_COSF(res[__idx], iter_cnt_max);    \
+                __idx++;                                     \
+                TEST_FAST_TANF(res[__idx], iter_cnt_max);    \
+                __idx++;                                     \
+                TEST_ATAN2F_QUAD1(res[__idx], iter_cnt_max); \
+                __idx++;                                     \
+                TEST_ATAN2F_QUAD2(res[__idx], iter_cnt_max); \
+                __idx++;                                     \
+                TEST_ATAN2F_QUAD3(res[__idx], iter_cnt_max); \
+                __idx++;                                     \
+                TEST_ATAN2F_QUAD4(res[__idx], iter_cnt_max); \
+                __idx++;                                     \
+                TEST_SQRTF(res[__idx], iter_cnt_max);        \
+                __idx++;                                     \
+                TEST_LOGF(res[__idx], iter_cnt_max);         \
+                __idx++;                                     \
+                TEST_EXPF(res[__idx], iter_cnt_max);         \
+                __idx++;                                     \
+                TEST_FAST_EXPF(res[__idx], iter_cnt_max);    \
+                __idx++;                                     \
+                TEST_F16_TO_F32(res[__idx], iter_cnt_max);   \
+                __idx++;                                     \
+                TEST_F32_TO_F16(res[__idx], iter_cnt_max);   \
         } while (0)
 
 #ifdef __cplusplus

@@ -1,14 +1,16 @@
-#include "linerhall.h"
+#include "mathdef.h"
+
+#include "foclinearhall.h"
 
 /* -------------------------------------------------------------------------- */
 /*                                  接口定义                                  */
 /* -------------------------------------------------------------------------- */
 
 void
-linerhall_init(linerhall_t *linerhall, const linerhall_cfg_t linerhall_cfg)
+linearhall_init(linearhall_t *linearhall, const linearhall_cfg_t linearhall_cfg)
 {
-        DECL(linerhall, lo);
-        CFG_INIT(linerhall, linerhall_cfg);
+        DECL(linearhall, lo);
+        CFG_INIT(linearhall, linearhall_cfg);
 
         lo->prev_theta = 0.0f;
         lo->theta_rate = 0.0f;
@@ -17,13 +19,13 @@ linerhall_init(linerhall_t *linerhall, const linerhall_cfg_t linerhall_cfg)
         lo->valid_cnt  = 0;
         memset(&lo->fault, 0, sizeof(lo->fault));
 
-        RESET(linerhall, out);
+        RESET(linearhall, out);
 }
 
 void
-linerhall_exec(linerhall_t *linerhall)
+linearhall_exec(linearhall_t *linearhall)
 {
-        DECL(linerhall, cfg, in, out, lo);
+        DECL(linearhall, cfg, in, out, lo);
 
         f32 sin_processed, cos_processed;
         f32 sin_amp, cos_amp, norm_amp;
@@ -113,11 +115,11 @@ fault:
 }
 
 void
-linerhall_exec_in(linerhall_t *linerhall, const f32 sin_raw, const f32 cos_raw)
+linearhall_exec_in(linearhall_t *linearhall, const f32 sin_raw, const f32 cos_raw)
 {
-        DECL(linerhall, in);
+        DECL(linearhall, in);
 
         in->sin_raw = sin_raw;
         in->cos_raw = cos_raw;
-        linerhall_exec(linerhall);
+        linearhall_exec(linearhall);
 }

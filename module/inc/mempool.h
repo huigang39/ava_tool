@@ -13,7 +13,7 @@ extern "C" {
 /*                                  宏/表定义                                 */
 /* -------------------------------------------------------------------------- */
 
-#define MEMPOOL_ALIGN             (sizeof(usize))
+#define MEMPOOL_ALIGN             sizeof(usize)
 #define MEMPOOL_ALIGN_UP(size)    (((size) + (MEMPOOL_ALIGN - 1)) & ~(MEMPOOL_ALIGN - 1))
 #define MEMPOOL_BLOCK_HEADER_SIZE MEMPOOL_ALIGN_UP(sizeof(mempool_blk_t))
 
@@ -39,7 +39,7 @@ typedef struct mempool {
 /* -------------------------------------------------------------------------- */
 
 /**
- * @brief 内存池初始化
+ * @brief 内存池结构体初始化
  *
  * @param mempool 内存池结构体
  */
@@ -48,33 +48,35 @@ void mempool_init(mempool_t *mempool);
 /**
  * @brief 从内存池分配 cap 字节
  *
- * @param mempool
- * @param cap
- * @return 指向分配内存的指针，失败返回 NULL
+ * @param mempool 内存池结构体
+ * @param cap     内存池容量
+ * @return        void* 指向分配内存的指针，失败返回 NULL
  */
 void *mempool_alloc(mempool_t *mempool, usize cap);
 
 /**
  * @brief 从内存池分配 cap 字节并初始化为 0
  *
- * @param mempool
- * @param cap
- * @return 指向分配内存的指针，失败返回 NULL
+ * @param mempool 内存池结构体
+ * @param cap     内存池容量
+ * @return        void* 指向分配内存的指针，失败返回 NULL
  */
 void *mempool_calloc(mempool_t *mempool, usize cap);
 
 /**
  * @brief 释放内存池中的内存块
  *
- * @param mempool
- * @param ptr
+ * @param mempool 内存池结构体
+ * @param ptr     需要释放的内存块指针
+ * @return        void
  */
 void mempool_free(mempool_t *mempool, void *ptr);
 
 /**
  * @brief 重置内存池, 清空所有已分配的内存
  *
- * @param mempool
+ * @param mempool 内存池结构体
+ * @return        void
  */
 void mempool_reset(mempool_t *mempool);
 

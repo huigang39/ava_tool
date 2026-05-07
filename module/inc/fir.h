@@ -58,8 +58,30 @@ typedef struct fir_filter {
 /*                                  接口声明                                  */
 /* -------------------------------------------------------------------------- */
 
-int  fir_init(fir_filter_t *fir, fir_cfg_t fir_cfg);
+/**
+ * @brief FIR 滤波器结构体初始化
+ *
+ * @param fir     FIR 滤波器结构体
+ * @param fir_cfg FIR 滤波器配置
+ * @return        int 状态码
+ */
+int fir_init(fir_filter_t *fir, fir_cfg_t fir_cfg);
+
+/**
+ * @brief FIR 滤波器单次执行器计算
+ *
+ * @param fir FIR 滤波器结构体
+ * @return    void
+ */
 void fir_exec(fir_filter_t *fir);
+
+/**
+ * @brief FIR 滤波器单次执行器计算(带输入)
+ *
+ * @param fir FIR 滤波器结构体
+ * @param x   待计算的数据
+ * @return    void
+ */
 void fir_exec_in(fir_filter_t *fir, f32 x);
 
 #ifdef __cplusplus

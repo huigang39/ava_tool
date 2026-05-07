@@ -1,91 +1,91 @@
 #include "mathdef.h"
 
-#include "foc.h"
+#include "focdef.h"
 
-void foc_obs_i_ab(foc_t *foc);
-void foc_obs_i_dq(foc_t *foc);
-void foc_obs_v_dq(foc_t *foc);
-
+/**
+ * @brief 以 alpha-beta 轴电流为输入的观测器单次执行计算
+ *
+ * @param foc FOC 结构体
+ * @return    void
+ */
 void
 foc_obs_i_ab(foc_t *foc)
 {
         DECL(foc, cfg, in, out, lo);
+        RENAME(&lo->hfi, hfi);
+        RENAME(&lo->smo, smo);
 
-        switch (cfg->obs_cfg.low) {
-                case FOC_OBS_HFI: {
-                        if (lo->e_theta != FOC_THETA_SENSORLESS || ABS(lo->fdb_pvct.vel) > cfg->obs_cfg.switch_vel)
-                                break;
+        if (cfg->obs_cfg.u_obs_flag.bit.hfi) {
+                // if (lo->e_elec_theta != FOC_ELEC_THETA_SENSORLESS)
+                //         return;
 
-                        RENAME(&lo->hfi, hfi);
+                if (hfi->lo.e_polar_idf != HFI_POLAR_IDF_FINISH)
+                        lo->e_mode = FOC_MODE_CUR;
 
-                        hfi_exec_in(hfi, in->i_ab);
-                        in->rotor.obs_theta = hfi->out.est_theta;
-                        in->rotor.obs_omega = hfi->out.est_omega;
-                        lo->ref_i_dq.d      = hfi->out.id;
+                hfi_exec_in(hfi, in->stator.i_ab);
+                lo->ref_i_dq.d = hfi->out.id;
 
-                        if (hfi->lo.e_polar_idf != HFI_POLAR_IDF_FINISH)
-                                lo->e_mode = FOC_MODE_CUR;
-
-                        break;
-                }
-                default:
-                        break;
+                in->rotor.elec_obs_theta = hfi->out.est_theta;
+                in->rotor.elec_obs_omega = hfi->out.est_omega;
+                return;
         }
 
-        switch (cfg->obs_cfg.high) {
-                case FOC_OBS_SMO: {
-                        RENAME(&lo->smo, smo);
+        if (cfg->obs_cfg.u_obs_flag.bit.smo) {
+                smo_exec_in(smo, in->stator.i_ab, in->stator.v_ab);
 
-                        smo_exec_in(smo, in->i_ab, out->v_ab);
-                        if (ABS(lo->fdb_pvct.vel) < cfg->obs_cfg.switch_vel)
-                                break;
-
-                        in->rotor.obs_theta = smo->out.est_theta;
-                        in->rotor.obs_omega = smo->out.est_omega;
-                        break;
-                }
-                default:
-                        break;
+                in->rotor.elec_obs_theta = smo->out.est_theta;
+                in->rotor.elec_obs_omega = smo->out.est_omega;
+                return;
         }
 }
 
+/**
+ * @brief 以 d-q 轴电流为输入的观测器单次执行计算
+ *
+ * @param foc FOC 结构体
+ * @return    void
+ */
 void
 foc_obs_i_dq(foc_t *foc)
 {
-        DECL(foc, cfg, in, out, lo);
+        DECL(foc, cfg, in, out, lo, tmp);
+        RENAME(&lo->luenberger, lbg);
 
-        switch (cfg->obs_cfg.load_tor) {
-                case FOC_OBS_LBG: {
-                        RENAME(&lo->lbg, lbg);
+        if (cfg->obs_cfg.u_obs_flag.bit.luenberger) {
+                luenberger_exec_in(lbg, in->rotor.elec_theta, out->fdb_pvct.elec_tor / cfg->base_cfg.outshaft_ratio);
+                out->fdb_pvct.load_tor = lbg->out.est_load_tor;
 
-                        lbg_exec_in(lbg, in->rotor.theta, lo->fdb_pvct.elec_tor / cfg->base_cfg.outshaft_ratio);
-                        lo->fdb_pvct.load_tor = lbg->out.est_load_tor;
-                        if (lo->e_theta != FOC_THETA_SENSOR || ABS(lo->fdb_pvct.vel) > cfg->obs_cfg.enable_vel)
-                                break;
-
-                        lo->comp_i_dq.q = CPYSGN(poly_eval(cfg->base_cfg.motor.tor2cur,
-                                                           ARRAY_LEN(cfg->base_cfg.motor.tor2cur) - 1,
-                                                           ABS(lo->fdb_pvct.load_tor)),
-                                                 lo->ref_i_dq.q);
+                if (cfg->obs_cfg.enable_vel == 0.0f || out->fdb_pvct.vel > cfg->obs_cfg.enable_vel) {
+                        lo->comp_i_dq.q = 0.0f;
+                        return;
                 }
-                default:
-                        break;
+
+                lo->comp_i_dq.q = CPYSGN(poly_eval(cfg->base_cfg.motor.tor2cur,
+                                                   ARRAY_LEN(cfg->base_cfg.motor.tor2cur) - 1,
+                                                   ABS(out->fdb_pvct.load_tor)),
+                                         lo->ref_i_dq.q);
+        }
+
+        if (cfg->obs_cfg.u_obs_flag.bit.rls) {
+                f32 y    = 0.0f;
+                f32 x[2] = {0.0f, 0.0f};
+
+                rls_exec_in(&lo->rls, y, x);
         }
 }
 
+/**
+ * @brief 以 d-q 轴电压为输入的观测器单次执行计算
+ *
+ * @param foc FOC 结构体
+ * @return    void
+ */
 void
 foc_obs_v_dq(foc_t *foc)
 {
-        DECL(foc, cfg, out, lo);
+        DECL(foc, cfg, in, out, lo, tmp);
+        RENAME(&lo->hfi, hfi)
 
-        switch (cfg->obs_cfg.low) {
-                case FOC_OBS_HFI: {
-                        RENAME(&lo->hfi, hfi)
-
-                        out->v_dq.d += hfi->out.vd;
-                        break;
-                }
-                default:
-                        break;
-        }
+        if (cfg->obs_cfg.u_obs_flag.bit.hfi)
+                out->v_dq.d += hfi->out.vd;
 }

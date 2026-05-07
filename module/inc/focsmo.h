@@ -2,7 +2,6 @@
 #define SMO_H
 
 #include "pll.h"
-#include "typedef.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -13,11 +12,12 @@ extern "C" {
 /* -------------------------------------------------------------------------- */
 
 typedef struct smo_cfg {
-        f32 fs;
-        f32 ks;
-        f32 es0;
+        f32       fs;
+        f32       ks;
+        f32       es0;
+        pll_cfg_t pll;
 
-        motor_cfg_t motor;
+        motor_cfg_t *motor;
 } smo_cfg_t;
 
 typedef struct smo_in {
@@ -30,9 +30,10 @@ typedef struct smo_out {
 } smo_out_t;
 
 typedef struct smo_lo {
-        f32_ab_t     est_i_ab;
-        f32_ab_t     est_i_ab_err;
-        f32_ab_t     est_emf_v_ab;
+        f32_ab_t est_i_ab;
+        f32_ab_t est_i_ab_err;
+        f32_ab_t est_emf_v_ab;
+
         pll_filter_t pll;
 } smo_lo_t;
 
@@ -47,8 +48,31 @@ typedef struct smo_obs {
 /*                                  接口声明                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * @brief 滑膜观测器结构体初始化
+ *
+ * @param smo     滑膜观测器结构体
+ * @param smo_cfg 滑膜观测器配置
+ * @return        void
+ */
 void smo_init(smo_obs_t *smo, smo_cfg_t smo_cfg);
+
+/**
+ * @brief 滑膜观测器单次执行计算
+ *
+ * @param smo 滑膜观测器结构体
+ * @return    void
+ */
 void smo_exec(smo_obs_t *smo);
+
+/**
+ * @brief 滑膜观测器单次执行计算(带输入)
+ *
+ * @param smo  滑膜观测器结构体
+ * @param i_ab alpha-beta 轴电流
+ * @param v_ab alpha-beta 轴电压
+ * @return     void
+ */
 void smo_exec_in(smo_obs_t *smo, f32_ab_t i_ab, f32_ab_t v_ab);
 
 #ifdef __cplusplus

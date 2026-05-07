@@ -8,9 +8,9 @@
 int
 iir_init(iir_filter_t *iir, const iir_cfg_t iir_cfg)
 {
+        DECL(iir, cfg, lo);
         ARG_CHECK(iir);
         CFG_INIT(iir, iir_cfg);
-        DECL(iir, cfg, lo);
 
         switch (cfg->order) {
                 case IIR_1: {
@@ -90,8 +90,8 @@ iir_init(iir_filter_t *iir, const iir_cfg_t iir_cfg)
 void
 iir_exec(iir_filter_t *iir)
 {
-        CFG_CHECK(iir, iir_init);
         DECL(iir, cfg, in, out, lo);
+        CFG_CHECK(iir, iir_init);
 
         switch (cfg->order) {
                 case IIR_1: {

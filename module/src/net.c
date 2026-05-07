@@ -20,12 +20,12 @@ net_init(net_t *net, const net_cfg_t net_cfg)
         ret = io_uring_queue_init(cfg->ring_len, &lo->ring, 0);
 #elif defined(_WIN32)
         WSADATA wsaData;
-        WSAStartup(MAKEWORD(2, 2), &wsaData);
+        ret      = WSAStartup(MAKEWORD(2, 2), &wsaData);
         lo->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
         list_init(&lo->pending_reqs);
 #endif
 
-        if (cfg->log_cfg.fp)
+        if (cfg->log_cfg.fd)
                 log_init(&lo->log, cfg->log_cfg);
 
         return ret;
@@ -69,7 +69,11 @@ net_set_nonblock(sockfd_t fd)
 net_ch_t
 net_cfg_ch(const u32 det_ip, const u16 dst_port, const net_mode_e e_mode)
 {
-        const net_ch_t ch = {.e_mode = e_mode, .dst_ip = det_ip, .dst_port = dst_port};
+        const net_ch_t ch = {
+            .e_mode   = e_mode,
+            .dst_ip   = det_ip,
+            .dst_port = dst_port,
+        };
         return ch;
 }
 
@@ -141,7 +145,7 @@ net_sync_send(const net_ch_t *ch, const void *tx_buf, const usize size)
 #ifdef __linux__
         return send(ch->fd, tx_buf, size, 0);
 #elif defined(_WIN32)
-        return send(ch->fd, (const char *)tx_buf, (int)size, 0);
+        return send(ch->fd, tx_buf, (int)size, 0);
 #endif
 }
 
@@ -161,7 +165,7 @@ net_sync_recv_yield(const net_ch_t *ch, void *rx_buf, const usize cap, const u32
                 tv_ms = 1;
 
         setsockopt(ch->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_ms, sizeof(tv_ms));
-        return recv(ch->fd, (char *)rx_buf, (int)cap, 0);
+        return recv(ch->fd, rx_buf, (int)cap, 0);
 #endif
 }
 
@@ -174,7 +178,16 @@ net_sync_recv_spin(const net_ch_t *ch, void *rx_buf, const usize cap, const u32 
 #ifdef __linux__
                 const int ret = recv(ch->fd, rx_buf, cap, MSG_DONTWAIT);
 #elif defined(_WIN32)
-                const int ret = recv(ch->fd, (char *)rx_buf, (int)cap, 0);
+                fd_set read_fds;
+                FD_ZERO(&read_fds);
+                FD_SET(ch->fd, &read_fds);
+                struct timeval tv         = {0, 0};
+                const int      select_ret = select(0, &read_fds, NULL, NULL, &tv);
+                int            ret        = -1;
+                if (select_ret > 0 && FD_ISSET(ch->fd, &read_fds))
+                        ret = recv(ch->fd, rx_buf, (int)cap, 0);
+                else if (select_ret < 0)
+                        return -MESYSERR;
 #endif
                 if (ret > 0)
                         return ret;
@@ -194,7 +207,7 @@ net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size)
         if (!send_sqe)
                 return -1;
 
-        net_async_req_t *req = (net_async_req_t *)mempool_calloc(cfg->mp, sizeof(net_async_req_t));
+        net_async_req_t *req = (net_async_req_t *)mempool_calloc(cfg->mempool, sizeof(net_async_req_t));
         if (!req)
                 return -MEALLOC;
 
@@ -209,7 +222,7 @@ net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size)
         io_uring_submit(&lo->ring);
         return size;
 #elif defined(_WIN32)
-        net_async_req_t *req = (net_async_req_t *)mempool_calloc(cfg->mp, sizeof(net_async_req_t));
+        net_async_req_t *req = mempool_calloc(cfg->mempool, sizeof(net_async_req_t));
         if (!req)
                 return -MEALLOC;
 
@@ -225,7 +238,7 @@ net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size)
         DWORD     tx_size;
         const int ret = WSASend(ch->fd, &buf, 1, &tx_size, 0, &req->ov, NULL);
         if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-                mempool_free(cfg->mp, req);
+                mempool_free(cfg->mempool, req);
                 return -1;
         }
 
@@ -240,7 +253,7 @@ net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
         DECL(net, cfg, lo);
 
 #ifdef __linux__
-        net_async_req_t *req = (net_async_req_t *)mempool_calloc(cfg->mp, sizeof(net_async_req_t));
+        net_async_req_t *req = (net_async_req_t *)mempool_calloc(cfg->mempool, sizeof(net_async_req_t));
         if (!req)
                 return -MEALLOC;
 
@@ -267,7 +280,7 @@ net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
 
         return io_uring_submit(&lo->ring);
 #elif defined(_WIN32)
-        net_async_req_t *req = (net_async_req_t *)mempool_calloc(cfg->mp, sizeof(net_async_req_t));
+        net_async_req_t *req = mempool_calloc(cfg->mempool, sizeof(net_async_req_t));
         if (!req)
                 return -MEALLOC;
 
@@ -285,7 +298,7 @@ net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
         DWORD     rx_size;
         const int ret = WSARecv(ch->fd, &buf, 1, &rx_size, &flags, &req->ov, NULL);
         if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
-                mempool_free(cfg->mp, req);
+                mempool_free(cfg->mempool, req);
                 return -1;
         }
 
@@ -311,9 +324,9 @@ net_poll(net_t *net)
                         continue;
                 }
 
-                if (ATOMIC_EXCHANGE(&req->processed, 1) == 0) {
+                if (ATOMIC_EXCHANGE(&req->processed, TRUE) == 0) {
                         req->f_cb(req->ch, req->buf, cqe->res == -ETIME ? -METIMEOUT : cqe->res);
-                        mempool_free(cfg->mp, req);
+                        mempool_free(cfg->mempool, req);
                 }
 
                 io_uring_cqe_seen(&lo->ring, cqe);
@@ -330,11 +343,11 @@ net_poll(net_t *net)
                 next                 = node->next;
                 net_async_req_t *req = CONTAINER_OF(node, net_async_req_t, pending_node);
                 if (req->timeout_us > 0 && curr_ts >= req->timeout_us) {
-                        if (ATOMIC_EXCHANGE(&req->processed, 1) == 0) {
+                        if (ATOMIC_EXCHANGE(&req->processed, TRUE) == 0) {
                                 CancelIoEx((HANDLE)req->ch->fd, &req->ov);
                                 req->f_cb(req->ch, req->buf, -METIMEOUT);
                                 list_del(&req->pending_node);
-                                mempool_free(cfg->mp, req);
+                                mempool_free(cfg->mempool, req);
                         }
                 }
         }
@@ -345,9 +358,8 @@ net_poll(net_t *net)
                 LIST_FOR_EACH(node, &lo->pending_reqs)
                 {
                         const net_async_req_t *req = CONTAINER_OF(node, net_async_req_t, pending_node);
-                        if (req->timeout_us > 0 && req->timeout_us < min_timeout_us) {
+                        if (req->timeout_us > 0 && req->timeout_us < min_timeout_us)
                                 min_timeout_us = req->timeout_us;
-                        }
                 }
                 if (min_timeout_us != (u64)-1 && min_timeout_us > curr_ts) {
                         timeout_ms = (DWORD)US2MS(min_timeout_us - curr_ts);
@@ -360,16 +372,16 @@ net_poll(net_t *net)
         if (!ok && ov == NULL)
                 return 0;
 
-        net_async_req_t *req = (net_async_req_t *)ov->Pointer;
+        net_async_req_t *req = ov->Pointer;
         if (!req)
                 return 0;
 
         if (req->timeout_us > 0)
                 list_del(&req->pending_node);
 
-        if (ATOMIC_EXCHANGE(&req->processed, 1) == 0) {
+        if (ATOMIC_EXCHANGE(&req->processed, TRUE) == 0) {
                 req->f_cb(req->ch, req->buf, ok ? (int)size : -1);
-                mempool_free(cfg->mp, req);
+                mempool_free(cfg->mempool, req);
         }
 
         return 0;
@@ -395,7 +407,7 @@ net_send(net_t *net, net_ch_t *ch, void *tx_buf, const usize size)
                             .size     = (u16)tx_size,
                         };
 
-                        if (cfg->log_cfg.fp)
+                        if (cfg->log_cfg.fd)
                                 log_write_bin(log, 0, &net_log_header, sizeof(net_log_header), tx_buf, tx_size);
 
                         break;
@@ -429,7 +441,7 @@ net_recv(net_t *net, net_ch_t *ch, void *rx_buf, const usize cap, const u32 time
                             .size     = (u16)rx_size,
                         };
 
-                        if (cfg->log_cfg.fp)
+                        if (cfg->log_cfg.fd)
                                 log_write_bin(log, 0, &net_log_header, sizeof(net_log_header), rx_buf, rx_size);
 
                         break;
@@ -444,7 +456,7 @@ net_recv(net_t *net, net_ch_t *ch, void *rx_buf, const usize cap, const u32 time
                             .size     = (u16)rx_size,
                         };
 
-                        if (cfg->log_cfg.fp)
+                        if (cfg->log_cfg.fd)
                                 log_write_bin(log, 0, &net_log_header, sizeof(net_log_header), rx_buf, rx_size);
 
                         break;
@@ -497,7 +509,7 @@ net_broadcast(const u32 ip, const u16 port, const void *tx_buf, const usize size
         dst_addr.sin_addr.s_addr = ip;
 
         addr_len = sizeof(dst_addr);
-        ret      = sendto(fd, (const char *)tx_buf, (int)size, 0, (struct sockaddr *)&dst_addr, addr_len);
+        ret      = sendto(fd, tx_buf, (int)size, 0, (struct sockaddr *)&dst_addr, addr_len);
         if (ret <= 0)
                 goto cleanup;
 

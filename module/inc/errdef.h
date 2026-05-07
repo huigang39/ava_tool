@@ -11,6 +11,7 @@ typedef enum errdef {
         MEBUSY,
         MEACCES,
         METIMEOUT,
+        MESYSERR,
         MECREATE,
         MEALLOC,
         MEXIST,

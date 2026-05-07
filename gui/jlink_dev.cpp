@@ -50,6 +50,8 @@ bool
 JLinkDev::connect()
 {
         std::lock_guard lk(mtx_);
+        lastErr_.clear(); // Clear previous error on new attempt
+
         if (!isOpen_) {
                 lastErr_ = "not open";
                 return false;
@@ -70,12 +72,11 @@ JLinkDev::connect()
         JLINKARM_SetSpeed(static_cast<u32>(speedKHz_));
 
         if (JLINKARM_Connect() < 0) {
-                lastErr_     = "Connect failed";
+                lastErr_     = "Connect failed (Check power/cable or replug J-Link)";
                 isConnected_ = false;
                 return false;
         }
         isConnected_ = true;
-        lastErr_.clear();
         return true;
 }
 
@@ -86,6 +87,15 @@ JLinkDev::readMem(const u32 addr, const u32 numBytes, void *dst)
         if (!isOpen_ || !isConnected_)
                 return false;
         return JLINKARM_ReadMemEx(addr, numBytes, dst, 0) >= 0;
+}
+
+bool
+JLinkDev::writeMem(const u32 addr, const u32 numBytes, const void *src)
+{
+        std::lock_guard lk(mtx_);
+        if (!isOpen_ || !isConnected_)
+                return false;
+        return JLINKARM_WriteMemEx(addr, numBytes, src, 0) >= 0;
 }
 
 bool
@@ -106,25 +116,34 @@ JLinkDev::hssStart(const std::vector<HssBlock> &blocks, const int periodUs)
         }
 
         std::vector<JLINK_HSS_MEM_BLOCK_DESC> descs(blocks.size());
-        u32                                   frameSize = 0;
+        u32                                   frameSize = static_cast<u32>(kHssHeaderBytes);
         for (usize i = 0; i < blocks.size(); ++i) {
-                descs[i].Addr     = blocks[i].addr;
-                descs[i].NumBytes = blocks[i].numBytes;
-                descs[i].Flags    = 0;
-                descs[i].Dummy    = 0;
-                frameSize += blocks[i].numBytes;
+                descs[i].Addr      = blocks[i].addr;
+                descs[i].NumBytes  = blocks[i].numBytes;
+                descs[i].Flags     = 0;
+                descs[i].Dummy     = 0;
+                frameSize         += blocks[i].numBytes;
         }
 
-        if (JLINK_HSS_Start(descs.data(), static_cast<i32>(descs.size()), periodUs, 0) < 0) {
-                char buf[64];
-                snprintf(buf, sizeof(buf), "HSS_Start failed (period=%dus, n=%zu)", periodUs, blocks.size());
+        int effectivePeriodUs = periodUs;
+        if (effectivePeriodUs > 100000) {
+                // HSS hardware typically doesn't support frequencies below 10Hz stably.
+                // Clamping to 100ms period. For lower frequencies, use POLL mode.
+                effectivePeriodUs = 100000;
+        }
+
+        int res = JLINK_HSS_Start(descs.data(), static_cast<i32>(descs.size()), effectivePeriodUs, 1);
+        if (res < 0) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "HSS Error: HW rejected period %dus. Min 10Hz recommended.", effectivePeriodUs);
                 lastErr_ = buf;
+                print_info(false, "%s", buf);
                 return false;
         }
 
         hssRunning_   = true;
         hssFrameSize_ = static_cast<int>(frameSize);
-        hssPeriodUs_  = periodUs;
+        hssPeriodUs_  = effectivePeriodUs;
         lastErr_.clear();
         return true;
 }
@@ -137,6 +156,7 @@ JLinkDev::hssStop()
                 JLINK_HSS_Stop();
                 hssRunning_   = false;
                 hssFrameSize_ = 0;
+                hssActualHz_.store(0.0f, std::memory_order_relaxed);
         }
 }
 
@@ -165,17 +185,30 @@ JLinkDev::drawUI()
                 snprintf(nameBuf, sizeof(nameBuf), "%s", deviceName_.c_str());
         }
 
-        ImGui::SetNextItemWidth(180.0f);
-        if (ImGui::InputText("device##jlink", nameBuf, sizeof(nameBuf), ImGuiInputTextFlags_EnterReturnsTrue)) {
-                std::lock_guard lk(mtx_);
-                deviceName_ = nameBuf;
+        char btnLabel[128];
+        snprintf(btnLabel, sizeof(btnLabel), "%s##jlink_dev_btn", nameBuf[0] != '\0' ? nameBuf : "Select Device");
+        if (ImGui::Button(btnLabel, ImVec2(180.0f, 0))) {
+                JLINKARM_DEVICE_SELECT_INFO sinfo;
+                sinfo.SizeOfStruct = sizeof(sinfo);
+                sinfo.CoreIndex    = 0;
+                int32_t devIdx     = JLINKARM_DEVICE_SelectDialog(nullptr, 0, &sinfo);
+                if (devIdx >= 0) {
+                        JLINKARM_DEVICE_INFO dinfo;
+                        dinfo.SizeOfStruct = sizeof(dinfo);
+                        if (JLINKARM_DEVICE_GetInfo(devIdx, &dinfo) >= 0) {
+                                std::lock_guard lk(mtx_);
+                                deviceName_ = dinfo.sName;
+                        }
+                }
         }
+        ImGui::SameLine();
+        ImGui::Text("device");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(140.0f);
         bool speedCommitted = false;
         {
                 std::lock_guard lk(mtx_);
-                ImGui::InputInt("kHz##jlink", &speedKHz_);
+                ImGui::InputInt("kHz##jlink", &speedKHz_, 0, 0);
                 speedCommitted = ImGui::IsItemDeactivatedAfterEdit();
                 if (speedKHz_ < 1)
                         speedKHz_ = 1;
@@ -186,44 +219,33 @@ JLinkDev::drawUI()
         }
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("J-Link SWD speed (kHz). Applies when you finish editing.");
-        ImGui::SameLine();
-        if (!isOpen_) {
-                if (ImGui::SmallButton("Open"))
-                        open();
-        } else if (!isConnected_) {
-                if (ImGui::SmallButton("Connect"))
-                        connect();
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Close"))
-                        close();
-        } else {
-                if (ImGui::SmallButton("Disconnect"))
-                        close();
-        }
-        ImGui::SameLine();
-        ImGui::TextDisabled("[%s%s%s]",
-                            isOpen_ ? "open" : "closed",
-                            isConnected_ ? "+conn" : "",
-                            hssRunning_ ? "+HSS" : "");
 
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(110.0f);
-        {
-                std::lock_guard lk(mtx_);
-                int hz = (hssPeriodUs_ > 0) ? (1000000 / hssPeriodUs_) : 1000;
-                if (ImGui::DragInt("##hsshz", &hz, 10.0f, 10, 100000, "%d Hz")) {
-                        if (hz < 10)
-                                hz = 10;
-                        hssPeriodUs_ = 1000000 / hz;
-                        if (hssPeriodUs_ < 10)
-                                hssPeriodUs_ = 10;
+        if (!isConnected_) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // Red
+                if (ImGui::SmallButton("CONNECT")) {
+                        if (!isOpen_)
+                                open();
+                        if (connect()) {
+                                // Handled by Gui::drawBar connection detection
+                        }
                 }
+                ImGui::PopStyleColor();
+        } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f)); // Green
+                if (ImGui::SmallButton("DISCONNECT")) {
+                        close();
+                }
+                ImGui::PopStyleColor();
         }
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("HSS sample frequency. Period = 1e6 / Hz us.\n10 Hz - 100000 Hz");
 
         if (!lastErr_.empty()) {
                 ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", lastErr_.c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+                ImGui::Text("Error: %s", lastErr_.c_str());
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(
+                            "Try reducing the sampling frequency (Hz) if you see 'Low on memory' or 'Start failed'.");
+                ImGui::PopStyleColor();
         }
 }

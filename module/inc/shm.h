@@ -47,7 +47,7 @@ typedef struct shm_lo {
 #elif defined(_WIN32)
         HANDLE fd;
 #endif
-        void   *base;
+        void   *addr;
         u8      is_creator;
         spsc_t *spsc;
 } shm_lo_t;
@@ -61,8 +61,31 @@ typedef struct shm {
 /*                                  接口声明                                  */
 /* -------------------------------------------------------------------------- */
 
-int  shm_init(shm_t *shm, shm_cfg_t shm_cfg);
+/**
+ * @brief 共享内存结构体初始化
+ *
+ * @param shm     共享内存结构体
+ * @param shm_cfg 共享内存配置
+ * @return        int 状态码
+ */
+int shm_init(shm_t *shm, shm_cfg_t shm_cfg);
+
+/**
+ * @brief 共享内存数据读取
+ *
+ * @param shm  共享内存结构体
+ * @param dst  待读取的数据目标地址
+ * @param size 读取字节数
+ */
 void shm_read(shm_t *shm, void *dst, usize size);
+
+/**
+ * @brief 共享内存数据写入
+ *
+ * @param shm  共享内存结构体
+ * @param src  待写入的数据源地址
+ * @param size 写入字节数
+ */
 void shm_write(shm_t *shm, const void *src, usize size);
 
 #ifdef __cplusplus

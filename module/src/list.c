@@ -1,18 +1,18 @@
 #include "list.h"
 
 /* -------------------------------------------------------------------------- */
-/*                                  接口定义                                  */
+/*                                  内部函数                                  */
 /* -------------------------------------------------------------------------- */
 
-void
-list_init(list_head_t *head)
-{
-        head->next = head;
-        head->prev = head;
-}
-
-void
-__list_add(list_head_t *entry, list_head_t *prev_node, list_head_t *next_node)
+/**
+ * @brief 在 prev_node 与 next_node 之间插入 entry
+ *
+ * @param entry
+ * @param prev_node
+ * @param next_node
+ */
+static void
+list_add__(list_head_t *entry, list_head_t *prev_node, list_head_t *next_node)
 {
         next_node->prev = entry;
         entry->next     = next_node;
@@ -20,44 +20,27 @@ __list_add(list_head_t *entry, list_head_t *prev_node, list_head_t *next_node)
         prev_node->next = entry;
 }
 
-void
-list_add(list_head_t *entry, list_head_t *head)
-{
-        __list_add(entry, head, head->next);
-}
-
-void
-list_add_tail(list_head_t *entry, list_head_t *head)
-{
-        __list_add(entry, head->prev, head);
-}
-
-void
-__list_del(list_head_t *prev_node, list_head_t *next_node)
+/**
+ * @brief 删除 prev_node 与 next_node 间的节点连接
+ *
+ * @param prev_node
+ * @param next_node
+ */
+static void
+list_del__(list_head_t *prev_node, list_head_t *next_node)
 {
         prev_node->next = next_node;
         next_node->prev = prev_node;
 }
 
-void
-list_del(list_head_t *entry)
-{
-        if (entry->prev == NULL || entry->next == NULL)
-                return;
-
-        __list_del(entry->prev, entry->next);
-        entry->next = NULL;
-        entry->prev = NULL;
-}
-
-u8
-list_empty(const list_head_t *head)
-{
-        return head->next == head;
-}
-
-void
-__list_splice(const list_head_t *list, list_head_t *head)
+/**
+ * @brief 将 list 整体拼接到 head 之后
+ *
+ * @param list
+ * @param head
+ */
+static void
+list_splice__(const list_head_t *list, list_head_t *head)
 {
         list_head_t *first = list->next;
         list_head_t *last  = list->prev;
@@ -70,11 +53,51 @@ __list_splice(const list_head_t *list, list_head_t *head)
         at->prev   = last;
 }
 
+/* -------------------------------------------------------------------------- */
+/*                                  接口定义                                  */
+/* -------------------------------------------------------------------------- */
+
 void
-list_splice(list_head_t *list, list_head_t *head)
+list_init(list_head_t *head)
+{
+        head->next = head;
+        head->prev = head;
+}
+
+void
+list_add(list_head_t *entry, list_head_t *head)
+{
+        list_add__(entry, head, head->next);
+}
+
+void
+list_add_tail(list_head_t *entry, list_head_t *head)
+{
+        list_add__(entry, head->prev, head);
+}
+
+void
+list_del(list_head_t *entry)
+{
+        if (entry->prev == NULL || entry->next == NULL)
+                return;
+
+        list_del__(entry->prev, entry->next);
+        entry->next = NULL;
+        entry->prev = NULL;
+}
+
+u8
+list_empty(const list_head_t *head)
+{
+        return head->next == head;
+}
+
+void
+list_splice(const list_head_t *list, list_head_t *head)
 {
         if (!list_empty(list))
-                __list_splice(list, head);
+                list_splice__(list, head);
 }
 
 void
@@ -96,13 +119,13 @@ list_replace_init(list_head_t *old_entry, list_head_t *new_entry)
 void
 list_move(list_head_t *entry, list_head_t *head)
 {
-        __list_del(entry->prev, entry->next);
+        list_del__(entry->prev, entry->next);
         list_add(entry, head);
 }
 
 void
 list_move_tail(list_head_t *entry, list_head_t *head)
 {
-        __list_del(entry->prev, entry->next);
+        list_del__(entry->prev, entry->next);
         list_add_tail(entry, head);
 }

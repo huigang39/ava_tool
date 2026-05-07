@@ -39,7 +39,7 @@ set(SRC
         ${DIR_THIRDPARTY}/cJSON/cJSON.c
         ${DIR_GUI}/gui.cpp
         ${DIR_GUI}/monitor.cpp
-        ${DIR_GUI}/editor.cpp
+        ${DIR_GUI}/parser.cpp
         ${DIR_GUI}/elf_parser.cpp
         ${DIR_GUI}/dwarf_parser.cpp
         ${DIR_GUI}/jlink_dev.cpp
@@ -75,6 +75,7 @@ add_dependencies(${PROJECT_NAME} module_build)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
         ${DIR_MODULE}
+        ${DIR_MODULE}/inc
 
         ${DIR_THIRDPARTY}/imgui
         ${DIR_THIRDPARTY}/imgui/backends
@@ -122,6 +123,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         ${JLINK_LIB}
         ${FFTW_LIB}
         ${MODULE_LIB}
+        $<$<PLATFORM_ID:Windows>:winmm>
 )
 
 # set(CPACK_PACKAGE_NAME ${PROJECT_NAME})

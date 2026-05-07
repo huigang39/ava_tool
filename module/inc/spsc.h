@@ -42,7 +42,6 @@ u8    spsc_empty(spsc_t *spsc);
 u8    spsc_full(spsc_t *spsc);
 usize spsc_avail(spsc_t *spsc);
 usize spsc_free(spsc_t *spsc);
-usize spsc_policy(spsc_t *spsc, usize wp, usize rp, usize size);
 
 #ifdef __cplusplus
 }

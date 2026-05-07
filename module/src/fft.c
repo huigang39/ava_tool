@@ -8,8 +8,8 @@
 void
 fft_init(fft_t *fft, const fft_cfg_t fft_cfg)
 {
-        CFG_INIT(fft, fft_cfg);
         DECL(fft, cfg, in, out, lo);
+        CFG_INIT(fft, fft_cfg);
 
         spsc_init(&lo->spsc, cfg->buf, cfg->npoints * sizeof(f32), SPSC_POLICY_REJECT);
 
@@ -62,8 +62,7 @@ fft_exec(fft_t *fft)
 
         out->ft = (f32)out->out_idx * cfg->fs / (f32)cfg->npoints;
 
-        lo->need_exec = 0;
-
+        lo->need_exec  = 0;
         lo->elapsed_us = (u32)(get_mono_ts_us() - start_ts);
 }
 

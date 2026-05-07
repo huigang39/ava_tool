@@ -50,10 +50,48 @@ typedef struct pll_filter {
 /*                                  接口定义                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * @brief PLL 结构体初始化
+ *
+ * @param pll     PLL 结构体
+ * @param pll_cfg PLL 配置
+ * @return        void
+ */
 void pll_init(pll_filter_t *pll, pll_cfg_t pll_cfg);
+
+/**
+ * @brief PLL 单次执行计算
+ *
+ * @param pll PLL 结构体
+ * @return    void
+ */
 void pll_exec(pll_filter_t *pll);
+
+/**
+ * @brief PLL 单次执行计算(带输入)
+ *
+ * @param pll PLL 结构体
+ * @param ab  正交信号
+ * @return    void
+ */
 void pll_exec_ab_in(pll_filter_t *pll, f32_ab_t ab);
+
+/**
+ * @brief PLL 单次执行计算(带输入)
+ *
+ * @param pll       PLL 结构体
+ * @param theta_err 角度误差
+ * @return          void
+ */
 void pll_exec_theta_err_in(pll_filter_t *pll, f32 theta_err);
+
+/**
+ * @brief PLL 单次执行计算(带输入)
+ *
+ * @param pll       PLL 结构体
+ * @param theta     角度
+ * @return          void
+ */
 void pll_exec_theta_in(pll_filter_t *pll, f32 theta);
 
 #ifdef __cplusplus
