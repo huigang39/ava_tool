@@ -49,12 +49,53 @@ fft_exec(fft_t *fft)
         memcpy(in->buf, lo->spsc.buf, lo->spsc.cap);
 
 #if defined(__linux__) || defined(_WIN32)
+        if (cfg->e_window != FFT_WINDOW_NONE) {
+                for (size_t i = 0; i < cfg->npoints; i++) {
+                        float w     = 1.0f;
+                        float phase = 2.0f * PI * i / (cfg->npoints - 1);
+                        switch (cfg->e_window) {
+                                case FFT_WINDOW_HANNING: {
+                                        w = 0.5f * (1.0f - COS(phase));
+                                        break;
+                                }
+                                case FFT_WINDOW_HAMMING: {
+                                        w = 0.54f - 0.46f * COS(phase);
+                                        break;
+                                }
+                                case FFT_WINDOW_BLACKMAN: {
+                                        w = 0.42f - 0.5f * COS(phase) + 0.08f * COS(2.0f * phase);
+                                        break;
+                                }
+                                default:
+                                        break;
+                        }
+                        in->buf[i] *= w;
+                }
+        }
         fftwf_execute(lo->p);
         for (size_t i = 0; i < cfg->npoints / 2 + 1; i++)
                 out->mag_buf[i] = SQRT(lo->buf[i][0] * lo->buf[i][0] + lo->buf[i][1] * lo->buf[i][1]);
+
         find_max(&out->mag_buf[1], cfg->npoints >> 1, &out->max_mag, &out->out_idx);
 #elif defined(ARM_MATH)
-        arm_hanning_f32(lo->buf, cfg->npoints);
+        if (cfg->e_window != FFT_WINDOW_NONE) {
+                switch (cfg->e_window) {
+                        case FFT_WINDOW_HANNING: {
+                                arm_hanning_f32(lo->buf, cfg->npoints);
+                                break;
+                        }
+                        case FFT_WINDOW_HAMMING: {
+                                arm_hamming_f32(lo->buf, cfg->npoints);
+                                break;
+                        }
+                        case FFT_WINDOW_BLACKMAN: {
+                                arm_blackman_harris_92db_f32(lo->buf, cfg->npoints);
+                                break;
+                        }
+                        default:
+                                break;
+                }
+        }
         arm_rfft_fast_f32(&lo->s, in->buf, lo->buf, cfg->flag);
         arm_cmplx_mag_f32(lo->buf, out->mag_buf, cfg->npoints >> 1);
         arm_max_f32(&out->mag_buf[1], cfg->npoints >> 1, &out->max_mag, &out->out_idx);

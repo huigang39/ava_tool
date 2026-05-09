@@ -116,6 +116,9 @@ Gui::saveSession() const
                         cJSON_AddStringToObject(
                             sObj, "draw", s->getDraw() == MonitorScope::DrawEnum::PLOT ? "PLOT" : "TABLE");
                         cJSON_AddNumberToObject(sObj, "height", static_cast<double>(s->getHeight()));
+                        cJSON_AddBoolToObject(sObj, "showFft", s->getShowFft());
+                        cJSON_AddNumberToObject(sObj, "fftPoints", static_cast<double>(s->getFftPoints()));
+                        cJSON_AddNumberToObject(sObj, "fftPeakCount", static_cast<double>(s->getFftPeakCount()));
 
                         cJSON *chsArr = cJSON_CreateArray();
                         for (auto &ch : s->getChannels() | std::views::values) {
@@ -271,6 +274,19 @@ Gui::loadSession()
                                 }
                                 if (const cJSON *hItem = cJSON_GetObjectItem(sItem, "height"); cJSON_IsNumber(hItem))
                                         scope->getHeight() = static_cast<f32>(hItem->valuedouble);
+
+                                if (const cJSON *fftShowItem = cJSON_GetObjectItem(sItem, "showFft"); cJSON_IsBool(fftShowItem))
+                                        scope->getShowFft() = cJSON_IsTrue(fftShowItem);
+
+                                if (const cJSON *fftPtsItem = cJSON_GetObjectItem(sItem, "fftPoints"); cJSON_IsNumber(fftPtsItem)) {
+                                        int pts = fftPtsItem->valueint;
+                                        if (pts != scope->getFftPoints()) {
+                                                scope->reinitFft(pts);
+                                        }
+                                }
+
+                                if (const cJSON *fftPkItem = cJSON_GetObjectItem(sItem, "fftPeakCount"); cJSON_IsNumber(fftPkItem))
+                                        scope->getFftPeakCount() = fftPkItem->valueint;
 
                                 const cJSON *chsArr = cJSON_GetObjectItem(sItem, "channels");
                                 if (!cJSON_IsArray(chsArr))

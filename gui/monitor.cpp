@@ -14,8 +14,8 @@
 
 std::atomic<bool> g_monitorPaused{false};
 
-std::vector<Monitor*> Monitor::sInstances_;
-std::mutex            Monitor::sMtxInstances_;
+std::vector<Monitor *> Monitor::sInstances_;
+std::mutex             Monitor::sMtxInstances_;
 
 class MonitorChannel;
 class MonitorScope;
@@ -56,6 +56,7 @@ MonitorScope::menu()
         }
         ImGui::PopStyleColor(3);
         ImGui::SameLine();
+        ImGui::SameLine();
         if (paused_) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.8f, 0.2f, 0.6f)); // Yellow/Orange
                 if (ImGui::Button("RESUME"))
@@ -66,6 +67,73 @@ MonitorScope::menu()
                 if (ImGui::Button("PAUSE"))
                         paused_ = true;
                 ImGui::PopStyleColor();
+        }
+
+        ImGui::SameLine();
+        ImGui::SameLine();
+        ImGui::SameLine();
+        if (showFft_) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue
+                if (ImGui::Button("FREQ")) {
+                        showFft_ = false;
+                }
+                ImGui::PopStyleColor();
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(100);
+                const char *pointOptions[] = {"256",
+                                              "512",
+                                              "1024",
+                                              "2048",
+                                              "4096",
+                                              "8192",
+                                              "16384",
+                                              "32768",
+                                              "65536",
+                                              "131072",
+                                              "262144",
+                                              "524288",
+                                              "1048576"};
+                int         currentIdx     = 0;
+                for (int i = 0; i < (int)(sizeof(pointOptions) / sizeof(pointOptions[0])); ++i) {
+                        if (fftPoints_ == atoi(pointOptions[i])) {
+                                currentIdx = i;
+                                break;
+                        }
+                }
+
+                if (ImGui::Combo(
+                        "##fftPoints", &currentIdx, pointOptions, (int)(sizeof(pointOptions) / sizeof(pointOptions[0])))) {
+                        int nextPoints = atoi(pointOptions[currentIdx]);
+                        if (nextPoints != fftPoints_) {
+                                reinitFft(nextPoints);
+                        }
+                }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("FFT Points (Resolution)");
+
+                ImGui::SameLine();
+                ImGui::TextDisabled("Peaks");
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(30);
+                char pkBuf[16];
+                snprintf(pkBuf, sizeof(pkBuf), "%d", fftPeakCount_);
+                if (ImGui::InputText("##fftPeakCount",
+                                     pkBuf,
+                                     sizeof(pkBuf),
+                                     ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsDecimal)) {
+                        fftPeakCount_ = atoi(pkBuf);
+                        if (fftPeakCount_ < 0)
+                                fftPeakCount_ = 0;
+                        if (fftPeakCount_ > 20)
+                                fftPeakCount_ = 20;
+                }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Enter number of peaks and press Enter to confirm");
+        } else {
+                if (ImGui::Button("TIME")) {
+                        showFft_ = true;
+                }
         }
 
         ImGui::Separator();
@@ -309,14 +377,30 @@ MonitorScope::plotMenu()
 void
 MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode)
 {
+        bool isPaused = g_monitorPaused.load();
+        if (showFft_ && mode != MonitorViewMode::MANUAL && !isPaused) {
+                // We keep a single-shot auto-fit when NOT in manual mode?
+                // Actually the user said "NEVER align automatically even for the first time".
+                // But let's keep it linked to the mode. If they are in FOLLOW/FULL, it fits.
+                ImPlot::SetNextAxesToFit();
+        }
+
+        if (showFft_) {
+                if (!ImGui::BeginTable("##fftLayoutTable", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+                        return;
+                }
+                ImGui::TableSetupColumn("Plot", ImGuiTableColumnFlags_WidthStretch, 0.75f);
+                ImGui::TableSetupColumn("Peaks", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+        }
+
         if (ImPlot::BeginPlot("##plot", ImVec2(-1, -1), ImPlotFlags_NoTitle)) {
-                if (linkXMin && linkXMax)
+                if (!showFft_ && linkXMin && linkXMax)
                         ImPlot::SetupAxisLinks(ImAxis_X1, linkXMin, linkXMax);
 
                 // Mode-based Y Axis setup
-                bool            isPaused = g_monitorPaused.load();
-                ImPlotAxisFlags yFlags =
-                    (mode == MonitorViewMode::FULL && !isPaused) ? ImPlotAxisFlags_AutoFit : ImPlotAxisFlags_None;
+                ImPlotAxisFlags yFlags = ImPlotAxisFlags_None;
 
                 // Add Y-axis margin in FULL mode by pushing style padding
                 bool pushedPadding = false;
@@ -325,7 +409,12 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                         pushedPadding = true;
                 }
 
-                ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_None, yFlags);
+                if (showFft_) {
+                        ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_None, ImPlotAxisFlags_None);
+                } else {
+                        yFlags = (mode == MonitorViewMode::FULL && !isPaused) ? ImPlotAxisFlags_AutoFit : ImPlotAxisFlags_None;
+                        ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_None, yFlags);
+                }
 
                 // Interaction Detection (Area or Axes)
                 bool plotHovered  = ImPlot::IsPlotHovered();
@@ -334,7 +423,6 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 bool anyHovered   = plotHovered || xAxisHovered || yAxisHovered;
 
                 // Capture if the plot is being interacted with (dragged/panned/zoomed)
-                // ImGui::IsItemActive() works here because BeginPlot creates an item.
                 bool plotActive = ImGui::IsItemActive();
 
                 bool isDoubleClick = ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
@@ -344,39 +432,118 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                         mode = MonitorViewMode::FOLLOW;
                                 else if (mode == MonitorViewMode::FOLLOW)
                                         mode = MonitorViewMode::FULL;
-                                // In FULL mode, do nothing on double click
                         } else if (ImGui::GetIO().MouseWheel != 0) {
-                                // Only switch to FOLLOW if we are currently in FULL mode.
-                                // In MANUAL mode, scrolling stays in MANUAL.
                                 if (mode == MonitorViewMode::FULL) {
                                         mode = MonitorViewMode::FOLLOW;
                                 }
                         }
                 }
 
-                // If user is dragging or the plot is active, switch to MANUAL if we were in FULL or FOLLOW
-                // CRITICAL: Skip this if we just double-clicked to enter FULL mode.
                 if (!isDoubleClick && plotActive && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f)) {
                         if (mode == MonitorViewMode::FULL || mode == MonitorViewMode::FOLLOW) {
                                 mode = MonitorViewMode::MANUAL;
                         }
                 }
 
+                channelPeaks_.clear();
                 for (auto &[chName, ch] : chs_) {
-                        // 1. Handle Visibility (Initial state from session)
+                        // 1. Handle Visibility
                         ImPlot::HideNextItem(!ch->show_, ImPlotCond_Once);
 
                         // 2. Handle Style & Color
                         const f32 *col = ch->getColor();
-                        // Always use the stored color from the channel.
-                        // "Auto" now means "automatically assigned by the system".
                         ImPlot::SetNextLineStyle(ImVec4(col[0], col[1], col[2], col[3]), ch->getLineWeight());
                         if (ch->showMarkers())
                                 ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 3.0f);
 
                         // 3. Prepare and Plot Data
                         bool plotted = false;
-                        {
+                        if (showFft_) {
+                                if (ch->show_ && fftPoints_ > 0) {
+                                        std::lock_guard lk(ch->valMutex_);
+
+                                        // Dynamic extraction: Find points within the current time-domain window
+                                        const double xmin = (linkXMin) ? *linkXMin : 0.0;
+                                        const double xmax = (linkXMax) ? *linkXMax : 1.0;
+
+                                        auto itStart =
+                                            std::lower_bound(ch->rTs_.begin(), ch->rTs_.end(), static_cast<f32>(xmin));
+                                        auto itEnd = std::upper_bound(ch->rTs_.begin(), ch->rTs_.end(), static_cast<f32>(xmax));
+
+                                        size_t startIdx     = std::distance(ch->rTs_.begin(), itStart);
+                                        size_t endIdx       = std::distance(ch->rTs_.begin(), itEnd);
+                                        size_t visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
+
+                                        if (visibleCount > 0) {
+                                                // Prepare buffer: Zero-fill first
+                                                std::fill(fftLoBuf_.begin(), fftLoBuf_.end(), 0.0f);
+
+                                                // Copy up to fftPoints_ points
+                                                size_t copyCount = std::min(visibleCount, static_cast<size_t>(fftPoints_));
+                                                // If window has more points than FFT resolution, take the latest ones in that
+                                                // window
+                                                size_t readOffset = (visibleCount > copyCount) ? (visibleCount - copyCount) : 0;
+
+                                                f32 mean = 0;
+                                                for (size_t i = 0; i < copyCount; ++i) {
+                                                        float v      = ch->rVals_[startIdx + readOffset + i];
+                                                        fftLoBuf_[i] = v;
+                                                        mean        += v;
+                                                }
+                                                mean /= (float)copyCount;
+
+                                                // DC removal
+                                                for (size_t i = 0; i < copyCount; ++i) {
+                                                        fftLoBuf_[i] -= mean;
+                                                }
+
+                                                // Update FS based on average delta in the window
+                                                float fs = (parent_) ? (f32)parent_->getHz() : 1000.0f;
+                                                if (copyCount > 1) {
+                                                        float totalTime = ch->rTs_[startIdx + readOffset + copyCount - 1] -
+                                                                          ch->rTs_[startIdx + readOffset];
+                                                        if (totalTime > 1e-9f) {
+                                                                fs = (float)(copyCount - 1) / totalTime;
+                                                        }
+                                                }
+                                                // Sanity check for FS
+                                                if (fs < 0.1f)
+                                                        fs = 0.1f;
+                                                if (fs > 10000000.0f)
+                                                        fs = 10000000.0f;
+                                                fft_.cfg.fs = fs;
+
+                                                fft_.lo.need_exec = 1;
+                                                fft_exec(&fft_);
+
+                                                float df = fs / (float)fftPoints_;
+                                                dxs_.resize(fftPoints_ / 2 + 1);
+                                                for (int i = 0; i < (int)dxs_.size(); ++i) {
+                                                        dxs_[i]       = (float)i * df;
+                                                        fftMagBuf_[i] = fftMagBuf_[i] * 2.0f / (float)fftPoints_;
+                                                }
+
+                                                ImPlot::PlotLine(chName.c_str(), dxs_.data(), fftMagBuf_.data(), (int)dxs_.size());
+                                                plotted = true;
+
+                                                if (fftPeakCount_ > 0) {
+                                                        std::vector<Peak> peaks;
+                                                        for (int i = 2; i < (int)fftMagBuf_.size() - 2; ++i) {
+                                                                if (fftMagBuf_[i] > fftMagBuf_[i - 1] &&
+                                                                    fftMagBuf_[i] > fftMagBuf_[i + 1]) {
+                                                                        peaks.push_back({dxs_[i], fftMagBuf_[i]});
+                                                                }
+                                                        }
+                                                        std::sort(peaks.begin(), peaks.end(), [](const Peak &a, const Peak &b) {
+                                                                return a.mag > b.mag;
+                                                        });
+                                                        if ((int)peaks.size() > fftPeakCount_)
+                                                                peaks.resize(fftPeakCount_);
+                                                        channelPeaks_[chName] = std::move(peaks);
+                                                }
+                                        }
+                                }
+                        } else {
                                 std::lock_guard lk(ch->valMutex_);
                                 const size_t    total = ch->rTs_.size();
                                 if (total > 0) {
@@ -465,11 +632,10 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                         }
 
                         if (!plotted) {
-                                // Register legend even if no data or not in visible range
                                 ImPlot::PlotLine(chName.c_str(), (const f32 *)nullptr, (const f32 *)nullptr, 0);
                         }
 
-                        // 4. Update State from ImPlot (sync legend toggle back to our channel)
+                        // 4. Update Legend Toggle
                         if (ImPlotContext *gp = ImPlot::GetCurrentContext(); gp && gp->CurrentPlot) {
                                 if (ImPlotItem *item = gp->CurrentPlot->Items.GetItem(chName.c_str())) {
                                         ch->show_ = item->Show;
@@ -489,7 +655,6 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 }
                                 ImGui::Separator();
 
-                                // Show effective color even if in Auto mode
                                 ImVec4 curCol = ImVec4(col[0], col[1], col[2], col[3]);
                                 if (ch->useAutoColor()) {
                                         if (ImPlotContext *gp = ImPlot::GetCurrentContext(); gp && gp->CurrentPlot) {
@@ -506,16 +671,12 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 ImGui::SameLine();
                                 if (ImGui::Checkbox("Auto", &ch->useAutoColor())) {
                                         if (ch->useAutoColor()) {
-                                                // Pick a fresh color from the colormap immediately
                                                 static int shuffleIdx = 0;
                                                 shuffleIdx            = (shuffleIdx + 1) % ImPlot::GetColormapSize();
                                                 ImVec4 newCol         = ImPlot::GetColormapColor(shuffleIdx);
                                                 memcpy(ch->getColor(), &newCol.x, sizeof(float) * 4);
                                         }
                                 }
-
-                                if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip("Automatically assign a color from the current colormap");
 
                                 ImGui::SetNextItemWidth(100);
                                 const char *styleNames[] = {"Line", "Stairs"};
@@ -534,6 +695,36 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                         ImPlot::PopStyleVar();
                 }
         }
+
+        if (showFft_) {
+                ImGui::TableSetColumnIndex(1);
+                if (!channelPeaks_.empty()) {
+                        for (auto &[chName, peaks] : channelPeaks_) {
+                                if (peaks.empty())
+                                        continue;
+                                ImGui::Text("Peaks: %s", chName.c_str());
+                                if (ImGui::BeginTable(("##peaksTable_" + chName).c_str(),
+                                                      2,
+                                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                                        ImGui::TableSetupColumn("Freq (Hz)");
+                                        ImGui::TableSetupColumn("Mag");
+                                        ImGui::TableHeadersRow();
+                                        for (const auto &p : peaks) {
+                                                ImGui::TableNextRow();
+                                                ImGui::TableSetColumnIndex(0);
+                                                ImGui::Text("%.1f", p.freq);
+                                                ImGui::TableSetColumnIndex(1);
+                                                ImGui::Text("%.3f", p.mag);
+                                        }
+                                        ImGui::EndTable();
+                                }
+                                ImGui::Spacing();
+                        }
+                } else {
+                        ImGui::Text("No peaks detected");
+                }
+                ImGui::EndTable();
+        }
 }
 
 int
@@ -548,6 +739,7 @@ MonitorScope::addChannel(const std::string &chName)
         ImVec4     c              = ImPlot::GetColormapColor(globalColorIdx);
         globalColorIdx            = (globalColorIdx + 1) % ImPlot::GetColormapSize();
         memcpy(ch->getColor(), &c.x, sizeof(float) * 4);
+        ch->minKeepPoints_ = fftPoints_;
 
         chs_[chName] = std::move(ch);
         return 0;
@@ -621,6 +813,32 @@ MonitorScope::dropTarget()
                         }
                 }
                 ImGui::EndDragDropTarget();
+        }
+}
+
+void
+MonitorScope::reinitFft(int newPoints)
+{
+        fftPoints_ = newPoints;
+        fft_destroy(&fft_);
+
+        fftInBuf_.assign(fftPoints_, 0.0f);
+        fftMagBuf_.assign(fftPoints_ / 2 + 1, 0.0f);
+        fftOutBuf_.assign((fftPoints_ / 2 + 1) * 2, 0.0f);
+        fftLoBuf_.assign(fftPoints_, 0.0f);
+
+        fft_cfg_t cfg;
+        cfg.npoints  = fftPoints_;
+        cfg.fs       = (parent_) ? (f32)parent_->getHz() : 1000.0f;
+        cfg.e_window = FFT_WINDOW_HANNING;
+        cfg.in_buf   = fftInBuf_.data();
+        cfg.mag_buf  = fftMagBuf_.data();
+        cfg.out_buf  = (decltype(cfg.out_buf))fftOutBuf_.data();
+        cfg.buf      = fftLoBuf_.data();
+        fft_init(&fft_, cfg);
+
+        for (auto &pair : chs_) {
+                pair.second->minKeepPoints_ = static_cast<size_t>(newPoints);
         }
 }
 
@@ -706,8 +924,10 @@ Monitor::updateDisplay()
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(80);
                 if (ImGui::InputInt("##MaxHz", &maxSampleHz_, 0, 0)) {
-                        if (maxSampleHz_ < 1) maxSampleHz_ = 1;
-                        if (maxSampleHz_ > 50000) maxSampleHz_ = 50000;
+                        if (maxSampleHz_ < 1)
+                                maxSampleHz_ = 1;
+                        if (maxSampleHz_ > 50000)
+                                maxSampleHz_ = 50000;
                         JLinkDev::instance().reqRestart();
                 }
                 ImGui::SameLine();
@@ -720,14 +940,12 @@ Monitor::updateDisplay()
                         ImGui::TextDisabled("-- Hz");
                 }
 
-                // Move SampMode and ViewMode to the far right
-                // Total width approx: 70 (Samp) + 100 (View) + spacings
-                float rightPos = ImGui::GetContentRegionAvail().x - 170 - ImGui::GetStyle().ItemSpacing.x * 3;
-                if (rightPos > ImGui::GetCursorPosX()) {
-                        ImGui::SameLine(ImGui::GetCursorPosX() + rightPos - ImGui::GetCursorPosX());
-                } else {
-                        ImGui::SameLine();
-                }
+                // Right-aligned mode control group
+                float spacing    = ImGui::GetStyle().ItemSpacing.x;
+                float totalWidth = 70 + spacing + 90 + spacing + ImGui::CalcTextSize("T-Mode").x +
+                                   spacing + 90 + spacing + ImGui::CalcTextSize("F-Mode").x;
+                
+                ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - totalWidth);
 
                 const char *sampModes[] = {"HSS", "POLL"};
                 int         curSamp     = (samplingMode_ == SamplingMode::HSS) ? 0 : 1;
@@ -740,26 +958,25 @@ Monitor::updateDisplay()
                 ImGui::SameLine();
 
                 const char *viewModeNames[] = {"FULL", "FOLLOW", "MANUAL"};
-                int         curViewMode     = 0;
-                if (viewMode_ == MonitorViewMode::FULL)
-                        curViewMode = 0;
-                else if (viewMode_ == MonitorViewMode::FOLLOW)
-                        curViewMode = 1;
-                else if (viewMode_ == MonitorViewMode::MANUAL)
-                        curViewMode = 2;
+                int         curViewMode     = (int)viewMode_;
+                int         curFftViewMode  = (int)fftViewMode_;
 
-                ImGui::SetNextItemWidth(100);
-                if (ImGui::Combo("##ViewMode", &curViewMode, viewModeNames, 3)) {
-                        if (curViewMode == 0)
-                                viewMode_ = MonitorViewMode::FULL;
-                        else if (curViewMode == 1)
-                                viewMode_ = MonitorViewMode::FOLLOW;
-                        else if (curViewMode == 2)
-                                viewMode_ = MonitorViewMode::MANUAL;
+                ImGui::SetNextItemWidth(90);
+                if (ImGui::Combo("##TimeMode", &curViewMode, viewModeNames, 3)) {
+                        viewMode_ = static_cast<MonitorViewMode>(curViewMode);
                 }
-                if (ImGui::IsItemHovered()) {
-                        ImGui::SetTooltip("Select View Mode\nDouble Click Plot -> Cycle Modes\nMouse Wheel -> FOLLOW (from FULL)\nLeft Drag -> MANUAL");
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Time Domain View Mode");
+                ImGui::SameLine();
+                ImGui::TextDisabled("T-Mode");
+
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90);
+                if (ImGui::Combo("##FftMode", &curFftViewMode, viewModeNames, 3)) {
+                        fftViewMode_ = static_cast<MonitorViewMode>(curFftViewMode);
                 }
+                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frequency Domain (FFT) View Mode");
+                ImGui::SameLine();
+                ImGui::TextDisabled("F-Mode");
 
                 ImGui::Separator();
 
@@ -856,8 +1073,11 @@ Monitor::updateDisplay()
                                 }
 
                                 wasPaused_ = isPaused;
-
-                                scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, viewMode_);
+                                if (scope->isFftEnabled()) {
+                                        scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, fftViewMode_);
+                                } else {
+                                        scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, viewMode_);
+                                }
                                 scope->dropTarget();
                         }
                         ImGui::EndChild();

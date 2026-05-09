@@ -38,12 +38,20 @@ typedef enum fft_len {
         FFT_POINTS_1048576 = 1048576,
 } fft_len_e;
 
+typedef enum fft_window {
+        FFT_WINDOW_NONE,
+        FFT_WINDOW_HANNING,
+        FFT_WINDOW_HAMMING,
+        FFT_WINDOW_BLACKMAN,
+} fft_window_e;
+
 typedef struct fft_cfg {
-        f32   fs;
-        u8    flag;
-        usize npoints;
-        f32  *buf;
-        f32  *in_buf;
+        f32          fs;
+        u8           flag;
+        fft_window_e e_window;
+        usize        npoints;
+        f32         *buf;
+        f32         *in_buf;
 #if defined(__linux__) || defined(_WIN32)
         fftwf_complex *out_buf;
 #else
