@@ -10,29 +10,40 @@
 extern "C" {
 #endif
 
-#define SIZE_128B    (128)
-#define SIZE_256B    (256)
+#define SIZE_128B  (128)
+#define SIZE_256B  (256)
 
-#define SIZE_1KB     (1024)
-#define SIZE_2KB     (2 * SIZE_1KB)
-#define SIZE_4KB     (4 * SIZE_1KB)
-#define SIZE_8KB     (8 * SIZE_1KB)
-#define SIZE_16KB    (16 * SIZE_1KB)
-#define SIZE_32KB    (32 * SIZE_1KB)
-#define SIZE_64KB    (64 * SIZE_1KB)
-#define SIZE_128KB   (128 * SIZE_1KB)
+#define SIZE_1KB   (1024)
+#define SIZE_2KB   (2 * SIZE_1KB)
+#define SIZE_4KB   (4 * SIZE_1KB)
+#define SIZE_8KB   (8 * SIZE_1KB)
+#define SIZE_16KB  (16 * SIZE_1KB)
+#define SIZE_32KB  (32 * SIZE_1KB)
+#define SIZE_64KB  (64 * SIZE_1KB)
+#define SIZE_128KB (128 * SIZE_1KB)
 
-#define SIZE_1MB     (SIZE_1KB * SIZE_1KB)
-#define SIZE_2MB     (2 * SIZE_1MB)
-#define SIZE_4MB     (4 * SIZE_1MB)
-#define SIZE_16MB    (16 * SIZE_1MB)
+#define SIZE_1MB   (SIZE_1KB * SIZE_1KB)
+#define SIZE_2MB   (2 * SIZE_1MB)
+#define SIZE_4MB   (4 * SIZE_1MB)
+#define SIZE_16MB  (16 * SIZE_1MB)
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#define AT(sec) __declspec(allocate(sec))
+#define OPTNONE
+#define ALIGN(align) __declspec(align(align))
+#define FUNC_UNUSED
+#define TYPEOF(var) decltype(var)
+#define PACKED      __declspec(align(1))
+#else
 #define AT(sec)      __attribute__((section(sec)))
 #define OPTNONE      __attribute__((optnone))
 #define ALIGN(align) __attribute__((aligned(align)))
 #define FUNC_UNUSED  __attribute__((unused))
 #define TYPEOF(var)  __typeof__(var)
+#define PACKED       __attribute__((packed))
+#endif
 
+#ifdef MCU
 #define ATOMIC_EXEC(code)                                 \
         do {                                              \
                 volatile u32 __primask = __get_PRIMASK(); \
@@ -40,6 +51,9 @@ extern "C" {
                 {code};                                   \
                 __set_PRIMASK(__primask);                 \
         } while (0)
+#else
+#define ATOMIC_EXEC(code) {code}
+#endif
 
 #define HAPI            static inline
 
@@ -72,42 +86,67 @@ extern "C" {
  * @brief 检查函数指针非空
  *
  */
-#define CHECK_FUNC_PTR(func_ptr)                             ((func_ptr) != NULL)
+#define CHECK_FUNC_PTR(func_ptr) ((func_ptr) != NULL)
 
-#define GET_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, NAME, ...) NAME
-
+#if defined(_MSC_VER)
+#define DECL_1(ptr, a1)       \
+        auto a1 = &(ptr)->a1; \
+        ARG_UNUSED(a1);
+#else
 #define DECL_1(ptr, a1)                     \
         TYPEOF((ptr)->a1) *a1 = &(ptr)->a1; \
         ARG_UNUSED(a1);
-#define DECL_2(ptr, a1, a2)                         DECL_1(ptr, a1) DECL_1(ptr, a2)
-#define DECL_3(ptr, a1, a2, a3)                     DECL_2(ptr, a1, a2) DECL_1(ptr, a3)
-#define DECL_4(ptr, a1, a2, a3, a4)                 DECL_3(ptr, a1, a2, a3) DECL_1(ptr, a4)
-#define DECL_5(ptr, a1, a2, a3, a4, a5)             DECL_4(ptr, a1, a2, a3, a4) DECL_1(ptr, a5)
-#define DECL_6(ptr, a1, a2, a3, a4, a5, a6)         DECL_5(ptr, a1, a2, a3, a4, a5) DECL_1(ptr, a6)
-#define DECL_7(ptr, a1, a2, a3, a4, a5, a6, a7)     DECL_6(ptr, a1, a2, a3, a4, a5, a6) DECL_1(ptr, a7)
-#define DECL_8(ptr, a1, a2, a3, a4, a5, a6, a7, a8) DECL_7(ptr, a1, a2, a3, a4, a5, a6, a7) DECL_1(ptr, a8)
+#endif
+#define DECL_2(ptr, a1, a2)                           DECL_1(ptr, a1) DECL_1(ptr, a2)
+#define DECL_3(ptr, a1, a2, a3)                       DECL_2(ptr, a1, a2) DECL_1(ptr, a3)
+#define DECL_4(ptr, a1, a2, a3, a4)                   DECL_3(ptr, a1, a2, a3) DECL_1(ptr, a4)
+#define DECL_5(ptr, a1, a2, a3, a4, a5)               DECL_4(ptr, a1, a2, a3, a4) DECL_1(ptr, a5)
+#define DECL_6(ptr, a1, a2, a3, a4, a5, a6)           DECL_5(ptr, a1, a2, a3, a4, a5) DECL_1(ptr, a6)
+#define DECL_7(ptr, a1, a2, a3, a4, a5, a6, a7)       DECL_6(ptr, a1, a2, a3, a4, a5, a6) DECL_1(ptr, a7)
+#define DECL_8(ptr, a1, a2, a3, a4, a5, a6, a7, a8)   DECL_7(ptr, a1, a2, a3, a4, a5, a6, a7) DECL_1(ptr, a8)
+
+#define RESET_1(ptr, a1)                              memset(&(ptr)->a1, 0, sizeof((ptr)->a1));
+#define RESET_2(ptr, a1, a2)                          RESET_1(ptr, a1) RESET_1(ptr, a2)
+#define RESET_3(ptr, a1, a2, a3)                      RESET_2(ptr, a1, a2) RESET_1(ptr, a3)
+#define RESET_4(ptr, a1, a2, a3, a4)                  RESET_3(ptr, a1, a2, a3) RESET_1(ptr, a4)
+#define RESET_5(ptr, a1, a2, a3, a4, a5)              RESET_4(ptr, a1, a2, a3, a4) RESET_1(ptr, a5)
+#define RESET_6(ptr, a1, a2, a3, a4, a5, a6)          RESET_5(ptr, a1, a2, a3, a4, a5) RESET_1(ptr, a6)
+#define RESET_7(ptr, a1, a2, a3, a4, a5, a6, a7)      RESET_6(ptr, a1, a2, a3, a4, a5, a6) RESET_1(ptr, a7)
+#define RESET_8(ptr, a1, a2, a3, a4, a5, a6, a7, a8)  RESET_7(ptr, a1, a2, a3, a4, a5, a6, a7) RESET_1(ptr, a8)
+
+#define ARG_N(_1, _2, _3, _4, _5, _6, _7, _8, N, ...) N
+
+#if defined(_MSC_VER)
+#define EXPAND(x)       x
+#define COUNT_ARGS(...) EXPAND(ARG_N(__VA_ARGS__, 8, 7, 6, 5, 4, 3, 2, 1, 0))
+
+#define DECL_JOIN(a, b) a##b
+#define DECL_N(n)       DECL_JOIN(DECL_, n)
+#define DECL(ptr, ...)  EXPAND(DECL_N(COUNT_ARGS(__VA_ARGS__))(ptr, __VA_ARGS__))
+
+#define RESET_M(n)      DECL_JOIN(RESET_, n)
+#define RESET(ptr, ...) EXPAND(RESET_M(COUNT_ARGS(__VA_ARGS__))(ptr, __VA_ARGS__))
+#else
+#define GET_MACRO(_1, _2, _3, _4, _5, _6, _7, _8, NAME, ...) NAME
 
 #define DECL(ptr, ...)                                                                              \
         GET_MACRO(__VA_ARGS__, DECL_8, DECL_7, DECL_6, DECL_5, DECL_4, DECL_3, DECL_2, DECL_1, ...) \
         (ptr, __VA_ARGS__)
 
-#define RESET_1(ptr, a1)                             memset(&(ptr)->a1, 0, sizeof((ptr)->a1));
-#define RESET_2(ptr, a1, a2)                         RESET_1(ptr, a1) RESET_1(ptr, a2)
-#define RESET_3(ptr, a1, a2, a3)                     RESET_2(ptr, a1, a2) RESET_1(ptr, a3)
-#define RESET_4(ptr, a1, a2, a3, a4)                 RESET_3(ptr, a1, a2, a3) RESET_1(ptr, a4)
-#define RESET_5(ptr, a1, a2, a3, a4, a5)             RESET_4(ptr, a1, a2, a3, a4) RESET_1(ptr, a5)
-#define RESET_6(ptr, a1, a2, a3, a4, a5, a6)         RESET_5(ptr, a1, a2, a3, a4, a5) RESET_1(ptr, a6)
-#define RESET_7(ptr, a1, a2, a3, a4, a5, a6, a7)     RESET_6(ptr, a1, a2, a3, a4, a5, a6) RESET_1(ptr, a7)
-#define RESET_8(ptr, a1, a2, a3, a4, a5, a6, a7, a8) RESET_7(ptr, a1, a2, a3, a4, a5, a6, a7) RESET_1(ptr, a8)
-
 #define RESET(ptr, ...)                                                                                     \
         GET_MACRO(__VA_ARGS__, RESET_8, RESET_7, RESET_6, RESET_5, RESET_4, RESET_3, RESET_2, RESET_1, ...) \
         (ptr, __VA_ARGS__)
+#endif
 
 #define SPINLOCK_BACKOFF_MIN (4)
 #define SPINLOCK_BACKOFF_MAX (128)
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define SPINLOCK_BACKOFF_HOOK _mm_pause()
+#else
 #define SPINLOCK_BACKOFF_HOOK __asm volatile("pause" ::: "memory")
+#endif
 #else
 #define SPINLOCK_BACKOFF_HOOK
 #endif
@@ -135,12 +174,16 @@ extern "C" {
 
 #ifdef __cplusplus
 #define IS_SAME_TYPE(a, b) std::is_same_v<decltype(a), decltype(b)>
+#elif defined(_MSC_VER)
+#define IS_SAME_TYPE(a, b) 0 // Limited support for type check in MSVC C
 #else
 #define IS_SAME_TYPE(a, b) __builtin_types_compatible_p(TYPEOF(a), TYPEOF(b))
 #endif
 
 #ifdef __cplusplus
 #define BUILD_BUG_ON_ZERO(e) ((sizeof(char[1 - 2 * !!(e)])) - 1)
+#elif defined(_MSC_VER)
+#define BUILD_BUG_ON_ZERO(e) (sizeof(char) * (e ? -1 : 0)) // Simplified for MSVC
 #else
 #define BUILD_BUG_ON_ZERO(e) (sizeof(struct { int : -!!(e); }))
 #endif

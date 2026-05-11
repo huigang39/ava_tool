@@ -1,7 +1,19 @@
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <commdlg.h>
+#include <GLFW/glfw3.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>
+#endif
+
 #include <cstdio>
 #include <fstream>
 #include <ranges>
 #include <sstream>
+#include "timeops.h"
 
 #include "cJSON.h"
 #include "imgui.h"
@@ -9,40 +21,49 @@
 #include "imgui_impl_opengl3.h"
 #include "implot.h"
 
-#include "gui.hpp"
-#include "jlink_dev.hpp"
-#include "parser.hpp"
-#include "monitor.hpp"
+#include "app_log.hpp"
+#include "core/jlink_dev.hpp"
+#include "gui/gui.hpp"
+#include "gui/monitor.hpp"
+#include "gui/variable.hpp"
+#include <cstdlib>
+#include <filesystem>
 
 std::vector<std::string> Gui::sDroppedFiles_{};
 
 void
-Gui::glfwErrCb(const int err, const char *desc)
+Gui::glfwErrCb(const i32 err, const char *desc)
 {
-        print_error(true, "Glfw Error %d: %s", err, desc);
+        LOG_E("Glfw Error %d: %s", err, desc);
 }
 
 void
-Gui::glfwDropCb(GLFWwindow * /*window*/, const int count, const char **paths)
+Gui::glfwDropCb(GLFWwindow * /*window*/, const i32 count, const char **paths)
 {
-        for (int i = 0; i < count; ++i)
+        for (i32 i = 0; i < count; ++i)
                 sDroppedFiles_.emplace_back(paths[i]);
 }
 
-Gui::Gui()
+Gui::Gui(const std::string &initialPath)
 {
-        print_info(true, "Gui()");
+        LOG_I("Gui(%s)", initialPath.c_str());
 
         glfwSetErrorCallback(glfwErrCb);
-        if (!glfwInit())
-                print_error(true, "Failed to init GLFW");
+        if (!glfwInit()) {
+                LOG_E("Failed to init GLFW");
+                return;
+        }
+        LOG_I("GLFW Inited");
 
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
 
-        window_ = glfwCreateWindow(windowWidth_, windowWidth_, windowTitle_.c_str(), nullptr, nullptr);
-        if (window_ == nullptr)
-                print_error(true, "Failed to create GLFW window");
+        window_ = glfwCreateWindow(windowWidth_, windowHeight_, windowTitle_.c_str(), nullptr, nullptr);
+        if (window_ == nullptr) {
+                LOG_E("Failed to create GLFW window");
+                glfwTerminate();
+                return;
+        }
 
         glfwMakeContextCurrent(window_);
         glfwSwapInterval(1);
@@ -53,19 +74,25 @@ Gui::Gui()
 
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
-        ImGuiIO &io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+        ImGuiIO &io         = ImGui::GetIO();
+        io.ConfigFlags     |= ImGuiConfigFlags_DockingEnable;
         io.FontGlobalScale  = 1.0f;
         io.Fonts->AddFontFromFileTTF(fontFile_.c_str(), 18.0f);
 
         ImGui::StyleColorsDark();
+
+        static std::string iniPath = getAppDir() + "/imgui.ini";
+        io.IniFilename             = iniPath.c_str();
 
         ImGui_ImplGlfw_InitForOpenGL(window_, true);
         ImGui_ImplOpenGL3_Init(glslVer_);
 
         ImPlot::CreateContext();
 
-        loadSession();
+        if (!initialPath.empty())
+                loadSession(initialPath);
+        else
+                loadSession();
 
         if (motorProfiles_.empty())
                 motorProfiles_.push_back(MotorProfile{});
@@ -73,9 +100,16 @@ Gui::Gui()
 
 Gui::~Gui()
 {
-        print_info(true, "~Gui()");
+        LOG_I("~Gui()");
 
-        saveSession();
+        // Hide window immediately to give user instant feedback
+        if (window_) {
+                glfwHideWindow(window_);
+        }
+
+        if (isModified_ || ImGui::GetIO().WantSaveIniSettings) {
+                saveSession();
+        }
 
         ImPlot::DestroyContext();
 
@@ -83,14 +117,51 @@ Gui::~Gui()
         ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
 
-        glfwDestroyWindow(window_);
+        if (window_) {
+                glfwDestroyWindow(window_);
+                window_ = nullptr;
+        }
         glfwTerminate();
 }
 
 void
-Gui::saveSession() const
+Gui::hide()
 {
-        cJSON *root = cJSON_CreateObject();
+        if (window_) {
+                glfwHideWindow(window_);
+        }
+}
+
+std::string
+Gui::getAppDir()
+{
+        std::string path;
+#ifdef _WIN32
+        const char *localAppData = std::getenv("LOCALAPPDATA");
+        if (localAppData) {
+                path = std::string(localAppData) + "\\AvA_Tool";
+        } else {
+                path = ".";
+        }
+#else
+        path = "./.avatool";
+#endif
+        std::filesystem::create_directories(path);
+        return path;
+}
+
+void
+Gui::saveSession(const std::string &path)
+{
+        if (path.empty() && isFirstSave_) {
+                saveSessionAs();
+                return;
+        }
+        u64 start = get_mono_ts_ms();
+
+        std::lock_guard lk(mtxMonitors_);
+        std::string     targetPath = path.empty() ? currentSessionPath_ : path;
+        cJSON          *root       = cJSON_CreateObject();
 
         cJSON *jlink = cJSON_CreateObject();
         cJSON_AddStringToObject(jlink, "device", JLinkDev::instance().deviceName().c_str());
@@ -106,19 +177,18 @@ Gui::saveSession() const
                 cJSON_AddStringToObject(mObj, "name", m->getName().c_str());
                 cJSON_AddStringToObject(mObj, "samplingMode", m->samplingMode_ == Monitor::SamplingMode::HSS ? "HSS" : "POLL");
                 cJSON_AddNumberToObject(mObj, "maxSampleHz", m->maxSampleHz_);
-                cJSON_AddNumberToObject(mObj, "historySeconds", static_cast<double>(m->historySeconds_));
-                cJSON_AddNumberToObject(mObj, "maxDisplayPoints", static_cast<double>(m->maxDisplayPoints_));
+                cJSON_AddNumberToObject(mObj, "historySeconds", static_cast<f64>(m->historySeconds_));
+                cJSON_AddNumberToObject(mObj, "maxDisplayPoints", static_cast<f64>(m->maxDisplayPoints_));
 
                 cJSON *scopesArr = cJSON_CreateArray();
                 for (auto &s : m->getScopes() | std::views::values) {
                         cJSON *sObj = cJSON_CreateObject();
                         cJSON_AddStringToObject(sObj, "name", s->getName().c_str());
-                        cJSON_AddStringToObject(
-                            sObj, "draw", s->getDraw() == MonitorScope::DrawEnum::PLOT ? "PLOT" : "TABLE");
-                        cJSON_AddNumberToObject(sObj, "height", static_cast<double>(s->getHeight()));
+                        cJSON_AddStringToObject(sObj, "draw", s->getDraw() == MonitorScope::DrawEnum::PLOT ? "PLOT" : "TABLE");
+                        cJSON_AddNumberToObject(sObj, "height", static_cast<f64>(s->getHeight()));
                         cJSON_AddBoolToObject(sObj, "showFft", s->getShowFft());
-                        cJSON_AddNumberToObject(sObj, "fftPoints", static_cast<double>(s->getFftPoints()));
-                        cJSON_AddNumberToObject(sObj, "fftPeakCount", static_cast<double>(s->getFftPeakCount()));
+                        cJSON_AddNumberToObject(sObj, "fftPoints", static_cast<f64>(s->getFftPoints()));
+                        cJSON_AddNumberToObject(sObj, "fftPeakCount", static_cast<f64>(s->getFftPeakCount()));
 
                         cJSON *chsArr = cJSON_CreateArray();
                         for (auto &ch : s->getChannels() | std::views::values) {
@@ -131,7 +201,7 @@ Gui::saveSession() const
                                 cJSON_AddStringToObject(chObj, "device", ch->getDevice().c_str());
 
                                 cJSON *colorArr = cJSON_CreateArray();
-                                for (int i = 0; i < 4; ++i)
+                                for (i32 i = 0; i < 4; ++i)
                                         cJSON_AddItemToArray(colorArr, cJSON_CreateNumber(ch->getColor()[i]));
                                 cJSON_AddItemToObject(chObj, "color", colorArr);
 
@@ -147,8 +217,7 @@ Gui::saveSession() const
                                         for (const auto &e : ch->getEnums()) {
                                                 cJSON *eObj = cJSON_CreateObject();
                                                 cJSON_AddStringToObject(eObj, "name", e.name.c_str());
-                                                cJSON_AddNumberToObject(eObj, "value",
-                                                                        static_cast<double>(e.value));
+                                                cJSON_AddNumberToObject(eObj, "value", static_cast<f64>(e.value));
                                                 cJSON_AddItemToArray(enumsArr, eObj);
                                         }
                                         cJSON_AddItemToObject(chObj, "enums", enumsArr);
@@ -158,22 +227,24 @@ Gui::saveSession() const
                         cJSON_AddItemToObject(sObj, "channels", chsArr);
                         cJSON_AddItemToArray(scopesArr, sObj);
                 }
-                cJSON_AddNumberToObject(mObj, "historySeconds", static_cast<double>(m->historySeconds_));
                 cJSON_AddItemToObject(mObj, "scopes", scopesArr);
                 cJSON_AddItemToArray(monitorsArr, mObj);
         }
         cJSON_AddItemToObject(root, "monitors", monitorsArr);
 
-        cJSON *parsersArr = cJSON_CreateArray();
-        for (const auto &p : parsers_ | std::views::values) {
+        cJSON *VariableArr = cJSON_CreateArray();
+        for (const auto &p : vars_ | std::views::values) {
                 cJSON *pObj = cJSON_CreateObject();
                 cJSON_AddStringToObject(pObj, "name", p->getName().c_str());
                 cJSON_AddStringToObject(pObj, "cfgPath", p->getCfgPath().c_str());
                 cJSON_AddStringToObject(pObj, "binPath", p->getBinPath().c_str());
                 cJSON_AddStringToObject(pObj, "elfPath", p->getElfPath().c_str());
-                cJSON_AddItemToArray(parsersArr, pObj);
+                p->save(pObj);
+                p->clearModified();
+                cJSON_AddItemToArray(VariableArr, pObj);
         }
-        cJSON_AddItemToObject(root, "parsers", parsersArr);
+        cJSON_AddItemToObject(root, "Variables", VariableArr);
+        isModified_ = false;
 
         cJSON *motorsArr = cJSON_CreateArray();
         for (const auto &mp : motorProfiles_) {
@@ -190,30 +261,87 @@ Gui::saveSession() const
         }
         cJSON_AddItemToObject(root, "motorProfiles", motorsArr);
         cJSON_AddNumberToObject(root, "currentMotorProfile", currentMotorProfile_);
+        cJSON_AddStringToObject(root, "imguiLayout", ImGui::SaveIniSettingsToMemory());
 
-        char         *out = cJSON_Print(root);
-        std::ofstream ofs(sessionPath_);
-        if (ofs && out)
+        u64 pStart = get_mono_ts_ms();
+        char *out   = cJSON_PrintUnformatted(root);
+        u64 pEnd   = get_mono_ts_ms();
+        std::ofstream ofs(targetPath);
+        if (ofs && out) {
                 ofs << out;
+                currentSessionPath_ = targetPath;
+                isModified_         = false;
+                isFirstSave_        = false;
+        }
+        size_t outLen = out ? strlen(out) : 0;
         cJSON_free(out);
         cJSON_Delete(root);
+
+        u64 end = get_mono_ts_ms();
+        LOG_I("SaveSession Profile: Total %llu ms, JSON Print %llu ms, Size %zu bytes",
+              end - start,
+              pEnd - pStart,
+              outLen);
 }
 
 void
-Gui::loadSession()
+Gui::saveSessionAs()
 {
-        std::ifstream ifs(sessionPath_);
+#ifdef _WIN32
+        char          szFile[260] = {0};
+        OPENFILENAMEA ofn;
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize     = sizeof(ofn);
+        ofn.hwndOwner       = glfwGetWin32Window(window_);
+        ofn.lpstrFile       = szFile;
+        ofn.nMaxFile        = sizeof(szFile);
+        ofn.lpstrFilter     = "AvA Session (*.ava)\0*.ava\0All Files (*.*)\0*.*\0";
+        ofn.nFilterIndex    = 1;
+        ofn.lpstrFileTitle  = NULL;
+        ofn.nMaxFileTitle   = 0;
+        ofn.lpstrInitialDir = NULL;
+        ofn.Flags           = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_OVERWRITEPROMPT;
+
+        if (GetSaveFileNameA(&ofn) == TRUE) {
+                std::string path = szFile;
+                if (path.find(".ava") == std::string::npos)
+                        path += ".ava";
+                saveSession(path);
+                saveToastAlpha_     = 2.0f;
+                LOG_I("Session saved As: %s", path.c_str());
+        }
+#endif
+}
+
+void
+Gui::loadSession(const std::string &path)
+{
+        u64 start = get_mono_ts_ms();
+        std::lock_guard lk(mtxMonitors_);
+        std::string     targetPath = path.empty() ? currentSessionPath_ : path;
+        std::ifstream   ifs(targetPath);
         if (!ifs.is_open())
                 return;
+
+        if (!path.empty())
+                isFirstSave_ = false;
+        currentSessionPath_ = targetPath;
+
         std::stringstream ss;
         ss << ifs.rdbuf();
         const std::string content = ss.str();
+        u64 fEnd = get_mono_ts_ms();
         if (content.empty())
                 return;
 
         cJSON *root = cJSON_Parse(content.c_str());
+        u64 pEnd = get_mono_ts_ms();
         if (!root)
                 return;
+
+        u64 monitorStart = get_mono_ts_ms();
+        monitors_.clear();
+        vars_.clear();
 
         if (const cJSON *jlink = cJSON_GetObjectItem(root, "jlink")) {
                 if (const cJSON *dev = cJSON_GetObjectItem(jlink, "device"); cJSON_IsString(dev))
@@ -234,12 +362,12 @@ Gui::loadSession()
                         if (!cJSON_IsString(nameItem))
                                 continue;
                         std::string mName = nameItem->valuestring;
-                        monitors_[mName]  = std::make_unique<Monitor>(mName);
+                        monitors_[mName]  = std::make_shared<Monitor>(mName);
                         Monitor *monitor  = monitors_[mName].get();
 
                         if (const cJSON *hSec = cJSON_GetObjectItem(mItem, "historySeconds"); cJSON_IsNumber(hSec))
                                 monitor->historySeconds_ = static_cast<f32>(hSec->valuedouble);
-                        
+
                         if (const cJSON *mHz = cJSON_GetObjectItem(mItem, "maxSampleHz"); cJSON_IsNumber(mHz))
                                 monitor->maxSampleHz_ = mHz->valueint;
 
@@ -265,8 +393,7 @@ Gui::loadSession()
                                         continue;
                                 MonitorScope *scope = monitor->getScopes()[sName].get();
 
-                                if (const cJSON *drawItem = cJSON_GetObjectItem(sItem, "draw");
-                                    cJSON_IsString(drawItem)) {
+                                if (const cJSON *drawItem = cJSON_GetObjectItem(sItem, "draw"); cJSON_IsString(drawItem)) {
                                         if (std::string(drawItem->valuestring) == "TABLE")
                                                 scope->setDraw(MonitorScope::DrawEnum::TABLE);
                                         else
@@ -278,14 +405,16 @@ Gui::loadSession()
                                 if (const cJSON *fftShowItem = cJSON_GetObjectItem(sItem, "showFft"); cJSON_IsBool(fftShowItem))
                                         scope->getShowFft() = cJSON_IsTrue(fftShowItem);
 
-                                if (const cJSON *fftPtsItem = cJSON_GetObjectItem(sItem, "fftPoints"); cJSON_IsNumber(fftPtsItem)) {
-                                        int pts = fftPtsItem->valueint;
+                                if (const cJSON *fftPtsItem = cJSON_GetObjectItem(sItem, "fftPoints");
+                                    cJSON_IsNumber(fftPtsItem)) {
+                                        i32 pts = fftPtsItem->valueint;
                                         if (pts != scope->getFftPoints()) {
                                                 scope->reinitFft(pts);
                                         }
                                 }
 
-                                if (const cJSON *fftPkItem = cJSON_GetObjectItem(sItem, "fftPeakCount"); cJSON_IsNumber(fftPkItem))
+                                if (const cJSON *fftPkItem = cJSON_GetObjectItem(sItem, "fftPeakCount");
+                                    cJSON_IsNumber(fftPkItem))
                                         scope->getFftPeakCount() = fftPkItem->valueint;
 
                                 const cJSON *chsArr = cJSON_GetObjectItem(sItem, "channels");
@@ -306,6 +435,21 @@ Gui::loadSession()
                                         if (const cJSON *sn = cJSON_GetObjectItem(chItem, "symbolName"); cJSON_IsString(sn))
                                                 ch->getSymbolName() = sn->valuestring;
 
+                                        if (const cJSON *devItem = cJSON_GetObjectItem(chItem, "device");
+                                            cJSON_IsString(devItem)) {
+                                                std::string d = devItem->valuestring;
+                                                if (d.empty())
+                                                        d = "JLINK";
+                                                ch->setDevice(d);
+                                                LOG_I("Loaded channel '%s' with device '%s'",
+                                                      ch->getSymbolName().c_str(),
+                                                      ch->getDevice().c_str());
+                                        } else {
+                                                ch->setDevice("JLINK");
+                                                LOG_I("Loaded channel '%s' with device 'JLINK' (default)",
+                                                      ch->getSymbolName().c_str());
+                                        }
+
                                         if (const cJSON *t = cJSON_GetObjectItem(chItem, "type"); cJSON_IsString(t))
                                                 ch->setType(t->valuestring);
                                         if (const cJSON *a = cJSON_GetObjectItem(chItem, "addr")) {
@@ -317,59 +461,51 @@ Gui::loadSession()
                                                         ch->setAddr(static_cast<usize>(a->valuedouble));
                                                 }
                                         }
-                                        if (const cJSON *d = cJSON_GetObjectItem(chItem, "device"); cJSON_IsString(d))
-                                                ch->setDevice(d->valuestring);
-                                        if (const cJSON *colArr = cJSON_GetObjectItem(chItem, "color");
-                                            cJSON_IsArray(colArr)) {
-                                                int idx = 0;
-                                                for (const cJSON *c = colArr->child; c && idx < 4;
-                                                     c = c->next, ++idx)
+                                        if (const cJSON *colArr = cJSON_GetObjectItem(chItem, "color"); cJSON_IsArray(colArr)) {
+                                                i32 idx = 0;
+                                                for (const cJSON *c = colArr->child; c && idx < 4; c = c->next, ++idx)
                                                         ch->getColor()[idx] = static_cast<f32>(c->valuedouble);
                                         }
-                                        if (const cJSON *uac = cJSON_GetObjectItem(chItem, "useAutoColor");
-                                            cJSON_IsBool(uac))
+                                        if (const cJSON *uac = cJSON_GetObjectItem(chItem, "useAutoColor"); cJSON_IsBool(uac))
                                                 ch->useAutoColor() = cJSON_IsTrue(uac);
-                                        if (const cJSON *lw = cJSON_GetObjectItem(chItem, "lineWeight");
-                                            cJSON_IsNumber(lw))
+                                        if (const cJSON *lw = cJSON_GetObjectItem(chItem, "lineWeight"); cJSON_IsNumber(lw))
                                                 ch->getLineWeight() = static_cast<f32>(lw->valuedouble);
-                                        if (const cJSON *ps = cJSON_GetObjectItem(chItem, "plotStyle");
-                                            cJSON_IsNumber(ps))
+                                        if (const cJSON *ps = cJSON_GetObjectItem(chItem, "plotStyle"); cJSON_IsNumber(ps))
                                                 ch->getPlotStyle() = ps->valueint;
-                                        if (const cJSON *sm = cJSON_GetObjectItem(chItem, "showMarkers");
-                                            cJSON_IsBool(sm))
+                                        if (const cJSON *sm = cJSON_GetObjectItem(chItem, "showMarkers"); cJSON_IsBool(sm))
                                                 ch->showMarkers() = cJSON_IsTrue(sm);
-                                        if (const cJSON *sh = cJSON_GetObjectItem(chItem, "show");
-                                            cJSON_IsBool(sh))
+                                        if (const cJSON *sh = cJSON_GetObjectItem(chItem, "show"); cJSON_IsBool(sh))
                                                 ch->show() = cJSON_IsTrue(sh);
 
                                         if (const cJSON *enumsArr = cJSON_GetObjectItem(chItem, "enums");
                                             cJSON_IsArray(enumsArr)) {
                                                 std::vector<MonitorChannel::EnumEntry> ents;
-                                                for (const cJSON *eItem = enumsArr->child; eItem;
-                                                     eItem            = eItem->next) {
+                                                for (const cJSON *eItem = enumsArr->child; eItem; eItem = eItem->next) {
                                                         const cJSON *nObj = cJSON_GetObjectItem(eItem, "name");
                                                         const cJSON *vObj = cJSON_GetObjectItem(eItem, "value");
                                                         if (cJSON_IsString(nObj) && cJSON_IsNumber(vObj))
-                                                                ents.push_back({nObj->valuestring,
-                                                                                static_cast<i64>(vObj->valuedouble)});
+                                                                ents.push_back(
+                                                                    {nObj->valuestring, static_cast<i64>(vObj->valuedouble)});
                                                 }
                                                 ch->setEnums(std::move(ents));
                                         }
 
-                                        if (ch->getDevice() == "LOCAL")
+                                        if (ch->getDevice() == "SHM")
                                                 MonitorScope::shmInit(*ch);
                                 }
                         }
                 }
         }
 
-        if (const cJSON *parsersArr = cJSON_GetObjectItem(root, "parsers"); cJSON_IsArray(parsersArr)) {
-                for (const cJSON *pItem = parsersArr->child; pItem; pItem = pItem->next) {
+        u64 varStart = get_mono_ts_ms();
+        if (const cJSON *VarArr = cJSON_GetObjectItem(root, "Variables"); cJSON_IsArray(VarArr)) {
+                for (const cJSON *pItem = VarArr->child; pItem; pItem = pItem->next) {
                         const cJSON *nItem = cJSON_GetObjectItem(pItem, "name");
                         if (!cJSON_IsString(nItem))
                                 continue;
                         std::string pName = nItem->valuestring;
-                        parsers_[pName]   = std::make_unique<Parser>(pName);
+                        vars_[pName]      = std::make_shared<Variable>(pName);
+                        Variable *v       = vars_[pName].get();
 
                         const cJSON      *cfgItem = cJSON_GetObjectItem(pItem, "cfgPath");
                         const cJSON      *binItem = cJSON_GetObjectItem(pItem, "binPath");
@@ -377,12 +513,14 @@ Gui::loadSession()
                         const std::string cfg     = cJSON_IsString(cfgItem) ? cfgItem->valuestring : "";
                         const std::string bin     = cJSON_IsString(binItem) ? binItem->valuestring : "";
                         const std::string elf     = cJSON_IsString(elfItem) ? elfItem->valuestring : "";
-                        
-                        // restoreFromPaths was removed in Parser, paths are loaded on demand or via draw loop logic.
-                        // If we want to restore on boot, we should call loadCfg/loadBin/loadElf here.
-                        if (!cfg.empty()) parsers_[pName]->loadCfg(cfg);
-                        if (!bin.empty()) parsers_[pName]->loadBin(bin);
-                        if (!elf.empty()) parsers_[pName]->loadElf(elf);
+
+                        if (!cfg.empty())
+                                v->loadCfg(cfg);
+                        if (!bin.empty())
+                                v->loadBin(bin);
+                        if (!elf.empty())
+                                v->loadElf(elf);
+                        v->load(pItem);
                 }
         }
 
@@ -393,45 +531,97 @@ Gui::loadSession()
                         if (const cJSON *nameItem = cJSON_GetObjectItem(mpItem, "modelName"); cJSON_IsString(nameItem))
                                 snprintf(mp.modelName, sizeof(mp.modelName), "%s", nameItem->valuestring);
                         if (const cJSON *item = cJSON_GetObjectItem(mpItem, "Rs"); cJSON_IsNumber(item))
-                                mp.Rs = static_cast<float>(item->valuedouble);
+                                mp.Rs = static_cast<f32>(item->valuedouble);
                         if (const cJSON *item = cJSON_GetObjectItem(mpItem, "Ld"); cJSON_IsNumber(item))
-                                mp.Ld = static_cast<float>(item->valuedouble);
+                                mp.Ld = static_cast<f32>(item->valuedouble);
                         if (const cJSON *item = cJSON_GetObjectItem(mpItem, "Lq"); cJSON_IsNumber(item))
-                                mp.Lq = static_cast<float>(item->valuedouble);
+                                mp.Lq = static_cast<f32>(item->valuedouble);
                         if (const cJSON *item = cJSON_GetObjectItem(mpItem, "polePairs"); cJSON_IsNumber(item))
                                 mp.polePairs = item->valueint;
                         if (const cJSON *item = cJSON_GetObjectItem(mpItem, "Kt"); cJSON_IsNumber(item))
-                                mp.Kt = static_cast<float>(item->valuedouble);
+                                mp.Kt = static_cast<f32>(item->valuedouble);
                         if (const cJSON *item = cJSON_GetObjectItem(mpItem, "backEmfFreq"); cJSON_IsNumber(item))
-                                mp.backEmfFreq = static_cast<float>(item->valuedouble);
+                                mp.backEmfFreq = static_cast<f32>(item->valuedouble);
                         if (const cJSON *item = cJSON_GetObjectItem(mpItem, "backEmfVpp"); cJSON_IsNumber(item))
-                                mp.backEmfVpp = static_cast<float>(item->valuedouble);
+                                mp.backEmfVpp = static_cast<f32>(item->valuedouble);
                         motorProfiles_.push_back(mp);
                 }
         }
-        if (const cJSON *item = cJSON_GetObjectItem(root, "currentMotorProfile"); cJSON_IsNumber(item))
-                currentMotorProfile_ = item->valueint;
-        
-        if (currentMotorProfile_ < 0 || currentMotorProfile_ >= static_cast<int>(motorProfiles_.size()))
-                currentMotorProfile_ = 0;
+        u64 layoutStart = get_mono_ts_ms();
+        if (const cJSON *layout = cJSON_GetObjectItem(root, "imguiLayout"); cJSON_IsString(layout)) {
+                ImGui::LoadIniSettingsFromMemory(layout->valuestring);
+        }
 
         cJSON_Delete(root);
+
+        u64 end = get_mono_ts_ms();
+        LOG_I("LoadSession Profile Detail: Parse %llu ms, Monitors %llu ms, Variables %llu ms, Layout %llu ms",
+              pEnd - fEnd,
+              varStart - monitorStart,
+              layoutStart - varStart,
+              end - layoutStart);
 }
 
 void
 Gui::drawBar()
 {
         if (ImGui::BeginMainMenuBar()) {
+                if (ImGui::BeginMenu("File")) {
+                        if (ImGui::MenuItem("New Session")) {
+                                monitors_.clear();
+                                vars_.clear();
+                                currentSessionPath_ = "session.ava";
+                                isModified_         = false;
+                                isFirstSave_        = true;
+                        }
+                        if (ImGui::MenuItem("Open Session...")) {
+#ifdef _WIN32
+                                char          szFile[260] = {0};
+                                OPENFILENAMEA ofn;
+                                ZeroMemory(&ofn, sizeof(ofn));
+                                ofn.lStructSize     = sizeof(ofn);
+                                ofn.hwndOwner       = glfwGetWin32Window(window_);
+                                ofn.lpstrFile       = szFile;
+                                ofn.nMaxFile        = sizeof(szFile);
+                                ofn.lpstrFilter     = "AvA Session (*.ava)\0*.ava\0All Files (*.*)\0*.*\0";
+                                ofn.nFilterIndex    = 1;
+                                ofn.lpstrFileTitle  = NULL;
+                                ofn.nMaxFileTitle   = 0;
+                                ofn.lpstrInitialDir = NULL;
+                                ofn.Flags           = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+
+                                if (GetOpenFileNameA(&ofn) == TRUE) {
+                                        loadSession(szFile);
+                                }
+#endif
+                        }
+                        if (ImGui::MenuItem("Save Session", "Ctrl+S")) {
+                                saveSession();
+                                saveToastAlpha_ = 2.0f;
+                                LOG_I("Session saved via Menu");
+                        }
+                        if (ImGui::MenuItem("Save Session As...")) {
+                                saveSessionAs();
+                        }
+                        ImGui::Separator();
+                        if (ImGui::MenuItem("Exit", "Alt+F4")) {
+                                glfwSetWindowShouldClose(window_, GLFW_TRUE);
+                        }
+                        ImGui::EndMenu();
+                }
+
                 if (ImGui::BeginMenu("Window")) {
                         if (ImGui::MenuItem("Add Monitor")) {
                                 std::string monitorName = "Monitor_" + std::to_string(monitors_.size());
-                                monitors_[monitorName]  = std::make_unique<Monitor>(monitorName);
-                                print_info(true, "Add Monitor: %s", monitorName.c_str());
+                                monitors_[monitorName]  = std::make_shared<Monitor>(monitorName);
+                                isModified_             = true;
+                                LOG_I("Add Monitor: %s", monitorName.c_str());
                         }
-                        if (ImGui::MenuItem("Add Parser")) {
-                                std::string parserName = "Parser_" + std::to_string(parsers_.size());
-                                parsers_[parserName]   = std::make_unique<Parser>(parserName);
-                                print_info(true, "Add Parser: %s", parserName.c_str());
+                        if (ImGui::MenuItem("Add Variable")) {
+                                std::string varName = "Variable_" + std::to_string(vars_.size());
+                                vars_[varName]      = std::make_shared<Variable>(varName);
+                                isModified_         = true;
+                                LOG_I("Add Variable Window: %s", varName.c_str());
                         }
                         ImGui::EndMenu();
                 }
@@ -450,14 +640,15 @@ Gui::drawBar()
                 const bool paused = g_monitorPaused.load();
                 if (paused) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // Red (State: Paused)
-                        if (ImGui::SmallButton("RESUME")) g_monitorPaused.store(false);
+                        if (ImGui::SmallButton("RESUME"))
+                                g_monitorPaused.store(false);
                         ImGui::PopStyleColor();
                 } else {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f)); // Green (State: Running)
-                        if (ImGui::SmallButton("PAUSE")) g_monitorPaused.store(true);
+                        if (ImGui::SmallButton("PAUSE"))
+                                g_monitorPaused.store(true);
                         ImGui::PopStyleColor();
                 }
-
 
                 // Total points currently in memory (across all channels)
                 u64 totalPts = 0;
@@ -476,12 +667,12 @@ Gui::drawBar()
                 char fpsBuf[32];
                 snprintf(fpsBuf, sizeof(fpsBuf), "%.0f FPS", ImGui::GetIO().Framerate);
 
-                const float ptsWidthFixed = ImGui::CalcTextSize("999.99 M pts").x;
-                const float fpsWidthFixed = ImGui::CalcTextSize("9999 FPS").x;
-                const float spacing       = ImGui::GetStyle().ItemSpacing.x;
+                const f32 ptsWidthFixed = ImGui::CalcTextSize("999.99 M pts").x;
+                const f32 fpsWidthFixed = ImGui::CalcTextSize("9999 FPS").x;
+                const f32 spacing       = ImGui::GetStyle().ItemSpacing.x;
 
-                const float totalWidth = fpsWidthFixed + ptsWidthFixed + spacing;
-                const float startX     = ImGui::GetWindowWidth() - totalWidth - spacing * 2;
+                const f32 totalWidth = fpsWidthFixed + ptsWidthFixed + spacing;
+                const f32 startX     = ImGui::GetWindowWidth() - totalWidth - spacing * 2;
 
                 // PTS (Green, Right-aligned in its block)
                 ImGui::SetCursorPosX(startX + ptsWidthFixed - ImGui::CalcTextSize(ptsBuf).x);
@@ -499,8 +690,24 @@ Gui::drawBar()
 void
 Gui::loop()
 {
-        while (!glfwWindowShouldClose(window_)) {
+        LOG_I("Gui::loop start");
+        while (!glfwWindowShouldClose(window_) || showQuitModal_) {
                 glfwPollEvents();
+
+                if (glfwWindowShouldClose(window_) && !showQuitModal_ && !wantsToQuit_) {
+                        bool anyModified = isModified_;
+                        if (!anyModified) {
+                            for (const auto &v : vars_ | std::views::values) {
+                                if (v->isModified()) { anyModified = true; break; }
+                            }
+                        }
+                        if (anyModified) {
+                                glfwSetWindowShouldClose(window_, GLFW_FALSE);
+                                showQuitModal_ = true;
+                        } else {
+                                break;
+                        }
+                }
 
                 ImGui_ImplOpenGL3_NewFrame();
                 ImGui_ImplGlfw_NewFrame();
@@ -508,12 +715,11 @@ Gui::loop()
 
                 drawBar();
 
-                static float saveToastAlpha = 0.0f;
-                static float spaceLastTime   = 0.0f;
-                static int   spaceClickCount = 0;
+                static f32 spaceLastTime   = 0.0f;
+                static i32 spaceClickCount = 0;
                 if (const ImGuiIO &io = ImGui::GetIO(); !io.WantTextInput) {
                         if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-                                float now = static_cast<float>(ImGui::GetTime());
+                                f32 now = static_cast<f32>(ImGui::GetTime());
                                 if (now - spaceLastTime < 0.35f) {
                                         spaceClickCount++;
                                 } else {
@@ -525,8 +731,9 @@ Gui::loop()
                                         // Triple Click: Reconnect J-Link
                                         JLinkDev::instance().close();
                                         if (JLinkDev::instance().open()) {
-                                                JLinkDev::instance().connect();
-                                                print_info(true, "J-Link Reconnected via Triple Space");
+                                                if (JLinkDev::instance().connect()) {
+                                                        LOG_I("J-Link Reconnected via Triple Space");
+                                                }
                                         }
                                         spaceClickCount = 0;
                                 } else {
@@ -534,20 +741,28 @@ Gui::loop()
                                         g_monitorPaused.store(!g_monitorPaused.load());
                                 }
                         }
-                        
+
                         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
                                 saveSession();
-                                saveToastAlpha = 2.0f;
-                                print_info(true, "Session saved via Ctrl+S");
+                                saveToastAlpha_ = 2.0f;
+                                LOG_I("Session saved via Ctrl+S");
                         }
                 }
 
-                if (saveToastAlpha > 0.0f) {
-                        saveToastAlpha -= ImGui::GetIO().DeltaTime;
-                        ImGui::SetNextWindowPos(ImVec2(ImGui::GetIO().DisplaySize.x / 2.0f, ImGui::GetIO().DisplaySize.y - 50.0f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-                        ImGui::SetNextWindowBgAlpha(std::min(1.0f, saveToastAlpha) * 0.8f);
-                        if (ImGui::Begin("##save_toast", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove)) {
-                                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, std::min(1.0f, saveToastAlpha)), "Session Saved Successfully!");
+                if (saveToastAlpha_ > 0.0f) {
+                        saveToastAlpha_ -= ImGui::GetIO().DeltaTime;
+                        ImGui::SetNextWindowPos(
+                            ImVec2(ImGui::GetIO().DisplaySize.x / 2.0f, ImGui::GetIO().DisplaySize.y - 50.0f),
+                            ImGuiCond_Always,
+                            ImVec2(0.5f, 0.5f));
+                        ImGui::SetNextWindowBgAlpha(std::min(1.0f, saveToastAlpha_) * 0.8f);
+                        if (ImGui::Begin("##save_toast",
+                                         nullptr,
+                                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove)) {
+                                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, std::min(1.0f, saveToastAlpha_)),
+                                                   "Session Saved Successfully!");
                         }
                         ImGui::End();
                 }
@@ -570,23 +785,59 @@ Gui::loop()
                 }
 
                 {
-                        for (auto it = parsers_.begin(); it != parsers_.end();) {
-                                if (it->second->isPendingDelete())
-                                        it = parsers_.erase(it);
-                                else {
+                        for (auto it = vars_.begin(); it != vars_.end();) {
+                                if (it->second->isPendingDelete()) {
+                                        it = vars_.erase(it);
+                                        isModified_ = true;
+                                } else {
                                         it->second->updateDisplay();
                                         if (it->second->consumeElfReloaded()) {
-                                                syncSymbolAddresses(it->second->getElfInfo());
+                                                syncSymbolAddresses(it->second->searchPool_);
                                         }
                                         ++it;
                                 }
                         }
                 }
 
+                for (const auto &file : sDroppedFiles_) {
+                        if (file.ends_with(".ava")) {
+                                loadSession(file);
+                        }
+                }
                 sDroppedFiles_.clear();
+                if (showQuitModal_) {
+                        ImGui::OpenPopup("Quit?");
+                        if (ImGui::BeginPopupModal("Quit?", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                                ImGui::Text("Save changes to session before quitting?");
+                                ImGui::Separator();
+                                if (ImGui::Button("Save", ImVec2(120, 0))) {
+                                        saveSession();
+                                        wantsToQuit_   = true;
+                                        showQuitModal_ = false;
+                                        ImGui::CloseCurrentPopup();
+                                }
+                                ImGui::SetItemDefaultFocus();
+                                ImGui::SameLine();
+                                if (ImGui::Button("Don't Save", ImVec2(120, 0))) {
+                                        wantsToQuit_   = true;
+                                        showQuitModal_ = false;
+                                        ImGui::CloseCurrentPopup();
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                                        showQuitModal_ = false;
+                                        ImGui::CloseCurrentPopup();
+                                }
+                                ImGui::EndPopup();
+                        }
+                }
+
+                if (wantsToQuit_) {
+                        break;
+                }
 
                 ImGui::Render();
-                int display_w, display_h;
+                i32 display_w, display_h;
                 glfwGetFramebufferSize(window_, &display_w, &display_h);
                 glViewport(0, 0, display_w, display_h);
                 glClearColor(0.45f, 0.55f, 0.60f, 1.00f);
@@ -598,10 +849,10 @@ Gui::loop()
 }
 
 void
-Gui::syncSymbolAddresses(const ElfInfo &elfInfo)
+Gui::syncSymbolAddresses(const std::vector<SearchEntry> &searchPool)
 {
         std::lock_guard lk(mtxMonitors_);
-        int             count = 0;
+        i32             count = 0;
         for (auto &pair : monitors_) {
                 for (auto &spair : pair.second->getScopes()) {
                         for (auto &cpair : spair.second->getChannels()) {
@@ -609,12 +860,9 @@ Gui::syncSymbolAddresses(const ElfInfo &elfInfo)
                                 if (ch->getSymbolName().empty())
                                         continue;
 
-                                // Try to find the symbol in the new elfInfo
-                                bool found = false;
-                                for (const auto &sym : elfInfo.symbols) {
-                                        if (sym.name == ch->getSymbolName()) {
-                                                ch->setAddr(sym.addr);
-                                                found = true;
+                                for (const auto &se : searchPool) {
+                                        if (se.path == ch->getSymbolName()) {
+                                                ch->setAddr(se.addr);
                                                 count++;
                                                 break;
                                         }
@@ -622,8 +870,26 @@ Gui::syncSymbolAddresses(const ElfInfo &elfInfo)
                         }
                 }
         }
+
+        for (auto &pair : vars_) {
+                for (auto &v : pair.second->vars_) {
+                        if (v.port != PortType::JLINK)
+                                continue;
+
+                        for (const auto &se : searchPool) {
+                                if (se.path == v.name) {
+                                        v.addr    = se.addr;
+                                        v.typeOff = se.typeOff;
+                                        count++;
+                                        break;
+                                }
+                        }
+                }
+        }
+
         if (count > 0) {
-                print_info(true, "Synced %d channel addresses with new ELF", count);
+                LOG_I("Synced %d symbol addresses with new ELF", count);
+                JLinkDev::instance().reqRestart(); // Force sampler thread to rebuild HSS list
         }
 }
 
@@ -639,14 +905,14 @@ Gui::drawCalculator()
                 motorProfiles_.push_back(MotorProfile{});
                 currentMotorProfile_ = 0;
         }
-        if (currentMotorProfile_ >= static_cast<int>(motorProfiles_.size())) {
+        if (currentMotorProfile_ >= static_cast<i32>(motorProfiles_.size())) {
                 currentMotorProfile_ = 0;
         }
 
         ImGui::Text("Saved Profiles:");
         ImGui::SetNextItemWidth(200.0f);
         if (ImGui::BeginCombo("##motor_profiles", motorProfiles_[currentMotorProfile_].modelName)) {
-                for (int i = 0; i < static_cast<int>(motorProfiles_.size()); ++i) {
+                for (i32 i = 0; i < static_cast<i32>(motorProfiles_.size()); ++i) {
                         const bool is_selected = (currentMotorProfile_ == i);
                         if (ImGui::Selectable(motorProfiles_[i].modelName, is_selected))
                                 currentMotorProfile_ = i;
@@ -658,14 +924,15 @@ Gui::drawCalculator()
         ImGui::SameLine();
         if (ImGui::Button("Add")) {
                 MotorProfile mp;
-                snprintf(mp.modelName, sizeof(mp.modelName), "Motor_%d", static_cast<int>(motorProfiles_.size() + 1));
+                snprintf(mp.modelName, sizeof(mp.modelName), "Motor_%d", static_cast<i32>(motorProfiles_.size() + 1));
                 motorProfiles_.push_back(mp);
-                currentMotorProfile_ = static_cast<int>(motorProfiles_.size()) - 1;
+                currentMotorProfile_ = static_cast<i32>(motorProfiles_.size()) - 1;
         }
         ImGui::SameLine();
         if (ImGui::Button("Del") && motorProfiles_.size() > 1) {
                 motorProfiles_.erase(motorProfiles_.begin() + currentMotorProfile_);
-                if (currentMotorProfile_ > 0) currentMotorProfile_--;
+                if (currentMotorProfile_ > 0)
+                        currentMotorProfile_--;
         }
 
         ImGui::Separator();
@@ -700,20 +967,20 @@ Gui::drawCalculator()
         // Calculations
         // Flux linkage Psi_m = Vpp / (2 * sqrt(3) * 2 * pi * f_e)
         // Ke (Vpeak_phase / rad/s_elec) = Psi_m
-        const float pi    = 3.14159265358979323846f;
-        float       psi_m = mp.backEmfVpp / (4.0f * sqrtf(3.0f) * pi * mp.backEmfFreq);
+        const f32 pi    = 3.14159265358979323846f;
+        f32       psi_m = mp.backEmfVpp / (4.0f * sqrtf(3.0f) * pi * mp.backEmfFreq);
 
         // Kt (Nm/A) = 1.5 * P * Psi_m
-        float kt = 1.5f * static_cast<float>(mp.polePairs) * psi_m;
+        f32 kt = 1.5f * static_cast<f32>(mp.polePairs) * psi_m;
 
         // Kv (RPM/V_LL_peak) = 120 * f_e / (P * Vpp)
-        float kv = (120.0f * mp.backEmfFreq) / (static_cast<float>(mp.polePairs) * mp.backEmfVpp);
+        f32 kv = (120.0f * mp.backEmfFreq) / (static_cast<f32>(mp.polePairs) * mp.backEmfVpp);
 
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "--- Calculated Results ---");
-        ImGui::Text("Flux Linkage (Psi_m): %.6f Wb", static_cast<double>(psi_m));
-        ImGui::Text("KV value: %.2f RPM/V", static_cast<double>(kv));
-        ImGui::Text("Calculated Kt (Ref): %.6f Nm/A", static_cast<double>(kt));
+        ImGui::Text("Flux Linkage (Psi_m): %.6f Wb", static_cast<f64>(psi_m));
+        ImGui::Text("KV value: %.2f RPM/V", static_cast<f64>(kv));
+        ImGui::Text("Calculated Kt (Ref): %.6f Nm/A", static_cast<f64>(kt));
 
         ImGui::End();
 }

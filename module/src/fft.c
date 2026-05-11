@@ -20,7 +20,7 @@ fft_init(fft_t *fft, const fft_cfg_t fft_cfg)
         out->fr = cfg->fs / (f32)cfg->npoints;
 
 #if defined(__linux__) || defined(_WIN32)
-        lo->p = fftwf_plan_dft_r2c_1d(cfg->npoints, in->buf, lo->buf, FFTW_ESTIMATE);
+        lo->p = fftwf_plan_dft_r2c_1d((int)cfg->npoints, in->buf, lo->buf, FFTW_ESTIMATE);
 #elif defined(ARM_MATH)
         arm_rfft_fast_init_f32(&lo->s, (u16)cfg->npoints);
 #endif
@@ -50,9 +50,9 @@ fft_exec(fft_t *fft)
 
 #if defined(__linux__) || defined(_WIN32)
         if (cfg->e_window != FFT_WINDOW_NONE) {
-                for (size_t i = 0; i < cfg->npoints; i++) {
-                        float w     = 1.0f;
-                        float phase = 2.0f * PI * i / (cfg->npoints - 1);
+                for (usize i = 0; i < cfg->npoints; i++) {
+                        f32 w     = 1.0f;
+                        f32 phase = 2.0f * PI * i / (cfg->npoints - 1);
                         switch (cfg->e_window) {
                                 case FFT_WINDOW_HANNING: {
                                         w = 0.5f * (1.0f - COS(phase));
@@ -73,7 +73,7 @@ fft_exec(fft_t *fft)
                 }
         }
         fftwf_execute(lo->p);
-        for (size_t i = 0; i < cfg->npoints / 2 + 1; i++)
+        for (usize i = 0; i < cfg->npoints / 2 + 1; i++)
                 out->mag_buf[i] = SQRT(lo->buf[i][0] * lo->buf[i][0] + lo->buf[i][1] * lo->buf[i][1]);
 
         find_max(&out->mag_buf[1], cfg->npoints >> 1, &out->max_mag, &out->out_idx);

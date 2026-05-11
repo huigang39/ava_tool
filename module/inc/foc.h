@@ -25,6 +25,14 @@ void foc_init(foc_t *foc, foc_cfg_t foc_cfg);
 void foc_exec(foc_t *foc);
 
 /**
+ * @brief FOC 校准
+ *
+ * @param foc FOC 结构体
+ * @return    i32
+ */
+i32 foc_cali(foc_t *foc);
+
+/**
  * @brief 判断 FOC 是否准备好
  *
  * @param foc FOC 结构体
@@ -32,14 +40,16 @@ void foc_exec(foc_t *foc);
  */
 u32 foc_is_ready(const foc_t *foc);
 
-int         foc_set_state(foc_t *foc, foc_state_e e_state);
+i32         foc_set_state(foc_t *foc, const foc_state_e e_state);
 foc_state_e foc_get_state(const foc_t *foc);
 
-int        foc_set_mode(foc_t *foc, foc_mode_e e_mode);
+i32        foc_set_mode(foc_t *foc, const foc_mode_e e_mode);
 foc_mode_e foc_get_mode(const foc_t *foc);
 
-int              foc_set_elec_theta(foc_t *foc, foc_elec_theta_e e_elec_theta);
+i32              foc_set_elec_theta(foc_t *foc, const foc_elec_theta_e e_elec_theta);
 foc_elec_theta_e foc_get_elec_theta(const foc_t *foc);
+
+i32 foc_nonlinear_elec_theta_cali(foc_t *foc);
 
 foc_temp_t foc_get_temp(const foc_t *foc);
 f32        foc_get_vbus(const foc_t *foc);
@@ -48,7 +58,7 @@ foc_store_t foc_get_store(const foc_t *foc);
 
 foc_ref_pvct_t foc_get_ref_pvct(const foc_t *foc);
 
-int foc_set_outshaft_zero(foc_t *foc);
+i32 foc_set_outshaft_zero(foc_t *foc);
 
 /**
  * @brief 设置 FOC 校准标志

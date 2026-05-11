@@ -5,7 +5,7 @@
 #include "foc.h"
 
 #define CUR_OFFSET_SAMPLE_MS (10)
-static int foc_stator_init(foc_t *foc);
+static i32 foc_stator_init(foc_t *foc);
 
 extern void foc_select_state(foc_t *foc);
 static void foc_update_fdb(foc_t *foc);
@@ -16,6 +16,7 @@ static void foc_self_check_exec(foc_t *foc);
 static void foc_rotor_init(foc_t *foc);
 static void foc_get_adc_value(foc_t *foc);
 static void foc_get_theta(foc_t *foc);
+static void foc_get_tor(foc_t *foc);
 
 void
 foc_init(foc_t *foc, const foc_cfg_t foc_cfg)
@@ -26,8 +27,10 @@ foc_init(foc_t *foc, const foc_cfg_t foc_cfg)
         foc_init_param(foc);
 
         if (!CHECK_FUNC_PTR(cfg->func_cfg.f_load) || !CHECK_FUNC_PTR(cfg->func_cfg.f_init_periph) ||
-            !CHECK_FUNC_PTR(cfg->func_cfg.f_init_motor_sensor) || !CHECK_FUNC_PTR(cfg->func_cfg.f_init_outshaft_sensor) ||
-            !CHECK_FUNC_PTR(cfg->func_cfg.f_get_motor_theta) || !CHECK_FUNC_PTR(cfg->func_cfg.f_get_outshaft_theta) ||
+            !CHECK_FUNC_PTR(cfg->func_cfg.f_init_tor_sensor) || !CHECK_FUNC_PTR(cfg->func_cfg.f_get_tor) ||
+            !CHECK_FUNC_PTR(cfg->func_cfg.f_init_motor_sensor) || !CHECK_FUNC_PTR(cfg->func_cfg.f_trigger_motor_theta) ||
+            !CHECK_FUNC_PTR(cfg->func_cfg.f_get_motor_theta) || !CHECK_FUNC_PTR(cfg->func_cfg.f_init_outshaft_sensor) ||
+            !CHECK_FUNC_PTR(cfg->func_cfg.f_trigger_outshaft_theta) || !CHECK_FUNC_PTR(cfg->func_cfg.f_get_outshaft_theta) ||
             !CHECK_FUNC_PTR(cfg->func_cfg.f_set_drv_status) || !CHECK_FUNC_PTR(cfg->func_cfg.f_set_irq_status)) {
                 lo->u_err.bit.null_ptr = TRUE;
                 return;
@@ -35,11 +38,13 @@ foc_init(foc_t *foc, const foc_cfg_t foc_cfg)
                 cfg->func_cfg.f_load();
 
                 cfg->func_cfg.f_init_periph();
+                cfg->func_cfg.f_init_tor_sensor();
                 cfg->func_cfg.f_init_motor_sensor();
                 cfg->func_cfg.f_init_outshaft_sensor();
 
                 cfg->func_cfg.f_get_motor_theta();
                 cfg->func_cfg.f_get_outshaft_theta();
+                cfg->func_cfg.f_get_tor();
 
                 cfg->func_cfg.f_set_drv_status(TRUE);
                 cfg->func_cfg.f_set_irq_status(TRUE);
@@ -69,6 +74,7 @@ foc_exec(foc_t *foc)
 
         foc_get_adc_value(foc);
         foc_get_theta(foc);
+        foc_get_tor(foc);
         foc_select_state(foc);
 
         foc_update_fdb(foc);
@@ -121,7 +127,7 @@ foc_is_ready(const foc_t *foc)
         return foc->in.stator.is_init && foc->in.rotor.is_init && foc->lo.is_ready;
 }
 
-int
+i32
 foc_set_state(foc_t *foc, const foc_state_e e_state)
 {
         foc->lo.e_state = e_state;
@@ -134,7 +140,7 @@ foc_get_state(const foc_t *foc)
         return foc->lo.e_state;
 }
 
-int
+i32
 foc_set_mode(foc_t *foc, const foc_mode_e e_mode)
 {
         if (foc->lo.e_state == FOC_STATE_CALI)
@@ -150,7 +156,7 @@ foc_get_mode(const foc_t *foc)
         return foc->lo.e_mode;
 }
 
-int
+i32
 foc_set_elec_theta(foc_t *foc, const foc_elec_theta_e e_elec_theta)
 {
         foc->lo.e_elec_theta = e_elec_theta;
@@ -181,7 +187,7 @@ foc_get_store(const foc_t *foc)
         return foc->lo.store;
 }
 
-int
+i32
 foc_set_outshaft_zero(foc_t *foc)
 {
         DECL(foc, cfg, lo);
@@ -215,6 +221,8 @@ foc_update_fdb(foc_t *foc)
             CPYSGN(poly_eval(cfg->base_cfg.motor.cur2tor, ARRAY_LEN(cfg->base_cfg.motor.cur2tor) - 1, ABS(in->stator.i_dq.q)),
                    in->stator.i_dq.q) *
             cfg->base_cfg.outshaft_ratio;
+
+        out->fdb_pvct.load_tor = cfg->sensor_cfg.tor_sensor_enable ? in->load_tor : lo->luenberger.out.est_load_tor;
 }
 
 void
@@ -455,6 +463,17 @@ foc_get_theta(foc_t *foc)
         foc_rotor_init(foc);
 }
 
+static void
+foc_get_tor(foc_t *foc)
+{
+        DECL(foc, cfg, in, lo, tmp);
+
+        if (++tmp->freq_div_cnt.tor_sensor >= cfg->ctl_cfg.div.tor_sensor)
+                tmp->freq_div_cnt.tor_sensor = 0;
+
+        in->load_tor = cfg->func_cfg.f_get_tor();
+}
+
 /**
  * @brief FOC 结构体参数初始化
  *
@@ -565,7 +584,7 @@ foc_rotor_init(foc_t *foc)
  * @param foc FOC 结构体
  * @return    int 状态码
  */
-static int
+static i32
 foc_stator_init(foc_t *foc)
 {
         DECL(foc, cfg, in, lo, tmp);

@@ -161,7 +161,7 @@ hfi_init(hfi_obs_t *hfi, const hfi_cfg_t hfi_cfg)
         iir_init(&lo->id_bpf, cfg->id_bpf);
         iir_init(&lo->iq_bpf, cfg->iq_bpf);
 
-        lo->sq_sign = 1;
+        lo->sq_sign = DIR_FORWARD;
 }
 
 void

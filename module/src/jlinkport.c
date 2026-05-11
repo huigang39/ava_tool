@@ -37,7 +37,7 @@ struct jlink_api_min {
 static struct jlink_api_min s_api;
 static bool                 s_api_loaded = false;
 
-static int
+static i32
 load_symbol(HMODULE dll, FARPROC *out, const char *name)
 {
         if (out == NULL)
@@ -46,7 +46,7 @@ load_symbol(HMODULE dll, FARPROC *out, const char *name)
         return (*out != NULL) ? 0 : -1;
 }
 
-static int
+static i32
 jlink_dll_load(const char *dll_path)
 {
         static const char *candidates[] = {
@@ -63,7 +63,7 @@ jlink_dll_load(const char *dll_path)
         if (dll_path != NULL && dll_path[0] != '\0') {
                 dll = LoadLibraryA(dll_path);
         } else {
-                for (size_t i = 0; i < (sizeof(candidates) / sizeof(candidates[0])); ++i) {
+                for (usize i = 0; i < (sizeof(candidates) / sizeof(candidates[0])); ++i) {
                         dll = LoadLibraryA(candidates[i]);
                         if (dll != NULL)
                                 break;
@@ -96,7 +96,7 @@ jlink_dll_load(const char *dll_path)
         return 0;
 }
 
-static int
+static i32
 jlink_exec(const char *cmd)
 {
         char out[1024];
@@ -106,7 +106,7 @@ jlink_exec(const char *cmd)
         return (s_api.ExecCommand(cmd, out, (i32)sizeof(out)) >= 0) ? 0 : -1;
 }
 
-int
+i32
 jlink_port_init(const char *dll_path, const char *device, u32 speed_khz, u32 serial_no, bool use_sn)
 {
         char cmd[256];
@@ -162,7 +162,7 @@ jlink_port_deinit(void)
         s_api_loaded = false;
 }
 
-int
+i32
 jlink_port_reset(void)
 {
         if (!s_api_loaded || s_api.Reset == NULL)
@@ -172,27 +172,27 @@ jlink_port_reset(void)
         return 0;
 }
 
-int
+i32
 jlink_port_write_mem(u32 addr, u32 len, const void *data)
 {
         if (!s_api_loaded || s_api.WriteMemEx == NULL)
                 return -1;
         i32 ret = s_api.WriteMemEx(addr, len, data, 0u);
-        return (ret >= 0) ? (int)ret : -1;
+        return (ret >= 0) ? (i32)ret : -1;
 }
 
-int
+i32
 jlink_port_read_mem(u32 addr, u32 len, void *data)
 {
         if (!s_api_loaded || s_api.ReadMemEx == NULL)
                 return -1;
         i32 ret = s_api.ReadMemEx(addr, len, data, 0u);
-        return (ret >= 0) ? (int)ret : -1;
+        return (ret >= 0) ? (i32)ret : -1;
 }
 
 #else
 /* Linux 或其他平台空实现占位，避免编译报错 */
-int
+i32
 jlink_port_init(const char *dll_path, const char *device, u32 speed_khz, u32 serial_no, bool use_sn)
 {
         return -1;
@@ -203,19 +203,19 @@ jlink_port_deinit(void)
 {
 }
 
-int
+i32
 jlink_port_reset(void)
 {
         return -1;
 }
 
-int
+i32
 jlink_port_write_mem(u32 addr, u32 len, const void *data)
 {
         return -1;
 }
 
-int
+i32
 jlink_port_read_mem(u32 addr, u32 len, void *data)
 {
         return -1;

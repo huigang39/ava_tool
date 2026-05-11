@@ -6,8 +6,7 @@
 #include <vector>
 
 #include "module.h"
-
-#include "elf_parser.hpp"
+#include "core/elf_types.hpp"
 
 namespace dwarf {
 

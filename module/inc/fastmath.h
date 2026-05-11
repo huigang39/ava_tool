@@ -97,7 +97,11 @@ fast_expf(f32 x)
 HAPI f32
 fast_absf(const f32 x)
 {
+#ifdef _MSC_VER
+        return fabsf(x);
+#else
         return __builtin_fabsf(x);
+#endif
 }
 
 HAPI f32

@@ -35,9 +35,7 @@ typedef enum log_mode {
 } log_mode_e;
 
 typedef enum log_ring {
-        LOG_RING_WRAP,
         LOG_RING_TRUNCATE,
-        LOG_RING_COMPLETE,
         LOG_RING_ROTATE,
 } log_ring_e;
 
@@ -70,7 +68,6 @@ typedef struct log_cfg {
 typedef struct log_chunk {
         mpsc_node_t node;
         usize       offset;
-        u8          data[];
 } log_chunk_t;
 
 typedef struct log_lo {
@@ -82,7 +79,6 @@ typedef struct log_lo {
         void *mmap_ptr;
         void *os_file_handle;
         void *os_map_handle;
-        usize curr_file_idx;
         char  curr_file_path[256];
 
         // 使用 ID 绑定的私有块数组

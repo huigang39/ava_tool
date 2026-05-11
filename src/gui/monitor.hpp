@@ -2,7 +2,7 @@
 #define MONITOR_HPP
 
 #include <atomic>
-#include <chrono>
+#include "timeops.h"
 #include <deque>
 #include <map>
 #include <memory>
@@ -12,10 +12,9 @@
 #include <utility>
 #include <vector>
 
-
-#include "fft.h"
-#include "jlink_dev.hpp"
-
+#include "app_log.hpp"
+#include "core/jlink_dev.hpp"
+#include "module.h"
 
 extern std::atomic<bool> g_monitorPaused;
 
@@ -31,10 +30,10 @@ struct ChannelDropPayload {
         char      name[128];
         u64       addr;
         char      type[8];   // "F32"/"F64"/"I8"/"I16"/"I32"/"I64"/"U8"/"U16"/"U32"/"U64"
-        char      device[8]; // "LOCAL" / "FSA" / "JLINK"
+        char      device[8]; // "SHM" / "JLINK" / "UDP"
         u8        numBytes;  // 1/2/4/8 - 派生自 type
         u8        numEnums;  // 0 表示不是枚举
-        u8        pad[6];
+        u64       typeOff;   // DWARF type offset
         EnumEntry enums[kMaxEnums];
 };
 
@@ -51,29 +50,27 @@ typeBytes(const std::string &t)
         return 4; // F32 / I32 / U32 / 空 / 未知
 }
 
-// 全局会话时间戳: 进程内首次调用为 0 时刻, 单调递增, 单位秒.
-// 所有 setRVal 调用点共享, 保证多通道时间轴一致.
-// 全局会话起始点
-inline std::chrono::steady_clock::time_point &
-getSessionStartPoint()
+// 全局会话起始点 (微秒)
+inline u64 &
+getSessionStartUs()
 {
-        static auto start = std::chrono::steady_clock::now();
+        static u64 start = get_mono_ts_us();
         return start;
 }
 
-inline double
+inline f64
 sessionTimeSec()
 {
-        using clock    = std::chrono::steady_clock;
-        auto now       = clock::now();
-        auto elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(now - getSessionStartPoint()).count();
-        return static_cast<double>(elapsedUs) / 1000000.0;
+        u64 now = get_mono_ts_us();
+        u64 start = getSessionStartUs();
+        if (now < start) return 0.0;
+        return static_cast<f64>(now - start) / 1000000.0;
 }
 
 inline void
 resetSessionTime()
 {
-        getSessionStartPoint() = std::chrono::steady_clock::now();
+        getSessionStartUs() = get_mono_ts_us();
 }
 
 class MonitorChannel
@@ -82,9 +79,9 @@ class MonitorChannel
 
       public:
         enum class DeviceEnum {
-                LOCAL,
-                FSA,
                 JLINK,
+                UDP,
+                SHM,
         };
 
         struct EnumEntry {
@@ -106,16 +103,16 @@ class MonitorChannel
         std::atomic<bool> pendingDelete_{false};
 
         std::deque<f32>        rVals_{};
-        std::deque<f32>        rTs_{}; // 与 rVals_ 一一对应的时间戳 (秒, 相对 session start)
+        std::deque<f64>        rTs_{}; // 与 rVals_ 一一对应的时间戳 (秒, 相对 session start)
         mutable std::mutex     valMutex_{};
         std::vector<EnumEntry> enums_{};
 
         u64                                   sampleCount_{0};
         u64                                   lastRateCount_{0};
-        std::chrono::steady_clock::time_point lastRateTime_{};
+        u64 lastRateTime_{0};
         bool                                  rateInited_{false};
         f32                                   sampleHz_{0.0f};
-        size_t                                minKeepPoints_{4096};
+        usize                                 minKeepPoints_{4096};
 
         f32  color_[4]{1.0f, 1.0f, 1.0f, 1.0f};
         bool useAutoColor_{true};
@@ -162,12 +159,12 @@ class MonitorChannel
         wave_t             wave_{};
         mutable std::mutex waveMtx_{};
         // 每个采样点都带一个绝对时间戳 (相对 session start), 多通道按帧时间戳同步.
-        void setRVal(f32 val, double ts)
+        void setRVal(f32 val, f64 ts)
         {
                 std::lock_guard lk(valMutex_);
-                f32             fts = static_cast<f32>(ts);
+                f64             fts = ts;
                 if (!rTs_.empty() && fts <= rTs_.back()) {
-                        fts = rTs_.back() + 0.000001f; // Enforce strict monotonicity (1us)
+                        fts = rTs_.back() + 0.000001; // Enforce strict monotonicity (1us)
                 }
                 rTs_.push_back(fts);
                 rVals_.push_back(val);
@@ -177,7 +174,7 @@ class MonitorChannel
 
                 // History pruning: keep at least minKeepPoints_ OR points within historySeconds_
                 if (historySeconds_ > 0.0f) {
-                        while (rTs_.size() > minKeepPoints_ && (fts - rTs_.front()) > historySeconds_) {
+                        while (rTs_.size() > minKeepPoints_ && (fts - rTs_.front()) > (f64)historySeconds_) {
                                 rTs_.pop_front();
                                 rVals_.pop_front();
                         }
@@ -185,16 +182,16 @@ class MonitorChannel
         }
 
         // 批量插入: 一次锁内完成所有 push + 裁剪, 大幅减少锁竞争.
-        void pushBatch(const f32 *vals, const f32 *ts, const size_t count)
+        void pushBatch(const f32 *vals, const f64 *ts, const usize count)
         {
                 if (count == 0)
                         return;
                 std::lock_guard lk(valMutex_);
                 for (size_t i = 0; i < count; ++i) {
                         rVals_.push_back(vals[i]);
-                        f32 fts = ts[i];
+                        f64 fts = ts[i];
                         if (!rTs_.empty() && fts <= rTs_.back()) {
-                                fts = rTs_.back() + 0.000001f;
+                                fts = rTs_.back() + 0.000001;
                         }
                         rTs_.push_back(fts);
                 }
@@ -202,10 +199,10 @@ class MonitorChannel
 
                 // Optimized block pruning: find the first element to keep
                 if (historySeconds_ > 0.0f) {
-                        const f32 cutoff   = ts[count - 1] - historySeconds_;
+                        const f64 cutoff   = ts[count - 1] - (f64)historySeconds_;
                         auto      itTs     = rTs_.begin();
                         auto      itVal    = rVals_.begin();
-                        size_t    popCount = 0;
+                        usize     popCount = 0;
                         // Never prune below minKeepPoints_
                         while (rTs_.size() - popCount > minKeepPoints_ && itTs != rTs_.end() && *itTs < cutoff) {
                                 ++itTs;
@@ -260,7 +257,7 @@ class MonitorChannel
         }
 
         // 同时拷出 X (时间) / Y (值) 两条 series, 一一对应.
-        void copyRVals(std::vector<f32> &xs, std::vector<f32> &ys) const
+        void copyRVals(std::vector<f64> &xs, std::vector<f32> &ys) const
         {
                 std::lock_guard lk(valMutex_);
                 xs.assign(rTs_.begin(), rTs_.end());
@@ -270,17 +267,16 @@ class MonitorChannel
       private:
         void updateRate_()
         {
-                using clock    = std::chrono::steady_clock;
-                const auto now = clock::now();
+                const u64 now = get_mono_ts_ms();
                 if (!rateInited_) {
                         lastRateTime_  = now;
                         lastRateCount_ = sampleCount_;
                         rateInited_    = true;
                 } else {
-                        const auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRateTime_).count();
+                        const auto dtMs = now - lastRateTime_;
                         if (dtMs >= 500) {
                                 const u64 dCount = sampleCount_ - lastRateCount_;
-                                sampleHz_        = static_cast<f32>(dCount * 1000.0 / static_cast<double>(dtMs));
+                                sampleHz_        = static_cast<f32>(dCount * 1000.0 / static_cast<f64>(dtMs));
                                 lastRateTime_    = now;
                                 lastRateCount_   = sampleCount_;
                         }
@@ -305,22 +301,22 @@ class MonitorChannel
         }
 
         // Return number of points currently stored in memory (excluding discarded)
-        size_t storedCount() const
+        usize storedCount() const
         {
                 std::lock_guard lk(valMutex_);
                 return rVals_.size();
         }
 
         // Return the earliest timestamp in memory, or -1 if empty
-        f32 earliestTs() const
+        f64 earliestTs() const
         {
                 std::lock_guard lk(valMutex_);
-                return rTs_.empty() ? -1.0f : rTs_.front();
+                return rTs_.empty() ? -1.0 : rTs_.front();
         }
-        f32 latestTs() const
+        f64 latestTs() const
         {
                 std::lock_guard lk(valMutex_);
-                return rTs_.empty() ? -1.0f : rTs_.back();
+                return rTs_.empty() ? -1.0 : rTs_.back();
         }
 
         // Clear all stored data points in the channel
@@ -345,11 +341,11 @@ class MonitorScope
                 PLOT,
                 TABLE,
         };
-        using ChannelMapType = std::unordered_map<std::string, std::unique_ptr<MonitorChannel>>;
+        using ChannelMapType = std::unordered_map<std::string, std::shared_ptr<MonitorChannel>>;
         const std::string &getName() const { return name_; }
         void               setDraw(DrawEnum d) { e_draw = d; }
         DrawEnum           getDraw() const { return e_draw; }
-        float             &getHeight() { return height_; }
+        f32               &getHeight() { return height_; }
         bool              &getShowFft() { return showFft_; }
         int               &getFftPoints() { return fftPoints_; }
         int               &getFftPeakCount() { return fftPeakCount_; }
@@ -360,37 +356,40 @@ class MonitorScope
         std::string       name_{};
         ChannelMapType    chs_{};
         DrawEnum          e_draw{};
-        float             height_{200.0f};
+        f32               height_{200.0f};
         bool              showFft_{false};
         int               fftPoints_{1024};
         int               fftPeakCount_{5};
         fft_t             fft_;
         std::vector<f32>  fftInBuf_;
-        std::vector<f32>  fftMagBuf_;
+        std::vector<f32>  fftMagF32_;
+        std::vector<f64>  fftMagBuf_;
         std::vector<f32>  fftOutBuf_;
         std::vector<f32>  fftLoBuf_;
         std::atomic<bool> pendingDelete_{false};
-        std::vector<f32>  dxs_{}, dys_{};
-        std::vector<f32>  tempTs_{}, tempVals_{};
+        std::vector<f64>  dxs_{};
+        std::vector<f64>  dys_{};
+        std::vector<f64>  tempTs_{};
+        std::vector<f64>  tempVals_{};
         bool              isManualHeight_{false};
         bool              paused_{false};
         int               lastSelectedIndex_{-1};
 
         bool pendingAxisReset_{false};
         struct Peak {
-                float freq;
-                float mag;
+                f64 freq;
+                f64 mag;
         };
         std::map<std::string, std::vector<Peak>> channelPeaks_;
 
         void tableDraw();
         void tableMenu();
 
-        void plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode);
+        void plotDraw(f64 *linkXMin, f64 *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode);
         void plotMenu();
 
         void drawTableRow(const std::string               &chName,
-                          std::unique_ptr<MonitorChannel> &ch,
+                          std::shared_ptr<MonitorChannel> &ch,
                           int                              idx,
                           const std::vector<std::string>  &allKeys);
 
@@ -399,6 +398,7 @@ class MonitorScope
         explicit MonitorScope(std::string scopeName) : name_(std::move(scopeName))
         {
                 fftInBuf_.resize(fftPoints_);
+                fftMagF32_.resize(fftPoints_ / 2 + 1);
                 fftMagBuf_.resize(fftPoints_ / 2 + 1);
                 fftOutBuf_.resize((fftPoints_ / 2 + 1) * 2); // 2 floats per complex point
                 fftLoBuf_.resize(fftPoints_);
@@ -408,7 +408,7 @@ class MonitorScope
                 cfg.fs       = 1000.0f;
                 cfg.e_window = FFT_WINDOW_HANNING;
                 cfg.in_buf   = fftInBuf_.data();
-                cfg.mag_buf  = fftMagBuf_.data();
+                cfg.mag_buf  = fftMagF32_.data();
                 cfg.out_buf  = (decltype(cfg.out_buf))fftOutBuf_.data();
                 cfg.buf      = fftLoBuf_.data();
                 fft_init(&fft_, cfg);
@@ -416,7 +416,7 @@ class MonitorScope
         ~MonitorScope() { fft_destroy(&fft_); }
 
         void            menu();
-        void            draw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode);
+        void            draw(f64 *linkXMin, f64 *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode);
         void            dropTarget();
         int             addChannel(const std::string &chName);
         int             setValue(const std::string &chName, f32 val);
@@ -454,7 +454,7 @@ class MonitorScope
 class Monitor
 {
       public:
-        using ScopeMapType = std::unordered_map<std::string, std::unique_ptr<MonitorScope>>;
+        using ScopeMapType = std::unordered_map<std::string, std::shared_ptr<MonitorScope>>;
 
       private:
         std::string      name_{};
@@ -475,10 +475,10 @@ class Monitor
         float           lastAvailY_{0.0f};
 
       public:
-        double            linkXMin_{0.0}, linkXMax_{1.0};
-        double            lastNow_{0.0};
-        double            dataStartTime_{0.0};
-        double            pauseXMax_{-1.0};
+        f64               linkXMin_{0.0}, linkXMax_{1.0};
+        f64               lastNow_{0.0};
+        f64               dataStartTime_{0.0};
+        f64               pauseXMax_{-1.0};
         bool              wasPaused_{false};
         float             historySeconds_{10.0f};
         u32               maxDisplayPoints_{5000};
@@ -488,26 +488,26 @@ class Monitor
 
         f32                                   actualHz_{0.0f};
         u64                                   pointAccum_{0};
-        std::chrono::steady_clock::time_point lastHzTick_{std::chrono::steady_clock::now()};
+        u64 lastHzTick_{get_mono_ts_ms()};
         static std::vector<Monitor *>         sInstances_;
         static std::mutex                     sMtxInstances_;
 
       public:
         explicit Monitor(std::string monitorName) : name_(std::move(monitorName))
         {
-                print_info(true, "Monitor()");
+                LOG_I("Monitor()");
                 std::lock_guard lk(sMtxInstances_);
                 sInstances_.push_back(this);
         }
         Monitor()
         {
-                print_info(true, "Monitor()");
+                LOG_I("Monitor()");
                 std::lock_guard lk(sMtxInstances_);
                 sInstances_.push_back(this);
         };
         ~Monitor()
         {
-                print_info(true, "~Monitor()");
+                LOG_I("~Monitor()");
                 std::lock_guard lk(sMtxInstances_);
                 auto            it = std::find(sInstances_.begin(), sInstances_.end(), this);
                 if (it != sInstances_.end())
@@ -531,10 +531,10 @@ class Monitor
 
         void updateHz()
         {
-                auto now  = std::chrono::steady_clock::now();
-                auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastHzTick_).count();
+                auto now  = get_mono_ts_ms();
+                auto dtMs = now - lastHzTick_;
                 if (dtMs >= 500) {
-                        actualHz_   = static_cast<f32>(static_cast<double>(pointAccum_) * 1000.0 / static_cast<double>(dtMs));
+                        actualHz_   = static_cast<f32>(static_cast<f64>(pointAccum_) * 1000.0 / static_cast<f64>(dtMs));
                         pointAccum_ = 0;
                         lastHzTick_ = now;
                 }
@@ -570,6 +570,7 @@ class Monitor
                         m->dataStartTime_ = 0.0;
                         m->clearData();
                 }
+                JLinkDev::instance().reqRestart();
         }
 };
 

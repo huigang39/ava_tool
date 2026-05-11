@@ -5,7 +5,7 @@
 /*                                  接口定义                                  */
 /* -------------------------------------------------------------------------- */
 
-int
+i32
 shm_init(shm_t *shm, const shm_cfg_t shm_cfg)
 {
         DECL(shm, cfg, lo);
@@ -44,7 +44,7 @@ shm_init(shm_t *shm, const shm_cfg_t shm_cfg)
                                            NULL,                 // 默认安全属性
                                            cfg->access,          // 可读可写
                                            0,                    // 内存大小高32位
-                                           cfg->cap,             // 内存大小低32位
+                                           (DWORD)cfg->cap,      // 内存大小低32位
                                            cfg->name);           // 命名对象
                 if (lo->fd == NULL)
                         return -MECREATE;
@@ -73,18 +73,18 @@ shm_init(shm_t *shm, const shm_cfg_t shm_cfg)
         return 0;
 }
 
-void
+usize
 shm_read(shm_t *shm, void *dst, const usize size)
 {
         DECL(shm, lo);
 
-        spsc_read_buf(lo->spsc, (u8 *)lo->addr + sizeof(*lo->spsc), dst, size);
+        return spsc_read_buf(lo->spsc, (u8 *)lo->addr + sizeof(*lo->spsc), dst, size);
 }
 
-void
+usize
 shm_write(shm_t *shm, const void *src, const usize size)
 {
         DECL(shm, lo);
 
-        spsc_write_buf(lo->spsc, (u8 *)lo->addr + sizeof(*lo->spsc), src, size);
+        return spsc_write_buf(lo->spsc, (u8 *)lo->addr + sizeof(*lo->spsc), src, size);
 }

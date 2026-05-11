@@ -58,7 +58,7 @@ u8
 crc8(const void *data, const usize size)
 {
         u8        crc = 0x00;
-        const u8 *p   = data;
+        const u8 *p   = (const u8 *)data;
         for (usize i = 0; i < size; i++)
                 crc = CRC8_TABLE[crc ^ p[i]];
 
@@ -73,4 +73,23 @@ crc32(const void *data, const usize size)
                 crc = crc >> 8 ^ CRC32_TABLE[(crc ^ ((const u8 *)data)[i]) & 0xFF];
 
         return crc ^ 0xFFFFFFFF;
+}
+
+u16
+crc16_modbus(const void *data, const usize size)
+{
+        u16       crc = 0xFFFF;
+        const u8 *p   = (const u8 *)data;
+
+        for (usize i = 0; i < size; i++) {
+                crc ^= p[i];
+                for (int j = 0; j < 8; j++) {
+                        if (crc & 0x0001)
+                                crc = (crc >> 1) ^ 0xA001;
+                        else
+                                crc >>= 1;
+                }
+        }
+
+        return crc;
 }

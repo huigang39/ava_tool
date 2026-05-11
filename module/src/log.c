@@ -2,6 +2,10 @@
 #include <string.h>
 
 #include "log.h"
+#include "macrodef.h"
+#include "mathdef.h"
+#include "mempool.h"
+#include "timeops.h"
 
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
@@ -9,12 +13,87 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 #endif
+
+static void
+purge_old_logs(const char *dir, usize max_files)
+{
+        if (max_files == 0)
+                return;
+
+#if defined(_WIN32) || defined(_WIN64)
+        char search_path[256];
+        snprintf(search_path, sizeof(search_path), "%s/*.log", dir);
+        WIN32_FIND_DATAA find_data;
+        HANDLE           hFind = FindFirstFileA(search_path, &find_data);
+        if (hFind == INVALID_HANDLE_VALUE)
+                return;
+
+        // 收集所有匹配的文件名
+        typedef struct {
+                char name[256];
+        } file_node_t;
+        file_node_t *files = NULL;
+        usize        count = 0;
+
+        do {
+                if (!(find_data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+                        files = (file_node_t *)realloc(files, sizeof(file_node_t) * (count + 1));
+                        strncpy(files[count].name, find_data.cFileName, 256);
+                        count++;
+                }
+        } while (FindNextFileA(hFind, &find_data));
+        FindClose(hFind);
+
+        if (count > max_files) {
+                // 按名称排序 (时间戳格式保证了名称序即时间序)
+                for (usize i = 0; i < count - 1; i++) {
+                        for (usize j = i + 1; j < count; j++) {
+                                if (strcmp(files[i].name, files[j].name) > 0) {
+                                        file_node_t tmp = files[i];
+                                        files[i]        = files[j];
+                                        files[j]        = tmp;
+                                }
+                        }
+                }
+                // 删除多余的最旧文件
+                for (usize i = 0; i < count - max_files; i++) {
+                        char full_path[512];
+                        snprintf(full_path, sizeof(full_path), "%s/%s", dir, files[i].name);
+                        DeleteFileA(full_path);
+                }
+        }
+        free(files);
+#endif
+}
+
+static void
+get_timestamp_str(char *buf, usize size)
+{
+        time_t    t  = time(NULL);
+        struct tm tm = *localtime(&t);
+        snprintf(buf,
+                 size,
+                 "%04d%02d%02d_%02d%02d%02d",
+                 tm.tm_year + 1900,
+                 tm.tm_mon + 1,
+                 tm.tm_mday,
+                 tm.tm_hour,
+                 tm.tm_min,
+                 tm.tm_sec);
+}
 
 /* -------------------------------------------------------------------------- */
 /*                                  内部函数                                  */
 /* -------------------------------------------------------------------------- */
+
+static u8 *
+log_chunk_data(log_chunk_t *chunk)
+{
+        return (u8 *)(chunk + 1);
+}
 
 static void
 log_os_mmap_init(log_t *log)
@@ -29,11 +108,16 @@ log_os_mmap_init(log_t *log)
                 return;
 
         if (cfg->e_ring == LOG_RING_ROTATE) {
-                snprintf(lo->curr_file_path,
-                         sizeof(lo->curr_file_path),
-                         "%s.%llu",
-                         cfg->file_path,
-                         (unsigned long long)lo->curr_file_idx);
+#if defined(_WIN32) || defined(_WIN64)
+                CreateDirectoryA(cfg->file_path, NULL);
+#else
+                mkdir(cfg->file_path, 0755);
+#endif
+                purge_old_logs(cfg->file_path, cfg->max_files);
+
+                char ts[32];
+                get_timestamp_str(ts, sizeof(ts));
+                snprintf(lo->curr_file_path, sizeof(lo->curr_file_path), "%s/%s.log", cfg->file_path, ts);
         } else
                 snprintf(lo->curr_file_path, sizeof(lo->curr_file_path), "%s", cfg->file_path);
 
@@ -61,11 +145,11 @@ log_os_mmap_init(log_t *log)
         lo->os_map_handle  = (void *)hMap;
 
 #elif defined(__linux__) || defined(__APPLE__)
-        int flags = O_RDWR | O_CREAT;
+        i32 flags = O_RDWR | O_CREAT;
         if (cfg->e_ring == LOG_RING_ROTATE)
                 flags |= O_TRUNC;
 
-        int fd = open(lo->curr_file_path, flags, 0644);
+        i32 fd = open(lo->curr_file_path, flags, 0644);
         if (fd < 0)
                 return;
 
@@ -100,21 +184,17 @@ log_os_mmap_deinit(log_t *log, usize actual_size)
                 CloseHandle((HANDLE)lo->os_map_handle);
 
         if (lo->os_file_handle) {
-                if (cfg->e_ring != LOG_RING_WRAP) {
-                        LARGE_INTEGER li;
-                        li.QuadPart = actual_size;
-                        SetFilePointerEx((HANDLE)lo->os_file_handle, li, NULL, FILE_BEGIN);
-                        SetEndOfFile((HANDLE)lo->os_file_handle);
-                }
+                LARGE_INTEGER li;
+                li.QuadPart = actual_size;
+                SetFilePointerEx((HANDLE)lo->os_file_handle, li, NULL, FILE_BEGIN);
+                SetEndOfFile((HANDLE)lo->os_file_handle);
                 CloseHandle((HANDLE)lo->os_file_handle);
         }
 #elif defined(__linux__) || defined(__APPLE__)
         munmap(lo->mmap_ptr, cfg->file_size);
         if (lo->os_file_handle) {
-                int fd = (int)(intptr_t)lo->os_file_handle;
-                if (cfg->e_ring != LOG_RING_WRAP)
-                        ftruncate(fd, (off_t)actual_size);
-
+                i32 fd = (i32)(intptr_t)lo->os_file_handle;
+                ftruncate(fd, (off_t)actual_size);
                 close(fd);
         }
 #endif
@@ -132,7 +212,6 @@ log_flush_ring(log_t *log, const void *src, usize size)
         if (cfg->file_size == 0) {
                 if (cfg->f_flush)
                         cfg->f_flush(cfg->fd, src, size);
-
                 return;
         }
 
@@ -140,43 +219,23 @@ log_flush_ring(log_t *log, const void *src, usize size)
         if (!use_mmap && cfg->fd == NULL && cfg->f_flush == NULL)
                 return;
 
-        FILE *fp = (FILE *)cfg->fd;
-
+        /* 1. ROTATE 逻辑: 如果写满则切换文件 (带时间戳) */
         if (cfg->e_ring == LOG_RING_ROTATE) {
                 if (lo->file_offset + size > cfg->file_size) {
                         log_os_mmap_deinit(log, lo->file_offset);
-                        lo->curr_file_idx++;
-                        if (cfg->max_files > 0 && lo->curr_file_idx >= cfg->max_files)
-                                lo->curr_file_idx = 0;
-
                         log_os_mmap_init(log);
                         lo->file_offset = 0;
                 }
         }
 
-        const usize remaining_space = cfg->file_size - lo->file_offset;
-
+        /* 2. TRUNCATE 逻辑: 仅保留文件末尾能塞下的部分 */
         if (cfg->e_ring == LOG_RING_TRUNCATE) {
-                if (remaining_space == 0)
-                        return;
-
-                if (size > remaining_space) {
-                        if (use_mmap) {
-                                memcpy((u8 *)lo->mmap_ptr + lo->file_offset, src, remaining_space);
-                                lo->file_offset = cfg->file_size;
-                        } else if (fseek(fp, (long)lo->file_offset, SEEK_SET) == 0) {
-                                cfg->f_flush(cfg->fd, src, remaining_space);
-                                lo->file_offset = cfg->file_size;
-                        }
-                        return;
-                }
-        }
-
-        if (cfg->e_ring == LOG_RING_COMPLETE) {
+                const usize remaining_space = (lo->file_offset < cfg->file_size) ? (cfg->file_size - lo->file_offset) : 0;
                 if (size > remaining_space)
-                        lo->file_offset = 0;
+                        size = remaining_space;
         }
 
+        /* 3. 通用写入逻辑 */
         const u8 *data      = (const u8 *)src;
         usize     remaining = size;
 
@@ -185,21 +244,24 @@ log_flush_ring(log_t *log, const void *src, usize size)
                 if (lo->file_offset + write_size > cfg->file_size)
                         write_size = cfg->file_size - lo->file_offset;
 
-                if (use_mmap)
-                        memcpy((u8 *)lo->mmap_ptr + lo->file_offset, data, write_size);
-                else {
-                        if (fseek(fp, (long)lo->file_offset, SEEK_SET) == 0)
-                                cfg->f_flush(cfg->fd, data, write_size);
-                        else
-                                break;
+                if (write_size > 0) {
+                        if (use_mmap)
+                                memcpy((u8 *)lo->mmap_ptr + lo->file_offset, data, write_size);
+                        else {
+                                FILE *fp = (FILE *)cfg->fd;
+                                if (fseek(fp, (long)lo->file_offset, SEEK_SET) == 0)
+                                        cfg->f_flush(cfg->fd, data, write_size);
+                                else
+                                        break;
+                        }
+
+                        lo->file_offset += write_size;
+                        data            += write_size;
+                        remaining       -= write_size;
                 }
 
-                lo->file_offset += write_size;
-                data            += write_size;
-                remaining       -= write_size;
-
                 if (lo->file_offset >= cfg->file_size)
-                        lo->file_offset = 0;
+                        break;
         }
 }
 
@@ -213,9 +275,8 @@ log_init(log_t *log, const log_cfg_t log_cfg)
         DECL(log, cfg, lo);
         CFG_INIT(log, log_cfg);
 
-        lo->flush_buf     = (u8 *)mempool_alloc(cfg->mempool, cfg->flush_cap);
-        lo->file_offset   = 0;
-        lo->curr_file_idx = 0;
+        lo->flush_buf   = (u8 *)mempool_alloc(cfg->mempool, cfg->flush_cap);
+        lo->file_offset = 0;
 
         lo->chunks = (log_chunk_t **)mempool_calloc(cfg->mempool, sizeof(log_chunk_t *) * cfg->nproducers);
 
@@ -285,7 +346,7 @@ log_write_bin(
                 if (chunk != NULL)
                         mpsc_push(&lo->mpsc, (mpsc_node_t *)chunk);
 
-                chunk = mempool_alloc(cfg->mempool, sizeof(log_chunk_t) + cfg->chunk_size);
+                chunk = (log_chunk_t *)mempool_alloc(cfg->mempool, sizeof(log_chunk_t) + cfg->chunk_size);
                 if (!chunk) {
                         lo->chunks[id] = NULL;
                         return; // 内存耗尽保护机制
@@ -294,7 +355,7 @@ log_write_bin(
                 lo->chunks[id] = chunk;
         }
 
-        u8 *ptr = chunk->data + chunk->offset;
+        u8 *ptr = log_chunk_data(chunk) + chunk->offset;
 
         memcpy(ptr, &log_header, sizeof(log_header));
         ptr += sizeof(log_header);
@@ -332,7 +393,7 @@ log_write(log_t *log, const usize idx, const char *fmt, const va_list args)
                 if (chunk != NULL)
                         mpsc_push(&lo->mpsc, (mpsc_node_t *)chunk);
 
-                chunk = mempool_alloc(cfg->mempool, sizeof(log_chunk_t) + cfg->chunk_size);
+                chunk = (log_chunk_t *)mempool_alloc(cfg->mempool, sizeof(log_chunk_t) + cfg->chunk_size);
                 if (!chunk) {
                         lo->chunks[idx] = NULL;
                         return; // 内存池耗尽，丢弃日志
@@ -341,7 +402,7 @@ log_write(log_t *log, const usize idx, const char *fmt, const va_list args)
                 lo->chunks[idx] = chunk;
         }
 
-        u8 *ptr = chunk->data + chunk->offset;
+        u8 *ptr = log_chunk_data(chunk) + chunk->offset;
 
         memcpy(ptr, &header, sizeof(header));
         ptr += sizeof(header);
@@ -366,10 +427,10 @@ log_flush(log_t *log)
                 if (cfg->e_format == LOG_FORMAT_TEXT) {
                         usize parse_offset = 0;
                         while (parse_offset < chunk->offset) {
-                                const log_header_t *header  = (log_header_t *)(chunk->data + parse_offset);
+                                const log_header_t *header  = (log_header_t *)(log_chunk_data(chunk) + parse_offset);
                                 parse_offset               += sizeof(log_header_t);
 
-                                const char *payload  = (char *)(chunk->data + parse_offset);
+                                const char *payload  = (char *)(log_chunk_data(chunk) + parse_offset);
                                 parse_offset        += header->size;
 
 #ifdef MCU
@@ -389,7 +450,7 @@ log_flush(log_t *log)
                                 log_flush_ring(log, lo->flush_buf, prefix_size + copy_len);
                         }
                 } else
-                        log_flush_ring(log, chunk->data, chunk->offset);
+                        log_flush_ring(log, log_chunk_data(chunk), chunk->offset);
 
                 mempool_free(cfg->mempool, chunk);
                 lo->busy = cfg->e_mode == LOG_MODE_ASYNC;

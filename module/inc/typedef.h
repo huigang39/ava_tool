@@ -19,9 +19,13 @@ typedef signed int   i32;
 typedef unsigned long long u64;
 typedef signed long long   i64;
 
+#if defined(_MSC_VER) && !defined(__clang__)
+typedef u16 f16; // MSVC doesn't support _Float16
+#else
 typedef _Float16 f16;
-typedef float    f32;
-typedef double   f64;
+#endif
+typedef float  f32;
+typedef double f64;
 
 #ifdef MCU
 typedef u32 usize;

@@ -4,6 +4,9 @@
 #ifdef __linux__
 #include <unistd.h>
 #elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #endif
 
@@ -61,7 +64,9 @@ get_mono_ts_ns(void)
         LARGE_INTEGER frequency, counter;
         QueryPerformanceFrequency(&frequency);
         QueryPerformanceCounter(&counter);
-        return counter.QuadPart * 1000000000 / frequency.QuadPart;
+        u64 q = (u64)counter.QuadPart / (u64)frequency.QuadPart;
+        u64 r = (u64)counter.QuadPart % (u64)frequency.QuadPart;
+        return q * 1000000000ULL + (r * 1000000000ULL) / (u64)frequency.QuadPart;
 #endif
         return 0;
 }
@@ -142,7 +147,6 @@ yield(const u32 ms)
         usleep(K(ms));
 }
 #elif defined(_WIN32)
-#include <windows.h>
 HAPI void
 yield(const u32 ms)
 {
@@ -159,7 +163,7 @@ yield(const u32 ms)
 HAPI void
 delay_us(const u64 us)
 {
-        spin(us);
+        spin((u32)us);
 }
 
 HAPI void
@@ -167,11 +171,11 @@ delay_ms(const u64 ms, const delay_e e_delay)
 {
         switch (e_delay) {
                 case DELAY_SPIN: {
-                        spin(MS2US(ms));
+                        spin((u32)MS2US(ms));
                         break;
                 }
                 case DELAY_YIELD: {
-                        yield(ms);
+                        yield((u32)ms);
                         break;
                 }
                 default:
@@ -184,11 +188,11 @@ delay_s(const u64 s, const delay_e e_delay)
 {
         switch (e_delay) {
                 case DELAY_SPIN: {
-                        spin(S2US(s));
+                        spin((u32)S2US(s));
                         break;
                 }
                 case DELAY_YIELD: {
-                        yield(S2MS(s));
+                        yield((u32)S2MS(s));
                         break;
                 }
                 default:

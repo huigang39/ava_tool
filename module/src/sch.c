@@ -47,7 +47,7 @@ sch_bind_thread_to_cpu(pthread_t thread_tid, const int cpu_id)
 static DWORD WINAPI
 sch_thread_exec(LPVOID arg)
 {
-        struct sch *t = arg;
+        struct sch *t = (struct sch *)arg;
         for (;;)
                 sch_exec(t);
 
@@ -57,7 +57,7 @@ sch_thread_exec(LPVOID arg)
 static void
 sch_bind_thread_to_cpu(HANDLE thread_handle, const int cpu_id)
 {
-        const DWORD_PTR mask = 1 << cpu_id;
+        const DWORD_PTR mask = (DWORD_PTR)1 << cpu_id;
         const DWORD_PTR ret  = SetThreadAffinityMask(thread_handle, mask);
         if (!ret)
                 print_error(FALSE, "[SCH] set thread affinity failed, errcode: %lu", GetLastError());
@@ -229,7 +229,7 @@ sch_exec(sch_t *sch)
                 const u64 end_ts = cfg->f_get_ts();
 
                 task->status.exec_cnt++;
-                task->status.elapsed_us = end_ts - start_ts;
+                task->status.elapsed_us = (u32)(end_ts - start_ts);
 
                 if (task->cfg.exec_cnt_max == 0 || task->status.exec_cnt < task->cfg.exec_cnt_max) {
                         task->status.next_exec_ts = end_ts + (usize)HZ2US(task->cfg.exec_freq);
@@ -241,7 +241,7 @@ sch_exec(sch_t *sch)
                                 task->cfg.f_deinit(task->cfg.arg);
                 }
 
-                tmp->elapsed_us      = (i64)(end_ts - lo->curr_ts) > 0 ? end_ts - lo->curr_ts : 0;
+                tmp->elapsed_us      = (i64)(end_ts - lo->curr_ts) > 0 ? (u32)(end_ts - lo->curr_ts) : 0;
                 lo->elapsed_us_max   = MAX(lo->elapsed_us_max, tmp->elapsed_us);
                 tmp->prev_elapsed_us = tmp->elapsed_us;
                 lo->curr_ts          = end_ts;
@@ -276,8 +276,8 @@ sch_set_task_freq(sch_t *sch, const usize id, const usize exec_freq)
         for (usize i = 0; i < lo->ntasks; i++) {
                 sch_task_t *task = &lo->tasks[i];
                 if (task->cfg.id == id) {
-                        task->cfg.exec_freq       = exec_freq;
-                        task->status.next_exec_ts = cfg->f_get_ts() + HZ2US(exec_freq);
+                        task->cfg.exec_freq       = (f32)exec_freq;
+                        task->status.next_exec_ts = cfg->f_get_ts() + (usize)HZ2US(exec_freq);
                         return 0;
                 }
         }

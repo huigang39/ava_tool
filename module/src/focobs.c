@@ -49,11 +49,10 @@ void
 foc_obs_i_dq(foc_t *foc)
 {
         DECL(foc, cfg, in, out, lo, tmp);
-        RENAME(&lo->luenberger, lbg);
+        RENAME(&lo->luenberger, luenberger);
 
         if (cfg->obs_cfg.u_obs_flag.bit.luenberger) {
-                luenberger_exec_in(lbg, in->rotor.elec_theta, out->fdb_pvct.elec_tor / cfg->base_cfg.outshaft_ratio);
-                out->fdb_pvct.load_tor = lbg->out.est_load_tor;
+                luenberger_exec_in(luenberger, in->rotor.elec_theta, out->fdb_pvct.elec_tor / cfg->base_cfg.outshaft_ratio);
 
                 if (cfg->obs_cfg.enable_vel == 0.0f || out->fdb_pvct.vel > cfg->obs_cfg.enable_vel) {
                         lo->comp_i_dq.q = 0.0f;
@@ -62,7 +61,7 @@ foc_obs_i_dq(foc_t *foc)
 
                 lo->comp_i_dq.q = CPYSGN(poly_eval(cfg->base_cfg.motor.tor2cur,
                                                    ARRAY_LEN(cfg->base_cfg.motor.tor2cur) - 1,
-                                                   ABS(out->fdb_pvct.load_tor)),
+                                                   ABS(luenberger->out.est_load_tor)),
                                          lo->ref_i_dq.q);
         }
 

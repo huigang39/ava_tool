@@ -14,6 +14,11 @@ extern "C" {
 u8 crc8(const void *data, usize size);
 
 /**
+ * @brief Modbus CRC16 计算
+ */
+u16 crc16_modbus(const void *data, usize size);
+
+/**
  * @brief CRC32 计算
  *
  * @param data 待计算的数据

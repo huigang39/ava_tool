@@ -5,7 +5,7 @@
 /*                                  接口定义                                  */
 /* -------------------------------------------------------------------------- */
 
-int
+i32
 iir_init(iir_filter_t *iir, const iir_cfg_t iir_cfg)
 {
         DECL(iir, cfg, lo);

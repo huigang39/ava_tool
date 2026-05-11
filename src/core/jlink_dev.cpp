@@ -3,7 +3,8 @@
 
 #include "imgui.h"
 
-#include "jlink_dev.hpp"
+#include "core/jlink_dev.hpp"
+#include "app_log.hpp"
 
 JLinkDev &
 JLinkDev::instance()
@@ -36,12 +37,15 @@ JLinkDev::close()
 {
         std::lock_guard lk(mtx_);
         if (hssRunning_) {
+                LOG_I("Stopping HSS...");
                 JLINK_HSS_Stop();
                 hssRunning_ = false;
         }
         if (isOpen_) {
+                LOG_I("Closing JLink connection...");
                 JLINKARM_Close();
                 isOpen_ = false;
+                LOG_I("JLink closed.");
         }
         isConnected_ = false;
 }
@@ -52,8 +56,10 @@ JLinkDev::connect()
         std::lock_guard lk(mtx_);
         lastErr_.clear(); // Clear previous error on new attempt
 
+        LOG_I("JLinkDev::connect() attempt");
         if (!isOpen_) {
                 lastErr_ = "not open";
+                LOG_E("JLinkDev::connect() FAILED: J-Link not open");
                 return false;
         }
 
@@ -62,21 +68,27 @@ JLinkDev::connect()
         char ack[256] = {0};
         if (JLINKARM_ExecCommand(cmd, ack, sizeof(ack)) < 0) {
                 lastErr_ = std::string("ExecCommand(Device): ") + ack;
+                LOG_E("JLinkDev::connect() FAILED: ExecCommand Device failed: %s", ack);
                 return false;
         }
+        LOG_I("JLinkDev::connect(): Device set to %s", deviceName_.c_str());
 
         if (JLINKARM_TIF_Select(JLINKARM_TIF_SWD) < 0) {
                 lastErr_ = "TIF_Select(SWD) failed";
+                LOG_E("JLinkDev::connect() FAILED: TIF_Select(SWD) failed");
                 return false;
         }
         JLINKARM_SetSpeed(static_cast<u32>(speedKHz_));
+        LOG_I("JLinkDev::connect(): TIF SWD selected, speed %d KHz", speedKHz_);
 
         if (JLINKARM_Connect() < 0) {
                 lastErr_     = "Connect failed (Check power/cable or replug J-Link)";
                 isConnected_ = false;
+                LOG_E("JLinkDev::connect() FAILED: JLINKARM_Connect() < 0");
                 return false;
         }
         isConnected_ = true;
+        LOG_I("JLinkDev::connect() SUCCEEDED");
         return true;
 }
 
@@ -99,11 +111,12 @@ JLinkDev::writeMem(const u32 addr, const u32 numBytes, const void *src)
 }
 
 bool
-JLinkDev::hssStart(const std::vector<HssBlock> &blocks, const int periodUs)
+JLinkDev::hssStart(const std::vector<HssBlock> &blocks, const i32 periodUs)
 {
         std::lock_guard lk(mtx_);
         if (!isOpen_ || !isConnected_) {
                 lastErr_ = "HSS: not connected";
+                LOG_E("JLinkDev::hssStart() FAILED: not connected");
                 return false;
         }
         if (blocks.empty()) {
@@ -125,24 +138,26 @@ JLinkDev::hssStart(const std::vector<HssBlock> &blocks, const int periodUs)
                 frameSize         += blocks[i].numBytes;
         }
 
-        int effectivePeriodUs = periodUs;
+        i32 effectivePeriodUs = periodUs;
         if (effectivePeriodUs > 100000) {
                 // HSS hardware typically doesn't support frequencies below 10Hz stably.
                 // Clamping to 100ms period. For lower frequencies, use POLL mode.
                 effectivePeriodUs = 100000;
         }
 
-        int res = JLINK_HSS_Start(descs.data(), static_cast<i32>(descs.size()), effectivePeriodUs, 1);
+        LOG_I("JLinkDev::hssStart(): starting with %zu blocks, period %d us", descs.size(), effectivePeriodUs);
+        i32 res = JLINK_HSS_Start(descs.data(), static_cast<i32>(descs.size()), effectivePeriodUs, 1);
         if (res < 0) {
                 char buf[128];
                 snprintf(buf, sizeof(buf), "HSS Error: HW rejected period %dus. Min 10Hz recommended.", effectivePeriodUs);
                 lastErr_ = buf;
-                print_info(false, "%s", buf);
+                LOG_E("JLinkDev::hssStart() FAILED: %s", buf);
                 return false;
         }
+        LOG_I("JLinkDev::hssStart() SUCCEEDED");
 
         hssRunning_   = true;
-        hssFrameSize_ = static_cast<int>(frameSize);
+        hssFrameSize_ = static_cast<i32>(frameSize);
         hssPeriodUs_  = effectivePeriodUs;
         lastErr_.clear();
         return true;
@@ -160,7 +175,7 @@ JLinkDev::hssStop()
         }
 }
 
-int
+i32
 JLinkDev::hssRead(void *buf, const u32 bufSize)
 {
         std::lock_guard lk(mtx_);

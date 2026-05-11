@@ -5,21 +5,21 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-
+#include <mutex>
 
 #include "module.h"
-
 #include "GLFW/glfw3.h"
 
-#include "monitor.hpp"
-#include "parser.hpp"
-
+#include "gui/variable.hpp"
+#include "gui/monitor.hpp"
 
 class Gui
 {
       public:
-        using MonitorMapType = std::unordered_map<std::string, std::unique_ptr<Monitor>>;
-        using ParserMapType  = std::unordered_map<std::string, std::unique_ptr<Parser>>;
+        using MonitorMapType  = std::unordered_map<std::string, std::shared_ptr<Monitor>>;
+        using VariableMapType = std::unordered_map<std::string, std::shared_ptr<Variable>>;
+
+        static std::string getAppDir();
 
       private:
         static void glfwErrCb(int err, const char *desc);
@@ -36,17 +36,23 @@ class Gui
         int         windowWidth_{1280}, windowHeight_{720};
         f32         xScale_{}, yScale_{};
 
-        MonitorMapType monitors_{};
-        std::mutex     mtxMonitors_{};
-        ParserMapType  parsers_{};
+        MonitorMapType  monitors_{};
+        mutable std::mutex      mtxMonitors_{};
+        VariableMapType vars_{};
 
-        static constexpr const char *sessionPath_ = "session.json";
+        std::string currentSessionPath_ = "session.ava";
+        bool        isModified_         = false;
+        bool        showQuitModal_      = false;
+        bool        wantsToQuit_        = false;
+        bool        isFirstSave_        = true;
+        f32         saveToastAlpha_     = 0.0f;
 
         void drawBar();
-        void loadSession();
-        void saveSession() const;
+        void loadSession(const std::string &path = "");
+        void saveSession(const std::string &path = "");
+        void saveSessionAs();
         void drawCalculator();
-        void syncSymbolAddresses(const ElfInfo &elfInfo);
+        void syncSymbolAddresses(const std::vector<SearchEntry> &searchPool);
 
         struct MotorProfile {
                 char  modelName[64] = "Motor_A";
@@ -64,13 +70,14 @@ class Gui
         bool showCalculator_{false};
 
       public:
-        Gui();
+        Gui(const std::string &initialPath = "");
         ~Gui();
 
         void loop();
+        void hide();
 
         MonitorMapType &getMonitors() { return monitors_; }
-        std::mutex     &getMonitorMtx() { return mtxMonitors_; }
+        std::mutex     &getMonitorMtx() { return mtxMonitors_; } 
 
         static std::vector<std::string> &getDroppedFiles() { return sDroppedFiles_; }
         static void                      clearDroppedFiles() { sDroppedFiles_.clear(); }

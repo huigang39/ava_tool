@@ -11,9 +11,9 @@ extern void foc_enable(foc_t *foc);
 
 extern void foc_set_force_vel_ref(foc_t *foc, f32 ref_id, f32 ref_vel, f32 exec_freq);
 
-static int foc_offset_elec_theta_cali(foc_t *foc);
-static int foc_nonlinear_elec_theta_cali(foc_t *foc);
-static int foc_nonlinear_outshaft_theta_cali(foc_t *foc);
+static i32 foc_offset_elec_theta_cali(foc_t *foc);
+static i32 foc_nonlinear_elec_theta_cali(foc_t *foc);
+static i32 foc_nonlinear_outshaft_theta_cali(foc_t *foc);
 
 // TODO 出轴方向辨识
 
@@ -23,7 +23,7 @@ static int foc_nonlinear_outshaft_theta_cali(foc_t *foc);
  * @param foc FOC 结构体
  * @return    int 状态码
  */
-int
+i32
 foc_offset_elec_theta_cali(foc_t *foc)
 {
         DECL(foc, cfg, in, lo, tmp);
@@ -31,9 +31,9 @@ foc_offset_elec_theta_cali(foc_t *foc)
         switch (lo->e_cali_state) {
                 case FOC_CALI_STATE_INIT: {
                         tmp->elec_theta_offset_sum                   = 0.0f;
-                        tmp->elec_theta_dir_cali_cnt                 = 0.0f;
-                        tmp->elec_theta_offset_cali_cycle_cnt        = 0.0f;
-                        tmp->elec_theta_offset_cali_sample_delay_cnt = 0.0f;
+                        tmp->elec_theta_dir_cali_cnt                 = 0;
+                        tmp->elec_theta_offset_cali_cycle_cnt        = 0;
+                        tmp->elec_theta_offset_cali_sample_delay_cnt = 0;
                         tmp->e_prev_elec_theta                       = lo->e_elec_theta;
                         tmp->e_prev_mode                             = lo->e_mode;
                         in->rotor.sensor.elec_offset_theta           = 0.0f;
@@ -135,7 +135,7 @@ foc_offset_elec_theta_cali(foc_t *foc)
  * @param foc FOC 结构体
  * @return    int 状态码
  */
-int
+i32
 foc_nonlinear_elec_theta_cali(foc_t *foc)
 {
         DECL(foc, cfg, in, lo, tmp);
@@ -183,7 +183,7 @@ foc_nonlinear_elec_theta_cali(foc_t *foc)
  * @param foc FOC 结构体
  * @return    int 状态码
  */
-int
+i32
 foc_nonlinear_outshaft_theta_cali(foc_t *foc)
 {
         DECL(foc, cfg, in, lo, tmp);
@@ -228,12 +228,12 @@ foc_nonlinear_outshaft_theta_cali(foc_t *foc)
  * @param foc FOC 结构体
  * @return    int 状态码
  */
-int
+i32
 foc_cali(foc_t *foc)
 {
         DECL(foc, cfg, in, lo, tmp);
 
-        int ret;
+        i32 ret;
 
         /* ---------------------------------- 电角度校准 --------------------------------- */
 

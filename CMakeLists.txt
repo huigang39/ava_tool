@@ -12,10 +12,58 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 find_package(OpenGL REQUIRED)
 
-set(DIR_MODULE ${PROJECT_SOURCE_DIR}/module)
-set(DIR_THIRDPARTY ${PROJECT_SOURCE_DIR}/thirdparty)
-set(DIR_GUI ${PROJECT_SOURCE_DIR}/gui)
+# --- Platform & Architecture Detection ---
+if(WIN32)
+    set(OS_DIR "win")
+    add_definitions(-D_CRT_SECURE_NO_WARNINGS)
+elseif(APPLE)
+    set(OS_DIR "macos")
+else()
+    set(OS_DIR "linux")
+endif()
 
+if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+        set(ARCH_DIR "arm64")
+    else()
+        set(ARCH_DIR "x64")
+    endif()
+else()
+    set(ARCH_DIR "x86")
+endif()
+
+message(STATUS "Build Platform: ${OS_DIR} Arch: ${ARCH_DIR}")
+
+# --- Compiler Specific Flags ---
+if(MSVC)
+    add_compile_options(/W3 /utf-8 /MP /experimental:c11atomics)
+    add_definitions(-DNOMINMAX -D_USE_MATH_DEFINES)
+else()
+    add_compile_options(-Wall -Wextra -O3)
+    if(APPLE)
+        add_compile_options(-fobjc-arc)
+    endif()
+endif()
+
+# --- Directories ---
+set(DIR_SRC ${PROJECT_SOURCE_DIR}/src)
+set(DIR_CORE ${DIR_SRC}/core)
+set(DIR_GUI ${DIR_SRC}/gui)
+set(DIR_THIRDPARTY ${PROJECT_SOURCE_DIR}/thirdparty)
+set(DIR_MODULE ${PROJECT_SOURCE_DIR}/module)
+
+# --- Module Library (Native CMake) ---
+file(GLOB SRC_MODULE "${DIR_MODULE}/src/*.c")
+add_library(module STATIC ${SRC_MODULE})
+if(MSVC)
+    set_source_files_properties(${SRC_MODULE} PROPERTIES LANGUAGE CXX)
+endif()
+target_include_directories(module PUBLIC ${DIR_MODULE} ${DIR_MODULE}/inc)
+if(WIN32)
+    target_link_libraries(module PRIVATE ws2_32)
+endif()
+
+# --- Thirdparty Sources ---
 set(SRC_IMGUI
         ${DIR_THIRDPARTY}/imgui/imgui.cpp
         ${DIR_THIRDPARTY}/imgui/imgui_demo.cpp
@@ -32,51 +80,32 @@ set(SRC_IMPLOT
         ${DIR_THIRDPARTY}/implot/implot_items.cpp
 )
 
-set(SRC
+set(SRC_THIRDPARTY
         ${SRC_IMGUI}
         ${SRC_IMPLOT}
         ${DIR_THIRDPARTY}/ImGuiFileDialog/ImGuiFileDialog.cpp
         ${DIR_THIRDPARTY}/cJSON/cJSON.c
+)
+
+# --- Main Executable ---
+add_executable(${PROJECT_NAME} WIN32
+        ${DIR_SRC}/main.cpp
         ${DIR_GUI}/gui.cpp
         ${DIR_GUI}/monitor.cpp
-        ${DIR_GUI}/parser.cpp
-        ${DIR_GUI}/elf_parser.cpp
-        ${DIR_GUI}/dwarf_parser.cpp
-        ${DIR_GUI}/jlink_dev.cpp
+        ${DIR_GUI}/variable.cpp
+        ${DIR_CORE}/elf_parser.cpp
+        ${DIR_CORE}/dwarf_parser.cpp
+        ${DIR_CORE}/json_parser.cpp
+        ${DIR_CORE}/bin_parser.cpp
+        ${DIR_CORE}/jlink_dev.cpp
+        ${SRC_THIRDPARTY}
 )
-
-set(MODULE_MAKE_TARGET all)
-
-if (UNIX)
-    set(MODULE_LIB_DIR ${DIR_MODULE}/lib/module/linux)
-elseif (WIN32)
-    set(MODULE_LIB_DIR ${DIR_MODULE}/lib/module/win)
-endif ()
-set(MODULE_LIB ${MODULE_LIB_DIR}/module.a)
-
-find_program(MAKE_PROGRAM make mingw32-make)
-if (NOT MAKE_PROGRAM)
-    message(FATAL_ERROR "make not found. please install make (MinGW/MSYS2 on Windows)")
-endif ()
-
-add_custom_target(module_build
-        COMMAND ${MAKE_PROGRAM} ${MODULE_MAKE_TARGET}
-        WORKING_DIRECTORY ${DIR_MODULE}
-        COMMENT "building module static library using Makefile"
-        BYPRODUCTS ${MODULE_LIB}
-)
-
-add_executable(${PROJECT_NAME}
-        main.cpp
-        ${SRC}
-)
-
-add_dependencies(${PROJECT_NAME} module_build)
 
 target_include_directories(${PROJECT_NAME} PRIVATE
-        ${DIR_MODULE}
+        ${DIR_SRC}
+        ${DIR_CORE}
+        ${DIR_GUI}
         ${DIR_MODULE}/inc
-
         ${DIR_THIRDPARTY}/imgui
         ${DIR_THIRDPARTY}/imgui/backends
         ${DIR_THIRDPARTY}/implot
@@ -84,47 +113,78 @@ target_include_directories(${PROJECT_NAME} PRIVATE
         ${DIR_THIRDPARTY}/ImGuiNotify/win32/backends
         ${DIR_THIRDPARTY}/ImGuiNotify/win32/fonts
         ${DIR_THIRDPARTY}/GLFW/inc
-        ${DIR_THIRDPARTY}/GLFW/inc/GLFW
         ${DIR_THIRDPARTY}/cJSON
-
-        ${DIR_GUI}
 )
 
-target_link_directories(${PROJECT_NAME} PRIVATE
-        ${MODULE_LIB_DIR}
-)
-
-if (UNIX)
+# --- External Libraries Mapping ---
+if(WIN32)
+    set(GLFW3_LIB ${DIR_THIRDPARTY}/GLFW/lib/win/glfw3.lib)
+    if(ARCH_DIR STREQUAL "arm64")
+        set(JLINK_LIB ${DIR_MODULE}/lib/win/JLink_arm64.lib)
+    else()
+        set(JLINK_LIB ${DIR_MODULE}/lib/win/JLink_x64.lib)
+    endif()
+    set(FFTW_LIB ${DIR_MODULE}/lib/win/libfftw3f-3.lib)
+    if(ARCH_DIR STREQUAL "arm64")
+        set(DLL_LIST
+            ${DIR_THIRDPARTY}/GLFW/lib/win/glfw3.dll
+            ${DIR_MODULE}/lib/win/JLink_arm64.dll
+            ${DIR_MODULE}/lib/win/libfftw3f-3.dll
+        )
+    else()
+        set(DLL_LIST
+            ${DIR_THIRDPARTY}/GLFW/lib/win/glfw3.dll
+            ${DIR_MODULE}/lib/win/JLink_x64.dll
+            ${DIR_MODULE}/lib/win/libfftw3f-3.dll
+        )
+    endif()
+    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 winmm)
+    if(MSVC)
+        # MSVC specific options
+    else()
+        target_link_options(${PROJECT_NAME} PRIVATE -static-libgcc -static-libstdc++)
+    endif()
+elseif(APPLE)
+    # macOS paths (Assuming shared libs are in macos subfolder if provided)
+    set(GLFW3_LIB ${DIR_THIRDPARTY}/GLFW/lib/macos/libglfw.3.dylib)
+    set(JLINK_LIB ${DIR_MODULE}/lib/macos/libjlinkarm.dylib)
+    set(FFTW_LIB ${DIR_MODULE}/lib/macos/libfftw3f.dylib)
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
+else()
+    # Linux paths
     set(GLFW3_LIB ${DIR_THIRDPARTY}/GLFW/lib/linux/libglfw3.so)
     set(JLINK_LIB ${DIR_MODULE}/lib/linux/libjlinkarm.so.8)
-elseif (WIN32)
-    set(GLFW3_LIB ${DIR_THIRDPARTY}/GLFW/lib/win/glfw3.dll)
-    set(JLINK_LIB ${DIR_MODULE}/lib/win/JLink_x64.dll)
-    set(FFTW_LIB ${DIR_MODULE}/lib/win/libfftw3f-3.dll)
-    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32)
-
-    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${GLFW3_LIB}"
-            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${JLINK_LIB}"
-            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${FFTW_LIB}"
-            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-            COMMENT "copying DLL files to output directory"
-    )
-endif ()
+    set(FFTW_LIB fftw3f) # Use system fftw if not provided
+    find_package(OpenGL REQUIRED)
+    find_package(Threads REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
+endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
-        OpenGL::GL
+        module
         ${GLFW3_LIB}
         ${JLINK_LIB}
         ${FFTW_LIB}
-        ${MODULE_LIB}
-        $<$<PLATFORM_ID:Windows>:winmm>
+        $<$<NOT:$<PLATFORM_ID:Darwin>>:OpenGL::GL>
 )
+
+# --- Post-Build: Copy Shared Libraries ---
+if(WIN32)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${DLL_LIST}
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+            COMMENT "copying dynamic libraries to output directory"
+    )
+elseif(APPLE)
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${GLFW3_LIB}" "${JLINK_LIB}" "${FFTW_LIB}"
+            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+            COMMENT "copying dynamic libraries to output directory"
+    )
+endif()
 
 # set(CPACK_PACKAGE_NAME ${PROJECT_NAME})
 # set(CPACK_PACKAGE_VERSION ${AVATOOL_VERSION})

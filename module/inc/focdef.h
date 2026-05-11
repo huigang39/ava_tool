@@ -239,6 +239,7 @@ typedef struct foc_store {
 typedef struct foc_freq_div {
         f32 motor_sensor;    // 电机轴编码器
         f32 outshaft_sensor; // 出轴编码器
+        f32 tor_sensor;      // 扭矩传感器
         f32 cur;             // 电流环
         f32 flux_week;       // 弱磁环
         f32 tor;             // 力矩环
@@ -269,7 +270,8 @@ typedef struct foc_cali_cfg {
 typedef struct foc_sensor_cfg {
         foc_sensor_e     e_sensor;                     // 编码器类型
         foc_elec_theta_e e_elec_theta;                 // 电角度源
-        u32              uart_baudrate;                // 编码器串口波特率
+        u32              theta_uart_baudrate;          // 角度传感器串口波特率
+        u32              tor_uart_baudrate;            // 转矩传感器串口波特率
         u32              outshaft_sensor_enable;       // 启用出轴编码器
         u32              motor_sensor_comp_enable;     // 启用电机轴编码器非线性补偿
         u32              outshaft_sensor_comp_enable;  // 启用出轴编码器非线性补偿
@@ -306,8 +308,8 @@ typedef int (*foc_load_f)(void);
 
 typedef int (*foc_init_f)(void);
 typedef foc_adc_raw_t (*foc_get_adc_raw_f)(void);
-typedef int (*foc_trigger_theta_f)(void);
-typedef f32 (*foc_get_theta_f)(void);
+typedef int (*foc_trigger_f)(void);
+typedef f32 (*foc_get_f)(void);
 
 typedef int (*foc_set_status_f)(u8 status);
 typedef int (*foc_set_pwm_status_f)(foc_pwm_ch_e pwm_ch, u8 status);
@@ -320,16 +322,18 @@ typedef struct foc_func_cfg {
         foc_init_f f_init_periph;          // 外设初始化
         foc_init_f f_init_motor_sensor;    // 电机轴编码器初始化
         foc_init_f f_init_outshaft_sensor; // 出轴编码器初始化
+        foc_init_f f_init_tor_sensor;      // 扭矩传感器初始化
 
         foc_set_status_f     f_set_irq_status; // 中断状态设置
         foc_set_pwm_status_f f_set_pwm_status; // PWM 状态设置
         foc_set_status_f     f_set_drv_status; // 预驱状态设置
 
-        foc_get_adc_raw_f   f_get_adc_raw;            // ADC 原始值获取
-        foc_trigger_theta_f f_trigger_motor_theta;    // 电机轴编码器触发
-        foc_get_theta_f     f_get_motor_theta;        // 电机轴角度获取
-        foc_trigger_theta_f f_trigger_outshaft_theta; // 出轴编码器触发
-        foc_get_theta_f     f_get_outshaft_theta;     // 出轴角度获取
+        foc_get_adc_raw_f f_get_adc_raw;            // ADC 原始值获取
+        foc_get_f         f_get_tor;                // 扭矩获取
+        foc_trigger_f     f_trigger_motor_theta;    // 电机轴编码器触发
+        foc_get_f         f_get_motor_theta;        // 电机轴角度获取
+        foc_trigger_f     f_trigger_outshaft_theta; // 出轴编码器触发
+        foc_get_f         f_get_outshaft_theta;     // 出轴角度获取
 
         foc_set_pwm_duty_f f_set_pwm_duty; // PWM 占空比设置
 } foc_func_cfg_t;
@@ -388,6 +392,7 @@ typedef struct foc_lo {
 
         foc_comm_t motor_sensor_comm;    // 电机轴编码器通信状态数据
         foc_comm_t outshaft_sensor_comm; // 出轴编码器通信状态数据
+        foc_comm_t tor_sensor_comm;      // 扭矩传感器通信状态数据
 
         pid_ctl_t id_pi;        // d 轴电流环 PI 控制器
         pid_ctl_t iq_pi;        // q 轴电流环 PI 控制器

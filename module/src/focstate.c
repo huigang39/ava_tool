@@ -92,7 +92,7 @@ foc_select_theta(foc_t *foc)
                 in->rotor.motor_elec_theta - in->rotor.sensor.elec_offset_theta - in->rotor.elec_obs_theta);
 
         CYCLE_CNT(in->rotor.elec_cycle_cnt, in->rotor.elec_theta, in->rotor.elec_prev_theta);
-        in->rotor.elec_total_theta = (f32)in->rotor.elec_cycle_cnt * TAU + in->rotor.elec_theta;
+        in->rotor.elec_total_theta = (f32)in->rotor.elec_cycle_cnt * (f32)TAU + in->rotor.elec_theta;
 }
 
 void
@@ -168,7 +168,8 @@ foc_enable(foc_t *foc)
         in->stator.v_dq = park(in->stator.v_ab, in->rotor.elec_theta);
         in->stator.v_s  = SQRT(SQ(in->stator.v_dq.d) + SQ(in->stator.v_dq.q));
 
-        in->i_bus = DIV_3_BY_2 * (in->stator.i_dq.d * in->stator.v_dq.d + in->stator.i_dq.q * in->stator.v_dq.q) / in->v_bus;
+        in->i_bus =
+            (f32)(DIV_3_BY_2 * (in->stator.i_dq.d * in->stator.v_dq.d + in->stator.i_dq.q * in->stator.v_dq.q) / in->v_bus);
 
         /* 无感观测器(idq) */
         foc_obs_i_dq(foc);
@@ -233,7 +234,7 @@ foc_enable(foc_t *foc)
         /* 补偿 PWM 采样造成的延迟 */
         if (lo->e_elec_theta != FOC_ELEC_THETA_FORCE) {
                 in->rotor.elec_comp_theta =
-                    cfg->sensor_cfg.elec_theta_delay_comp_cycle * in->rotor.elec_omega / cfg->base_cfg.fs;
+                    (f32)cfg->sensor_cfg.elec_theta_delay_comp_cycle * in->rotor.elec_omega / cfg->base_cfg.fs;
                 WARP_TAU(in->rotor.elec_theta, in->rotor.elec_theta + in->rotor.elec_comp_theta);
         }
 
@@ -282,5 +283,7 @@ foc_svpwm(foc_t *foc)
 
         UVW_MUL(out->f32_v_uvw, out->svpwm.f32_pwm_duty, in->v_bus);
 
-        UVW_MUL(out->svpwm.u32_pwm_duty, out->svpwm.f32_pwm_duty, cfg->base_cfg.periph.pwm_full_cnt);
+        out->svpwm.u32_pwm_duty.u = (u32)(out->svpwm.f32_pwm_duty.u * cfg->base_cfg.periph.pwm_full_cnt);
+        out->svpwm.u32_pwm_duty.v = (u32)(out->svpwm.f32_pwm_duty.v * cfg->base_cfg.periph.pwm_full_cnt);
+        out->svpwm.u32_pwm_duty.w = (u32)(out->svpwm.f32_pwm_duty.w * cfg->base_cfg.periph.pwm_full_cnt);
 }

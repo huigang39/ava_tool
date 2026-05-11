@@ -77,7 +77,7 @@ int shm_init(shm_t *shm, shm_cfg_t shm_cfg);
  * @param dst  待读取的数据目标地址
  * @param size 读取字节数
  */
-void shm_read(shm_t *shm, void *dst, usize size);
+usize shm_read(shm_t *shm, void *dst, usize size);
 
 /**
  * @brief 共享内存数据写入
@@ -86,7 +86,7 @@ void shm_read(shm_t *shm, void *dst, usize size);
  * @param src  待写入的数据源地址
  * @param size 写入字节数
  */
-void shm_write(shm_t *shm, const void *src, usize size);
+usize shm_write(shm_t *shm, const void *src, usize size);
 
 #ifdef __cplusplus
 }

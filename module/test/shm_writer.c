@@ -30,5 +30,6 @@ main()
                        ATOMIC_LOAD(&shm.lo.spsc->wp),
                        ATOMIC_LOAD(&shm.lo.spsc->rp),
                        spsc_free(shm.lo.spsc));
+                delay_ms(1, DELAY_SPIN);
         }
 }

@@ -23,13 +23,13 @@ extern "C" {
 
 /* 正向遍历链表，并将节点转换为宿主结构体 */
 #define LIST_FOR_EACH_ENTRY(entry, head, member)                                                           \
-        for ((entry) = CONTAINER_OF((head)->next, typeof(*(entry)), (member)); &(entry)->member != (head); \
-             (entry) = CONTAINER_OF((entry)->member.next, typeof(*(entry)), (member)))
+        for ((entry) = CONTAINER_OF((head)->next, TYPEOF(*(entry)), (member)); &(entry)->member != (head); \
+             (entry) = CONTAINER_OF((entry)->member.next, TYPEOF(*(entry)), (member)))
 
 /* 反向遍历链表，并将节点转换为宿主结构体 */
 #define LIST_FOR_EACH_ENTRY_REVERSE(entry, head, member)                                                   \
-        for ((entry) = CONTAINER_OF((head)->prev, typeof(*(entry)), (member)); &(entry)->member != (head); \
-             (entry) = CONTAINER_OF((entry)->member.prev, typeof(*(entry)), (member)))
+        for ((entry) = CONTAINER_OF((head)->prev, TYPEOF(*(entry)), (member)); &(entry)->member != (head); \
+             (entry) = CONTAINER_OF((entry)->member.prev, TYPEOF(*(entry)), (member)))
 
 /* -------------------------------------------------------------------------- */
 /*                                  类型定义                                  */

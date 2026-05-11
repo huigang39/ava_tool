@@ -555,6 +555,42 @@ f16_to_f32(const u16 f16_val)
         return u.f;
 }
 
+HAPI void
+f32_sort_asc(f32 *buf, usize len)
+{
+        if (!buf || len < 2)
+                return;
+
+        for (usize gap = len >> 1; gap > 0; gap >>= 1) {
+                for (usize i = gap; i < len; i++) {
+                        f32   temp = buf[i];
+                        usize j;
+                        for (j = i; j >= gap && buf[j - gap] > temp; j -= gap)
+                                buf[j] = buf[j - gap];
+
+                        buf[j] = temp;
+                }
+        }
+}
+
+HAPI void
+f32_sort_desc(f32 *buf, usize len)
+{
+        if (!buf || len < 2)
+                return;
+
+        for (usize gap = len >> 1; gap > 0; gap >>= 1) {
+                for (usize i = gap; i < len; i++) {
+                        f32   temp = buf[i];
+                        usize j;
+                        for (j = i; j >= gap && buf[j - gap] < temp; j -= gap)
+                                buf[j] = buf[j - gap];
+
+                        buf[j] = temp;
+                }
+        }
+}
+
 #ifdef __cplusplus
 }
 #endif

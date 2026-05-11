@@ -3,7 +3,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "dwarf_parser.hpp"
+#include "core/dwarf_parser.hpp"
 
 namespace dwarf {
 
@@ -789,7 +789,7 @@ parseCu(const ElfInfo &elf, u64 &cuOff, Info &out)
         if (cuEnd > total)
                 return false;
 
-        const u8 version = readU16(info, o, total);
+        const u8 version = static_cast<u8>(readU16(info, o, total));
 
         u8  addrSize     = elf.addrSize;
         u64 abbrevOffset = 0;

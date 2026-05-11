@@ -2,14 +2,14 @@
 #include <fstream>
 #include <vector>
 
-#include "elf_parser.hpp"
+#include "core/elf_parser.hpp"
 
 namespace {
 
 constexpr u8 ELF_MAGIC[4] = {0x7F, 'E', 'L', 'F'};
 
-constexpr int EI_CLASS = 4;
-constexpr int EI_DATA  = 5;
+constexpr i32 EI_CLASS = 4;
+constexpr i32 EI_DATA  = 5;
 
 constexpr u8 ELFCLASS32  = 1;
 constexpr u8 ELFCLASS64  = 2;
@@ -246,9 +246,10 @@ parseElf(const std::vector<u8> &buf, ElfInfo &out)
 } // namespace
 
 bool
-ElfParser::parse(const std::string &path, ElfInfo &out)
+ElfParser::parse(const std::string &path)
 {
-        out = ElfInfo{};
+        path_    = path;
+        elfInfo_ = ElfInfo{};
 
         std::vector<u8> buf;
         if (!loadFile(path, buf))
@@ -266,18 +267,23 @@ ElfParser::parse(const std::string &path, ElfInfo &out)
         if (data != ELFDATA2LSB)
                 return false;
 
-        out.isLE = true;
+        elfInfo_.isLE = true;
         if (cls == ELFCLASS32) {
-                out.is64    = false;
-                out.addrSize = 4;
-                return parseElf<Elf32_Ehdr, Elf32_Shdr, Elf32_Sym>(buf, out);
+                elfInfo_.is64     = false;
+                elfInfo_.addrSize = 4;
+                if (!parseElf<Elf32_Ehdr, Elf32_Shdr, Elf32_Sym>(buf, elfInfo_))
+                        return false;
+        } else if (cls == ELFCLASS64) {
+                elfInfo_.is64     = true;
+                elfInfo_.addrSize = 8;
+                if (!parseElf<Elf64_Ehdr, Elf64_Shdr, Elf64_Sym>(buf, elfInfo_))
+                        return false;
+        } else {
+                return false;
         }
-        if (cls == ELFCLASS64) {
-                out.is64    = true;
-                out.addrSize = 8;
-                return parseElf<Elf64_Ehdr, Elf64_Shdr, Elf64_Sym>(buf, out);
-        }
-        return false;
+
+        dwarf::parse(elfInfo_, dwarfInfo_);
+        return true;
 }
 
 const char *

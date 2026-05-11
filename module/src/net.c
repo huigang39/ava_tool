@@ -6,7 +6,7 @@
 /*                                  接口定义                                  */
 /* -------------------------------------------------------------------------- */
 
-int
+int32_t
 net_init(net_t *net, const net_cfg_t net_cfg)
 {
         DECL(net, cfg, lo);
@@ -15,7 +15,7 @@ net_init(net_t *net, const net_cfg_t net_cfg)
 
         list_init(&lo->ch_root);
 
-        int ret = 0;
+        i32 ret = 0;
 #ifdef __linux__
         ret = io_uring_queue_init(cfg->ring_len, &lo->ring, 0);
 #elif defined(_WIN32)
@@ -50,18 +50,18 @@ net_destroy(net_t *net)
 #endif
 }
 
-int
+i32
 net_set_nonblock(sockfd_t fd)
 {
 #ifdef __linux__
-        int flags = fcntl(fd, F_GETFL, 0);
+        i32 flags = fcntl(fd, F_GETFL, 0);
         if (flags < 0)
                 return flags;
 
         flags |= O_NONBLOCK;
         return fcntl(fd, F_SETFL, flags);
 #elif defined(_WIN32)
-        unsigned long mode = 1;
+        u_long mode = 1;
         return ioctlsocket(fd, FIONBIO, &mode);
 #endif
 }
@@ -77,7 +77,7 @@ net_cfg_ch(const u32 det_ip, const u16 dst_port, const net_mode_e e_mode)
         return ch;
 }
 
-int
+i32
 net_add_ch(net_t *net, net_ch_t *ch)
 {
         DECL(net, cfg, lo);
@@ -109,7 +109,7 @@ net_add_ch(net_t *net, net_ch_t *ch)
         };
         dst_addr.sin_addr.s_addr = ch->dst_ip;
 
-        int ret;
+        i32 ret;
         if (ch->src_ip != 0 && ch->src_port != 0) {
                 struct sockaddr_in src_addr = {
                     .sin_family = AF_INET,
@@ -145,7 +145,7 @@ net_sync_send(const net_ch_t *ch, const void *tx_buf, const usize size)
 #ifdef __linux__
         return send(ch->fd, tx_buf, size, 0);
 #elif defined(_WIN32)
-        return send(ch->fd, tx_buf, (int)size, 0);
+        return send(ch->fd, (const char *)tx_buf, (int)size, 0);
 #endif
 }
 
@@ -154,18 +154,18 @@ net_sync_recv_yield(const net_ch_t *ch, void *rx_buf, const usize cap, const u32
 {
 #ifdef __linux__
         const struct timeval tv = {
-            .tv_sec  = (int)US2S(timeout_us),
-            .tv_usec = (int)(timeout_us % 1000000),
+            .tv_sec  = (i32)US2S(timeout_us),
+            .tv_usec = (i32)(timeout_us % 1000000),
         };
         setsockopt(ch->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         return recv(ch->fd, rx_buf, cap, 0);
 #elif defined(_WIN32)
-        DWORD tv_ms = US2MS(timeout_us);
+        DWORD tv_ms = (DWORD)US2MS(timeout_us);
         if (tv_ms == 0 && timeout_us > 0)
                 tv_ms = 1;
 
         setsockopt(ch->fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv_ms, sizeof(tv_ms));
-        return recv(ch->fd, rx_buf, (int)cap, 0);
+        return recv(ch->fd, (char *)rx_buf, (i32)cap, 0);
 #endif
 }
 
@@ -176,16 +176,16 @@ net_sync_recv_spin(const net_ch_t *ch, void *rx_buf, const usize cap, const u32 
         u64       curr_ns  = 0;
         while (curr_ns < start_ns + US2NS(timeout_us)) {
 #ifdef __linux__
-                const int ret = recv(ch->fd, rx_buf, cap, MSG_DONTWAIT);
+                const i32 ret = recv(ch->fd, rx_buf, cap, MSG_DONTWAIT);
 #elif defined(_WIN32)
                 fd_set read_fds;
                 FD_ZERO(&read_fds);
                 FD_SET(ch->fd, &read_fds);
                 struct timeval tv         = {0, 0};
-                const int      select_ret = select(0, &read_fds, NULL, NULL, &tv);
-                int            ret        = -1;
+                const i32      select_ret = select(0, &read_fds, NULL, NULL, &tv);
+                i32            ret        = -1;
                 if (select_ret > 0 && FD_ISSET(ch->fd, &read_fds))
-                        ret = recv(ch->fd, rx_buf, (int)cap, 0);
+                        ret = recv(ch->fd, (char *)rx_buf, (i32)cap, 0);
                 else if (select_ret < 0)
                         return -MESYSERR;
 #endif
@@ -222,7 +222,7 @@ net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size)
         io_uring_submit(&lo->ring);
         return size;
 #elif defined(_WIN32)
-        net_async_req_t *req = mempool_calloc(cfg->mempool, sizeof(net_async_req_t));
+        net_async_req_t *req = (net_async_req_t *)mempool_calloc(cfg->mempool, sizeof(net_async_req_t));
         if (!req)
                 return -MEALLOC;
 
@@ -236,14 +236,14 @@ net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size)
         buf.len = (ULONG)size;
 
         DWORD     tx_size;
-        const int ret = WSASend(ch->fd, &buf, 1, &tx_size, 0, &req->ov, NULL);
+        const i32 ret = WSASend(ch->fd, &buf, 1, &tx_size, 0, &req->ov, NULL);
         if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
                 mempool_free(cfg->mempool, req);
                 return -1;
         }
 
         req->ov.Pointer = req;
-        return tx_size;
+        return (isize)tx_size;
 #endif
 }
 
@@ -280,7 +280,7 @@ net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
 
         return io_uring_submit(&lo->ring);
 #elif defined(_WIN32)
-        net_async_req_t *req = mempool_calloc(cfg->mempool, sizeof(net_async_req_t));
+        net_async_req_t *req = (net_async_req_t *)mempool_calloc(cfg->mempool, sizeof(net_async_req_t));
         if (!req)
                 return -MEALLOC;
 
@@ -296,7 +296,7 @@ net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
 
         DWORD     flags = 0;
         DWORD     rx_size;
-        const int ret = WSARecv(ch->fd, &buf, 1, &rx_size, &flags, &req->ov, NULL);
+        const i32 ret = WSARecv(ch->fd, &buf, 1, &rx_size, &flags, &req->ov, NULL);
         if (ret == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
                 mempool_free(cfg->mempool, req);
                 return -1;
@@ -306,11 +306,11 @@ net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
         if (timeout_us > 0)
                 list_add_tail(&req->pending_node, &lo->pending_reqs);
 
-        return rx_size;
+        return (isize)rx_size;
 #endif
 }
 
-int
+i32
 net_poll(net_t *net)
 {
         DECL(net, cfg, lo);
@@ -372,7 +372,7 @@ net_poll(net_t *net)
         if (!ok && ov == NULL)
                 return 0;
 
-        net_async_req_t *req = ov->Pointer;
+        net_async_req_t *req = (net_async_req_t *)ov->Pointer;
         if (!req)
                 return 0;
 
@@ -380,7 +380,7 @@ net_poll(net_t *net)
                 list_del(&req->pending_node);
 
         if (ATOMIC_EXCHANGE(&req->processed, TRUE) == 0) {
-                req->f_cb(req->ch, req->buf, ok ? (int)size : -1);
+                req->f_cb(req->ch, req->buf, ok ? (i32)size : -1);
                 mempool_free(cfg->mempool, req);
         }
 
@@ -482,15 +482,15 @@ net_send_recv(net_t *net, net_ch_t *ch, void *tx_buf, const usize size, void *rx
         return net_recv(net, ch, rx_buf, cap, timeout_us);
 }
 
-int
+i32
 net_broadcast(const u32 ip, const u16 port, const void *tx_buf, const usize size, net_resp_t *resps, const u32 timeout_us)
 {
         sockfd_t           fd;
         struct sockaddr_in src_addr;
         socklen_t          addr_len;
         usize              start_ts;
-        int                resp_cnt = 0;
-        int                ret;
+        i32                resp_cnt = 0;
+        i32                ret;
         const char         opt = 1;
 
 #ifdef __linux__
@@ -509,15 +509,15 @@ net_broadcast(const u32 ip, const u16 port, const void *tx_buf, const usize size
         dst_addr.sin_addr.s_addr = ip;
 
         addr_len = sizeof(dst_addr);
-        ret      = sendto(fd, tx_buf, (int)size, 0, (struct sockaddr *)&dst_addr, addr_len);
+        ret      = sendto(fd, (const char *)tx_buf, (i32)size, 0, (struct sockaddr *)&dst_addr, addr_len);
         if (ret <= 0)
                 goto cleanup;
 
         addr_len = sizeof(src_addr);
         start_ts = get_mono_ts_us();
         do {
-                ret =
-                    recvfrom(fd, resps[resp_cnt].buf, sizeof(resps[resp_cnt].buf), 0, (struct sockaddr *)&src_addr, &addr_len);
+                ret = recvfrom(
+                    fd, (char *)resps[resp_cnt].buf, sizeof(resps[resp_cnt].buf), 0, (struct sockaddr *)&src_addr, &addr_len);
                 if (ret > 0) {
                         IP_U32_TO_STR(&src_addr.sin_addr, resps[resp_cnt].ip, sizeof(resps[resp_cnt].ip));
                         resp_cnt++;

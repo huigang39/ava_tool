@@ -6,7 +6,7 @@
 /*                                  接口定义                                  */
 /* -------------------------------------------------------------------------- */
 
-int
+i32
 fir_init(fir_filter_t *fir, const fir_cfg_t fir_cfg)
 {
         DECL(fir, cfg, lo);
