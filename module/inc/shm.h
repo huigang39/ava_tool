@@ -1,7 +1,9 @@
 #ifndef SHM_H
 #define SHM_H
 
-#ifdef __linux__
+#include "platdef.h"
+
+#ifdef OS_POSIX
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -22,7 +24,7 @@ extern "C" {
 /* -------------------------------------------------------------------------- */
 
 typedef enum shm_access {
-#ifdef __linux__
+#ifdef OS_POSIX
         SHM_READONLY  = PROT_READ,
         SHM_WRITEONLY = PROT_WRITE,
         SHM_READWRITE = SHM_READONLY | SHM_WRITEONLY,
@@ -42,7 +44,7 @@ typedef struct shm_cfg {
 } shm_cfg_t;
 
 typedef struct shm_lo {
-#ifdef __linux__
+#ifdef OS_POSIX
         int fd;
 #elif defined(_WIN32)
         HANDLE fd;

@@ -8,8 +8,8 @@
 #define MAX_FSA_NUM        (1)
 #define RMAIO_PORT         (2340)
 #define MEMPOOL_SIZE       (SIZE_4MB)
-#define LOG_BUF_SIZE       (SIZE_2MB)
 #define LOG_FLUSH_BUF_SIZE (SIZE_2KB)
+#define LOG_CHUNK_SIZE     (SIZE_4KB)
 #define LOG_FILE_SIZE      (1 * SIZE_1KB) // 日志文件大小限制为 1KB (环形缓冲区)
 
 static void
@@ -27,7 +27,7 @@ const net_cfg_t g_net_cfg = {
     .f_get_ts = get_real_ts_us,
 };
 
-u8        g_mempool_buf[MEMPOOL_SIZE];
+NO_ASAN ALIGN(SIZE_16KB) u8 g_mempool_buf[MEMPOOL_SIZE];
 mempool_t g_mempool = {
     .buf = g_mempool_buf,
     .cap = sizeof(g_mempool_buf),
@@ -170,11 +170,12 @@ main(void)
         const log_cfg_t log_cfg = {
             .e_mode     = LOG_MODE_SYNC,
             .e_level    = LOG_LEVEL_DATA,
+            .e_format   = LOG_FORMAT_TEXT,
             .mempool    = &g_mempool,
             .fd         = file,
             .file_size  = LOG_FILE_SIZE,
-            .e_ring     = LOG_RING_COMPLETE,
-            .cap        = LOG_BUF_SIZE,
+            .e_ring     = LOG_RING_TRUNCATE,
+            .chunk_size = LOG_CHUNK_SIZE,
             .flush_cap  = LOG_FLUSH_BUF_SIZE,
             .nproducers = MAX_FSA_NUM,
             .f_get_ts   = get_real_ts_us,

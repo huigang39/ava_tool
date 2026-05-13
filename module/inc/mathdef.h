@@ -1,12 +1,16 @@
 #ifndef MATHDEF_H
 #define MATHDEF_H
 
+#include "platdef.h"
+
 #ifdef ARM_MATH
 #include "arm_math.h"
 #endif
 
-#if defined(__linux__) || defined(_WIN32)
+#if defined(OS_HOSTED) && defined(ARCH_X86_FAMILY)
 #include <immintrin.h>
+#elif defined(OS_HOSTED) && defined(ARCH_ARM64) && defined(HAS_NEON)
+#include <arm_neon.h>
 #endif
 
 #include <math.h>
@@ -432,6 +436,36 @@ find_max(const f32 *arr, const usize n, f32 *max_val, usize *max_idx)
 
                 f32 tmp[4];
                 _mm_storeu_ps(tmp, max_vec);
+                for (int j = 0; j < 4; j++) {
+                        if (tmp[j] > tmp_max) {
+                                tmp_max = tmp[j];
+                                idx_max = i + j;
+                        }
+                }
+        }
+
+        for (; i < n; i++) {
+                if (arr[i] > tmp_max) {
+                        tmp_max = arr[i];
+                        idx_max = i;
+                }
+        }
+
+        *max_val = tmp_max;
+        *max_idx = idx_max;
+
+#elif defined(HAS_NEON)
+        usize       i       = 0;
+        float32x4_t max_vec = vdupq_n_f32(arr[0]);
+        f32         tmp_max = arr[0];
+        usize       idx_max = 0;
+
+        for (; i + 3 < n; i += 4) {
+                const float32x4_t v = vld1q_f32(arr + i);
+                max_vec             = vmaxq_f32(max_vec, v);
+
+                f32 tmp[4];
+                vst1q_f32(tmp, max_vec);
                 for (int j = 0; j < 4; j++) {
                         if (tmp[j] > tmp_max) {
                                 tmp_max = tmp[j];

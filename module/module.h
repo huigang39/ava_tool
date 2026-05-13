@@ -37,6 +37,7 @@
 #include "inc/fastmath.h"
 #include "inc/macrodef.h"
 #include "inc/mathdef.h"
+#include "inc/platdef.h"
 #include "inc/typedef.h"
 
 #include "inc/benchmark.h"

@@ -17,20 +17,6 @@ mempool_is_valid_ptr(const mempool_t *mempool, const void *ptr)
 }
 
 /**
- * @brief 获取块的下一个相邻块
- */
-static mempool_blk_t *
-mempool_get_next_block(const mempool_t *mempool, const mempool_blk_t *blk)
-{
-        const u8 *next_addr = (const u8 *)blk + blk->size;
-        const u8 *buf_end   = (const u8 *)mempool->buf + mempool->offset;
-        if (next_addr >= buf_end)
-                return NULL; // 超出已分配区域
-
-        return (mempool_blk_t *)next_addr;
-}
-
-/**
  * @brief 在空闲链表中查找最佳匹配块
  */
 static mempool_blk_t *
@@ -70,44 +56,28 @@ mempool_insert_free_block_ordered(const mempool_t *mp, mempool_blk_t *blk)
 
 /**
  * @brief 尝试合并相邻的空闲块
- * @note 调用此函数前，blk 必须已经在空闲链表中
+ * @note 调用此函数前，blk 必须已经按地址有序插入空闲链表。
+ *       基于地址有序不变量，prev/next 链表邻居就是空间上的潜在邻居，O(1) 完成。
  */
 static void
 mempool_merge_adjacent_blocks(const mempool_t *mp, mempool_blk_t *blk)
 {
-        // 检查是否可以与前一个块合并
-        // 遍历空闲链表，查找地址紧邻当前块之前的块
-        list_head_t   *node;
-        mempool_blk_t *prev_blk = NULL;
-        LIST_FOR_EACH(node, &mp->blk_root)
-        {
-                mempool_blk_t *candidate = CONTAINER_OF(node, mempool_blk_t, blk_node);
-                if ((u8 *)candidate + candidate->size == (u8 *)blk) {
-                        prev_blk = candidate;
-                        break;
+        list_head_t *prev_node = blk->blk_node.prev;
+        if (prev_node != &mp->blk_root) {
+                mempool_blk_t *prev_blk = CONTAINER_OF(prev_node, mempool_blk_t, blk_node);
+                if ((u8 *)prev_blk + prev_blk->size == (u8 *)blk) {
+                        list_del(&blk->blk_node);
+                        prev_blk->size += blk->size;
+                        blk             = prev_blk;
                 }
         }
 
-        if (prev_blk) {
-                // 找到前一个相邻空闲块，合并到前一个块
-                list_del(&blk->blk_node); // 从链表中移除当前块
-                prev_blk->size += blk->size;
-                blk             = prev_blk; // 更新当前块指针为合并后的块
-        }
-
-        // 检查是否可以与后一个块合并
-        const mempool_blk_t *next_blk = mempool_get_next_block(mp, blk);
-        if (next_blk) {
-                // 检查后一个块是否在空闲链表中
-                LIST_FOR_EACH(node, &mp->blk_root)
-                {
-                        const mempool_blk_t *candidate = CONTAINER_OF(node, mempool_blk_t, blk_node);
-                        if (candidate == next_blk) {
-                                // 合并后一个块到当前块
-                                list_del(node);
-                                blk->size += next_blk->size;
-                                break;
-                        }
+        list_head_t *next_node = blk->blk_node.next;
+        if (next_node != &mp->blk_root) {
+                mempool_blk_t *next_blk = CONTAINER_OF(next_node, mempool_blk_t, blk_node);
+                if ((u8 *)blk + blk->size == (u8 *)next_blk) {
+                        list_del(next_node);
+                        blk->size += next_blk->size;
                 }
         }
 }

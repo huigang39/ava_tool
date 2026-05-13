@@ -3,8 +3,8 @@ PROJECT_DIR               := $(CURDIR)
 
 KEIL_PATH                 ?= C:/Keil_v5
 
-COMPILER                  ?= gcc
-OPTIMIZATION              := -O3
+# COMPILER 默认值会根据下方宿主平台自动选择 (msvc / clang / gcc)
+OPTIMIZATION              := -O2
 
 SRC_DIR                   := src
 BUILD_DIR                 := build
@@ -22,6 +22,8 @@ FMT_EXCLUDE_DIRS          :=
 
 ifeq ($(OS),Windows_NT)
     PLATFORM              := win
+    ARCH                  ?= $(if $(filter AMD64,$(PROCESSOR_ARCHITECTURE)),x86_64,$(if $(filter ARM64,$(PROCESSOR_ARCHITECTURE)),arm64,x86_64))
+    COMPILER              ?= msvc
     SHELL                 := cmd.exe
     ECHO_NL               := echo.
 define MKDIR
@@ -31,7 +33,29 @@ define RMDIR
 	@if exist "$(subst /,\,$(1))" rd /s /q "$(subst /,\,$(1))" 2>nul
 endef
 else
-    PLATFORM              := linux
+    UNAME_S               := $(shell uname -s)
+    UNAME_M               := $(shell uname -m)
+    ifeq ($(UNAME_S),Darwin)
+        PLATFORM          ?= mac
+        COMPILER          ?= clang
+    else ifeq ($(UNAME_S),Linux)
+        PLATFORM          ?= linux
+        COMPILER          ?= gcc
+    else
+        PLATFORM          ?= linux
+        COMPILER          ?= gcc
+    endif
+    ifeq ($(UNAME_M),x86_64)
+        ARCH              ?= x86_64
+    else ifeq ($(UNAME_M),amd64)
+        ARCH              ?= x86_64
+    else ifeq ($(UNAME_M),arm64)
+        ARCH              ?= arm64
+    else ifeq ($(UNAME_M),aarch64)
+        ARCH              ?= arm64
+    else
+        ARCH              ?= $(UNAME_M)
+    endif
     SHELL                 := /bin/bash
     ECHO_NL               := echo
 define MKDIR
@@ -45,22 +69,19 @@ endif
 AC5_COMPILER_PATH         := $(KEIL_PATH)/ARM/ARMCC/bin
 AC5_COMPILER_EXE          := armcc.exe
 AC5_ARCHIVER_EXE          := armar.exe
-
-AC6_COMPILER_PATH         := $(KEIL_PATH)/ARM/ARMCLANG/bin
-AC6_COMPILER_EXE          := armclang.exe
-AC6_ARCHIVER_EXE          := armar.exe
-
-GCC_COMPILER_EXE          := gcc
-GCC_ARCHIVER_EXE          := ar
-
 AC5_MCU_DEFINE            := -DMCU
 AC5_MCU_STATIC_LIB        := $(PROJECT_NAME).lib
 AC5_MCU_CFLAGS            := -c $(OPTIMIZATION) -g --cpu=Cortex-M7 --apcs=interwork
 
+AC6_COMPILER_PATH         := $(KEIL_PATH)/ARM/ARMCLANG/bin
+AC6_COMPILER_EXE          := armclang.exe
+AC6_ARCHIVER_EXE          := armar.exe
 AC6_MCU_DEFINE            := -DMCU
 AC6_MCU_STATIC_LIB        := $(PROJECT_NAME).lib
 AC6_MCU_CFLAGS            := -c $(OPTIMIZATION) -g --target=arm-arm-none-eabi -mcpu=Cortex-M7 -mfloat-abi=hard -mfpu=fpv5-d16
 
+GCC_COMPILER_EXE          := gcc
+GCC_ARCHIVER_EXE          := ar
 GCC_MCU_DEFINE            := -DMCU
 GCC_MCU_STATIC_LIB        := $(PROJECT_NAME).a
 GCC_MCU_CFLAGS            := -c $(OPTIMIZATION) -g -Wall -mcpu=cortex-m7 -mfloat-abi=hard -mfpu=fpv5-d16
@@ -71,15 +92,35 @@ GCC_LINUX_SHARED_LIB      := $(PROJECT_NAME).so
 GCC_LINUX_CFLAGS          := -c $(OPTIMIZATION) -g -Wall -Wextra -fPIC
 GCC_LINUX_LDFLAGS         := -shared -fPIC
 GCC_LINUX_LIB_DIRS        := -Llib/linux
-GCC_LINUX_LDLIBS          := -luring
+GCC_LINUX_LDLIBS          := -lfftw3f -luring -lpthread -lm
 
-GCC_WIN_DEFINE            := -DWIN
-GCC_WIN_STATIC_LIB        := $(PROJECT_NAME).a
-GCC_WIN_SHARED_LIB        := $(PROJECT_NAME).dll
-GCC_WIN_CFLAGS            := -c $(OPTIMIZATION) -g -Wall -Wextra -fPIC
-GCC_WIN_LDFLAGS           := -shared -fPIC
-GCC_WIN_LIB_DIRS          := -Llib/win
-GCC_WIN_LDLIBS            := -lfftw3f-3 -lws2_32
+# MSVC (cl.exe / lib.exe / link.exe)，仅 Windows 可用
+# 需在 "x64 Native Tools Command Prompt" 中运行以加载 vcvarsall.bat
+MSVC_COMPILER_EXE         := cl.exe
+MSVC_ARCHIVER_EXE         := lib.exe
+MSVC_LINKER_EXE           := link.exe
+MSVC_OPTIMIZATION         := /O2
+MSVC_WIN_DEFINE           := /DWIN
+MSVC_WIN_STATIC_LIB       := $(PROJECT_NAME).lib
+MSVC_WIN_SHARED_LIB       := $(PROJECT_NAME).dll
+MSVC_WIN_CFLAGS           := /c $(MSVC_OPTIMIZATION) /Zi /W3 /nologo /TC /MD
+MSVC_WIN_LDFLAGS          := /DLL /nologo /DEBUG
+MSVC_WIN_LIB_DIRS         := /LIBPATH:lib/win
+MSVC_WIN_LDLIBS           := libfftw3f-3.lib ws2_32.lib
+
+# macOS 默认使用 Apple Clang，Homebrew 安装前缀按架构区分
+ifeq ($(ARCH),arm64)
+    MAC_BREW_PREFIX       ?= /opt/homebrew
+else
+    MAC_BREW_PREFIX       ?= /usr/local
+endif
+CLANG_MAC_DEFINE          := -DMAC
+CLANG_MAC_STATIC_LIB      := $(PROJECT_NAME).a
+CLANG_MAC_SHARED_LIB      := $(PROJECT_NAME).dylib
+CLANG_MAC_CFLAGS          := -c $(OPTIMIZATION) -g -Wall -Wextra -fPIC -I$(MAC_BREW_PREFIX)/include
+CLANG_MAC_LDFLAGS         := -dynamiclib -fPIC -L$(MAC_BREW_PREFIX)/lib
+CLANG_MAC_LIB_DIRS        := -L$(MAC_BREW_PREFIX)/lib
+CLANG_MAC_LDLIBS          := -lfftw3f -lpthread -lm
 
 ifneq ($(COMPILER),)
     ifeq ($(COMPILER),ac5)
@@ -90,7 +131,7 @@ ifneq ($(COMPILER),)
             STATIC_LIB    := $(AC5_MCU_STATIC_LIB)
             PLATFORM_DIR  := mcu
         else
-            $(error ac5 only supports mcu platform)
+            $(error ac5 仅支持 mcu 平台)
         endif
     else ifeq ($(COMPILER),ac6)
         ifeq ($(PLATFORM),mcu)
@@ -100,10 +141,10 @@ ifneq ($(COMPILER),)
             STATIC_LIB    := $(AC6_MCU_STATIC_LIB)
             PLATFORM_DIR  := mcu
         else
-            $(error ac6 only supports mcu platform)
+            $(error ac6 仅支持 mcu 平台)
         endif
     else ifeq ($(COMPILER),gcc)
-    	ifeq ($(PLATFORM),mcu)
+        ifeq ($(PLATFORM),mcu)
             CC            := $(GCC_COMPILER_EXE)
             AR            := $(GCC_ARCHIVER_EXE)
             CFLAGS        := $(GCC_MCU_CFLAGS) $(GCC_MCU_DEFINE)
@@ -118,27 +159,54 @@ ifneq ($(COMPILER),)
             STATIC_LIB    := $(GCC_LINUX_STATIC_LIB)
             SHARED_LIB    := $(GCC_LINUX_SHARED_LIB)
             PLATFORM_DIR  := linux
-        else ifeq ($(PLATFORM),win)
-            CC            := $(GCC_COMPILER_EXE)
-            AR            := $(GCC_ARCHIVER_EXE)
-            CFLAGS        := $(GCC_WIN_CFLAGS) $(GCC_WIN_DEFINE)
-            LDFLAGS       := $(GCC_WIN_LDFLAGS) $(GCC_WIN_LIB_DIRS)
-            LDLIBS        := $(GCC_WIN_LDLIBS)
-            STATIC_LIB    := $(GCC_WIN_STATIC_LIB)
-            SHARED_LIB    := $(GCC_WIN_SHARED_LIB)
+        else
+            $(error gcc 不支持该平台: $(PLATFORM))
+        endif
+    else ifeq ($(COMPILER),clang)
+        ifeq ($(PLATFORM),mac)
+            CC            := clang
+            AR            := ar
+            CFLAGS        := $(CLANG_MAC_CFLAGS) $(CLANG_MAC_DEFINE)
+            LDFLAGS       := $(CLANG_MAC_LDFLAGS)
+            LDLIBS        := $(CLANG_MAC_LDLIBS)
+            STATIC_LIB    := $(CLANG_MAC_STATIC_LIB)
+            SHARED_LIB    := $(CLANG_MAC_SHARED_LIB)
+            PLATFORM_DIR  := mac/$(ARCH)
+        else ifeq ($(PLATFORM),linux)
+            CC            := clang
+            AR            := ar
+            CFLAGS        := $(GCC_LINUX_CFLAGS) $(GCC_LINUX_DEFINE)
+            LDFLAGS       := $(GCC_LINUX_LDFLAGS) $(GCC_LINUX_LIB_DIRS)
+            LDLIBS        := $(GCC_LINUX_LDLIBS)
+            STATIC_LIB    := $(GCC_LINUX_STATIC_LIB)
+            SHARED_LIB    := $(GCC_LINUX_SHARED_LIB)
+            PLATFORM_DIR  := linux
+        else
+            $(error clang 仅支持 mac 或 linux 平台)
+        endif
+    else ifeq ($(COMPILER),msvc)
+        ifeq ($(PLATFORM),win)
+            CC            := $(MSVC_COMPILER_EXE)
+            AR            := $(MSVC_ARCHIVER_EXE)
+            LD            := $(MSVC_LINKER_EXE)
+            CFLAGS        := $(MSVC_WIN_CFLAGS) $(MSVC_WIN_DEFINE)
+            LDFLAGS       := $(MSVC_WIN_LDFLAGS) $(MSVC_WIN_LIB_DIRS)
+            LDLIBS        := $(MSVC_WIN_LDLIBS)
+            STATIC_LIB    := $(MSVC_WIN_STATIC_LIB)
+            SHARED_LIB    := $(MSVC_WIN_SHARED_LIB)
             PLATFORM_DIR  := win
         else
-            $(error invalid platform for gcc: $(PLATFORM))
+            $(error msvc 仅支持 win 平台)
         endif
     else
-        $(error invalid compiler: $(COMPILER). use ac5, ac6, or gcc)
+        $(error 无效的编译器: $(COMPILER), 可选 msvc, clang, gcc, ac5, ac6)
     endif
 endif
 
 INCLUDE_DIRS              := -I$(PROJECT_DIR)/inc
 CFLAGS                    += $(INCLUDE_DIRS)
 
-OUTPUT_BUILD_DIR          := $(BUILD_DIR)/$(COMPILER)-$(PLATFORM)
+OUTPUT_BUILD_DIR          := $(BUILD_DIR)/$(COMPILER)-$(PLATFORM)-$(ARCH)
 OUTPUT_LIB_DIR            := $(LIB_DIR)/$(PLATFORM_DIR)
 OUTPUT_STATIC_LIB         := $(OUTPUT_LIB_DIR)/$(STATIC_LIB)
 OUTPUT_SHARED_LIB         := $(OUTPUT_LIB_DIR)/$(SHARED_LIB)
@@ -175,7 +243,31 @@ endif
 
 OBJ_FILES                 := $(SRC_FILES:$(SRC_DIR)/%.c=$(OUTPUT_BUILD_DIR)/%.o)
 
-.PHONY: all tool test clean fmt list help info ac5-mcu ac6-mcu gcc-mcu gcc-linux gcc-win
+.PHONY: all static shared tool test clean fmt list help info ac5-mcu ac6-mcu gcc-mcu gcc-linux clang-mac clang-linux msvc-win
+
+.DEFAULT_GOAL := static
+
+static: $(OUTPUT_STATIC_LIB)
+	@$(ECHO_NL)
+	@echo "=================================================="
+	@echo "static library created successfully: $(OUTPUT_STATIC_LIB)"
+	@$(ECHO_NL)
+	@echo "make static complete."
+
+shared:
+ifeq ($(SHARED_LIB),)
+	@$(ECHO_NL)
+	@echo "=================================================="
+	@echo "当前平台/编译器组合不支持动态库 (COMPILER=$(COMPILER), PLATFORM=$(PLATFORM))"
+	@$(ECHO_NL)
+else
+	@$(MAKE) $(OUTPUT_SHARED_LIB)
+	@$(ECHO_NL)
+	@echo "=================================================="
+	@echo "shared library created successfully: $(OUTPUT_SHARED_LIB)"
+	@$(ECHO_NL)
+	@echo "make shared complete."
+endif
 
 all: $(OUTPUT_STATIC_LIB) $(if $(SHARED_LIB),$(OUTPUT_SHARED_LIB),)
 	@$(ECHO_NL)
@@ -271,6 +363,7 @@ info:
 	@echo "=================================================="
 	@echo "build configuration:"
 	@echo "PLATFORM: $(PLATFORM)"
+	@echo "ARCH: $(ARCH)"
 	@echo "CC: $(CC)"
 	@echo "AR: $(AR)"
 	@echo "CFLAGS: $(CFLAGS)"
@@ -284,47 +377,62 @@ help:
 	@echo "usage: make [options] [target]"
 	@$(ECHO_NL)
 	@echo "targets:"
-	@echo "  all   - build static and shared libraries (default)"
-	@echo "  tool  - build the tool program"
-	@echo "  test  - build the test program"
-	@echo "  clean - remove build artifacts"
-	@echo "  fmt   - format code files using clang-format"
-	@echo "  list  - list all available source files"
-	@echo "  info  - show build configuration"
-	@echo "  help  - show this help message"
+	@echo "  static - build static library only (default, no external deps)"
+	@echo "  shared - build shared library only (requires external deps like fftw3f)"
+	@echo "  all    - build both static and shared libraries"
+	@echo "  tool   - build the tool program"
+	@echo "  test   - build the test program"
+	@echo "  clean  - remove build artifacts"
+	@echo "  fmt    - format code files using clang-format"
+	@echo "  list   - list all available source files"
+	@echo "  info   - show build configuration"
+	@echo "  help   - show this help message"
 	@$(ECHO_NL)
 	@echo "options:"
 	@echo "  INCLUDE_FILES=<files> - include only these files (space-separated)"
 	@echo "  EXCLUDE_FILES=<files> - exclude these files (space-separated)"
 	@$(ECHO_NL)
 	@echo "examples:"
-	@echo "  make           - build with default settings (gcc/linux)"
-	@echo "  make ac5-mcu   - build for MCU with ac5"
-	@echo "  make ac6-mcu   - build for MCU with ac6"
-	@echo "  make gcc-mcu   - build static library for MCU with gcc"
-	@echo "  make gcc-linux - build libraries for Linux with gcc"
-	@echo "  make gcc-win   - build libraries for Windows with gcc"
+	@echo "  make           - build static lib only with host defaults (win=msvc, mac=clang, linux=gcc)"
+	@echo "  make shared    - build shared lib only (requires fftw3f etc.)"
+	@echo "  make all       - build both static and shared libs"
+	@echo "  make ac5-mcu   - cross-compile for MCU with Arm Compiler 5 (armcc)"
+	@echo "  make ac6-mcu   - cross-compile for MCU with Arm Compiler 6 (armclang)"
+	@echo "  make gcc-mcu   - cross-compile for MCU with arm-none-eabi-gcc"
+	@echo "  make msvc-win  - build for Windows with MSVC (run from x64 Native Tools Cmd)"
+	@echo "  make clang-mac - build for macOS with Apple Clang (auto x86_64/arm64)"
+	@echo "  make gcc-linux - build for Linux with gcc"
 
 ac5-mcu:
-	@$(MAKE) COMPILER=ac5 PLATFORM=mcu all
+	@$(MAKE) COMPILER=ac5 PLATFORM=mcu static
 
 ac6-mcu:
-	@$(MAKE) COMPILER=ac6 PLATFORM=mcu all
+	@$(MAKE) COMPILER=ac6 PLATFORM=mcu static
 
 gcc-mcu:
-	@$(MAKE) COMPILER=gcc PLATFORM=mcu all
+	@$(MAKE) COMPILER=gcc PLATFORM=mcu static
 
 gcc-linux:
-	@$(MAKE) COMPILER=gcc PLATFORM=linux all
+	@$(MAKE) COMPILER=gcc PLATFORM=linux static
 
-gcc-win:
-	@$(MAKE) COMPILER=gcc PLATFORM=win all
+clang-mac:
+	@$(MAKE) COMPILER=clang PLATFORM=mac static
+
+clang-linux:
+	@$(MAKE) COMPILER=clang PLATFORM=linux static
+
+msvc-win:
+	@$(MAKE) COMPILER=msvc PLATFORM=win static
 
 $(OUTPUT_STATIC_LIB): $(OBJ_FILES) | $(OUTPUT_LIB_DIR)
 	@$(ECHO_NL)
 	@echo "=================================================="
 	@echo "creating static library: $(STATIC_LIB)"
-ifeq ($(COMPILER),gcc)
+ifeq ($(COMPILER),msvc)
+	$(AR) /nologo /OUT:"$@" $(OBJ_FILES)
+else ifeq ($(COMPILER),gcc)
+	$(AR) rcs "$@" $(OBJ_FILES)
+else ifeq ($(COMPILER),clang)
 	$(AR) rcs "$@" $(OBJ_FILES)
 else
 	$(AR) -r "$@" $(OBJ_FILES)
@@ -334,23 +442,35 @@ $(OUTPUT_SHARED_LIB): $(OBJ_FILES) | $(OUTPUT_LIB_DIR)
 	@$(ECHO_NL)
 	@echo "=================================================="
 	@echo "creating shared library: $(SHARED_LIB)"
-ifeq ($(COMPILER),gcc)
+ifeq ($(COMPILER),msvc)
+	$(LD) $(LDFLAGS) /OUT:"$@" /IMPLIB:"$(OUTPUT_LIB_DIR)/$(PROJECT_NAME).lib" $(OBJ_FILES) $(LDLIBS)
+else ifeq ($(COMPILER),clang)
+ifeq ($(PLATFORM),mac)
+	$(CC) $(LDFLAGS) -o "$@" $(OBJ_FILES) $(LDLIBS)
+else ifeq ($(PLATFORM),linux)
+	$(CC) $(LDFLAGS) -o "$@" $(OBJ_FILES) $(LDLIBS)
+else
+	$(error clang+$(PLATFORM) 不支持动态库)
+endif
+else ifeq ($(COMPILER),gcc)
 ifeq ($(PLATFORM),linux)
 	$(CC) $(LDFLAGS) -o "$@" $(OBJ_FILES) $(LDLIBS)
-else ifeq ($(PLATFORM),win)
-	$(CC) $(LDFLAGS) -Wl,--out-implib,"$(OUTPUT_LIB_DIR)/$(PROJECT_NAME).lib" -o "$@" $(OBJ_FILES) $(LDLIBS)
 else
-	$(error shared library not supported for platform: $(PLATFORM))
+	$(error 该平台不支持动态库: $(PLATFORM))
 endif
 else
-	$(error shared library only supported with gcc compiler)
+	$(error 该编译器不支持动态库: $(COMPILER))
 endif
 
 $(OUTPUT_BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(OUTPUT_BUILD_DIR)
 	@$(ECHO_NL)
 	@echo "[COMPILE] $<"
 	$(call MKDIR,$(dir $@))
-ifeq ($(COMPILER),gcc)
+ifeq ($(COMPILER),msvc)
+	$(CC) $(CFLAGS) /Fo"$@" "$<"
+else ifeq ($(COMPILER),gcc)
+	$(CC) $(CFLAGS) -o "$@" "$<"
+else ifeq ($(COMPILER),clang)
 	$(CC) $(CFLAGS) -o "$@" "$<"
 else
 	$(CC) $(CFLAGS) -o"$@" "$<"

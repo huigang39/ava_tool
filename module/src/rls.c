@@ -10,6 +10,9 @@ rls_init(rls_obs_t *rls, const rls_cfg_t rls_cfg)
         DECL(rls, cfg, out, lo);
         CFG_INIT(rls, rls_cfg);
 
+        if (cfg->order > MAX_ORDER)
+                cfg->order = MAX_ORDER;
+
         for (u32 i = 0; i < cfg->order; i++) {
                 for (u32 j = 0; j < cfg->order; j++) {
                         if (i == j)

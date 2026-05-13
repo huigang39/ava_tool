@@ -1,6 +1,8 @@
 #ifndef NET_H
 #define NET_H
 
+#include "platdef.h"
+
 #ifdef __linux__
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -8,6 +10,17 @@
 #include <sched.h>
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <unistd.h>
+typedef int sockfd_t;
+#define CLOSE_SOCKET close
+#elif defined(OS_MACOS)
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/event.h>
+#include <sys/socket.h>
+#include <sys/types.h>
 #include <unistd.h>
 typedef int sockfd_t;
 #define CLOSE_SOCKET close
@@ -59,18 +72,18 @@ typedef enum net_mode {
         NET_MODE_ASYNC,
 } net_mode_e;
 
-typedef enum net_op : u8 {
+typedef enum net_op {
         NET_OP_SEND,
         NET_OP_RECV,
 } net_op_e;
 
 #pragma pack(push, 1)
 typedef struct net_log_header {
-        usize    ts;       // 时间戳
-        net_op_e e_op;     // 收发标志
-        u32      dst_ip;   // 设备IP
-        u16      dst_port; // 设备端口
-        u16      size;     // 数据长度
+        usize ts;       // 时间戳
+        u8    e_op;     // 收发标志 (net_op_e, 存储为 u8 以保持包紧凑)
+        u32   dst_ip;   // 设备IP
+        u16   dst_port; // 设备端口
+        u16   size;     // 数据长度
 } net_log_header_t;
 #pragma pack(pop)
 
@@ -97,10 +110,15 @@ typedef struct net_async_req {
         usize          size;
         net_async_cb_f f_cb;
         ATOMIC(u8) processed;
-#ifdef _WIN32
-        OVERLAPPED  ov;
+#if defined(_WIN32) || defined(OS_MACOS)
         u64         timeout_us;
         list_head_t pending_node; // 待处理请求链表节点
+#endif
+#ifdef _WIN32
+        OVERLAPPED ov;
+#endif
+#ifdef OS_MACOS
+        net_op_e e_op;
 #endif
 } net_async_req_t;
 
@@ -119,6 +137,9 @@ typedef struct net_lo {
         log_t       log;
 #ifdef __linux__
         struct io_uring ring;
+#elif defined(OS_MACOS)
+        int         kq;
+        list_head_t pending_reqs;
 #elif defined(_WIN32)
         HANDLE      iocp;
         list_head_t pending_reqs; // 待处理的异步请求列表
@@ -286,10 +307,12 @@ isize net_send_recv(net_t *net, net_ch_t *ch, void *tx_buf, usize size, void *rx
  * @param tx_buf     发送缓冲区
  * @param size       发送字节数
  * @param resps      回复内容数组
+ * @param resps_cap  回复内容数组容量 (resps[] 元素个数)
  * @param timeout_us 超时时间(微秒)
  * @return           成功返回回复的 IP 个数, 失败返回错误码
  */
-int net_broadcast(u32 ip, u16 port, const void *tx_buf, usize size, net_resp_t *resps, u32 timeout_us);
+int net_broadcast(
+    u32 ip, u16 port, const void *tx_buf, usize size, net_resp_t *resps, usize resps_cap, u32 timeout_us);
 
 #ifdef __cplusplus
 }

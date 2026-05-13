@@ -10,7 +10,9 @@
 #if defined(_WIN32) || defined(_WIN64)
 #include <windows.h>
 #elif defined(__linux__) || defined(__APPLE__)
+#include <dirent.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -63,6 +65,51 @@ purge_old_logs(const char *dir, usize max_files)
                         char full_path[512];
                         snprintf(full_path, sizeof(full_path), "%s/%s", dir, files[i].name);
                         DeleteFileA(full_path);
+                }
+        }
+        free(files);
+#elif defined(__linux__) || defined(__APPLE__)
+        DIR *dp = opendir(dir);
+        if (dp == NULL)
+                return;
+
+        typedef struct {
+                char name[256];
+        } file_node_t;
+        file_node_t *files = NULL;
+        usize        count = 0;
+
+        struct dirent *ent;
+        while ((ent = readdir(dp)) != NULL) {
+                const char *name = ent->d_name;
+                const usize n    = strlen(name);
+                if (n < 4 || strcmp(name + n - 4, ".log") != 0)
+                        continue;
+
+                file_node_t *new_files = (file_node_t *)realloc(files, sizeof(file_node_t) * (count + 1));
+                if (new_files == NULL)
+                        break;
+                files = new_files;
+                strncpy(files[count].name, name, sizeof(files[count].name) - 1);
+                files[count].name[sizeof(files[count].name) - 1] = '\0';
+                count++;
+        }
+        closedir(dp);
+
+        if (count > max_files) {
+                for (usize i = 0; i < count - 1; i++) {
+                        for (usize j = i + 1; j < count; j++) {
+                                if (strcmp(files[i].name, files[j].name) > 0) {
+                                        file_node_t tmp = files[i];
+                                        files[i]        = files[j];
+                                        files[j]        = tmp;
+                                }
+                        }
+                }
+                for (usize i = 0; i < count - max_files; i++) {
+                        char full_path[512];
+                        snprintf(full_path, sizeof(full_path), "%s/%s", dir, files[i].name);
+                        unlink(full_path);
                 }
         }
         free(files);
@@ -124,12 +171,12 @@ log_os_mmap_init(log_t *log)
 #if defined(_WIN32) || defined(_WIN64)
         DWORD  creation_disp = (cfg->e_ring == LOG_RING_ROTATE) ? CREATE_ALWAYS : OPEN_ALWAYS;
         HANDLE hFile         = CreateFileA(lo->curr_file_path,
-                                   GENERIC_READ | GENERIC_WRITE,
-                                   FILE_SHARE_READ,
-                                   NULL,
-                                   creation_disp,
-                                   FILE_ATTRIBUTE_NORMAL,
-                                   NULL);
+                                           GENERIC_READ | GENERIC_WRITE,
+                                           FILE_SHARE_READ,
+                                           NULL,
+                                           creation_disp,
+                                           FILE_ATTRIBUTE_NORMAL,
+                                           NULL);
         if (hFile == INVALID_HANDLE_VALUE)
                 return;
 
@@ -209,7 +256,7 @@ log_flush_ring(log_t *log, const void *src, usize size)
 {
         DECL(log, cfg, lo);
 
-        if (cfg->file_size == 0) {
+        if (cfg->file_size == 0 || cfg->file_path == NULL) {
                 if (cfg->f_flush)
                         cfg->f_flush(cfg->fd, src, size);
                 return;
@@ -370,17 +417,22 @@ log_write_bin(
 }
 
 void
-log_write(log_t *log, const usize idx, const char *fmt, const va_list args)
+log_write(log_t *log, const usize idx, const char *fmt, va_list args)
 {
         DECL(log, cfg, lo);
 
         if (idx >= cfg->nproducers)
                 return; // 安全检查
 
+        va_list args_copy;
+        va_copy(args_copy, args);
+        const int sz = vsnprintf(NULL, 0, fmt, args_copy);
+        va_end(args_copy);
+
         const log_header_t header = {
             .ts   = cfg->f_get_ts(),
             .id   = idx,
-            .size = (usize)vsnprintf(NULL, 0, fmt, args) + 1,
+            .size = (usize)(sz < 0 ? 0 : sz) + 1,
         };
 
         const usize total_size = sizeof(header) + header.size;

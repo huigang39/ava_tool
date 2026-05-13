@@ -97,7 +97,6 @@ typedef struct log {
 void log_init(log_t *log, log_cfg_t log_cfg);
 void log_deinit(log_t *log);
 void log_write_bin(log_t *log, usize id, const void *header, usize header_size, const void *payload, usize payload_size);
-void log_flush_bin(log_t *log);
 void log_write(log_t *log, usize idx, const char *fmt, va_list args);
 void log_flush(log_t *log);
 

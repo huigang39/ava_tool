@@ -1,9 +1,11 @@
 #ifndef TIMEOPS_H
 #define TIMEOPS_H
 
-#ifdef __linux__
+#include "platdef.h"
+
+#ifdef OS_POSIX
 #include <unistd.h>
-#elif defined(_WIN32)
+#elif defined(OS_WINDOWS)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -21,32 +23,36 @@ extern "C" {
 
 #define WIN_TO_UNIX_EPOCH (116444736000000000ULL)
 
-#define NS2US(ns)         ((ns) / 1000.0F)
-#define NS2MS(ns)         ((ns) / 1000000.0F)
-#define NS2S(ns)          ((ns) / 1000000000.0F)
-#define US2NS(us)         ((us) * 1000)
-#define US2MS(us)         ((us) / 1000.0F)
-#define US2S(us)          ((us) / 1000000.0F)
-#define MS2NS(ms)         ((ms) * 1000000)
-#define MS2US(ms)         ((ms) * 1000)
-#define MS2S(ms)          ((ms) / 1000.0F)
-#define S2NS(s)           ((s) * 1000000000)
-#define S2US(s)           ((s) * 1000000)
-#define S2MS(s)           ((s) * 1000)
+#ifndef NANO_PER_SEC
+#define NANO_PER_SEC (1000000000ULL)
+#endif
 
-#define HZ2S(hz)          (1.0F / (hz))
-#define HZ2MS(hz)         (1.0F / (hz) * 1000)
-#define HZ2US(hz)         (1.0F / (hz) * 1000000)
+#define NS2US(ns)      ((ns) / 1000.0F)
+#define NS2MS(ns)      ((ns) / 1000000.0F)
+#define NS2S(ns)       ((ns) / 1000000000.0F)
+#define US2NS(us)      ((us) * 1000)
+#define US2MS(us)      ((us) / 1000.0F)
+#define US2S(us)       ((us) / 1000000.0F)
+#define MS2NS(ms)      ((ms) * 1000000)
+#define MS2US(ms)      ((ms) * 1000)
+#define MS2S(ms)       ((ms) / 1000.0F)
+#define S2NS(s)        ((s) * 1000000000)
+#define S2US(s)        ((s) * 1000000)
+#define S2MS(s)        ((s) * 1000)
 
-#define S2CNT(s, hz)      ((s) * (hz))
-#define MS2CNT(ms, hz)    ((ms) * (hz) / 1000.0F)
+#define HZ2S(hz)       (1.0F / (hz))
+#define HZ2MS(hz)      (1.0F / (hz) * 1000)
+#define HZ2US(hz)      (1.0F / (hz) * 1000000)
+
+#define S2CNT(s, hz)   ((s) * (hz))
+#define MS2CNT(ms, hz) ((ms) * (hz) / 1000.0F)
 
 #define TIMED_EXEC(ret, period_us, code)                               \
         do {                                                           \
                 const u64 __start = get_mono_ts_us();                  \
                 {code};                                                \
                 const u64 __elapsed = get_mono_ts_us() - __start;      \
-                ret                 = (int)elapsed;                    \
+                (ret)               = __elapsed;                       \
                 if (__elapsed < (period_us)) {                         \
                         const u64 remaining = (period_us) - __elapsed; \
                         delay_us(remaining);                           \
@@ -56,11 +62,15 @@ extern "C" {
 HAPI u64
 get_mono_ts_ns(void)
 {
-#ifdef __linux__
+#ifdef OS_POSIX
         struct timespec ts;
+#ifdef CLOCK_MONOTONIC_RAW
         clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+#else
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
         return ts.tv_sec * NANO_PER_SEC + ts.tv_nsec;
-#elif defined(_WIN32)
+#elif defined(OS_WINDOWS)
         LARGE_INTEGER frequency, counter;
         QueryPerformanceFrequency(&frequency);
         QueryPerformanceCounter(&counter);
@@ -92,11 +102,11 @@ get_mono_ts_s(void)
 HAPI u64
 get_real_ts_ns(void)
 {
-#ifdef __linux__
+#ifdef OS_POSIX
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         return ts.tv_sec * NANO_PER_SEC + ts.tv_nsec;
-#elif defined(_WIN32)
+#elif defined(OS_WINDOWS)
         FILETIME ft;
         GetSystemTimeAsFileTime(&ft);
 
@@ -140,13 +150,13 @@ spin(u32 us)
                 ;
 }
 
-#ifdef __linux__
+#ifdef OS_POSIX
 HAPI void
 yield(const u32 ms)
 {
-        usleep(K(ms));
+        usleep((u32)(ms) * 1000);
 }
-#elif defined(_WIN32)
+#elif defined(OS_WINDOWS)
 HAPI void
 yield(const u32 ms)
 {

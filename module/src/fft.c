@@ -19,7 +19,7 @@ fft_init(fft_t *fft, const fft_cfg_t fft_cfg)
 
         out->fr = cfg->fs / (f32)cfg->npoints;
 
-#if defined(__linux__) || defined(_WIN32)
+#if defined(FFT_HAS_FFTW3)
         lo->p = fftwf_plan_dft_r2c_1d((int)cfg->npoints, in->buf, lo->buf, FFTW_ESTIMATE);
 #elif defined(ARM_MATH)
         arm_rfft_fast_init_f32(&lo->s, (u16)cfg->npoints);
@@ -31,7 +31,7 @@ fft_destroy(fft_t *fft)
 {
         DECL(fft, lo);
 
-#if defined(__linux__) || defined(_WIN32)
+#if defined(FFT_HAS_FFTW3)
         fftwf_destroy_plan(lo->p);
 #endif
 }
@@ -48,7 +48,7 @@ fft_exec(fft_t *fft)
 
         memcpy(in->buf, lo->spsc.buf, lo->spsc.cap);
 
-#if defined(__linux__) || defined(_WIN32)
+#if defined(FFT_HAS_FFTW3)
         if (cfg->e_window != FFT_WINDOW_NONE) {
                 for (usize i = 0; i < cfg->npoints; i++) {
                         f32 w     = 1.0f;

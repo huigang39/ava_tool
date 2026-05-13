@@ -1,11 +1,21 @@
+#include "platdef.h"
+
 #ifdef __linux__
 #define _GNU_SOURCE
 #endif
 
-#ifdef __linux__
+#ifdef OS_POSIX
 #include <pthread.h>
+#endif
+#ifdef __linux__
 #include <sched.h>
-#elif defined(_WIN32)
+#endif
+#ifdef OS_MACOS
+#include <mach/mach.h>
+#include <mach/thread_act.h>
+#include <mach/thread_policy.h>
+#endif
+#ifdef _WIN32
 #include <windows.h>
 #endif
 
@@ -20,7 +30,7 @@
 /*                                  内部函数                                  */
 /* -------------------------------------------------------------------------- */
 
-#ifdef __linux__
+#ifdef OS_POSIX
 static void *
 sch_thread_exec(void *arg)
 {
@@ -34,6 +44,7 @@ sch_thread_exec(void *arg)
 static void
 sch_bind_thread_to_cpu(pthread_t thread_tid, const int cpu_id)
 {
+#ifdef __linux__
         cpu_set_t cpu_set;
         CPU_ZERO(&cpu_set);
         CPU_SET(cpu_id, &cpu_set);
@@ -42,6 +53,20 @@ sch_bind_thread_to_cpu(pthread_t thread_tid, const int cpu_id)
                 print_error(FALSE, "[SCH] set thread affinity failed, errcode: %d", ret);
 
         print_error(FALSE, "[SCH] bind thread to CPU %d success", cpu_id);
+#elif defined(OS_MACOS)
+        /* macOS pthreads don't support hard affinity; thread_policy provides hints. */
+        thread_affinity_policy_data_t policy      = {.affinity_tag = cpu_id + 1};
+        const mach_port_t             mach_thread = pthread_mach_thread_np(thread_tid);
+        const kern_return_t           ret =
+            thread_policy_set(mach_thread, THREAD_AFFINITY_POLICY, (thread_policy_t)&policy, THREAD_AFFINITY_POLICY_COUNT);
+        if (ret != KERN_SUCCESS)
+                print_error(FALSE, "[SCH] set thread affinity hint failed, errcode: %d", ret);
+        else
+                print_error(FALSE, "[SCH] set thread affinity hint to tag %d", cpu_id + 1);
+#else
+        ARG_UNUSED(thread_tid);
+        ARG_UNUSED(cpu_id);
+#endif
 }
 #elif defined(_WIN32)
 static DWORD WINAPI
@@ -72,7 +97,7 @@ sch_thread_init(void *arg, const int cpu_id)
         ARG_UNUSED(arg);
         ARG_UNUSED(cpu_id);
 
-#ifdef __linux__
+#ifdef OS_POSIX
         pthread_t sch_tid;
         int       ret = pthread_create(&sch_tid, NULL, sch_thread_exec, arg);
         if (ret != 0) {
@@ -199,7 +224,13 @@ sch_init(sch_t *sch, const sch_cfg_t sch_cfg)
                         return -MEINVAL;
         }
 
-        // only run on Linux/Windows
+        return 0;
+}
+
+int
+sch_run(sch_t *sch)
+{
+        DECL(sch, cfg);
         sch_thread_init(sch, cfg->cpu_id);
         return 0;
 }
@@ -252,6 +283,9 @@ int
 sch_add_task(sch_t *sch, const sch_task_cfg_t task_cfg)
 {
         DECL(sch, cfg, lo);
+
+        if (lo->ntasks >= SCH_TASK_MAX)
+                return -MEINVAL;
 
         sch_task_t *task          = &lo->tasks[lo->ntasks];
         task->cfg                 = task_cfg;

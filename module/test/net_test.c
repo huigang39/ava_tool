@@ -16,7 +16,7 @@
 
 net_t g_net;
 
-u8        g_mempool_buf[MEMPOOL_SIZE];
+NO_ASAN ALIGN(SIZE_16KB) u8 g_mempool_buf[MEMPOOL_SIZE];
 mempool_t g_mempool = {
     .buf = g_mempool_buf,
     .cap = sizeof(g_mempool_buf),
@@ -63,7 +63,7 @@ send_recv_thread(void *arg)
                         print_error(TRUE, "mempool full!\n");
                         continue;
                 }
-                sprintf(tx_buf, "CNT_%llu", cnt++);
+                snprintf(tx_buf, 64, "CNT_%llu", cnt++);
 
                 char *rx_buf = mempool_calloc(&g_mempool, 64);
                 if (!rx_buf) {
@@ -111,7 +111,7 @@ init(void)
         const char *tx_buf = "{\"method\":\"GET\",\"reqTarget\":\"/custom\",\"cnt\":\"    "
                              "0\",\"type\":true,\"mcu_fw_version\":true,\"mac_address\":true,"
                              "\"static_IP\":true}";
-        ret                = net_broadcast(IP_STR_TO_U32(DST_IP), DST_PORT, tx_buf, strlen(tx_buf), resps, MS2US(1));
+        ret                = net_broadcast(IP_STR_TO_U32(DST_IP), DST_PORT, tx_buf, strlen(tx_buf), resps, ARRAY_LEN(resps), MS2US(1));
 
         for (int i = 0; i < ret; i++)
                 printf("%s\n", resps[i].buf);

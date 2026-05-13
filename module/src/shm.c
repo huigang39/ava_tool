@@ -11,7 +11,7 @@ shm_init(shm_t *shm, const shm_cfg_t shm_cfg)
         DECL(shm, cfg, lo);
         CFG_INIT(shm, shm_cfg);
 
-#ifdef __linux__
+#ifdef OS_POSIX
         lo->fd = shm_open(cfg->name, O_RDWR, 0666);
         if (lo->fd == -1) {
                 lo->fd = shm_open(cfg->name, O_CREAT | O_RDWR, 0666);

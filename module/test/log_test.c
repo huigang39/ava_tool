@@ -6,16 +6,16 @@
 
 static void log_stdout(void *fp, const void *src, usize size);
 
-#define WRITE_THREAD_NUM   (1000)
+#define WRITE_THREAD_NUM   (100)
 #define MEMPOOL_SIZE       (SIZE_16MB)
 
 #define LOG_CHUNK_SIZE     (SIZE_4KB)
 #define LOG_FLUSH_BUF_SIZE (SIZE_1KB)
 
-u64   g_producers_cnts[WRITE_THREAD_NUM];
+NO_ASAN ALIGN(SIZE_16KB) u64 g_producers_cnts[WRITE_THREAD_NUM];
 log_t g_log;
 
-u8        g_mempool_buf[MEMPOOL_SIZE];
+NO_ASAN ALIGN(SIZE_16KB) u8 g_mempool_buf[MEMPOOL_SIZE];
 mempool_t g_mempool = {
     .buf = g_mempool_buf,
     .cap = sizeof(g_mempool_buf),

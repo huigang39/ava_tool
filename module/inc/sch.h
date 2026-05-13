@@ -124,6 +124,7 @@ typedef struct sch {
 /* -------------------------------------------------------------------------- */
 
 int sch_init(sch_t *sch, sch_cfg_t sch_cfg);
+int sch_run(sch_t *sch);
 int sch_exec(sch_t *sch);
 
 int sch_add_task(sch_t *sch, sch_task_cfg_t task_cfg);

@@ -1,8 +1,11 @@
 #ifndef FFT_H
 #define FFT_H
 
-#if defined(__linux__) || defined(_WIN32)
+#include "platdef.h"
+
+#if defined(OS_HOSTED)
 #include "fftw3.h"
+#define FFT_HAS_FFTW3 1
 #elif defined(ARM_MATH)
 #include "arm_const_structs.h"
 #include "arm_math.h"
@@ -52,7 +55,7 @@ typedef struct fft_cfg {
         usize        npoints;
         f32         *buf;
         f32         *in_buf;
-#if defined(__linux__) || defined(_WIN32)
+#if defined(FFT_HAS_FFTW3)
         fftwf_complex *out_buf;
 #else
         f32 *out_buf;
@@ -76,7 +79,7 @@ typedef struct fft_lo {
         u32    elapsed_us;
         spsc_t spsc;
         u8     need_exec;
-#if defined(__linux__) || defined(_WIN32)
+#if defined(FFT_HAS_FFTW3)
         fftwf_plan     p;
         fftwf_complex *buf;
 #elif defined(ARM_MATH)

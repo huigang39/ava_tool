@@ -15,7 +15,13 @@ define RMDIR
 	@if exist "$(subst /,\,$(1))" rd /s /q "$(subst /,\,$(1))" 2>nul
 endef
 else
-    PLATFORM          := linux
+    UNAME_S           := $(shell uname -s)
+    UNAME_M           := $(shell uname -m)
+    ifeq ($(UNAME_S),Darwin)
+        PLATFORM      := mac
+    else
+        PLATFORM      := linux
+    endif
     SHELL             := /bin/bash
     ECHO_NL           := echo
 define MKDIR
@@ -34,6 +40,19 @@ LDFLAGS               := -lpthread -lm
 ifeq ($(PLATFORM),win)
     OUTPUT_STATIC_LIB := $(LIB_DIR)/win/module.a
     LDFLAGS           += -lkernel32 -lws2_32
+else ifeq ($(PLATFORM),mac)
+    ARCH              := $(UNAME_M)
+    ifeq ($(ARCH),arm64)
+        BREW_PREFIX   ?= /opt/homebrew
+    else
+        BREW_PREFIX   ?= /usr/local
+    endif
+    CC                := clang
+    OUTPUT_STATIC_LIB := $(LIB_DIR)/mac/$(ARCH)/module.a
+    INCLUDE_DIRS      += -I$(BREW_PREFIX)/include
+    LDFLAGS           += -L$(BREW_PREFIX)/lib -lfftw3f
+    CFLAGS            += -fsanitize=address -fno-omit-frame-pointer -mllvm -asan-globals=0
+    LDFLAGS           += -fsanitize=address
 else
     OUTPUT_STATIC_LIB := $(LIB_DIR)/linux/module.a
     LDFLAGS           += -luring
@@ -43,7 +62,8 @@ endif
 
 CFLAGS                += $(INCLUDE_DIRS)
 
-SRC_FILES             := $(wildcard *.c)
+EXCLUDE_FILES         := jlink_demo.c
+SRC_FILES             := $(filter-out $(EXCLUDE_FILES),$(wildcard *.c))
 TARGETS               := $(SRC_FILES:.c=)
 BINS                  := $(addprefix $(BUILD_DIR)/,$(TARGETS))
 

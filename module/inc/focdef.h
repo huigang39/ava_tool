@@ -34,7 +34,7 @@ typedef struct foc_svpwm {
         u32_uvw_t u32_pwm_duty;     // PWM 占空比计数值
 } foc_svpwm_t;
 
-typedef enum foc_pwm_ch : u32 {
+typedef enum foc_pwm_ch {
         PWM_CH_UH,
         PWM_CH_UL,
 
@@ -50,13 +50,13 @@ typedef enum foc_pwm_ch : u32 {
         PWM_CH_ALL,
 } foc_pwm_ch_e;
 
-typedef enum foc_sensor : u32 {
+typedef enum foc_sensor {
         FOC_SENSOR_NONE,
         FOC_SENSOR_ELEC, // 电角度编码器
         FOC_SENSOR_MECH, // 机械角度编码器
 } foc_sensor_e;
 
-typedef enum foc_theta : u32 {
+typedef enum foc_theta {
         FOC_ELEC_THETA_NONE,
         FOC_ELEC_THETA_FORCE,        // 强拖角度
         FOC_ELEC_THETA_SENSOR,       // 有感角度
@@ -97,21 +97,21 @@ typedef union foc_cali_flag {
         } bit;
 } foc_cali_flag_u;
 
-typedef enum foc_cali_state : u32 {
+typedef enum foc_cali_state {
         FOC_CALI_STATE_INIT,   // 初始化
         FOC_CALI_STATE_CW,     // 正转
         FOC_CALI_STATE_CCW,    // 反转
         FOC_CALI_STATE_FINISH, // 结束
 } foc_cali_state_e;
 
-typedef enum foc_select_state : u32 {
+typedef enum foc_select_state {
         FOC_STATE_DISABLE, // 失能
         FOC_STATE_ENABLE,  // 使能
         FOC_STATE_CALI,    // 校准
         FOC_STATE_FAULT,   // 故障
 } foc_state_e;
 
-typedef enum foc_mode : u32 {
+typedef enum foc_mode {
         FOC_MODE_NONE,
         FOC_MODE_VOL, // 电压模式
         FOC_MODE_CUR, // 电流模式

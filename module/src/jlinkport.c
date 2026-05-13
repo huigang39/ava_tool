@@ -2,25 +2,49 @@
 #include <string.h>
 
 #include "jlinkport.h"
+#include "macrodef.h"
+#include "platdef.h"
 
 #ifdef _WIN32
 #include <windows.h>
+typedef HMODULE   jlink_lib_t;
+typedef FARPROC   jlink_sym_t;
+#define JLINK_LIB_NULL NULL
+#define JLINK_LOAD(p)  LoadLibraryA(p)
+#define JLINK_SYM(h, n) (jlink_sym_t)GetProcAddress((h), (n))
+#define JLINK_FREE(h)  FreeLibrary(h)
+#elif defined(OS_POSIX)
+#include <dlfcn.h>
+typedef void     *jlink_lib_t;
+typedef void     *jlink_sym_t;
+#define JLINK_LIB_NULL NULL
+#define JLINK_LOAD(p)  dlopen((p), RTLD_LAZY | RTLD_LOCAL)
+#define JLINK_SYM(h, n) dlsym((h), (n))
+#define JLINK_FREE(h)  dlclose(h)
+#endif
 
-// J-Link DLL 原始函数签名
-typedef const char *(__cdecl *jlinkarm_open_fn)(void);
-typedef void(__cdecl *jlinkarm_close_fn)(void);
-typedef char(__cdecl *jlinkarm_isopen_fn)(void);
-typedef i32(__cdecl *jlinkarm_connect_fn)(void);
-typedef i32(__cdecl *jlinkarm_writememex_fn)(u32 Addr, u32 NumBytes, const void *p, u32 Flags);
-typedef i32(__cdecl *jlinkarm_readmemex_fn)(u32 Addr, u32 NumBytes, void *p, u32 Flags);
-typedef i32(__cdecl *jlinkarm_emu_select_by_usb_sn_fn)(u32 SerialNo);
-typedef i32(__cdecl *jlinkarm_execcommand_fn)(const char *pIn, char *pOut, i32 BufferSize);
-typedef i32(__cdecl *jlinkarm_tif_select_fn)(i32 interface_id);
-typedef void(__cdecl *jlinkarm_setspeed_fn)(u32 Speed);
-typedef void(__cdecl *jlinkarm_reset_fn)(void);
+#if defined(_WIN32) || defined(OS_POSIX)
+
+#ifdef _WIN32
+#define JLINK_CC __cdecl
+#else
+#define JLINK_CC
+#endif
+
+typedef const char *(JLINK_CC *jlinkarm_open_fn)(void);
+typedef void(JLINK_CC *jlinkarm_close_fn)(void);
+typedef char(JLINK_CC *jlinkarm_isopen_fn)(void);
+typedef i32(JLINK_CC *jlinkarm_connect_fn)(void);
+typedef i32(JLINK_CC *jlinkarm_writememex_fn)(u32 Addr, u32 NumBytes, const void *p, u32 Flags);
+typedef i32(JLINK_CC *jlinkarm_readmemex_fn)(u32 Addr, u32 NumBytes, void *p, u32 Flags);
+typedef i32(JLINK_CC *jlinkarm_emu_select_by_usb_sn_fn)(u32 SerialNo);
+typedef i32(JLINK_CC *jlinkarm_execcommand_fn)(const char *pIn, char *pOut, i32 BufferSize);
+typedef i32(JLINK_CC *jlinkarm_tif_select_fn)(i32 interface_id);
+typedef void(JLINK_CC *jlinkarm_setspeed_fn)(u32 Speed);
+typedef void(JLINK_CC *jlinkarm_reset_fn)(void);
 
 struct jlink_api_min {
-        HMODULE                          dll;
+        jlink_lib_t                      dll;
         jlinkarm_open_fn                 Open;
         jlinkarm_close_fn                Close;
         jlinkarm_isopen_fn               IsOpen;
@@ -38,11 +62,11 @@ static struct jlink_api_min s_api;
 static bool                 s_api_loaded = false;
 
 static i32
-load_symbol(HMODULE dll, FARPROC *out, const char *name)
+load_symbol(jlink_lib_t dll, jlink_sym_t *out, const char *name)
 {
         if (out == NULL)
                 return -1;
-        *out = GetProcAddress(dll, name);
+        *out = JLINK_SYM(dll, name);
         return (*out != NULL) ? 0 : -1;
 }
 
@@ -50,44 +74,58 @@ static i32
 jlink_dll_load(const char *dll_path)
 {
         static const char *candidates[] = {
+#ifdef _WIN32
             "JLink_x64.dll",
             "JLinkARM.dll",
             "JLink.dll",
+            "lib/win/JLink_x64.dll",
+#elif defined(OS_MACOS)
+            "libjlinkarm.dylib",
+            "lib/mac/libjlinkarm.dylib",
+            "/Applications/SEGGER/JLink/libjlinkarm.dylib",
+#elif defined(__linux__)
+            "libjlinkarm.so",
+            "libjlinkarm.so.8",
+            "lib/linux/libjlinkarm.so.8",
+            "lib/linux/libjlinkarm.so",
+            "/opt/SEGGER/JLink/libjlinkarm.so",
+            "/opt/SEGGER/JLink/libjlinkarm.so.8",
+#endif
         };
 
-        HMODULE dll = NULL;
+        jlink_lib_t dll = JLINK_LIB_NULL;
 
         if (s_api_loaded)
                 return 0;
 
         if (dll_path != NULL && dll_path[0] != '\0') {
-                dll = LoadLibraryA(dll_path);
+                dll = JLINK_LOAD(dll_path);
         } else {
                 for (usize i = 0; i < (sizeof(candidates) / sizeof(candidates[0])); ++i) {
-                        dll = LoadLibraryA(candidates[i]);
-                        if (dll != NULL)
+                        dll = JLINK_LOAD(candidates[i]);
+                        if (dll != JLINK_LIB_NULL)
                                 break;
                 }
         }
 
-        if (dll == NULL)
+        if (dll == JLINK_LIB_NULL)
                 return -1;
 
         memset(&s_api, 0, sizeof(s_api));
         s_api.dll = dll;
 
-        if (load_symbol(dll, (FARPROC *)&s_api.Open, "JLINKARM_Open") < 0 ||
-            load_symbol(dll, (FARPROC *)&s_api.Close, "JLINKARM_Close") < 0 ||
-            load_symbol(dll, (FARPROC *)&s_api.IsOpen, "JLINKARM_IsOpen") < 0 ||
-            load_symbol(dll, (FARPROC *)&s_api.Connect, "JLINKARM_Connect") < 0 ||
-            load_symbol(dll, (FARPROC *)&s_api.WriteMemEx, "JLINKARM_WriteMemEx") < 0 ||
-            load_symbol(dll, (FARPROC *)&s_api.ReadMemEx, "JLINKARM_ReadMemEx") < 0 ||
-            load_symbol(dll, (FARPROC *)&s_api.EMU_SelectByUSBSN, "JLINKARM_EMU_SelectByUSBSN") < 0 ||
-            load_symbol(dll, (FARPROC *)&s_api.ExecCommand, "JLINKARM_ExecCommand") < 0 ||
-            load_symbol(dll, (FARPROC *)&s_api.TIF_Select, "JLINKARM_TIF_Select") < 0 ||
-            load_symbol(dll, (FARPROC *)&s_api.SetSpeed, "JLINKARM_SetSpeed") < 0 ||
-            load_symbol(dll, (FARPROC *)&s_api.Reset, "JLINKARM_Reset") < 0) {
-                FreeLibrary(dll);
+        if (load_symbol(dll, (jlink_sym_t *)&s_api.Open, "JLINKARM_Open") < 0 ||
+            load_symbol(dll, (jlink_sym_t *)&s_api.Close, "JLINKARM_Close") < 0 ||
+            load_symbol(dll, (jlink_sym_t *)&s_api.IsOpen, "JLINKARM_IsOpen") < 0 ||
+            load_symbol(dll, (jlink_sym_t *)&s_api.Connect, "JLINKARM_Connect") < 0 ||
+            load_symbol(dll, (jlink_sym_t *)&s_api.WriteMemEx, "JLINKARM_WriteMemEx") < 0 ||
+            load_symbol(dll, (jlink_sym_t *)&s_api.ReadMemEx, "JLINKARM_ReadMemEx") < 0 ||
+            load_symbol(dll, (jlink_sym_t *)&s_api.EMU_SelectByUSBSN, "JLINKARM_EMU_SelectByUSBSN") < 0 ||
+            load_symbol(dll, (jlink_sym_t *)&s_api.ExecCommand, "JLINKARM_ExecCommand") < 0 ||
+            load_symbol(dll, (jlink_sym_t *)&s_api.TIF_Select, "JLINKARM_TIF_Select") < 0 ||
+            load_symbol(dll, (jlink_sym_t *)&s_api.SetSpeed, "JLINKARM_SetSpeed") < 0 ||
+            load_symbol(dll, (jlink_sym_t *)&s_api.Reset, "JLINKARM_Reset") < 0) {
+                JLINK_FREE(dll);
                 memset(&s_api, 0, sizeof(s_api));
                 return -1;
         }
@@ -155,8 +193,8 @@ jlink_port_deinit(void)
         if (s_api.IsOpen != NULL && s_api.IsOpen() != 0) {
                 s_api.Close();
         }
-        if (s_api.dll != NULL) {
-                FreeLibrary(s_api.dll);
+        if (s_api.dll != JLINK_LIB_NULL) {
+                JLINK_FREE(s_api.dll);
         }
         memset(&s_api, 0, sizeof(s_api));
         s_api_loaded = false;
@@ -191,10 +229,15 @@ jlink_port_read_mem(u32 addr, u32 len, void *data)
 }
 
 #else
-/* Linux 或其他平台空实现占位，避免编译报错 */
+/* MCU 等无法加载动态库的平台空实现占位 */
 i32
 jlink_port_init(const char *dll_path, const char *device, u32 speed_khz, u32 serial_no, bool use_sn)
 {
+        ARG_UNUSED(dll_path);
+        ARG_UNUSED(device);
+        ARG_UNUSED(speed_khz);
+        ARG_UNUSED(serial_no);
+        ARG_UNUSED(use_sn);
         return -1;
 }
 
@@ -212,12 +255,18 @@ jlink_port_reset(void)
 i32
 jlink_port_write_mem(u32 addr, u32 len, const void *data)
 {
+        ARG_UNUSED(addr);
+        ARG_UNUSED(len);
+        ARG_UNUSED(data);
         return -1;
 }
 
 i32
 jlink_port_read_mem(u32 addr, u32 len, void *data)
 {
+        ARG_UNUSED(addr);
+        ARG_UNUSED(len);
+        ARG_UNUSED(data);
         return -1;
 }
 

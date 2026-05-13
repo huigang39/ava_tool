@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "errdef.h"
+#include "platdef.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,6 +35,7 @@ extern "C" {
 #define FUNC_UNUSED
 #define TYPEOF(var) decltype(var)
 #define PACKED      __declspec(align(1))
+#define NO_ASAN
 #else
 #define AT(sec)      __attribute__((section(sec)))
 #define OPTNONE      __attribute__((optnone))
@@ -41,6 +43,17 @@ extern "C" {
 #define FUNC_UNUSED  __attribute__((unused))
 #define TYPEOF(var)  __typeof__(var)
 #define PACKED       __attribute__((packed))
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define NO_ASAN __attribute__((no_sanitize("address")))
+#endif
+#endif
+#if !defined(NO_ASAN) && defined(__SANITIZE_ADDRESS__)
+#define NO_ASAN __attribute__((no_sanitize("address")))
+#endif
+#ifndef NO_ASAN
+#define NO_ASAN
+#endif
 #endif
 
 #ifdef MCU
@@ -140,13 +153,17 @@ extern "C" {
 
 #define SPINLOCK_BACKOFF_MIN (4)
 #define SPINLOCK_BACKOFF_MAX (128)
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(ARCH_X86_64) || defined(ARCH_X86)
 #if defined(_MSC_VER)
 #include <intrin.h>
 #define SPINLOCK_BACKOFF_HOOK _mm_pause()
 #else
 #define SPINLOCK_BACKOFF_HOOK __asm volatile("pause" ::: "memory")
 #endif
+#elif defined(ARCH_ARM64)
+#define SPINLOCK_BACKOFF_HOOK __asm volatile("yield" ::: "memory")
+#elif defined(ARCH_ARM32)
+#define SPINLOCK_BACKOFF_HOOK __asm volatile("yield" ::: "memory")
 #else
 #define SPINLOCK_BACKOFF_HOOK
 #endif
