@@ -29,11 +29,12 @@ struct ChannelDropPayload {
 
         char      name[128];
         u64       addr;
-        char      type[8];   // "F32"/"F64"/"I8"/"I16"/"I32"/"I64"/"U8"/"U16"/"U32"/"U64"
-        char      device[8]; // "SHM" / "JLINK" / "UDP"
-        u8        numBytes;  // 1/2/4/8 - 派生自 type
-        u8        numEnums;  // 0 表示不是枚举
-        u64       typeOff;   // DWARF type offset
+        char      type[8];    // "F32"/"F64"/"I8"/"I16"/"I32"/"I64"/"U8"/"U16"/"U32"/"U64"
+        char      device[8];  // "SHM" / "JLINK" / "UDP"
+        char      shmName[64]; // SHM region name (when device=="SHM"), separate from variable path
+        u8        numBytes;   // 1/2/4/8 - 派生自 type
+        u8        numEnums;   // 0 表示不是枚举
+        u64       typeOff;    // DWARF type offset
         EnumEntry enums[kMaxEnums];
 };
 
@@ -99,6 +100,7 @@ class MonitorChannel
         u32               numBytes_{4};
         f32               rVal_{}, wVal_{};
         std::string       device_{};
+        std::string       shmRegionName_{}; // actual SHM region name (may differ from channel name)
         std::atomic<bool> wValDirty_{false};
         std::atomic<bool> pendingDelete_{false};
 
@@ -146,6 +148,8 @@ class MonitorChannel
         void         setAddr(const usize addr) { addr_ = addr; }
         std::string &getDevice() { return device_; }
         void         setDevice(const std::string &device) { device_ = device; }
+        std::string &getShmRegionName() { return shmRegionName_; }
+        void         setShmRegionName(const std::string &n) { shmRegionName_ = n; }
         shm_t       &getShm() { return shm_; }
 
         f32  &getRVal() { return rVal_; }
@@ -461,6 +465,7 @@ class Monitor
         std::vector<f32> timestamps_{};
         bool             paused_{false};
         ScopeMapType     scopes_{};
+        bool             isModified_{false};
 
       public:
         enum class SamplingMode { HSS, POLL };
@@ -515,6 +520,9 @@ class Monitor
         };
 
         void updateDisplay();
+        bool isModified() const { return isModified_; }
+        void setModified()      { isModified_ = true; }
+        void clearModified()    { isModified_ = false; }
         void clearData()
         {
                 for (auto &pair : scopes_)

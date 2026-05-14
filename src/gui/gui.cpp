@@ -7,8 +7,11 @@
 #include <GLFW/glfw3.h>
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
+#else
+#include <GLFW/glfw3.h>
 #endif
 
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <ranges>
@@ -20,6 +23,7 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "implot.h"
+#include "native_dlg.hpp"
 
 #include "app_log.hpp"
 #include "core/jlink_dev.hpp"
@@ -56,7 +60,13 @@ Gui::Gui(const std::string &initialPath)
         LOG_I("GLFW Inited");
 
         glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
+#ifdef __APPLE__
+        glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
+        glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+        glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+#else
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 0);
+#endif
 
         window_ = glfwCreateWindow(windowWidth_, windowHeight_, windowTitle_.c_str(), nullptr, nullptr);
         if (window_ == nullptr) {
@@ -74,12 +84,29 @@ Gui::Gui(const std::string &initialPath)
 
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
-        ImGuiIO &io         = ImGui::GetIO();
-        io.ConfigFlags     |= ImGuiConfigFlags_DockingEnable;
-        io.FontGlobalScale  = 1.0f;
-        io.Fonts->AddFontFromFileTTF(fontFile_.c_str(), 18.0f);
+        ImGuiIO &io     = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+
+        // On macOS Retina the GLFW backend already sets DisplayFramebufferScale = 2,
+        // so ImGui renders in logical pixels and the backend up-scales to physical.
+        // On Windows/Linux the framebuffer equals the window in pixels, so we must
+        // bake the DPI scale into the font ourselves.
+        // uiScale = contentScale / (fb/window) → 1.0 on macOS Retina, 1.5 on Win 150%
+        int winW = 1, fbW = 1;
+        glfwGetWindowSize(window_, &winW, nullptr);
+        glfwGetFramebufferSize(window_, &fbW, nullptr);
+        const float fbRatio  = (winW > 0) ? static_cast<float>(fbW) / static_cast<float>(winW) : 1.0f;
+        const float uiScale  = xScale_ / fbRatio;
+
+        const float fontSize = std::round(18.0f * uiScale);
+        if (!io.Fonts->AddFontFromFileTTF(fontFile_.c_str(), fontSize)) {
+                ImFontConfig cfg;
+                cfg.SizePixels = fontSize;
+                io.Fonts->AddFontDefault(&cfg);
+        }
 
         ImGui::StyleColorsDark();
+        ImGui::GetStyle().ScaleAllSizes(uiScale);
 
         static std::string iniPath = getAppDir() + "/imgui.ini";
         io.IniFilename             = iniPath.c_str();
@@ -144,7 +171,7 @@ Gui::getAppDir()
                 path = ".";
         }
 #else
-        path = "./.avatool";
+        path = "./.ava_tool";
 #endif
         std::filesystem::create_directories(path);
         return path;
@@ -199,6 +226,8 @@ Gui::saveSession(const std::string &path)
                                 snprintf(addrHex, sizeof(addrHex), "0x%zX", ch->getAddr());
                                 cJSON_AddStringToObject(chObj, "addr", addrHex);
                                 cJSON_AddStringToObject(chObj, "device", ch->getDevice().c_str());
+                                if (!ch->getShmRegionName().empty())
+                                        cJSON_AddStringToObject(chObj, "shmRegionName", ch->getShmRegionName().c_str());
 
                                 cJSON *colorArr = cJSON_CreateArray();
                                 for (i32 i = 0; i < 4; ++i)
@@ -244,6 +273,8 @@ Gui::saveSession(const std::string &path)
                 cJSON_AddItemToArray(VariableArr, pObj);
         }
         cJSON_AddItemToObject(root, "Variables", VariableArr);
+        for (const auto &m : monitors_ | std::views::values)
+                m->clearModified();
         isModified_ = false;
 
         cJSON *motorsArr = cJSON_CreateArray();
@@ -284,33 +315,20 @@ Gui::saveSession(const std::string &path)
               outLen);
 }
 
-void
+bool
 Gui::saveSessionAs()
 {
-#ifdef _WIN32
-        char          szFile[260] = {0};
-        OPENFILENAMEA ofn;
-        ZeroMemory(&ofn, sizeof(ofn));
-        ofn.lStructSize     = sizeof(ofn);
-        ofn.hwndOwner       = glfwGetWin32Window(window_);
-        ofn.lpstrFile       = szFile;
-        ofn.nMaxFile        = sizeof(szFile);
-        ofn.lpstrFilter     = "AvA Session (*.ava)\0*.ava\0All Files (*.*)\0*.*\0";
-        ofn.nFilterIndex    = 1;
-        ofn.lpstrFileTitle  = NULL;
-        ofn.nMaxFileTitle   = 0;
-        ofn.lpstrInitialDir = NULL;
-        ofn.Flags           = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_OVERWRITEPROMPT;
-
-        if (GetSaveFileNameA(&ofn) == TRUE) {
-                std::string path = szFile;
-                if (path.find(".ava") == std::string::npos)
-                        path += ".ava";
-                saveSession(path);
-                saveToastAlpha_     = 2.0f;
-                LOG_I("Session saved As: %s", path.c_str());
-        }
-#endif
+        std::string path = nativeDlgSave("Save Session As",
+                                         {{"Session Files", {"ava"}}},
+                                         "session.ava");
+        if (path.empty())
+                return false;
+        if (path.find(".ava") == std::string::npos)
+                path += ".ava";
+        saveSession(path);
+        saveToastAlpha_ = 2.0f;
+        LOG_I("Session saved As: %s", path.c_str());
+        return true;
 }
 
 void
@@ -490,6 +508,9 @@ Gui::loadSession(const std::string &path)
                                                 ch->setEnums(std::move(ents));
                                         }
 
+                                        if (const cJSON *shmRN = cJSON_GetObjectItem(chItem, "shmRegionName");
+                                            cJSON_IsString(shmRN))
+                                                ch->setShmRegionName(shmRN->valuestring);
                                         if (ch->getDevice() == "SHM")
                                                 MonitorScope::shmInit(*ch);
                                 }
@@ -575,25 +596,9 @@ Gui::drawBar()
                                 isFirstSave_        = true;
                         }
                         if (ImGui::MenuItem("Open Session...")) {
-#ifdef _WIN32
-                                char          szFile[260] = {0};
-                                OPENFILENAMEA ofn;
-                                ZeroMemory(&ofn, sizeof(ofn));
-                                ofn.lStructSize     = sizeof(ofn);
-                                ofn.hwndOwner       = glfwGetWin32Window(window_);
-                                ofn.lpstrFile       = szFile;
-                                ofn.nMaxFile        = sizeof(szFile);
-                                ofn.lpstrFilter     = "AvA Session (*.ava)\0*.ava\0All Files (*.*)\0*.*\0";
-                                ofn.nFilterIndex    = 1;
-                                ofn.lpstrFileTitle  = NULL;
-                                ofn.nMaxFileTitle   = 0;
-                                ofn.lpstrInitialDir = NULL;
-                                ofn.Flags           = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
-
-                                if (GetOpenFileNameA(&ofn) == TRUE) {
-                                        loadSession(szFile);
-                                }
-#endif
+                                std::string p = nativeDlgOpen("Open Session",
+                                                              {{"Session Files", {"ava", "json"}}});
+                                if (!p.empty()) loadSession(p);
                         }
                         if (ImGui::MenuItem("Save Session", "Ctrl+S")) {
                                 saveSession();
@@ -697,11 +702,17 @@ Gui::loop()
                 if (glfwWindowShouldClose(window_) && !showQuitModal_ && !wantsToQuit_) {
                         bool anyModified = isModified_;
                         if (!anyModified) {
-                            for (const auto &v : vars_ | std::views::values) {
-                                if (v->isModified()) { anyModified = true; break; }
-                            }
+                                for (const auto &v : vars_ | std::views::values) {
+                                        if (v->isModified()) { anyModified = true; break; }
+                                }
                         }
-                        if (anyModified) {
+                        if (!anyModified) {
+                                std::lock_guard lk(mtxMonitors_);
+                                for (const auto &m : monitors_ | std::views::values) {
+                                        if (m->isModified()) { anyModified = true; break; }
+                                }
+                        }
+                        if (anyModified || isFirstSave_) {
                                 glfwSetWindowShouldClose(window_, GLFW_FALSE);
                                 showQuitModal_ = true;
                         } else {
@@ -769,6 +780,7 @@ Gui::loop()
 
                 ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
 
+
                 if (showCalculator_)
                         drawCalculator();
 
@@ -811,10 +823,17 @@ Gui::loop()
                                 ImGui::Text("Save changes to session before quitting?");
                                 ImGui::Separator();
                                 if (ImGui::Button("Save", ImVec2(120, 0))) {
-                                        saveSession();
-                                        wantsToQuit_   = true;
+                                        bool saved;
+                                        if (isFirstSave_) {
+                                                saved = saveSessionAs();
+                                        } else {
+                                                saveSession();
+                                                saved = true;
+                                        }
                                         showQuitModal_ = false;
                                         ImGui::CloseCurrentPopup();
+                                        if (saved) wantsToQuit_ = true;
+                                        // If user cancelled the native dialog, saved==false → stay in app
                                 }
                                 ImGui::SetItemDefaultFocus();
                                 ImGui::SameLine();

@@ -27,9 +27,19 @@ class Gui
 
         static std::vector<std::string> sDroppedFiles_;
 
+#ifdef __APPLE__
+        static constexpr char *glslVer_ = (char *)"#version 150";
+#else
         static constexpr char *glslVer_ = (char *)"#version 130";
+#endif
 
+#ifdef _WIN32
         std::string fontFile_ = "C:/Windows/Fonts/msyh.ttc";
+#elif defined(__APPLE__)
+        std::string fontFile_ = "/System/Library/Fonts/STHeiti Medium.ttc";
+#else
+        std::string fontFile_ = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc";
+#endif
 
         GLFWwindow *window_      = nullptr;
         std::string windowTitle_ = "AvA Tool";
@@ -42,15 +52,15 @@ class Gui
 
         std::string currentSessionPath_ = "session.ava";
         bool        isModified_         = false;
-        bool        showQuitModal_      = false;
-        bool        wantsToQuit_        = false;
-        bool        isFirstSave_        = true;
-        f32         saveToastAlpha_     = 0.0f;
+        bool        showQuitModal_        = false;
+        bool        wantsToQuit_          = false;
+        bool        isFirstSave_    = true;
+        f32         saveToastAlpha_ = 0.0f;
 
         void drawBar();
         void loadSession(const std::string &path = "");
         void saveSession(const std::string &path = "");
-        void saveSessionAs();
+        bool saveSessionAs(); // returns false if user cancelled the dialog
         void drawCalculator();
         void syncSymbolAddresses(const std::vector<SearchEntry> &searchPool);
 

@@ -205,11 +205,16 @@ MonitorScope::drawTableRow(const std::string &chName, std::shared_ptr<MonitorCha
         }
 
         if (ImGui::BeginPopupContextItem()) {
+                // Right-click implies selection — auto-select this row so Delete works
+                // without requiring a prior left-click.
+                if (!ch->selected_) {
+                        for (auto &pair : chs_) pair.second->selected_ = false;
+                        ch->selected_ = true;
+                }
                 if (ImGui::MenuItem("Delete Selected")) {
-                        for (auto &pair : chs_) {
+                        for (auto &pair : chs_)
                                 if (pair.second->selected_)
                                         pair.second->markPendingDelete();
-                        }
                 }
                 ImGui::EndPopup();
         }
@@ -756,7 +761,12 @@ MonitorScope::shmInit(MonitorChannel &ch)
 {
         if (ch.getDevice() != "SHM")
                 return;
-        shm_cfg_t cfg = {ch.getName().c_str(), SHM_READONLY, ch.getNumBytes()};
+        // Use the dedicated SHM region name if set; fall back to channel name.
+        // Use SHM_READWRITE because spsc_read_buf updates spsc->rp (read pointer).
+        // Use 4096 as the minimum region capacity to accommodate the spsc header.
+        const std::string &regionName =
+            ch.getShmRegionName().empty() ? ch.getName() : ch.getShmRegionName();
+        shm_cfg_t cfg = {regionName.c_str(), SHM_READWRITE, 4096};
         shm_init(&ch.getShm(), cfg);
 }
 
@@ -774,6 +784,8 @@ MonitorScope::dropTarget()
                                                 ch->setAddr(chPayload->addr);
                                                 ch->getSymbolName() = chPayload->name;
                                                 ch->setDevice(chPayload->device);
+                                                if (chPayload->shmName[0] != '\0')
+                                                        ch->setShmRegionName(chPayload->shmName);
                                                 if (chPayload->numEnums > 0) {
                                                         std::vector<MonitorChannel::EnumEntry> ents;
                                                         for (int i = 0; i < chPayload->numEnums; ++i)
@@ -783,6 +795,8 @@ MonitorScope::dropTarget()
                                                 }
                                                 if (ch->getDevice() == "SHM")
                                                         shmInit(*ch);
+                                                if (parent_)
+                                                        parent_->setModified();
                                         }
                                 }
                         }
@@ -931,9 +945,8 @@ Monitor::updateDisplay()
 
                 // Right-aligned mode control group
                 f32 spacing    = ImGui::GetStyle().ItemSpacing.x;
-                f32 totalWidth = 70 + spacing + 90 + spacing + ImGui::CalcTextSize("T-Mode").x +
-                                   spacing + 90 + spacing + ImGui::CalcTextSize("F-Mode").x;
-                
+                f32 totalWidth = 70 + spacing + 90 + spacing + ImGui::CalcTextSize("MODE").x;
+
                 ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - totalWidth);
 
                 const char *sampModes[] = {"HSS", "POLL"};
@@ -946,26 +959,24 @@ Monitor::updateDisplay()
                 }
                 ImGui::SameLine();
 
+                // Single MODE combo — targets FFT axis when any scope is in FFT view,
+                // otherwise targets the time-domain axis.
+                bool anyFft = false;
+                for (const auto &sp : scopes_)
+                        if (sp.second && sp.second->isFftEnabled()) { anyFft = true; break; }
+
                 const char *viewModeNames[] = {"FULL", "FOLLOW", "MANUAL"};
-                i32         curViewMode     = (i32)viewMode_;
-                i32         curFftViewMode  = (i32)fftViewMode_;
+                i32         curMode = anyFft ? (i32)fftViewMode_ : (i32)viewMode_;
 
                 ImGui::SetNextItemWidth(90);
-                if (ImGui::Combo("##TimeMode", &curViewMode, viewModeNames, 3)) {
-                        viewMode_ = static_cast<MonitorViewMode>(curViewMode);
+                if (ImGui::Combo("##Mode", &curMode, viewModeNames, 3)) {
+                        if (anyFft) fftViewMode_ = static_cast<MonitorViewMode>(curMode);
+                        else        viewMode_    = static_cast<MonitorViewMode>(curMode);
                 }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Time Domain View Mode");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip(anyFft ? "Frequency Domain View Mode" : "Time Domain View Mode");
                 ImGui::SameLine();
-                ImGui::TextDisabled("T-Mode");
-
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(90);
-                if (ImGui::Combo("##FftMode", &curFftViewMode, viewModeNames, 3)) {
-                        fftViewMode_ = static_cast<MonitorViewMode>(curFftViewMode);
-                }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Frequency Domain (FFT) View Mode");
-                ImGui::SameLine();
-                ImGui::TextDisabled("F-Mode");
+                ImGui::TextDisabled("MODE");
 
                 ImGui::Separator();
 

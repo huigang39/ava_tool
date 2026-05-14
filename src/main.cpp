@@ -218,7 +218,7 @@ threadFunc(Gui *gui)
                                                 if (ch->isPendingDelete())
                                                         continue;
                                                 const std::string &dev = ch->getDevice();
-                                                if (dev == "SHM") {
+                                                if (dev == "SHM" && ch->getShm().lo.spsc != nullptr) {
                                                         u8  raw[8];
                                                         u32 nb = ch->getNumBytes();
                                                         if (nb == 0)
@@ -549,7 +549,11 @@ module_init()
         mempool_init(&g_log_mp);
 
         // 配置日志
+#ifdef _WIN32
         static std::string logDir = Gui::getAppDir() + "\\log";
+#else
+        static std::string logDir = Gui::getAppDir() + "/log";
+#endif
         log_cfg_t          cfg    = {.e_mode     = LOG_MODE_ASYNC,
                              .e_level    = LOG_LEVEL_INFO,
                              .e_format   = LOG_FORMAT_TEXT,

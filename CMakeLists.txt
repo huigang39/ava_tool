@@ -2,15 +2,13 @@ cmake_minimum_required(VERSION 3.15)
 
 project(ava_tool
         VERSION 0.0.1
-        LANGUAGES CXX C
+        LANGUAGES CXX C OBJCXX
 )
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD_REQUIRED ON)
-
-find_package(OpenGL REQUIRED)
 
 # --- Platform & Architecture Detection ---
 if(WIN32)
@@ -42,6 +40,7 @@ else()
     add_compile_options(-Wall -Wextra -O3)
     if(APPLE)
         add_compile_options(-fobjc-arc)
+        add_definitions(-DGL_SILENCE_DEPRECATION)
     endif()
 endif()
 
@@ -83,9 +82,17 @@ set(SRC_IMPLOT
 set(SRC_THIRDPARTY
         ${SRC_IMGUI}
         ${SRC_IMPLOT}
-        ${DIR_THIRDPARTY}/ImGuiFileDialog/ImGuiFileDialog.cpp
         ${DIR_THIRDPARTY}/cJSON/cJSON.c
 )
+
+# Native file dialog — one platform-specific translation unit
+if(APPLE)
+    set(SRC_NATIVE_DLG ${DIR_SRC}/native_dlg_mac.mm)
+elseif(WIN32)
+    set(SRC_NATIVE_DLG ${DIR_SRC}/native_dlg_win.cpp)
+else()
+    set(SRC_NATIVE_DLG ${DIR_SRC}/native_dlg_linux.cpp)
+endif()
 
 # --- Main Executable ---
 add_executable(${PROJECT_NAME} WIN32
@@ -98,8 +105,15 @@ add_executable(${PROJECT_NAME} WIN32
         ${DIR_CORE}/json_parser.cpp
         ${DIR_CORE}/bin_parser.cpp
         ${DIR_CORE}/jlink_dev.cpp
+        ${SRC_NATIVE_DLG}
         ${SRC_THIRDPARTY}
 )
+
+if(WIN32)
+    set(IMGUI_NOTIFY_DIR ${DIR_THIRDPARTY}/ImGuiNotify/win32)
+else()
+    set(IMGUI_NOTIFY_DIR ${DIR_THIRDPARTY}/ImGuiNotify/unix)
+endif()
 
 target_include_directories(${PROJECT_NAME} PRIVATE
         ${DIR_SRC}
@@ -109,9 +123,8 @@ target_include_directories(${PROJECT_NAME} PRIVATE
         ${DIR_THIRDPARTY}/imgui
         ${DIR_THIRDPARTY}/imgui/backends
         ${DIR_THIRDPARTY}/implot
-        ${DIR_THIRDPARTY}/ImGuiFileDialog
-        ${DIR_THIRDPARTY}/ImGuiNotify/win32/backends
-        ${DIR_THIRDPARTY}/ImGuiNotify/win32/fonts
+        ${IMGUI_NOTIFY_DIR}/backends
+        ${IMGUI_NOTIFY_DIR}/fonts
         ${DIR_THIRDPARTY}/GLFW/inc
         ${DIR_THIRDPARTY}/cJSON
 )
@@ -124,7 +137,7 @@ if(WIN32)
     else()
         set(JLINK_LIB ${DIR_MODULE}/lib/win/JLink_x64.lib)
     endif()
-    set(FFTW_LIB ${DIR_MODULE}/lib/win/libfftw3f-3.lib)
+    set(FFTW3F_LIB ${DIR_MODULE}/lib/win/libfftw3f-3.lib)
     if(ARCH_DIR STREQUAL "arm64")
         set(DLL_LIST
             ${DIR_THIRDPARTY}/GLFW/lib/win/glfw3.dll
@@ -145,17 +158,26 @@ if(WIN32)
         target_link_options(${PROJECT_NAME} PRIVATE -static-libgcc -static-libstdc++)
     endif()
 elseif(APPLE)
-    # macOS paths (Assuming shared libs are in macos subfolder if provided)
-    set(GLFW3_LIB ${DIR_THIRDPARTY}/GLFW/lib/macos/libglfw.3.dylib)
-    set(JLINK_LIB ${DIR_MODULE}/lib/macos/libjlinkarm.dylib)
-    set(FFTW_LIB ${DIR_MODULE}/lib/macos/libfftw3f.dylib)
-    find_package(OpenGL REQUIRED)
-    target_link_libraries(${PROJECT_NAME} PRIVATE "-framework Cocoa" "-framework IOKit" "-framework CoreVideo")
+    # macOS: 使用 Homebrew 安装的 GLFW / FFTW, 以及 SEGGER 安装的 JLink dylib
+    find_package(glfw3 REQUIRED)
+    set(GLFW3_LIB glfw)
+
+    find_path(FFTW3F_INCLUDE_DIR fftw3.h
+        HINTS /opt/homebrew/include /usr/local/include)
+    find_library(FFTW3F_LIB NAMES fftw3f
+        HINTS /opt/homebrew/lib /usr/local/lib REQUIRED)
+
+    find_library(JLINK_LIB NAMES jlinkarm
+        HINTS /Applications/SEGGER/JLink REQUIRED)
+
+    target_include_directories(${PROJECT_NAME} PRIVATE ${FFTW3F_INCLUDE_DIR})
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        "-framework Cocoa" "-framework IOKit" "-framework CoreVideo" "-framework OpenGL")
 else()
     # Linux paths
     set(GLFW3_LIB ${DIR_THIRDPARTY}/GLFW/lib/linux/libglfw3.so)
     set(JLINK_LIB ${DIR_MODULE}/lib/linux/libjlinkarm.so.8)
-    set(FFTW_LIB fftw3f) # Use system fftw if not provided
+    set(FFTW3F_LIB fftw3f) # Use system fftw if not provided
     find_package(OpenGL REQUIRED)
     find_package(Threads REQUIRED)
     target_link_libraries(${PROJECT_NAME} PRIVATE ${CMAKE_DL_LIBS} Threads::Threads)
@@ -165,7 +187,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
         module
         ${GLFW3_LIB}
         ${JLINK_LIB}
-        ${FFTW_LIB}
+        ${FFTW3F_LIB}
         $<$<NOT:$<PLATFORM_ID:Darwin>>:OpenGL::GL>
 )
 
@@ -178,12 +200,23 @@ if(WIN32)
             COMMENT "copying dynamic libraries to output directory"
     )
 elseif(APPLE)
-    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${GLFW3_LIB}" "${JLINK_LIB}" "${FFTW_LIB}"
-            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-            COMMENT "copying dynamic libraries to output directory"
+    # macOS: 让可执行文件能够找到 SEGGER JLink dylib (brew 装的 glfw/fftw 已在标准 rpath 下)
+    set_target_properties(${PROJECT_NAME} PROPERTIES
+        BUILD_RPATH   "/Applications/SEGGER/JLink"
+        INSTALL_RPATH "/Applications/SEGGER/JLink"
     )
+    # SEGGER 的 dylib install_name 为相对路径 (Output/Release/<arch>/...), dyld 无法解析,
+    # 这里改写为已存在 rpath 中的绝对路径名,确保运行时可加载。
+    if(ARCH_DIR STREQUAL "arm64")
+        set(JLINK_INSTALL_NAME "Output/Release/arm64/libjlinkarm.9.42.0.dylib")
+    else()
+        set(JLINK_INSTALL_NAME "Output/Release/x64/libjlinkarm.9.42.0.dylib")
+    endif()
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND install_name_tool -change "${JLINK_INSTALL_NAME}"
+                "/Applications/SEGGER/JLink/libjlinkarm.dylib"
+                "$<TARGET_FILE:${PROJECT_NAME}>"
+        COMMENT "Rewriting JLink dylib install name to absolute path")
 endif()
 
 # set(CPACK_PACKAGE_NAME ${PROJECT_NAME})

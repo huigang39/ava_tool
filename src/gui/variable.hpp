@@ -138,7 +138,7 @@ class Variable
         void               clearModified() { isModified_ = false; }
         void               addRecursive(const std::string &fullPath, u64 addr, u64 typeOff, PortType port);
         void               draw();
-        void               drawVarVarTreeRow(const std::string &name, u64 addr, u64 typeOff, i32 depth);
+        void               drawVarVarTreeRow(const std::string &name, u64 addr, u64 typeOff, i32 depth, PortType port = PortType::JLINK, const std::string &shmRegionName = {});
 
         void               drawSymbolBrowser();
         void               drawSymbolTree();

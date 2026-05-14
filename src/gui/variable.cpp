@@ -4,7 +4,7 @@
 #include <sstream>
 #include <functional>
 
-#include "ImGuiFileDialog.h"
+#include "native_dlg.hpp"
 #include "ImGuiNotify.hpp"
 #include "imgui.h"
 
@@ -631,7 +631,7 @@ Variable::drawSymbolBrowser()
                 ImGui::TableSetColumnIndex(4); ImGui::TextUnformatted("...");
 
                 if (open && isComplex) {
-                    drawVarVarTreeRow(e.path, e.addr, e.typeOff, 1);
+                    drawVarVarTreeRow(e.path, e.addr, e.typeOff, 1, e.defaultPort);
                     ImGui::TreePop();
                 }
 
@@ -725,6 +725,8 @@ Variable::drawVariableList()
                     snprintf(p.type, sizeof(p.type), "%s", Parser::dataTypeToStr(v.type));
                 }
                 snprintf(p.device, sizeof(p.device), v.port == PortType::JLINK ? "JLINK" : (v.port == PortType::SHM ? "SHM" : "LOCAL"));
+                if (v.port == PortType::SHM)
+                    snprintf(p.shmName, sizeof(p.shmName), "%s", v.shm.name);
                 p.numBytes = (u8)Parser::typeBytes(v.type);
                 p.typeOff = v.typeOff;
                 fillEnumPayload(dwarfInfo_, v.typeOff, p);
@@ -763,7 +765,7 @@ Variable::drawVariableList()
             if (open && isComplex) {
                 {
                     std::lock_guard lk(mtxElf_);
-                    drawVarVarTreeRow(v.name, v.addr, v.typeOff, 1);
+                    drawVarVarTreeRow(v.name, v.addr, v.typeOff, 1, v.port, v.shm.name);
                 }
                 ImGui::TreePop();
             }
@@ -851,6 +853,48 @@ Variable::drawAddVariableDialog()
     }
 }
 
+static void
+populateShmMemberCache(const dwarf::Info &info, u64 baseAddr, u64 typeOff,
+                       const u8 *blob, usize blobSize,
+                       std::unordered_map<u64, std::string> &cache)
+{
+    const dwarf::Type *t = resolveAlias(info, typeOff);
+    if (!t) return;
+    if (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION) {
+        for (const auto &m : t->members) {
+            if (m.offset >= blobSize) continue;
+            u64 memberAddr = baseAddr + m.offset;
+            const char *sType = scalarPayloadType(info, m.type);
+            if (sType) {
+                u32 sz = Parser::typeBytes(Parser::strToDataType(sType));
+                if (m.offset + sz <= blobSize)
+                    cache[memberAddr] = decodeValue(blob + m.offset, Parser::strToDataType(sType));
+            } else {
+                populateShmMemberCache(info, memberAddr, m.type,
+                                       blob + m.offset, blobSize - m.offset, cache);
+            }
+        }
+    } else if (t->kind == dwarf::TypeKind::ARRAY) {
+        u64 elemSize = typeSize(info, t->inner);
+        if (elemSize == 0) return;
+        u64 dim = t->dims.empty() ? 0 : t->dims.front();
+        const char *sType = scalarPayloadType(info, t->inner);
+        for (u64 i = 0; i < dim; ++i) {
+            u64 offset = i * elemSize;
+            if (offset >= blobSize) break;
+            u64 memberAddr = baseAddr + offset;
+            if (sType) {
+                u32 sz = Parser::typeBytes(Parser::strToDataType(sType));
+                if (offset + sz <= blobSize)
+                    cache[memberAddr] = decodeValue(blob + offset, Parser::strToDataType(sType));
+            } else {
+                populateShmMemberCache(info, memberAddr, t->inner,
+                                       blob + offset, blobSize - offset, cache);
+            }
+        }
+    }
+}
+
 void
 Variable::updateVariables()
 {
@@ -861,11 +905,27 @@ Variable::updateVariables()
     for (auto &v : vars_) {
         if (v.is_editing) continue;
 
-        // Skip complex types
         const dwarf::Type *t = resolveAlias(dwarfInfo_, v.typeOff);
         const bool isComplex = t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION || t->kind == dwarf::TypeKind::ARRAY);
         if (isComplex) {
             v.valueStr = "...";
+            // For SHM structs: read the full blob and populate the member cache so the
+            // struct browser can display live values without requiring JLink.
+            if (v.port == PortType::SHM) {
+                if (!v.shm.inited) {
+                    shm_cfg_t cfg = {v.shm.name, SHM_READWRITE, 4096};
+                    if (shm_init(&v.shm.handle, cfg) == 0) v.shm.inited = true;
+                }
+                if (v.shm.inited) {
+                    usize sz = typeSize(dwarfInfo_, v.typeOff);
+                    if (sz > 0 && sz <= 4096) {
+                        std::vector<u8> blob(sz);
+                        if (shm_read(&v.shm.handle, blob.data(), sz) == sz)
+                            populateShmMemberCache(dwarfInfo_, v.addr, v.typeOff,
+                                                   blob.data(), sz, memberValueCache_);
+                    }
+                }
+            }
             continue;
         }
 
@@ -952,14 +1012,11 @@ Variable::draw()
     ImGui::EndChild();
 
     drawAddVariableDialog();
-    if (state_ == WindowState::LoadElf) { 
-        IGFD::FileDialogConfig config; config.path = "."; 
-        ImGuiFileDialog::Instance()->OpenDialog("ChooseFileKey", "Choose Symbol File", ".elf,.axf,.out,.json,.bin", config); 
-        state_ = WindowState::None; 
-    }
-    if (ImGuiFileDialog::Instance()->Display("ChooseFileKey")) {
-        if (ImGuiFileDialog::Instance()->IsOk()) { handleDroppedFile(ImGuiFileDialog::Instance()->GetFilePathName()); }
-        ImGuiFileDialog::Instance()->Close();
+    if (state_ == WindowState::LoadElf) {
+        state_ = WindowState::None;
+        std::string p = nativeDlgOpen("Choose Symbol File",
+                                      {{"Symbol Files", {"elf", "axf", "out", "json", "bin"}}});
+        if (!p.empty()) handleDroppedFile(p);
     }
     for (auto &path : Gui::getDroppedFiles()) handleDroppedFile(path);
 }
@@ -1060,139 +1117,122 @@ Variable::addRecursive(const std::string &fullPath, u64 addr, u64 typeOff, PortT
 }
 
 void
-Variable::drawVarVarTreeRow(const std::string &fullPath, u64 addr, u64 typeOff, i32 depth)
+Variable::drawVarVarTreeRow(const std::string &fullPath, u64 addr, u64 typeOff, i32 depth, PortType port, const std::string &shmRegionName)
 {
     if (depth > 16) return;
     const dwarf::Type *t = resolveAlias(dwarfInfo_, typeOff);
     if (!t) return;
 
+    const char *devLabel = (port == PortType::SHM) ? "SHM" : (port == PortType::UDP) ? "UDP" : "JLINK";
+
+    auto drawValueCell = [&](u64 memberAddr, const char *sType) {
+        auto it = memberValueCache_.find(memberAddr);
+        if (port == PortType::JLINK) {
+            u8  buf[8]{};
+            u32 sz         = Parser::typeBytes(Parser::strToDataType(sType));
+            u64 now        = get_mono_ts_ms();
+            bool shouldRead = (now - lastUpdateTs_ < 20);
+            if (shouldRead && JLinkDev::instance().isConnected() &&
+                JLinkDev::instance().readMem((u32)memberAddr, sz, buf)) {
+                std::string val         = decodeValue(buf, Parser::strToDataType(sType));
+                memberValueCache_[memberAddr] = val;
+                ImGui::TextUnformatted(val.c_str());
+            } else if (it != memberValueCache_.end()) {
+                ImGui::TextUnformatted(it->second.c_str());
+            } else {
+                ImGui::TextUnformatted("...");
+            }
+        } else {
+            // SHM/UDP: cache is populated by updateVariables — just display
+            if (it != memberValueCache_.end()) ImGui::TextUnformatted(it->second.c_str());
+            else ImGui::TextUnformatted("...");
+        }
+    };
+
     if (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION) {
         for (const auto &m : t->members) {
             std::string memberPath = fullPath + "." + (m.name.empty() ? "<anon>" : m.name);
-            u64 memberAddr = addr + m.offset;
-            const char* sType = scalarPayloadType(dwarfInfo_, m.type);
-            bool isComplex = !sType;
+            u64         memberAddr = addr + m.offset;
+            const char *sType      = scalarPayloadType(dwarfInfo_, m.type);
+            bool        isComplex  = !sType;
 
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            
             ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_OpenOnArrow;
             if (!isComplex) nodeFlags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-            
-            bool open = ImGui::TreeNodeEx(m.name.empty() ? "<anon>" : m.name.c_str(), nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
+            bool open = ImGui::TreeNodeEx(m.name.empty() ? "<anon>" : m.name.c_str(),
+                                          nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
 
             if (ImGui::BeginDragDropSource()) {
                 ChannelDropPayload p{};
                 snprintf(p.name, sizeof(p.name), "%s", memberPath.c_str());
                 p.addr = memberAddr;
-                if (sType) {
-                    snprintf(p.type, sizeof(p.type), "%s", sType);
-                } else {
-                    snprintf(p.type, sizeof(p.type), "STRUCT");
-                }
-                snprintf(p.device, sizeof(p.device), "JLINK");
+                snprintf(p.type, sizeof(p.type), "%s", sType ? sType : "STRUCT");
+                snprintf(p.device, sizeof(p.device), "%s", devLabel);
+                if (!shmRegionName.empty())
+                    snprintf(p.shmName, sizeof(p.shmName), "%s", shmRegionName.c_str());
                 p.numBytes = (u8)typeSize(dwarfInfo_, m.type);
-                p.typeOff = m.type;
+                p.typeOff  = m.type;
                 fillEnumPayload(dwarfInfo_, m.type, p);
                 ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                 ImGui::Text("Dragging %s", memberPath.c_str());
                 ImGui::EndDragDropSource();
             }
 
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(sType ? sType : "STRUCT");
-            ImGui::TableSetColumnIndex(2);
-            ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
-            ImGui::TableSetColumnIndex(3);
-            ImGui::TextUnformatted("JLINK");
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(sType ? sType : "STRUCT");
+            ImGui::TableSetColumnIndex(2); ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
+            ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(devLabel);
             ImGui::TableSetColumnIndex(4);
-            if (sType) {
-                u8 buf[8];
-                u32 sz = Parser::typeBytes(Parser::strToDataType(sType));
-                u64 now = get_mono_ts_ms();
-                bool shouldRead = (now - lastUpdateTs_ < 20);
-                if (shouldRead && JLinkDev::instance().isConnected() && JLinkDev::instance().readMem((u32)memberAddr, sz, buf)) {
-                    std::string val = decodeValue(buf, Parser::strToDataType(sType));
-                    memberValueCache_[memberAddr] = val;
-                    ImGui::TextUnformatted(val.c_str());
-                } else {
-                    auto it = memberValueCache_.find(memberAddr);
-                    if (it != memberValueCache_.end()) ImGui::TextUnformatted(it->second.c_str());
-                    else ImGui::TextUnformatted("...");
-                }
-            } else {
-                ImGui::TextUnformatted("...");
-            }
+            if (sType) drawValueCell(memberAddr, sType);
+            else ImGui::TextUnformatted("...");
 
             if (open && isComplex) {
-                drawVarVarTreeRow(memberPath, memberAddr, m.type, depth + 1);
+                drawVarVarTreeRow(memberPath, memberAddr, m.type, depth + 1, port, shmRegionName);
                 ImGui::TreePop();
             }
         }
     } else if (t->kind == dwarf::TypeKind::ARRAY) {
-        u64 elemSize = typeSize(dwarfInfo_, t->inner);
-        u64 dim = t->dims.empty() ? 0 : t->dims.front();
+        u64 elemSize  = typeSize(dwarfInfo_, t->inner);
+        u64 dim       = t->dims.empty() ? 0 : t->dims.front();
         u64 displayed = (dim == 0) ? 0 : (dim < (u64)elfArrayMaxElems_ ? dim : (u64)elfArrayMaxElems_);
         for (u64 i = 0; i < displayed; ++i) {
-            std::string idxStr = "[" + std::to_string(i) + "]";
+            std::string idxStr     = "[" + std::to_string(i) + "]";
             std::string memberPath = fullPath + idxStr;
-            u64 memberAddr = addr + i * elemSize;
-            const char* sType = scalarPayloadType(dwarfInfo_, t->inner);
-            bool isComplex = !sType;
+            u64         memberAddr = addr + i * elemSize;
+            const char *sType      = scalarPayloadType(dwarfInfo_, t->inner);
+            bool        isComplex  = !sType;
 
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            
             ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_OpenOnArrow;
             if (!isComplex) nodeFlags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-            
             bool open = ImGui::TreeNodeEx(idxStr.c_str(), nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
 
             if (ImGui::BeginDragDropSource()) {
                 ChannelDropPayload p{};
                 snprintf(p.name, sizeof(p.name), "%s", memberPath.c_str());
                 p.addr = memberAddr;
-                if (sType) {
-                    snprintf(p.type, sizeof(p.type), "%s", sType);
-                } else {
-                    snprintf(p.type, sizeof(p.type), "ARRAY");
-                }
-                snprintf(p.device, sizeof(p.device), "JLINK");
+                snprintf(p.type, sizeof(p.type), "%s", sType ? sType : "ARRAY");
+                snprintf(p.device, sizeof(p.device), "%s", devLabel);
+                if (!shmRegionName.empty())
+                    snprintf(p.shmName, sizeof(p.shmName), "%s", shmRegionName.c_str());
                 p.numBytes = (u8)typeSize(dwarfInfo_, t->inner);
-                p.typeOff = t->inner;
+                p.typeOff  = t->inner;
                 fillEnumPayload(dwarfInfo_, t->inner, p);
                 ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                 ImGui::Text("Dragging %s", memberPath.c_str());
                 ImGui::EndDragDropSource();
             }
 
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(sType ? sType : "ARRAY");
-            ImGui::TableSetColumnIndex(2);
-            ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
-            ImGui::TableSetColumnIndex(3);
-            ImGui::TextUnformatted("JLINK");
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(sType ? sType : "ARRAY");
+            ImGui::TableSetColumnIndex(2); ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
+            ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(devLabel);
             ImGui::TableSetColumnIndex(4);
-            if (sType) {
-                u8 buf[8];
-                u32 sz = Parser::typeBytes(Parser::strToDataType(sType));
-                u64 now = get_mono_ts_ms();
-                bool shouldRead = (now - lastUpdateTs_ < 20);
-                if (shouldRead && JLinkDev::instance().isConnected() && JLinkDev::instance().readMem((u32)memberAddr, sz, buf)) {
-                    std::string val = decodeValue(buf, Parser::strToDataType(sType));
-                    memberValueCache_[memberAddr] = val;
-                    ImGui::TextUnformatted(val.c_str());
-                } else {
-                    auto it = memberValueCache_.find(memberAddr);
-                    if (it != memberValueCache_.end()) ImGui::TextUnformatted(it->second.c_str());
-                    else ImGui::TextUnformatted("...");
-                }
-            } else {
-                ImGui::TextUnformatted("...");
-            }
+            if (sType) drawValueCell(memberAddr, sType);
+            else ImGui::TextUnformatted("...");
 
             if (open && isComplex) {
-                drawVarVarTreeRow(memberPath, memberAddr, t->inner, depth + 1);
+                drawVarVarTreeRow(memberPath, memberAddr, t->inner, depth + 1, port, shmRegionName);
                 ImGui::TreePop();
             }
         }
