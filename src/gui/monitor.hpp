@@ -2,6 +2,7 @@
 #define MONITOR_HPP
 
 #include <atomic>
+#include <cmath>
 #include "timeops.h"
 #include <deque>
 #include <map>
@@ -268,6 +269,24 @@ class MonitorChannel
                 ys.assign(rVals_.begin(), rVals_.end());
         }
 
+        // Returns (re, im) of the DFT at frequency f for samples within [tMin, tMax].
+        // Uses actual timestamps so non-uniform sampling is handled correctly.
+        std::pair<f64, f64> dftSlice(f64 tMin, f64 tMax, f64 f) const
+        {
+                std::lock_guard lk(valMutex_);
+                const size_t si = static_cast<size_t>(
+                    std::distance(rTs_.begin(), std::lower_bound(rTs_.begin(), rTs_.end(), tMin)));
+                const size_t ei = static_cast<size_t>(
+                    std::distance(rTs_.begin(), std::upper_bound(rTs_.begin(), rTs_.end(), tMax)));
+                double re = 0.0, im = 0.0;
+                for (size_t i = si; i < ei; ++i) {
+                        const double ph = 2.0 * M_PI * f * static_cast<double>(rTs_[i]);
+                        re += static_cast<double>(rVals_[i]) * std::cos(ph);
+                        im -= static_cast<double>(rVals_[i]) * std::sin(ph);
+                }
+                return {re, im};
+        }
+
       private:
         void updateRate_()
         {
@@ -478,6 +497,28 @@ class Monitor
         MonitorViewMode fftViewMode_{MonitorViewMode::FULL};
         bool            needsLayout_{true};
         float           lastAvailY_{0.0f};
+
+        // ---- Bode Plot ----
+        struct BodePoint { f64 freq; f64 magDb; f64 phaseDeg; };
+        bool                   showBode_{false};
+        char                   bodeInputKey_[256]{};
+        char                   bodeOutputKey_[256]{};
+        float                  bodeFStart_{1.0f};
+        float                  bodeFStop_{1000.0f};
+        float                  bodeFStep_{10.0f};
+        float                  bodeDwellSec_{1.0f};
+        bool                   bodeSweepRunning_{false};
+        int                    bodeSweepFreqIdx_{0};
+        u64                    bodeSweepStepStart_{0};
+        std::vector<f64>       bodeFreqList_{};
+        std::vector<BodePoint> bodeData_{};
+        std::vector<f64>       bodeFreqsV_{};
+        std::vector<f64>       bodeMagsV_{};
+        std::vector<f64>       bodePhsV_{};
+
+        void            generateBodeFreqs_();
+        MonitorChannel *findChannelByKey_(const char *key);
+        void            bodeDraw_();
 
       public:
         f64               linkXMin_{0.0}, linkXMax_{1.0};

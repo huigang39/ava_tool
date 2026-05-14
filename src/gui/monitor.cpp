@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -876,6 +877,165 @@ Monitor::findChannel(const std::string &scopeName, const std::string &chName)
 }
 
 void
+Monitor::generateBodeFreqs_()
+{
+        bodeFreqList_.clear();
+        if (bodeFStart_ <= 0.0f || bodeFStop_ <= bodeFStart_ || bodeFStep_ <= 0.0f)
+                return;
+        for (float f = bodeFStart_; f <= bodeFStop_ + bodeFStep_ * 0.01f; f += bodeFStep_)
+                bodeFreqList_.push_back(static_cast<double>(f));
+}
+
+MonitorChannel *
+Monitor::findChannelByKey_(const char *key)
+{
+        const char *sep = std::strchr(key, '/');
+        if (!sep)
+                return nullptr;
+        return findChannel(std::string(key, sep), std::string(sep + 1));
+}
+
+void
+Monitor::bodeDraw_()
+{
+        // ---------- Channel selection ----------
+        std::vector<std::string> keys;
+        for (auto &[sn, sc] : scopes_)
+                for (auto &[cn, _] : sc->getChannels())
+                        keys.push_back(sn + "/" + cn);
+        std::sort(keys.begin(), keys.end());
+
+        auto drawCombo = [&](const char *id, const char *labelText, char *buf, size_t bufSz) {
+                ImGui::TextDisabled("%s", labelText);
+                ImGui::SameLine();
+                int curIdx = -1;
+                for (int i = 0; i < (int)keys.size(); ++i)
+                        if (std::strcmp(buf, keys[i].c_str()) == 0) { curIdx = i; break; }
+                const char *preview = (curIdx >= 0) ? keys[curIdx].c_str() : "(none)";
+                ImGui::SetNextItemWidth(180);
+                if (ImGui::BeginCombo(id, preview)) {
+                        for (int i = 0; i < (int)keys.size(); ++i) {
+                                bool sel = (i == curIdx);
+                                if (ImGui::Selectable(keys[i].c_str(), sel))
+                                        std::snprintf(buf, bufSz, "%s", keys[i].c_str());
+                                if (sel) ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                }
+        };
+
+        drawCombo("##bodeIn",  "Input",  bodeInputKey_,  sizeof(bodeInputKey_));
+        ImGui::SameLine();
+        drawCombo("##bodeOut", "Output", bodeOutputKey_, sizeof(bodeOutputKey_));
+
+        // Warn when wave gen is not active on the input channel
+        MonitorChannel *inCh = findChannelByKey_(bodeInputKey_);
+        if (inCh && !inCh->waveEnable_)
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                                   "Wave gen not enabled on input channel");
+
+        // ---------- Sweep parameters ----------
+        if (bodeSweepRunning_) ImGui::BeginDisabled();
+
+        ImGui::TextDisabled("F Start(Hz)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80);
+        ImGui::InputFloat("##bFS", &bodeFStart_, 0, 0, "%.3g");
+        ImGui::SameLine();
+        ImGui::TextDisabled("F Stop(Hz)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(80);
+        ImGui::InputFloat("##bFE", &bodeFStop_, 0, 0, "%.3g");
+        ImGui::SameLine();
+        ImGui::TextDisabled("Step(Hz)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70);
+        ImGui::InputFloat("##bSTP", &bodeFStep_, 0, 0, "%.3g");
+        if (bodeFStep_ <= 0.0f) bodeFStep_ = 1.0f;
+        ImGui::SameLine();
+        ImGui::TextDisabled("Dwell(s)");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(60);
+        ImGui::InputFloat("##bDw", &bodeDwellSec_, 0, 0, "%.2f");
+        if (bodeDwellSec_ < 0.05f) bodeDwellSec_ = 0.05f;
+
+        if (bodeSweepRunning_) ImGui::EndDisabled();
+
+        // ---------- Control buttons ----------
+        ImGui::SameLine();
+        if (!bodeSweepRunning_) {
+                if (ImGui::Button("Start##bodeSt")) {
+                        generateBodeFreqs_();
+                        if (!bodeFreqList_.empty()) {
+                                bodeData_.clear();
+                                bodeFreqsV_.clear();
+                                bodeMagsV_.clear();
+                                bodePhsV_.clear();
+                                bodeSweepFreqIdx_  = 0;
+                                bodeSweepRunning_  = true;
+                                bodeSweepStepStart_ = get_mono_ts_us();
+                                MonitorChannel *inCh2 = findChannelByKey_(bodeInputKey_);
+                                if (inCh2) {
+                                        std::lock_guard lk(inCh2->waveMtx_);
+                                        inCh2->wave_.cfg.freq =
+                                            static_cast<float>(bodeFreqList_[0]);
+                                }
+                        }
+                }
+        } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 0.8f));
+                if (ImGui::Button("Stop##bodeSt")) bodeSweepRunning_ = false;
+                ImGui::PopStyleColor();
+                ImGui::SameLine();
+                const int   total = static_cast<int>(bodeFreqList_.size());
+                const float pct   = (total > 0) ? static_cast<float>(bodeSweepFreqIdx_) / total : 0.0f;
+                ImGui::ProgressBar(pct, ImVec2(100.0f, 0.0f));
+                ImGui::SameLine();
+                const double curF = (bodeSweepFreqIdx_ < total)
+                                        ? bodeFreqList_[bodeSweepFreqIdx_]
+                                        : static_cast<double>(bodeFStop_);
+                ImGui::TextDisabled("%d/%d  %.3g Hz", bodeSweepFreqIdx_, total, curF);
+        }
+
+        ImGui::SameLine();
+        if (ImGui::Button("Clear##bodeCl")) {
+                bodeData_.clear();
+                bodeFreqsV_.clear();
+                bodeMagsV_.clear();
+                bodePhsV_.clear();
+        }
+
+        ImGui::Separator();
+
+        // ---------- Bode subplots ----------
+        if (ImPlot::BeginSubplots("##bodeSP", 2, 1, ImVec2(-1.0f, -1.0f),
+                                   ImPlotSubplotFlags_LinkAllX | ImPlotSubplotFlags_NoTitle |
+                                       ImPlotSubplotFlags_NoMenus)) {
+                if (ImPlot::BeginPlot("##bodeMag")) {
+                        ImPlot::SetupAxis(ImAxis_X1, "Frequency (Hz)");
+                        ImPlot::SetupAxis(ImAxis_Y1, "Magnitude (dB)");
+                        ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
+                        if (!bodeFreqsV_.empty())
+                                ImPlot::PlotLine("H(jw)", bodeFreqsV_.data(), bodeMagsV_.data(),
+                                                 static_cast<int>(bodeFreqsV_.size()));
+                        ImPlot::EndPlot();
+                }
+                if (ImPlot::BeginPlot("##bodePhs")) {
+                        ImPlot::SetupAxis(ImAxis_X1, "Frequency (Hz)");
+                        ImPlot::SetupAxis(ImAxis_Y1, "Phase (deg)");
+                        ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
+                        if (!bodeFreqsV_.empty())
+                                ImPlot::PlotLine("H(jw)", bodeFreqsV_.data(), bodePhsV_.data(),
+                                                 static_cast<int>(bodeFreqsV_.size()));
+                        ImPlot::EndPlot();
+                }
+                ImPlot::EndSubplots();
+        }
+}
+
+/* -------------------------------------------------------------------------- */
+
+void
 Monitor::updateDisplay()
 {
         bool open = true;
@@ -895,6 +1055,15 @@ Monitor::updateDisplay()
                 if (ImGui::Button("Clear Data"))
                         clearData();
                 ImGui::PopStyleColor(3);
+
+                ImGui::SameLine();
+                if (showBode_) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 0.8f));
+                        if (ImGui::Button("Bode")) showBode_ = false;
+                        ImGui::PopStyleColor();
+                } else {
+                        if (ImGui::Button("Bode")) showBode_ = true;
+                }
 
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(100);
@@ -1115,6 +1284,66 @@ Monitor::updateDisplay()
                         for (auto &pair : scopes_)
                                 pair.second->setManual(false);
                 }
+
+                // ---- Bode sweep advancement (runs every frame while dwelling) ----
+                if (bodeSweepRunning_ && !bodeFreqList_.empty() &&
+                    bodeSweepFreqIdx_ < (int)bodeFreqList_.size()) {
+                        const double    f     = bodeFreqList_[bodeSweepFreqIdx_];
+                        MonitorChannel *inCh  = findChannelByKey_(bodeInputKey_);
+                        MonitorChannel *outCh = findChannelByKey_(bodeOutputKey_);
+
+                        if (inCh && outCh) {
+                                auto [reX, imX] = inCh->dftSlice(linkXMin_, linkXMax_, f);
+                                auto [reY, imY] = outCh->dftSlice(linkXMin_, linkXMax_, f);
+                                const double magX  = std::hypot(reX, imX);
+                                const double magY  = std::hypot(reY, imY);
+                                const double magDb = (magX > 1e-10) ? 20.0 * std::log10(magY / magX) : -120.0;
+                                double       phRad = std::atan2(imY, reY) - std::atan2(imX, reX);
+                                phRad              = std::remainder(phRad, 2.0 * M_PI);
+
+                                // Update the in-progress point for this frequency index
+                                const BodePoint pt{f, magDb, phRad * (180.0 / M_PI)};
+                                if (bodeSweepFreqIdx_ < (int)bodeData_.size()) {
+                                        bodeData_[bodeSweepFreqIdx_] = pt;
+                                } else {
+                                        bodeData_.push_back(pt);
+                                        bodeFreqsV_.push_back(0.0);
+                                        bodeMagsV_.push_back(0.0);
+                                        bodePhsV_.push_back(0.0);
+                                }
+                                bodeFreqsV_[bodeSweepFreqIdx_] = pt.freq;
+                                bodeMagsV_[bodeSweepFreqIdx_]  = pt.magDb;
+                                bodePhsV_[bodeSweepFreqIdx_]   = pt.phaseDeg;
+                        }
+
+                        // Advance frequency when dwell time expires
+                        const u64 now = get_mono_ts_us();
+                        if (now - bodeSweepStepStart_ >= static_cast<u64>(bodeDwellSec_ * 1.0e6f)) {
+                                ++bodeSweepFreqIdx_;
+                                if (bodeSweepFreqIdx_ >= (int)bodeFreqList_.size()) {
+                                        bodeSweepRunning_ = false;
+                                } else {
+                                        MonitorChannel *inCh2 = findChannelByKey_(bodeInputKey_);
+                                        if (inCh2) {
+                                                std::lock_guard lk(inCh2->waveMtx_);
+                                                inCh2->wave_.cfg.freq =
+                                                    static_cast<float>(bodeFreqList_[bodeSweepFreqIdx_]);
+                                        }
+                                        bodeSweepStepStart_ = now;
+                                }
+                        }
+                }
         }
         ImGui::End();
+
+        // ---- Bode plot window (separate floating window) ----
+        if (showBode_) {
+                char bodeTitle[320];
+                std::snprintf(bodeTitle, sizeof(bodeTitle), "Bode Plot  [%s]##bode%s",
+                              name_.c_str(), name_.c_str());
+                ImGui::SetNextWindowSize(ImVec2(700.0f, 520.0f), ImGuiCond_FirstUseEver);
+                if (ImGui::Begin(bodeTitle, &showBode_))
+                        bodeDraw_();
+                ImGui::End();
+        }
 }
