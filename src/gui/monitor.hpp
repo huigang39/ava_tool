@@ -129,8 +129,7 @@ class MonitorChannel
       public:
         explicit MonitorChannel(std::string chName) : name_(std::move(chName))
         {
-                // Default wave config: 1000Hz sample rate, 1Hz Sine wave, 1.0 Amp
-                wave_cfg_t cfg = {1000.0f, WAVE_TYPE_SINE, 1.0f, 1.0f, 0.0f, 0.0f, 0.5f, 1.0f};
+                wave_cfg_t cfg = {1000.0f, WAVE_TYPE_SINE, 0.0f, 0.0f, 0.0f, 0.0f, 0.5f, 1.0f};
                 wave_init(&wave_, cfg);
         }
         MonitorChannel()  = default;
@@ -392,8 +391,6 @@ class MonitorScope
         std::atomic<bool> pendingDelete_{false};
         std::vector<f64>  dxs_{};
         std::vector<f64>  dys_{};
-        std::vector<f64>  tempTs_{};
-        std::vector<f64>  tempVals_{};
         bool              isManualHeight_{false};
         bool              paused_{false};
         int               lastSelectedIndex_{-1};
@@ -500,6 +497,12 @@ class Monitor
 
         // ---- Bode Plot ----
         struct BodePoint { f64 freq; f64 magDb; f64 phaseDeg; };
+        struct BodeCurveStyle {
+                f32  color[4]{1.0f, 1.0f, 1.0f, 1.0f};
+                bool useAutoColor{true};
+                f32  lineWeight{1.5f};
+                bool showMarkers{false};
+        };
         bool                   showBode_{false};
         char                   bodeInputKey_[256]{};
         char                   bodeOutputKey_[256]{};
@@ -507,6 +510,7 @@ class Monitor
         float                  bodeFStop_{1000.0f};
         float                  bodeFStep_{10.0f};
         float                  bodeDwellSec_{1.0f};
+        float                  bodeAmp_{1.0f};
         bool                   bodeSweepRunning_{false};
         int                    bodeSweepFreqIdx_{0};
         u64                    bodeSweepStepStart_{0};
@@ -515,6 +519,9 @@ class Monitor
         std::vector<f64>       bodeFreqsV_{};
         std::vector<f64>       bodeMagsV_{};
         std::vector<f64>       bodePhsV_{};
+        BodeCurveStyle         bodeMagStyle_{};
+        BodeCurveStyle         bodePhsStyle_{};
+        bool                   bodeStyleInit_{false};
 
         void            generateBodeFreqs_();
         MonitorChannel *findChannelByKey_(const char *key);
@@ -529,7 +536,7 @@ class Monitor
         float             historySeconds_{10.0f};
         u32               maxDisplayPoints_{5000};
         bool              hssAutoPeriod_{true};
-        int               maxSampleHz_{1000};
+        int               maxSampleHz_{100};
         std::atomic<bool> pendingDelete_{false};
 
         f32                                   actualHz_{0.0f};

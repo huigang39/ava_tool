@@ -149,6 +149,85 @@ encodeFromF32(const f32 val, const std::string &type, u8 *out)
         std::memcpy(out, &v, 4);
 }
 
+// Dedicated wave-generation thread.
+// Completely independent of the sampler thread — only competes for JLinkDev::mtx_
+// when it actually needs to write, which is the unavoidable serialization point.
+void
+waveFunc(Gui *gui)
+{
+        LOG_I("WaveGen thread started.");
+
+        struct WaveTask {
+                std::shared_ptr<MonitorChannel> ch;
+                std::shared_ptr<Monitor>        monitor;
+                u32                             addr;
+                u32                             nb;
+        };
+
+        std::unordered_map<std::shared_ptr<Monitor>, u64> lastMonitorWaveTicks;
+
+        while (g_appRunning.load()) {
+                std::unordered_map<std::shared_ptr<Monitor>, std::vector<WaveTask>> groups;
+
+                {
+                        std::lock_guard lk(gui->getMonitorMtx());
+                        for (const auto &monitor : gui->getMonitors() | std::views::values) {
+                                for (auto &scope : monitor->getScopes() | std::views::values) {
+                                        if (scope->isPendingDelete() || scope->isPaused())
+                                                continue;
+                                        for (auto &ch : scope->getChannels() | std::views::values) {
+                                                if (ch->isPendingDelete())
+                                                        continue;
+                                                if (ch->getDevice() != "JLINK" || !ch->waveEnable_ ||
+                                                    ch->getAddr() == 0)
+                                                        continue;
+                                                u32 nb = ch->getNumBytes();
+                                                if (nb == 0)
+                                                        nb = typeBytes(ch->getType());
+                                                groups[monitor].push_back(
+                                                    {ch, monitor, static_cast<u32>(ch->getAddr()), nb});
+                                        }
+                                }
+                        }
+                } // mtxMonitors_ released — wave exec + JLink I/O happen outside
+
+                if (groups.empty() || !JLinkDev::instance().isConnected()) {
+                        delay_us(1000);
+                        continue;
+                }
+
+                for (auto &[m, tasks] : groups) {
+                        const u64 waveNow        = get_mono_ts_us();
+                        const i32 targetPeriodUs = 1000000 / m->maxSampleHz_;
+
+                        auto tickIt = lastMonitorWaveTicks.find(m);
+                        if (tickIt == lastMonitorWaveTicks.end()) {
+                                lastMonitorWaveTicks[m] = waveNow;
+                                continue;
+                        }
+
+                        const u64 elapsedUs = waveNow - tickIt->second;
+                        if (elapsedUs < static_cast<u64>(targetPeriodUs))
+                                continue;
+
+                        const f32 dt   = static_cast<f32>(elapsedUs) * 1e-6f;
+                        tickIt->second = waveNow;
+
+                        for (auto &wt : tasks) {
+                                std::lock_guard lk_ch(wt.ch->waveMtx_);
+                                wt.ch->wave_.cfg.fs = 1.0f / dt;
+                                wave_exec(&wt.ch->wave_);
+                                const f32 outVal = wt.ch->wave_.out.val;
+                                JLinkDev::instance().writeMem(wt.addr, wt.nb, &outVal);
+                        }
+                }
+
+                delay_us(100); // up to 10 kHz wakeup; actual rate is capped by targetPeriodUs
+        }
+
+        LOG_I("WaveGen thread stopped.");
+}
+
 void
 threadFunc(Gui *gui)
 {
@@ -170,7 +249,6 @@ threadFunc(Gui *gui)
         u64 hzLastTick         = get_mono_ts_ms();
         u64 lastHssStart       = get_mono_ts_ms();
         f64 lastHssSessionTime = 0;
-        u64 lastWaveTick       = get_mono_ts_ms();
 
         bool lastPaused      = false;
         f64  nextHssTs       = -1.0;
@@ -201,9 +279,23 @@ threadFunc(Gui *gui)
                         u32                             nb;
                         std::string                     type;
                 };
-                std::vector<TempCh> tempChs;
-                std::vector<TempCh> pollTasks;
-                std::vector<TempCh> waveTasks;
+                struct WValTask {
+                        std::shared_ptr<MonitorChannel> ch;
+                        u32                             addr, nb;
+                        std::string                     type;
+                        f32                             wv;
+                };
+                struct ShmTask {
+                        std::shared_ptr<MonitorChannel> ch;
+                        std::shared_ptr<Monitor>        monitor;
+                        u32                             nb;
+                        std::string                     type;
+                };
+
+                std::vector<TempCh>   tempChs;
+                std::vector<TempCh>   pollTasks;
+                std::vector<WValTask> wvalTasks;
+                std::vector<ShmTask>  shmTasks;
 
                 i32 maxHssHz = 1;
 
@@ -218,23 +310,12 @@ threadFunc(Gui *gui)
                                                 if (ch->isPendingDelete())
                                                         continue;
                                                 const std::string &dev = ch->getDevice();
+                                                u32 nb = ch->getNumBytes();
+                                                if (nb == 0)
+                                                        nb = typeBytes(ch->getType());
                                                 if (dev == "SHM" && ch->getShm().lo.spsc != nullptr) {
-                                                        u8  raw[8];
-                                                        u32 nb = ch->getNumBytes();
-                                                        if (nb == 0)
-                                                                nb = typeBytes(ch->getType());
-
-                                                        // Drain SHM buffer to keep up with high-speed writers
-                                                        while (shm_read(&ch->getShm(), raw, nb) == nb) {
-                                                                ch->setRVal(decodeAs(raw, ch->getType()), sessionTimeSec());
-                                                                monitor->addPoints(1);
-                                                                hzFrameAccum++;
-                                                        }
+                                                        shmTasks.push_back({ch, monitor, nb, ch->getType()});
                                                 } else if (dev == "JLINK" && ch->getAddr() != 0) {
-                                                        u32 nb = ch->getNumBytes();
-                                                        if (nb == 0)
-                                                                nb = typeBytes(ch->getType());
-
                                                         if (monitor->samplingMode_ == Monitor::SamplingMode::HSS) {
                                                                 tempChs.push_back({ch,
                                                                                    monitor,
@@ -249,28 +330,38 @@ threadFunc(Gui *gui)
                                                                                      nb,
                                                                                      ch->getType()});
                                                         }
-
-                                                        if (ch->waveEnable_) {
-                                                                waveTasks.push_back({ch,
-                                                                                     monitor,
+                                                        f32 wv;
+                                                        if (ch->consumeWValDirty(wv))
+                                                                wvalTasks.push_back({ch,
                                                                                      static_cast<u32>(ch->getAddr()),
                                                                                      nb,
-                                                                                     ch->getType()});
-                                                        }
-
-                                                        f32 wv;
-                                                        if (ch->consumeWValDirty(wv) && JLinkDev::instance().isConnected()) {
-                                                                u8 wbuf[8] = {0};
-                                                                encodeFromF32(wv, ch->getType(), wbuf);
-                                                                JLinkDev::instance().writeMem(
-                                                                    static_cast<u32>(ch->getAddr()), nb, wbuf);
-                                                        }
+                                                                                     ch->getType(),
+                                                                                     wv});
                                                 }
                                         }
                                 }
                                 if (hasHss && monitor->maxSampleHz_ > maxHssHz) {
                                         maxHssHz = monitor->maxSampleHz_;
                                 }
+                        }
+                }
+
+                // Drain SHM buffers outside the monitor lock (no blocking of UI thread)
+                for (auto &st : shmTasks) {
+                        u8 raw[8];
+                        while (shm_read(&st.ch->getShm(), raw, st.nb) == st.nb) {
+                                st.ch->setRVal(decodeAs(raw, st.type), sessionTimeSec());
+                                st.monitor->addPoints(1);
+                                hzFrameAccum++;
+                        }
+                }
+
+                // Write wVal dirty values outside the monitor lock (JLinkDev::mtx_ is the real serializer)
+                if (JLinkDev::instance().isConnected()) {
+                        for (auto &wt : wvalTasks) {
+                                u8 wbuf[8] = {0};
+                                encodeFromF32(wt.wv, wt.type, wbuf);
+                                JLinkDev::instance().writeMem(wt.addr, wt.nb, wbuf);
                         }
                 }
 
@@ -282,38 +373,6 @@ threadFunc(Gui *gui)
                               tempChs.size(),
                               pollTasks.size(),
                               maxHssHz);
-                }
-
-                // Execute WaveGen logic (Grouped by monitor to respect MaxHz)
-                if (!waveTasks.empty() && JLinkDev::instance().isConnected()) {
-                        std::unordered_map<std::shared_ptr<Monitor>, std::vector<TempCh>> monitorWaveGroups;
-                        for (auto &wt : waveTasks)
-                                monitorWaveGroups[wt.monitor].push_back(wt);
-
-                        for (auto &[m, tasks] : monitorWaveGroups) {
-                                static std::unordered_map<std::shared_ptr<Monitor>, u64> lastMonitorWaveTicks;
-                                u64 waveNow        = get_mono_ts_us();
-                                i32 targetPeriodUs = 1000000 / m->maxSampleHz_;
-
-                                if (lastMonitorWaveTicks.find(m) == lastMonitorWaveTicks.end()) {
-                                        lastMonitorWaveTicks[m] = waveNow;
-                                        continue;
-                                }
-
-                                u64 elapsedUs = waveNow - lastMonitorWaveTicks[m];
-                                if (elapsedUs >= (u64)targetPeriodUs) {
-                                        f32 dt                  = static_cast<f32>(elapsedUs) * 1e-6f;
-                                        lastMonitorWaveTicks[m] = waveNow;
-
-                                        for (auto &wt : tasks) {
-                                                std::lock_guard lk_ch(wt.ch->waveMtx_);
-                                                wt.ch->wave_.cfg.fs = 1.0f / dt;
-                                                wave_exec(&wt.ch->wave_);
-                                                f32 outVal = wt.ch->wave_.out.val;
-                                                JLinkDev::instance().writeMem(wt.addr, wt.nb, &outVal);
-                                        }
-                                }
-                        }
                 }
 
                 // Collect current HSS needs
@@ -592,13 +651,16 @@ main(int argc, char **argv)
         auto gui = std::make_unique<Gui>(initialSession);
 
         std::thread t1(threadFunc, gui.get());
+        std::thread t2(waveFunc,   gui.get());
         gui->loop();
 
-        LOG_I("Stopping sampler thread...");
+        LOG_I("Stopping sampler and wave-gen threads...");
         g_appRunning.store(false);
         if (t1.joinable())
                 t1.join();
-        LOG_I("Sampler thread stopped.");
+        if (t2.joinable())
+                t2.join();
+        LOG_I("Sampler and wave-gen threads stopped.");
 
         JLinkDev::instance().close();
 

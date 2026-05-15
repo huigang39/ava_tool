@@ -139,17 +139,18 @@ JLinkDev::hssStart(const std::vector<HssBlock> &blocks, const i32 periodUs)
         }
 
         i32 effectivePeriodUs = periodUs;
-        if (effectivePeriodUs > 100000) {
-                // HSS hardware typically doesn't support frequencies below 10Hz stably.
-                // Clamping to 100ms period. For lower frequencies, use POLL mode.
-                effectivePeriodUs = 100000;
-        }
+        if (effectivePeriodUs > 100000)
+                effectivePeriodUs = 100000; // clamp to 10Hz minimum
+        if (effectivePeriodUs < 1000)
+                effectivePeriodUs = 1000;   // clamp to 1kHz maximum
 
         LOG_I("JLinkDev::hssStart(): starting with %zu blocks, period %d us", descs.size(), effectivePeriodUs);
         i32 res = JLINK_HSS_Start(descs.data(), static_cast<i32>(descs.size()), effectivePeriodUs, 1);
         if (res < 0) {
-                char buf[128];
-                snprintf(buf, sizeof(buf), "HSS Error: HW rejected period %dus. Min 10Hz recommended.", effectivePeriodUs);
+                char buf[160];
+                snprintf(buf, sizeof(buf),
+                         "HSS Error: HW rejected period %dus (~%dHz). Try reducing sample rate (recommend <= 100Hz).",
+                         effectivePeriodUs, 1000000 / effectivePeriodUs);
                 lastErr_ = buf;
                 LOG_E("JLinkDev::hssStart() FAILED: %s", buf);
                 return false;

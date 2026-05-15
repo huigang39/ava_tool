@@ -50,6 +50,10 @@ struct VarEntry {
 
     u64  typeOff = 0; // For DWARF nested display
     bool selected = false;
+
+    // User-editable enum label definitions (overrides DWARF when non-empty)
+    struct EnumDef { std::string name; i64 value; };
+    std::vector<EnumDef> enumDefs;
 };
 
 struct SearchEntry {
@@ -103,6 +107,7 @@ class Variable
         char                     searchBuf_[128]{};
         std::vector<SearchEntry> searchResults_;
         i32                      lastSelectedIndex_{-1};
+        i32                      enumEditIdx_{-1}; // index into vars_ for enum definition editing
 
         void rebuildSearchPool();
         void flattenDwarfType(std::vector<SearchEntry> &pool, const dwarf::Info &info, const std::string &parentPath, u64 parentAddr, u64 typeOff, int depth);
@@ -147,6 +152,7 @@ class Variable
         
         void               drawVariableList();
         void               drawAddVariableDialog();
+        void               drawEnumEditPopup();
 
         void handleDroppedFile(const std::string &path);
 

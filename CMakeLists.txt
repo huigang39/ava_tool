@@ -151,7 +151,8 @@ if(WIN32)
             ${DIR_MODULE}/lib/win/libfftw3f-3.dll
         )
     endif()
-    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 winmm)
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(${PROJECT_NAME} PRIVATE ws2_32 winmm shlwapi)
     if(MSVC)
         # MSVC specific options
     else()

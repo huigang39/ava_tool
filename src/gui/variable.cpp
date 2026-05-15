@@ -456,6 +456,7 @@ Variable::drawSymbolLeaf(const std::string &displayName, const std::string &full
         if (scalarKind) {
             VarEntry v;
             v.name = fullPath; v.type = Parser::strToDataType(scalarKind); v.port = PortType::JLINK; v.addr = addr; v.writable = true;
+            v.typeOff = typeOff;
             vars_.push_back(v);
             ImGui::InsertNotification({ImGuiToastType::Success, 2000, "Added %s to watch list", fullPath.c_str()});
         } else if (isStruct || isArray) {
@@ -581,12 +582,11 @@ Variable::drawSymbolBrowser()
         drawSymbolTree();
     } else {
         constexpr ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
-        if (ImGui::BeginTable("SymbolSearchTable", 5, flags, ImVec2(0, 0))) {
-            ImGui::TableSetupColumn("Path", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        if (ImGui::BeginTable("SymbolSearchTable", 4, flags, ImVec2(0, 0))) {
+            ImGui::TableSetupColumn("Name",    ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
-            ImGui::TableSetupColumn("Port", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+            ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed, 60.0f);
+            ImGui::TableSetupColumn("Type",    ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableHeadersRow();
 
             for (int i = 0; i < (int)searchResults_.size(); ++i) {
@@ -594,15 +594,15 @@ Variable::drawSymbolBrowser()
                 ImGui::PushID(i);
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                
+
                 const dwarf::Type *t = resolveAlias(dwarfInfo_, e.typeOff);
                 const bool isComplex = t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION || t->kind == dwarf::TypeKind::ARRAY);
-                
-                ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_OpenOnArrow;
+
+                ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_OpenOnArrow;
                 if (!isComplex) nodeFlags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-                
-                bool open = ImGui::TreeNodeEx(e.path.c_str(), nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
-                
+
+                bool open = ImGui::TreeNodeEx(e.path.c_str(), nodeFlags);
+
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
                     addRecursive(e.path, e.addr, e.typeOff, e.defaultPort);
                 }
@@ -625,13 +625,25 @@ Variable::drawSymbolBrowser()
                     ImGui::EndDragDropSource();
                 }
 
-                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(isComplex ? (t->kind == dwarf::TypeKind::ARRAY ? "ARRAY" : "STRUCT") : Parser::dataTypeToStr(e.type));
-                ImGui::TableSetColumnIndex(2); ImGui::Text("0x%08llX", (unsigned long long)e.addr);
-                ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(e.defaultPort == PortType::JLINK ? "JLINK" : "None");
-                ImGui::TableSetColumnIndex(4); ImGui::TextUnformatted("...");
+                ImGui::TableSetColumnIndex(1); ImGui::Text("0x%08llX", (unsigned long long)e.addr);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%llu", (unsigned long long)typeSize(dwarfInfo_, e.typeOff));
+                ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(prettyType(dwarfInfo_, e.typeOff).c_str());
 
                 if (open && isComplex) {
-                    drawVarVarTreeRow(e.path, e.addr, e.typeOff, 1, e.defaultPort);
+                    if (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION) {
+                        for (const auto &m : t->members)
+                            drawSymbolLeaf(m.name.empty() ? "<anon>" : m.name,
+                                           e.path + "." + (m.name.empty() ? "<anon>" : m.name),
+                                           e.addr + m.offset, m.type, 1);
+                    } else if (t->kind == dwarf::TypeKind::ARRAY) {
+                        u64 elemSize  = typeSize(dwarfInfo_, t->inner);
+                        u64 dim       = t->dims.empty() ? 0 : t->dims.front();
+                        u64 displayed = dim < (u64)elfArrayMaxElems_ ? dim : (u64)elfArrayMaxElems_;
+                        for (u64 j = 0; j < displayed; ++j) {
+                            std::string idx = "[" + std::to_string(j) + "]";
+                            drawSymbolLeaf(idx, e.path + idx, e.addr + j * elemSize, t->inner, 1);
+                        }
+                    }
                     ImGui::TreePop();
                 }
 
@@ -656,11 +668,11 @@ Variable::drawVariableList()
 
     constexpr ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
     if (ImGui::BeginTable("VarMonitorTable", 5, flags, ImVec2(0, 0))) {
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("Name",    ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Value",   ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Type",    ImGuiTableColumnFlags_WidthFixed, 60.0f);
         ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
-        ImGui::TableSetupColumn("Port", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Port",    ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableHeadersRow();
 
         for (int i = 0; i < (int)vars_.size(); ++i) {
@@ -698,22 +710,29 @@ Variable::drawVariableList()
                 lastSelectedIndex_ = i;
             }
 
-            bool pendingDelete = false;
+            bool pendingDelete   = false;
+            bool pendingEnumEdit = false;
             if (ImGui::BeginPopupContextItem()) {
-                if (ImGui::MenuItem("Delete Selected")) {
+                if (ImGui::MenuItem("Delete")) {
                     pendingDelete = true;
+                }
+                const bool isEnumType = (t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty();
+                if (!isComplex && isEnumType && ImGui::MenuItem("Edit Enum Definition...")) {
+                    pendingEnumEdit = true;
                 }
                 ImGui::EndPopup();
             }
 
             if (pendingDelete) {
-                vars_.erase(std::remove_if(vars_.begin(), vars_.end(), [](const VarEntry &ve){ return ve.selected; }), vars_.end());
+                vars_.erase(vars_.begin() + i);
                 isModified_ = true;
                 lastSelectedIndex_ = -1;
                 if (open && isComplex) ImGui::TreePop();
                 ImGui::PopID();
-                break; // Break loop as vars_ changed
+                break;
             }
+            if (pendingEnumEdit)
+                enumEditIdx_ = i;
 
             if (ImGui::BeginDragDropSource()) {
                 ChannelDropPayload p{};
@@ -735,16 +754,22 @@ Variable::drawVariableList()
                 ImGui::EndDragDropSource();
             }
 
-            // Type
+            // Value
             ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(v.valueStr.c_str());
+
+            // Type
+            ImGui::TableSetColumnIndex(2);
             if (isComplex) {
                 ImGui::TextUnformatted(t->kind == dwarf::TypeKind::ARRAY ? "ARRAY" : "STRUCT");
+            } else if ((t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty()) {
+                ImGui::TextUnformatted("ENUM");
             } else {
                 ImGui::TextUnformatted(Parser::dataTypeToStr(v.type));
             }
 
             // Address
-            ImGui::TableSetColumnIndex(2);
+            ImGui::TableSetColumnIndex(3);
             if (v.port == PortType::UDP) {
                 ImGui::Text("%s:%d", v.udp.ip, v.udp.port);
             } else if (v.port == PortType::SHM) {
@@ -754,13 +779,9 @@ Variable::drawVariableList()
             }
 
             // Port
-            ImGui::TableSetColumnIndex(3);
+            ImGui::TableSetColumnIndex(4);
             const char* portNames[] = {"JLINK", "UDP", "SHM", "MANUAL"};
             ImGui::TextUnformatted(portNames[(int)v.port]);
-
-            // Value
-            ImGui::TableSetColumnIndex(4);
-            ImGui::TextUnformatted(v.valueStr.c_str());
 
             if (open && isComplex) {
                 {
@@ -849,6 +870,74 @@ Variable::drawAddVariableDialog()
         }
         ImGui::SameLine();
         if (ImGui::Button("Cancel", ImVec2(120, 0))) { state_ = WindowState::None; ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
+}
+
+void
+Variable::drawEnumEditPopup()
+{
+    if (enumEditIdx_ < 0 || enumEditIdx_ >= (int)vars_.size()) {
+        enumEditIdx_ = -1;
+        return;
+    }
+    ImGui::OpenPopup("Edit Enum Definition");
+    if (ImGui::BeginPopupModal("Edit Enum Definition", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        VarEntry &v = vars_[enumEditIdx_];
+
+        // Pre-populate from DWARF on first open (when user hasn't set anything yet)
+        if (v.enumDefs.empty()) {
+            std::lock_guard lk(mtxElf_);
+            const dwarf::Type *et = resolveAlias(dwarfInfo_, v.typeOff);
+            if (et && et->kind == dwarf::TypeKind::ENUM) {
+                for (const auto &e : et->enums)
+                    v.enumDefs.push_back({e.name, e.value});
+            }
+        }
+
+        ImGui::Text("Variable: %s", v.name.c_str());
+        ImGui::Separator();
+
+        constexpr ImGuiTableFlags tfl = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp;
+        if (ImGui::BeginTable("EnumDefTable", 3, tfl, ImVec2(400, 200))) {
+            ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 24.0f);
+            ImGui::TableHeadersRow();
+
+            int deleteIdx = -1;
+            for (int j = 0; j < (int)v.enumDefs.size(); ++j) {
+                ImGui::PushID(j);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::SetNextItemWidth(-1);
+                char nameBuf[64];
+                snprintf(nameBuf, sizeof(nameBuf), "%s", v.enumDefs[j].name.c_str());
+                if (ImGui::InputText("##name", nameBuf, sizeof(nameBuf)))
+                    v.enumDefs[j].name = nameBuf;
+                ImGui::TableSetColumnIndex(1);
+                ImGui::SetNextItemWidth(-1);
+                int ival = (int)v.enumDefs[j].value;
+                if (ImGui::InputInt("##val", &ival, 0, 0))
+                    v.enumDefs[j].value = ival;
+                ImGui::TableSetColumnIndex(2);
+                if (ImGui::SmallButton("x")) deleteIdx = j;
+                ImGui::PopID();
+            }
+            if (deleteIdx >= 0)
+                v.enumDefs.erase(v.enumDefs.begin() + deleteIdx);
+            ImGui::EndTable();
+        }
+
+        if (ImGui::Button("+ Add")) v.enumDefs.push_back({"", 0});
+        ImGui::SameLine();
+        if (ImGui::Button("Clear All")) v.enumDefs.clear();
+        ImGui::SameLine(0, 40);
+        if (ImGui::Button("Close", ImVec2(80, 0))) {
+            isModified_ = true;
+            enumEditIdx_ = -1;
+            ImGui::CloseCurrentPopup();
+        }
         ImGui::EndPopup();
     }
 }
@@ -950,8 +1039,24 @@ Variable::updateVariables()
             }
         }
         
-        if (ret == 0) v.valueStr = decodeValue(buf, v.type);
-        else if (ret == -1) v.valueStr = "ERR";
+        if (ret == 0) {
+            const dwarf::Type *et = resolveAlias(dwarfInfo_, v.typeOff);
+            const bool isEnum = (et && et->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty();
+            if (isEnum) {
+                i64 ival = 0;
+                std::memcpy(&ival, buf, std::min((size_t)sz, sizeof(ival)));
+                v.valueStr = decodeValue(buf, v.type);
+                // User-defined defs take priority over DWARF
+                bool found = false;
+                for (const auto &e : v.enumDefs)
+                    if (e.value == ival) { v.valueStr = e.name; found = true; break; }
+                if (!found && et && et->kind == dwarf::TypeKind::ENUM)
+                    for (const auto &e : et->enums)
+                        if (e.value == ival) { v.valueStr = e.name; break; }
+            } else {
+                v.valueStr = decodeValue(buf, v.type);
+            }
+        } else if (ret == -1) v.valueStr = "ERR";
         else if (v.valueStr.empty()) v.valueStr = "...";
     }
 }
@@ -1012,6 +1117,7 @@ Variable::draw()
     ImGui::EndChild();
 
     drawAddVariableDialog();
+    drawEnumEditPopup();
     if (state_ == WindowState::LoadElf) {
         state_ = WindowState::None;
         std::string p = nativeDlgOpen("Choose Symbol File",
@@ -1110,6 +1216,7 @@ Variable::addRecursive(const std::string &fullPath, u64 addr, u64 typeOff, PortT
         if (sType) {
             VarEntry v;
             v.name = fullPath; v.type = Parser::strToDataType(sType); v.port = port; v.addr = addr; v.writable = true;
+            v.typeOff = typeOff;
             vars_.push_back(v);
             isModified_ = true;
         }
@@ -1125,8 +1232,18 @@ Variable::drawVarVarTreeRow(const std::string &fullPath, u64 addr, u64 typeOff, 
 
     const char *devLabel = (port == PortType::SHM) ? "SHM" : (port == PortType::UDP) ? "UDP" : "JLINK";
 
-    auto drawValueCell = [&](u64 memberAddr, const char *sType) {
+    auto drawValueCell = [&](u64 memberAddr, const char *sType, u64 memberTypeOff) {
         auto it = memberValueCache_.find(memberAddr);
+        const dwarf::Type *et = resolveAlias(dwarfInfo_, memberTypeOff);
+        const bool isEnum = et && et->kind == dwarf::TypeKind::ENUM;
+        auto decodeWithEnum = [&](const u8 *buf, u32 sz) -> std::string {
+            if (!isEnum) return decodeValue(buf, Parser::strToDataType(sType));
+            i64 ival = 0;
+            std::memcpy(&ival, buf, std::min((size_t)sz, sizeof(ival)));
+            for (const auto &e : et->enums)
+                if (e.value == ival) return e.name;
+            return decodeValue(buf, Parser::strToDataType(sType));
+        };
         if (port == PortType::JLINK) {
             u8  buf[8]{};
             u32 sz         = Parser::typeBytes(Parser::strToDataType(sType));
@@ -1134,7 +1251,7 @@ Variable::drawVarVarTreeRow(const std::string &fullPath, u64 addr, u64 typeOff, 
             bool shouldRead = (now - lastUpdateTs_ < 20);
             if (shouldRead && JLinkDev::instance().isConnected() &&
                 JLinkDev::instance().readMem((u32)memberAddr, sz, buf)) {
-                std::string val         = decodeValue(buf, Parser::strToDataType(sType));
+                std::string val         = decodeWithEnum(buf, sz);
                 memberValueCache_[memberAddr] = val;
                 ImGui::TextUnformatted(val.c_str());
             } else if (it != memberValueCache_.end()) {
@@ -1179,12 +1296,18 @@ Variable::drawVarVarTreeRow(const std::string &fullPath, u64 addr, u64 typeOff, 
                 ImGui::EndDragDropSource();
             }
 
-            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(sType ? sType : "STRUCT");
-            ImGui::TableSetColumnIndex(2); ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
-            ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(devLabel);
-            ImGui::TableSetColumnIndex(4);
-            if (sType) drawValueCell(memberAddr, sType);
-            else ImGui::TextUnformatted("...");
+            {
+                const dwarf::Type *mt = resolveAlias(dwarfInfo_, m.type);
+                const bool isMemberEnum = mt && mt->kind == dwarf::TypeKind::ENUM;
+                ImGui::TableSetColumnIndex(1);
+                if (sType) drawValueCell(memberAddr, sType, m.type);
+                else ImGui::TextUnformatted("...");
+                ImGui::TableSetColumnIndex(2);
+                if (isMemberEnum) ImGui::TextUnformatted(mt->name.empty() ? "enum" : mt->name.c_str());
+                else ImGui::TextUnformatted(sType ? sType : "STRUCT");
+                ImGui::TableSetColumnIndex(3); ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
+                ImGui::TableSetColumnIndex(4); ImGui::TextUnformatted(devLabel);
+            }
 
             if (open && isComplex) {
                 drawVarVarTreeRow(memberPath, memberAddr, m.type, depth + 1, port, shmRegionName);
@@ -1224,12 +1347,18 @@ Variable::drawVarVarTreeRow(const std::string &fullPath, u64 addr, u64 typeOff, 
                 ImGui::EndDragDropSource();
             }
 
-            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(sType ? sType : "ARRAY");
-            ImGui::TableSetColumnIndex(2); ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
-            ImGui::TableSetColumnIndex(3); ImGui::TextUnformatted(devLabel);
-            ImGui::TableSetColumnIndex(4);
-            if (sType) drawValueCell(memberAddr, sType);
-            else ImGui::TextUnformatted("...");
+            {
+                const dwarf::Type *et2 = resolveAlias(dwarfInfo_, t->inner);
+                const bool isElemEnum = et2 && et2->kind == dwarf::TypeKind::ENUM;
+                ImGui::TableSetColumnIndex(1);
+                if (sType) drawValueCell(memberAddr, sType, t->inner);
+                else ImGui::TextUnformatted("...");
+                ImGui::TableSetColumnIndex(2);
+                if (isElemEnum) ImGui::TextUnformatted(et2->name.empty() ? "enum" : et2->name.c_str());
+                else ImGui::TextUnformatted(sType ? sType : "ARRAY");
+                ImGui::TableSetColumnIndex(3); ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
+                ImGui::TableSetColumnIndex(4); ImGui::TextUnformatted(devLabel);
+            }
 
             if (open && isComplex) {
                 drawVarVarTreeRow(memberPath, memberAddr, t->inner, depth + 1, port, shmRegionName);

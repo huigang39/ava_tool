@@ -537,90 +537,56 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                         }
                                 }
                         } else {
-                                std::lock_guard lk(ch->valMutex_);
-                                const size_t    total = ch->rTs_.size();
-                                if (total > 0) {
-                                        size_t startIdx = 0, endIdx = total;
-                                        if (linkXMin) {
-                                                const f64 xmin = *linkXMin;
-                                                auto      it   = std::lower_bound(ch->rTs_.begin(), ch->rTs_.end(), xmin);
-                                                startIdx = static_cast<size_t>(std::distance(ch->rTs_.begin(), it));
-                                        }
-                                        if (linkXMax) {
-                                                const f64 xmax = *linkXMax;
-                                                auto it = std::upper_bound(ch->rTs_.begin() + startIdx, ch->rTs_.end(), xmax);
-                                                endIdx  = static_cast<size_t>(std::distance(ch->rTs_.begin(), it));
-                                        }
-
-                                        const size_t visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
-                                        if (visibleCount > 0) {
-                                                tempTs_.assign(ch->rTs_.begin() + startIdx, ch->rTs_.begin() + endIdx);
-                                                tempVals_.assign(ch->rVals_.begin() + startIdx, ch->rVals_.begin() + endIdx);
-
-                                                const f64 *pTs   = tempTs_.data();
-                                                const f64 *pVals = tempVals_.data();
-
-                                                dxs_.clear();
-                                                dys_.clear();
-
-                                                if (maxDisplayPoints > 0 && visibleCount > maxDisplayPoints) {
-                                                        usize  buckets = maxDisplayPoints / 2;
-                                                        if (buckets < 1)
-                                                                buckets = 1;
-                                                        f64 samplesPerBucket = static_cast<f64>(visibleCount) / buckets;
-
-                                                        for (usize b = 0; b < buckets; ++b) {
-                                                                usize bStart = static_cast<usize>(b * samplesPerBucket);
-                                                                usize bEnd   = static_cast<usize>((b + 1) * samplesPerBucket);
-                                                                if (bEnd > visibleCount)
-                                                                        bEnd = visibleCount;
-                                                                if (bStart >= bEnd)
-                                                                        continue;
-
-                                                                usize minI = bStart, maxI = bStart;
-                                                                f64    minVal = pVals[bStart], maxVal = minVal;
-                                                                for (usize i = bStart + 1; i < bEnd; ++i) {
-                                                                        const f64 val = pVals[i];
-                                                                        if (val < minVal) {
-                                                                                minVal = val;
-                                                                                minI   = i;
-                                                                        } else if (val > maxVal) {
-                                                                                maxVal = val;
-                                                                                maxI   = i;
-                                                                        }
+                                // Stride decimation directly on the deque under the lock.
+                                // O(maxDisplayPoints) deque random-accesses — no temp allocation.
+                                dxs_.clear();
+                                dys_.clear();
+                                {
+                                        std::lock_guard lk(ch->valMutex_);
+                                        const size_t total = ch->rTs_.size();
+                                        if (total > 0) {
+                                                size_t startIdx = 0, endIdx = total;
+                                                if (linkXMin) {
+                                                        auto it  = std::lower_bound(ch->rTs_.begin(), ch->rTs_.end(), *linkXMin);
+                                                        startIdx = static_cast<size_t>(std::distance(ch->rTs_.begin(), it));
+                                                }
+                                                if (linkXMax) {
+                                                        auto it  = std::upper_bound(ch->rTs_.begin() + startIdx, ch->rTs_.end(), *linkXMax);
+                                                        endIdx   = static_cast<size_t>(std::distance(ch->rTs_.begin(), it));
+                                                }
+                                                const size_t visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
+                                                if (visibleCount > 0) {
+                                                        if (maxDisplayPoints > 0 && visibleCount > (size_t)maxDisplayPoints) {
+                                                                // Stride-based: visit only maxDisplayPoints elements
+                                                                const usize stride = visibleCount / (usize)maxDisplayPoints;
+                                                                dxs_.reserve((usize)maxDisplayPoints + 1);
+                                                                dys_.reserve((usize)maxDisplayPoints + 1);
+                                                                for (usize i = startIdx; i < endIdx; i += stride) {
+                                                                        dxs_.push_back(ch->rTs_[i]);
+                                                                        dys_.push_back(static_cast<f64>(ch->rVals_[i]));
                                                                 }
-                                                                if (minI < maxI) {
-                                                                        dxs_.push_back(pTs[minI]);
-                                                                        dys_.push_back(minVal);
-                                                                        dxs_.push_back(pTs[maxI]);
-                                                                        dys_.push_back(maxVal);
-                                                                } else if (minI > maxI) {
-                                                                        dxs_.push_back(pTs[maxI]);
-                                                                        dys_.push_back(maxVal);
-                                                                        dxs_.push_back(pTs[minI]);
-                                                                        dys_.push_back(minVal);
-                                                                } else {
-                                                                        dxs_.push_back(pTs[minI]);
-                                                                        dys_.push_back(minVal);
+                                                        } else {
+                                                                dxs_.reserve(visibleCount);
+                                                                dys_.reserve(visibleCount);
+                                                                for (usize i = startIdx; i < endIdx; ++i) {
+                                                                        dxs_.push_back(ch->rTs_[i]);
+                                                                        dys_.push_back(static_cast<f64>(ch->rVals_[i]));
                                                                 }
                                                         }
-                                                } else {
-                                                        dxs_.assign(tempTs_.begin(), tempTs_.end());
-                                                        dys_.assign(tempVals_.begin(), tempVals_.end());
                                                 }
-
-                                                if (ch->getPlotStyle() == 1) // 1 = Stairs
-                                                        ImPlot::PlotStairs(chName.c_str(),
-                                                                           dxs_.data(),
-                                                                           dys_.data(),
-                                                                           static_cast<i32>(dxs_.size()));
-                                                else
-                                                        ImPlot::PlotLine(chName.c_str(),
-                                                                         dxs_.data(),
-                                                                         dys_.data(),
-                                                                         static_cast<i32>(dxs_.size()));
-                                                plotted = true;
                                         }
+                                } // valMutex_ released
+
+                                if (!dxs_.empty()) {
+                                        if (ch->getPlotStyle() == 1)
+                                                ImPlot::PlotStairs(chName.c_str(),
+                                                                   dxs_.data(), dys_.data(),
+                                                                   static_cast<i32>(dxs_.size()));
+                                        else
+                                                ImPlot::PlotLine(chName.c_str(),
+                                                                 dxs_.data(), dys_.data(),
+                                                                 static_cast<i32>(dxs_.size()));
+                                        plotted = true;
                                 }
                         }
 
@@ -898,6 +864,15 @@ Monitor::findChannelByKey_(const char *key)
 void
 Monitor::bodeDraw_()
 {
+        // Initialize curve colors from colormap on first render
+        if (!bodeStyleInit_) {
+                ImVec4 c0 = ImPlot::GetColormapColor(0);
+                ImVec4 c1 = ImPlot::GetColormapColor(1);
+                memcpy(bodeMagStyle_.color, &c0.x, sizeof(f32) * 4);
+                memcpy(bodePhsStyle_.color, &c1.x, sizeof(f32) * 4);
+                bodeStyleInit_ = true;
+        }
+
         // ---------- Channel selection ----------
         std::vector<std::string> keys;
         for (auto &[sn, sc] : scopes_)
@@ -928,12 +903,6 @@ Monitor::bodeDraw_()
         ImGui::SameLine();
         drawCombo("##bodeOut", "Output", bodeOutputKey_, sizeof(bodeOutputKey_));
 
-        // Warn when wave gen is not active on the input channel
-        MonitorChannel *inCh = findChannelByKey_(bodeInputKey_);
-        if (inCh && !inCh->waveEnable_)
-                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
-                                   "Wave gen not enabled on input channel");
-
         // ---------- Sweep parameters ----------
         if (bodeSweepRunning_) ImGui::BeginDisabled();
 
@@ -958,6 +927,12 @@ Monitor::bodeDraw_()
         ImGui::SetNextItemWidth(60);
         ImGui::InputFloat("##bDw", &bodeDwellSec_, 0, 0, "%.2f");
         if (bodeDwellSec_ < 0.05f) bodeDwellSec_ = 0.05f;
+        ImGui::SameLine();
+        ImGui::TextDisabled("Amp");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70);
+        ImGui::InputFloat("##bAmp", &bodeAmp_, 0, 0, "%.3g");
+        if (bodeAmp_ < 0.0f) bodeAmp_ = 0.0f;
 
         if (bodeSweepRunning_) ImGui::EndDisabled();
 
@@ -977,14 +952,26 @@ Monitor::bodeDraw_()
                                 MonitorChannel *inCh2 = findChannelByKey_(bodeInputKey_);
                                 if (inCh2) {
                                         std::lock_guard lk(inCh2->waveMtx_);
-                                        inCh2->wave_.cfg.freq =
-                                            static_cast<float>(bodeFreqList_[0]);
+                                        inCh2->wave_.cfg.freq = static_cast<float>(bodeFreqList_[0]);
+                                        inCh2->wave_.cfg.amp  = bodeAmp_;
+                                        inCh2->waveEnable_ = true;
                                 }
                         }
                 }
         } else {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 0.8f));
-                if (ImGui::Button("Stop##bodeSt")) bodeSweepRunning_ = false;
+                if (ImGui::Button("Stop##bodeSt")) {
+                        bodeSweepRunning_ = false;
+                        MonitorChannel *inCh2 = findChannelByKey_(bodeInputKey_);
+                        if (inCh2) {
+                                {
+                                        std::lock_guard lk(inCh2->waveMtx_);
+                                        inCh2->waveEnable_ = false;
+                                }
+                                inCh2->setWVal(0.0f);
+                                inCh2->markWValDirty();
+                        }
+                }
                 ImGui::PopStyleColor();
                 ImGui::SameLine();
                 const int   total = static_cast<int>(bodeFreqList_.size());
@@ -1009,24 +996,61 @@ Monitor::bodeDraw_()
 
         // ---------- Bode subplots ----------
         if (ImPlot::BeginSubplots("##bodeSP", 2, 1, ImVec2(-1.0f, -1.0f),
-                                   ImPlotSubplotFlags_LinkAllX | ImPlotSubplotFlags_NoTitle |
-                                       ImPlotSubplotFlags_NoMenus)) {
+                                   ImPlotSubplotFlags_LinkAllX | ImPlotSubplotFlags_NoTitle)) {
+                auto legendPopup = [](const char *label, BodeCurveStyle &style) {
+                        if (ImPlot::BeginLegendPopup(label)) {
+                                f32 colArr[4];
+                                memcpy(colArr, style.color, sizeof(colArr));
+                                if (ImGui::ColorEdit4("Color", colArr, ImGuiColorEditFlags_NoInputs)) {
+                                        style.useAutoColor = false;
+                                        memcpy(style.color, colArr, sizeof(colArr));
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Checkbox("Auto", &style.useAutoColor)) {
+                                        if (style.useAutoColor) {
+                                                static i32 bodeShuffleIdx = 0;
+                                                bodeShuffleIdx = (bodeShuffleIdx + 1) % ImPlot::GetColormapSize();
+                                                ImVec4 nc = ImPlot::GetColormapColor(bodeShuffleIdx);
+                                                memcpy(style.color, &nc.x, sizeof(f32) * 4);
+                                        }
+                                }
+                                ImGui::SetNextItemWidth(100);
+                                ImGui::SliderFloat("Width", &style.lineWeight, 0.5f, 5.0f, "%.1f");
+                                ImGui::Checkbox("Markers", &style.showMarkers);
+                                ImPlot::EndLegendPopup();
+                        }
+                };
+
                 if (ImPlot::BeginPlot("##bodeMag")) {
                         ImPlot::SetupAxis(ImAxis_X1, "Frequency (Hz)");
                         ImPlot::SetupAxis(ImAxis_Y1, "Magnitude (dB)");
                         ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
+                        ImPlot::SetNextLineStyle(
+                            ImVec4(bodeMagStyle_.color[0], bodeMagStyle_.color[1],
+                                   bodeMagStyle_.color[2], bodeMagStyle_.color[3]),
+                            bodeMagStyle_.lineWeight);
+                        if (bodeMagStyle_.showMarkers)
+                                ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 3.0f);
                         if (!bodeFreqsV_.empty())
-                                ImPlot::PlotLine("H(jw)", bodeFreqsV_.data(), bodeMagsV_.data(),
+                                ImPlot::PlotLine("H(jw)##mag", bodeFreqsV_.data(), bodeMagsV_.data(),
                                                  static_cast<int>(bodeFreqsV_.size()));
+                        legendPopup("H(jw)##mag", bodeMagStyle_);
                         ImPlot::EndPlot();
                 }
                 if (ImPlot::BeginPlot("##bodePhs")) {
                         ImPlot::SetupAxis(ImAxis_X1, "Frequency (Hz)");
                         ImPlot::SetupAxis(ImAxis_Y1, "Phase (deg)");
                         ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
+                        ImPlot::SetNextLineStyle(
+                            ImVec4(bodePhsStyle_.color[0], bodePhsStyle_.color[1],
+                                   bodePhsStyle_.color[2], bodePhsStyle_.color[3]),
+                            bodePhsStyle_.lineWeight);
+                        if (bodePhsStyle_.showMarkers)
+                                ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 3.0f);
                         if (!bodeFreqsV_.empty())
-                                ImPlot::PlotLine("H(jw)", bodeFreqsV_.data(), bodePhsV_.data(),
+                                ImPlot::PlotLine("H(jw)##phs", bodeFreqsV_.data(), bodePhsV_.data(),
                                                  static_cast<int>(bodeFreqsV_.size()));
+                        legendPopup("H(jw)##phs", bodePhsStyle_);
                         ImPlot::EndPlot();
                 }
                 ImPlot::EndSubplots();
@@ -1102,6 +1126,8 @@ Monitor::updateDisplay()
                                 maxSampleHz_ = 50000;
                         JLinkDev::instance().reqRestart();
                 }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("HSS sample rate (Hz). Most J-Link hardware supports up to ~200Hz reliably.");
                 ImGui::SameLine();
                 ImGui::TextDisabled("MaxHz");
 
@@ -1322,6 +1348,15 @@ Monitor::updateDisplay()
                                 ++bodeSweepFreqIdx_;
                                 if (bodeSweepFreqIdx_ >= (int)bodeFreqList_.size()) {
                                         bodeSweepRunning_ = false;
+                                        MonitorChannel *inChStop = findChannelByKey_(bodeInputKey_);
+                                        if (inChStop) {
+                                                {
+                                                        std::lock_guard lk(inChStop->waveMtx_);
+                                                        inChStop->waveEnable_ = false;
+                                                }
+                                                inChStop->setWVal(0.0f);
+                                                inChStop->markWValDirty();
+                                        }
                                 } else {
                                         MonitorChannel *inCh2 = findChannelByKey_(bodeInputKey_);
                                         if (inCh2) {
