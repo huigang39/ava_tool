@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <map>
 #include <vector>
 
 #include "imgui.h"
@@ -47,7 +49,19 @@ MonitorScope::menu()
 
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(100);
-                const char *pointOptions[] = {"256", "512", "1024", "2048", "4096", "8192", "16384", "32768", "65536", "131072", "262144", "524288", "1048576"};
+                const char *pointOptions[] = {"256",
+                                              "512",
+                                              "1024",
+                                              "2048",
+                                              "4096",
+                                              "8192",
+                                              "16384",
+                                              "32768",
+                                              "65536",
+                                              "131072",
+                                              "262144",
+                                              "524288",
+                                              "1048576"};
                 i32         currentIdx     = 0;
                 for (i32 i = 0; i < (i32)(sizeof(pointOptions) / sizeof(pointOptions[0])); ++i) {
                         if (fftPoints_ == atoi(pointOptions[i])) {
@@ -56,13 +70,15 @@ MonitorScope::menu()
                         }
                 }
 
-                if (ImGui::Combo("##fftPoints", &currentIdx, pointOptions, (i32)(sizeof(pointOptions) / sizeof(pointOptions[0])))) {
+                if (ImGui::Combo(
+                        "##fftPoints", &currentIdx, pointOptions, (i32)(sizeof(pointOptions) / sizeof(pointOptions[0])))) {
                         i32 nextPoints = atoi(pointOptions[currentIdx]);
                         if (nextPoints != fftPoints_) {
                                 reinitFft(nextPoints);
                         }
                 }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("FFT Points (Resolution)");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("FFT Points (Resolution)");
 
                 ImGui::SameLine();
                 ImGui::TextDisabled("Peaks");
@@ -70,12 +86,18 @@ MonitorScope::menu()
                 ImGui::SetNextItemWidth(30);
                 char pkBuf[16];
                 snprintf(pkBuf, sizeof(pkBuf), "%d", fftPeakCount_);
-                if (ImGui::InputText("##fftPeakCount", pkBuf, sizeof(pkBuf), ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsDecimal)) {
+                if (ImGui::InputText("##fftPeakCount",
+                                     pkBuf,
+                                     sizeof(pkBuf),
+                                     ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CharsDecimal)) {
                         fftPeakCount_ = atoi(pkBuf);
-                        if (fftPeakCount_ < 0) fftPeakCount_ = 0;
-                        if (fftPeakCount_ > 20) fftPeakCount_ = 20;
+                        if (fftPeakCount_ < 0)
+                                fftPeakCount_ = 0;
+                        if (fftPeakCount_ > 20)
+                                fftPeakCount_ = 20;
                 }
-                if (ImGui::IsItemHovered()) ImGui::SetTooltip("Enter number of peaks and press Enter to confirm");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Enter number of peaks and press Enter to confirm");
         } else {
                 if (ImGui::Button("TIME")) {
                         showFft_ = true;
@@ -83,9 +105,9 @@ MonitorScope::menu()
         }
 
         // Right-aligned buttons: Delete Scope and Pause/Resume
-        float delBtnWidth     = ImGui::CalcTextSize("Delete Scope").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-        float pauseBtnWidth   = std::max(ImGui::CalcTextSize("PAUSE").x, ImGui::CalcTextSize("RESUME").x) +
-                              ImGui::GetStyle().FramePadding.x * 2.0f;
+        float delBtnWidth = ImGui::CalcTextSize("Delete Scope").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        float pauseBtnWidth =
+            std::max(ImGui::CalcTextSize("PAUSE").x, ImGui::CalcTextSize("RESUME").x) + ImGui::GetStyle().FramePadding.x * 2.0f;
         float spacing         = ImGui::GetStyle().ItemSpacing.x;
         float totalRightWidth = delBtnWidth + spacing + pauseBtnWidth;
         float availWidth      = ImGui::GetContentRegionAvail().x;
@@ -137,32 +159,161 @@ MonitorScope::tableMenu()
 void
 MonitorScope::tableDraw()
 {
-        if (ImGui::BeginTable("MonitorTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable)) {
-                ImGui::TableSetupColumn("Name");
-                ImGui::TableSetupColumn("Value");
-                ImGui::TableSetupColumn("Wave", ImGuiTableColumnFlags_WidthFixed, 100.0f);
-                ImGui::TableSetupColumn("Type");
-                ImGui::TableSetupColumn("Address");
-                ImGui::TableSetupColumn("Port");
-                ImGui::TableHeadersRow();
+        if (!ImGui::BeginTable("MonitorTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
+                return;
 
-                std::vector<std::string> keys;
-                for (auto &pair : chs_)
-                        keys.push_back(pair.first);
-                std::sort(keys.begin(), keys.end());
+        ImGui::TableSetupColumn("Name");
+        ImGui::TableSetupColumn("Value");
+        ImGui::TableSetupColumn("Wave", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Type");
+        ImGui::TableSetupColumn("Address");
+        ImGui::TableSetupColumn("Port");
+        ImGui::TableHeadersRow();
 
-                for (i32 i = 0; i < static_cast<i32>(keys.size()); ++i)
-                        drawTableRow(keys[i], chs_[keys[i]], i, keys);
+        std::vector<std::string> keys;
+        for (auto &pair : chs_)
+                keys.push_back(pair.first);
+        std::sort(keys.begin(), keys.end());
 
-                // Detect click on blank space inside the table to deselect all
-                if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
-                        for (auto &pair : chs_)
-                                pair.second->selected_ = false;
-                        lastSelectedIndex_ = -1;
+        // Build a prefix trie on '.' so struct members render as an expandable tree.
+        struct TNode {
+                std::map<std::string, TNode> children;
+                std::string                  leafKey; // non-empty → this node is a channel
+        };
+        TNode root;
+        for (const auto &k : keys) {
+                TNode      *cur = &root;
+                std::string rem = k;
+                size_t      pos;
+                while ((pos = rem.find('.')) != std::string::npos) {
+                        cur = &cur->children[rem.substr(0, pos)];
+                        rem = rem.substr(pos + 1);
                 }
-
-                ImGui::EndTable();
+                cur->children[rem].leafKey = k;
         }
+
+        // Collect all leaf channel keys under a trie node (recursive).
+        std::function<void(TNode &, std::vector<std::string> &)> collectLeaves;
+        collectLeaves = [&](TNode &n, std::vector<std::string> &out) {
+                if (!n.leafKey.empty()) {
+                        out.push_back(n.leafKey);
+                } else {
+                        for (auto &[_, child] : n.children)
+                                collectLeaves(child, out);
+                }
+        };
+
+        // A group is highlighted if it equals a selected path or is a descendant of one.
+        auto isGroupHighlighted = [&](const std::string &path) {
+                for (const auto &sel : selectedGroupPaths_) {
+                        if (path == sel)
+                                return true;
+                        if (path.size() > sel.size() + 1 && path.compare(0, sel.size(), sel) == 0 && path[sel.size()] == '.')
+                                return true;
+                }
+                return false;
+        };
+
+        i32                                                                    rowIdx = 0;
+        std::function<void(const std::string &, TNode &, const std::string &)> drawNode;
+        drawNode = [&](const std::string &label, TNode &node, const std::string &fullPath) {
+                if (!node.leafKey.empty()) {
+                        // Leaf — draw a full interactive row, but show only the short label.
+                        drawTableRow(node.leafKey, chs_[node.leafKey], rowIdx++, keys, label);
+                } else {
+                        // Collect all leaves under this group (for selection/deletion).
+                        std::vector<std::string> groupLeaves;
+                        collectLeaves(node, groupLeaves);
+
+                        bool isGroupSelected = isGroupHighlighted(fullPath);
+
+                        // Group header — show collapsible tree node, empty other columns.
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::SetNextItemOpen(true, ImGuiCond_Once);
+                        ImGuiTreeNodeFlags treeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_DefaultOpen;
+                        if (isGroupSelected)
+                                treeFlags |= ImGuiTreeNodeFlags_Selected;
+                        bool open = ImGui::TreeNodeEx(label.c_str(), treeFlags);
+
+                        // Left-click on header row (not the expand arrow) → select this group.
+                        if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen()) {
+                                if (ImGui::GetIO().KeyCtrl) {
+                                        // Ctrl+click: toggle this group without deselecting others.
+                                        if (isGroupSelected) {
+                                                selectedGroupPaths_.erase(fullPath);
+                                                for (auto &lk : groupLeaves) {
+                                                        auto it = chs_.find(lk);
+                                                        if (it != chs_.end())
+                                                                it->second->selected_ = false;
+                                                }
+                                        } else {
+                                                selectedGroupPaths_.insert(fullPath);
+                                                for (auto &lk : groupLeaves) {
+                                                        auto it = chs_.find(lk);
+                                                        if (it != chs_.end())
+                                                                it->second->selected_ = true;
+                                                }
+                                        }
+                                } else {
+                                        for (auto &pair : chs_)
+                                                pair.second->selected_ = false;
+                                        selectedGroupPaths_.clear();
+                                        selectedGroupPaths_.insert(fullPath);
+                                        for (auto &lk : groupLeaves) {
+                                                auto it = chs_.find(lk);
+                                                if (it != chs_.end())
+                                                        it->second->selected_ = true;
+                                        }
+                                }
+                        }
+
+                        // Right-click: auto-select this group when not selected, then show unified menu.
+                        if (ImGui::BeginPopupContextItem()) {
+                                if (!isGroupSelected) {
+                                        for (auto &pair : chs_)
+                                                pair.second->selected_ = false;
+                                        selectedGroupPaths_.clear();
+                                        selectedGroupPaths_.insert(fullPath);
+                                        for (auto &lk : groupLeaves) {
+                                                auto it = chs_.find(lk);
+                                                if (it != chs_.end())
+                                                        it->second->selected_ = true;
+                                        }
+                                }
+                                if (ImGui::MenuItem("Delete Selected")) {
+                                        for (auto &pair : chs_)
+                                                if (pair.second->selected_)
+                                                        pair.second->markPendingDelete();
+                                        selectedGroupPaths_.clear();
+                                }
+                                ImGui::EndPopup();
+                        }
+
+                        ImGui::TableNextColumn();
+                        ImGui::TableNextColumn();
+                        ImGui::TableNextColumn();
+                        ImGui::TableNextColumn();
+                        ImGui::TableNextColumn();
+                        if (open) {
+                                for (auto &[childLabel, childNode] : node.children)
+                                        drawNode(childLabel, childNode, fullPath + "." + childLabel);
+                                ImGui::TreePop();
+                        }
+                }
+        };
+
+        for (auto &[childLabel, childNode] : root.children)
+                drawNode(childLabel, childNode, childLabel);
+
+        if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
+                for (auto &pair : chs_)
+                        pair.second->selected_ = false;
+                selectedGroupPaths_.clear();
+                lastSelectedIndex_ = -1;
+        }
+
+        ImGui::EndTable();
 }
 
 static bool
@@ -175,15 +326,21 @@ isIntegerType(const std::string &t)
 }
 
 void
-MonitorScope::drawTableRow(const std::string &chName, std::shared_ptr<MonitorChannel> &ch, i32 idx, const std::vector<std::string> &allKeys)
+MonitorScope::drawTableRow(const std::string               &chName,
+                           std::shared_ptr<MonitorChannel> &ch,
+                           i32                              idx,
+                           const std::vector<std::string>  &allKeys,
+                           const std::string               &displayLabel)
 {
         ImGui::PushID(chName.c_str());
         ImGui::TableNextRow();
 
         // 1. Name (Selectable for Shift/Ctrl support)
         ImGui::TableNextColumn();
-        bool isSelected = ch->selected_;
-        if (ImGui::Selectable(chName.c_str(), isSelected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+        const char *label      = displayLabel.empty() ? chName.c_str() : displayLabel.c_str();
+        bool        isSelected = ch->selected_;
+        if (ImGui::Selectable(label, isSelected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                selectedGroupPaths_.clear();
                 if (ImGui::GetIO().KeyCtrl) {
                         // Ctrl + Click: Toggle current
                         ch->selected_ = !ch->selected_;
@@ -209,7 +366,8 @@ MonitorScope::drawTableRow(const std::string &chName, std::shared_ptr<MonitorCha
                 // Right-click implies selection — auto-select this row so Delete works
                 // without requiring a prior left-click.
                 if (!ch->selected_) {
-                        for (auto &pair : chs_) pair.second->selected_ = false;
+                        for (auto &pair : chs_)
+                                pair.second->selected_ = false;
                         ch->selected_ = true;
                 }
                 if (ImGui::MenuItem("Delete Selected")) {
@@ -459,9 +617,8 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                         const double xmin = (linkXMin) ? *linkXMin : 0.0;
                                         const double xmax = (linkXMax) ? *linkXMax : 1.0;
 
-                                        auto itStart =
-                                            std::lower_bound(ch->rTs_.begin(), ch->rTs_.end(), xmin);
-                                        auto itEnd = std::upper_bound(ch->rTs_.begin(), ch->rTs_.end(), xmax);
+                                        auto itStart = std::lower_bound(ch->rTs_.begin(), ch->rTs_.end(), xmin);
+                                        auto itEnd   = std::upper_bound(ch->rTs_.begin(), ch->rTs_.end(), xmax);
 
                                         size_t startIdx     = std::distance(ch->rTs_.begin(), itStart);
                                         size_t endIdx       = std::distance(ch->rTs_.begin(), itEnd);
@@ -479,9 +636,9 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
 
                                                 f32 mean = 0;
                                                 for (usize i = 0; i < copyCount; ++i) {
-                                                        f32 v        = ch->rVals_[startIdx + readOffset + i];
-                                                        fftLoBuf_[i] = v;
-                                                        mean        += v;
+                                                        f32 v         = ch->rVals_[startIdx + readOffset + i];
+                                                        fftLoBuf_[i]  = v;
+                                                        mean         += v;
                                                 }
                                                 mean /= (f32)copyCount;
 
@@ -494,9 +651,9 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                 f32 fs = (parent_) ? (f32)parent_->getHz() : 1000.0f;
                                                 if (copyCount > 1) {
                                                         f64 totalTime = ch->rTs_[startIdx + readOffset + copyCount - 1] -
-                                                                           ch->rTs_[startIdx + readOffset];
+                                                                        ch->rTs_[startIdx + readOffset];
                                                         if (totalTime > 1e-9f) {
-                                                                 fs = static_cast<f32>((f64)(copyCount - 1) / totalTime);
+                                                                fs = static_cast<f32>((f64)(copyCount - 1) / totalTime);
                                                         }
                                                 }
                                                 // Sanity check for FS
@@ -516,7 +673,8 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                         fftMagBuf_[i] = (f64)fftMagF32_[i] * 2.0 / (f64)fftPoints_;
                                                 }
 
-                                                ImPlot::PlotLine(chName.c_str(), dxs_.data(), fftMagBuf_.data(), (int)dxs_.size());
+                                                ImPlot::PlotLine(
+                                                    chName.c_str(), dxs_.data(), fftMagBuf_.data(), (int)dxs_.size());
                                                 plotted = true;
 
                                                 if (fftPeakCount_ > 0) {
@@ -543,16 +701,17 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 dys_.clear();
                                 {
                                         std::lock_guard lk(ch->valMutex_);
-                                        const size_t total = ch->rTs_.size();
+                                        const size_t    total = ch->rTs_.size();
                                         if (total > 0) {
                                                 size_t startIdx = 0, endIdx = total;
                                                 if (linkXMin) {
-                                                        auto it  = std::lower_bound(ch->rTs_.begin(), ch->rTs_.end(), *linkXMin);
+                                                        auto it = std::lower_bound(ch->rTs_.begin(), ch->rTs_.end(), *linkXMin);
                                                         startIdx = static_cast<size_t>(std::distance(ch->rTs_.begin(), it));
                                                 }
                                                 if (linkXMax) {
-                                                        auto it  = std::upper_bound(ch->rTs_.begin() + startIdx, ch->rTs_.end(), *linkXMax);
-                                                        endIdx   = static_cast<size_t>(std::distance(ch->rTs_.begin(), it));
+                                                        auto it = std::upper_bound(
+                                                            ch->rTs_.begin() + startIdx, ch->rTs_.end(), *linkXMax);
+                                                        endIdx = static_cast<size_t>(std::distance(ch->rTs_.begin(), it));
                                                 }
                                                 const size_t visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
                                                 if (visibleCount > 0) {
@@ -579,13 +738,11 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
 
                                 if (!dxs_.empty()) {
                                         if (ch->getPlotStyle() == 1)
-                                                ImPlot::PlotStairs(chName.c_str(),
-                                                                   dxs_.data(), dys_.data(),
-                                                                   static_cast<i32>(dxs_.size()));
+                                                ImPlot::PlotStairs(
+                                                    chName.c_str(), dxs_.data(), dys_.data(), static_cast<i32>(dxs_.size()));
                                         else
-                                                ImPlot::PlotLine(chName.c_str(),
-                                                                 dxs_.data(), dys_.data(),
-                                                                 static_cast<i32>(dxs_.size()));
+                                                ImPlot::PlotLine(
+                                                    chName.c_str(), dxs_.data(), dys_.data(), static_cast<i32>(dxs_.size()));
                                         plotted = true;
                                 }
                         }
@@ -731,9 +888,8 @@ MonitorScope::shmInit(MonitorChannel &ch)
         // Use the dedicated SHM region name if set; fall back to channel name.
         // Use SHM_READWRITE because spsc_read_buf updates spsc->rp (read pointer).
         // Use 4096 as the minimum region capacity to accommodate the spsc header.
-        const std::string &regionName =
-            ch.getShmRegionName().empty() ? ch.getName() : ch.getShmRegionName();
-        shm_cfg_t cfg = {regionName.c_str(), SHM_READWRITE, 4096};
+        const std::string &regionName = ch.getShmRegionName().empty() ? ch.getName() : ch.getShmRegionName();
+        shm_cfg_t          cfg        = {regionName.c_str(), SHM_READWRITE, 4096};
         shm_init(&ch.getShm(), cfg);
 }
 
@@ -764,6 +920,30 @@ MonitorScope::dropTarget()
                                                         shmInit(*ch);
                                                 if (parent_)
                                                         parent_->setModified();
+                                        }
+                                }
+                        }
+                }
+
+                if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("STRUCT_CHANNEL")) {
+                        if (payload->DataSize == sizeof(StructChannelPayload)) {
+                                auto *sp = static_cast<const StructChannelPayload *>(payload->Data);
+                                for (int ei = 0; ei < sp->count; ++ei) {
+                                        const auto &e = sp->entries[ei];
+                                        if (addChannel(e.name) == 0) {
+                                                MonitorChannel *ch = findChannel(e.name);
+                                                if (ch) {
+                                                        ch->setType(e.type);
+                                                        ch->setAddr(e.addr);
+                                                        ch->getSymbolName() = e.name;
+                                                        ch->setDevice(sp->device);
+                                                        if (sp->shmName[0] != '\0')
+                                                                ch->setShmRegionName(sp->shmName);
+                                                        if (ch->getDevice() == "SHM")
+                                                                shmInit(*ch);
+                                                        if (parent_)
+                                                                parent_->setModified();
+                                                }
                                         }
                                 }
                         }
@@ -825,7 +1005,7 @@ Monitor::addScope(const std::string &scopeName)
 {
         if (scopes_.find(scopeName) != scopes_.end())
                 return -1;
-        auto scope = std::make_shared<MonitorScope>(scopeName);
+        auto scope         = std::make_shared<MonitorScope>(scopeName);
         scopes_[scopeName] = scope;
         needsLayout_       = true;
         for (auto &pair : scopes_)
@@ -840,221 +1020,6 @@ Monitor::findChannel(const std::string &scopeName, const std::string &chName)
         if (it == scopes_.end())
                 return nullptr;
         return it->second->findChannel(chName);
-}
-
-void
-Monitor::generateBodeFreqs_()
-{
-        bodeFreqList_.clear();
-        if (bodeFStart_ <= 0.0f || bodeFStop_ <= bodeFStart_ || bodeFStep_ <= 0.0f)
-                return;
-        for (float f = bodeFStart_; f <= bodeFStop_ + bodeFStep_ * 0.01f; f += bodeFStep_)
-                bodeFreqList_.push_back(static_cast<double>(f));
-}
-
-MonitorChannel *
-Monitor::findChannelByKey_(const char *key)
-{
-        const char *sep = std::strchr(key, '/');
-        if (!sep)
-                return nullptr;
-        return findChannel(std::string(key, sep), std::string(sep + 1));
-}
-
-void
-Monitor::bodeDraw_()
-{
-        // Initialize curve colors from colormap on first render
-        if (!bodeStyleInit_) {
-                ImVec4 c0 = ImPlot::GetColormapColor(0);
-                ImVec4 c1 = ImPlot::GetColormapColor(1);
-                memcpy(bodeMagStyle_.color, &c0.x, sizeof(f32) * 4);
-                memcpy(bodePhsStyle_.color, &c1.x, sizeof(f32) * 4);
-                bodeStyleInit_ = true;
-        }
-
-        // ---------- Channel selection ----------
-        std::vector<std::string> keys;
-        for (auto &[sn, sc] : scopes_)
-                for (auto &[cn, _] : sc->getChannels())
-                        keys.push_back(sn + "/" + cn);
-        std::sort(keys.begin(), keys.end());
-
-        auto drawCombo = [&](const char *id, const char *labelText, char *buf, size_t bufSz) {
-                ImGui::TextDisabled("%s", labelText);
-                ImGui::SameLine();
-                int curIdx = -1;
-                for (int i = 0; i < (int)keys.size(); ++i)
-                        if (std::strcmp(buf, keys[i].c_str()) == 0) { curIdx = i; break; }
-                const char *preview = (curIdx >= 0) ? keys[curIdx].c_str() : "(none)";
-                ImGui::SetNextItemWidth(180);
-                if (ImGui::BeginCombo(id, preview)) {
-                        for (int i = 0; i < (int)keys.size(); ++i) {
-                                bool sel = (i == curIdx);
-                                if (ImGui::Selectable(keys[i].c_str(), sel))
-                                        std::snprintf(buf, bufSz, "%s", keys[i].c_str());
-                                if (sel) ImGui::SetItemDefaultFocus();
-                        }
-                        ImGui::EndCombo();
-                }
-        };
-
-        drawCombo("##bodeIn",  "Input",  bodeInputKey_,  sizeof(bodeInputKey_));
-        ImGui::SameLine();
-        drawCombo("##bodeOut", "Output", bodeOutputKey_, sizeof(bodeOutputKey_));
-
-        // ---------- Sweep parameters ----------
-        if (bodeSweepRunning_) ImGui::BeginDisabled();
-
-        ImGui::TextDisabled("F Start(Hz)");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(80);
-        ImGui::InputFloat("##bFS", &bodeFStart_, 0, 0, "%.3g");
-        ImGui::SameLine();
-        ImGui::TextDisabled("F Stop(Hz)");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(80);
-        ImGui::InputFloat("##bFE", &bodeFStop_, 0, 0, "%.3g");
-        ImGui::SameLine();
-        ImGui::TextDisabled("Step(Hz)");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(70);
-        ImGui::InputFloat("##bSTP", &bodeFStep_, 0, 0, "%.3g");
-        if (bodeFStep_ <= 0.0f) bodeFStep_ = 1.0f;
-        ImGui::SameLine();
-        ImGui::TextDisabled("Dwell(s)");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(60);
-        ImGui::InputFloat("##bDw", &bodeDwellSec_, 0, 0, "%.2f");
-        if (bodeDwellSec_ < 0.05f) bodeDwellSec_ = 0.05f;
-        ImGui::SameLine();
-        ImGui::TextDisabled("Amp");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(70);
-        ImGui::InputFloat("##bAmp", &bodeAmp_, 0, 0, "%.3g");
-        if (bodeAmp_ < 0.0f) bodeAmp_ = 0.0f;
-
-        if (bodeSweepRunning_) ImGui::EndDisabled();
-
-        // ---------- Control buttons ----------
-        ImGui::SameLine();
-        if (!bodeSweepRunning_) {
-                if (ImGui::Button("Start##bodeSt")) {
-                        generateBodeFreqs_();
-                        if (!bodeFreqList_.empty()) {
-                                bodeData_.clear();
-                                bodeFreqsV_.clear();
-                                bodeMagsV_.clear();
-                                bodePhsV_.clear();
-                                bodeSweepFreqIdx_  = 0;
-                                bodeSweepRunning_  = true;
-                                bodeSweepStepStart_ = get_mono_ts_us();
-                                MonitorChannel *inCh2 = findChannelByKey_(bodeInputKey_);
-                                if (inCh2) {
-                                        std::lock_guard lk(inCh2->waveMtx_);
-                                        inCh2->wave_.cfg.freq = static_cast<float>(bodeFreqList_[0]);
-                                        inCh2->wave_.cfg.amp  = bodeAmp_;
-                                        inCh2->waveEnable_ = true;
-                                }
-                        }
-                }
-        } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 0.8f));
-                if (ImGui::Button("Stop##bodeSt")) {
-                        bodeSweepRunning_ = false;
-                        MonitorChannel *inCh2 = findChannelByKey_(bodeInputKey_);
-                        if (inCh2) {
-                                {
-                                        std::lock_guard lk(inCh2->waveMtx_);
-                                        inCh2->waveEnable_ = false;
-                                }
-                                inCh2->setWVal(0.0f);
-                                inCh2->markWValDirty();
-                        }
-                }
-                ImGui::PopStyleColor();
-                ImGui::SameLine();
-                const int   total = static_cast<int>(bodeFreqList_.size());
-                const float pct   = (total > 0) ? static_cast<float>(bodeSweepFreqIdx_) / total : 0.0f;
-                ImGui::ProgressBar(pct, ImVec2(100.0f, 0.0f));
-                ImGui::SameLine();
-                const double curF = (bodeSweepFreqIdx_ < total)
-                                        ? bodeFreqList_[bodeSweepFreqIdx_]
-                                        : static_cast<double>(bodeFStop_);
-                ImGui::TextDisabled("%d/%d  %.3g Hz", bodeSweepFreqIdx_, total, curF);
-        }
-
-        ImGui::SameLine();
-        if (ImGui::Button("Clear##bodeCl")) {
-                bodeData_.clear();
-                bodeFreqsV_.clear();
-                bodeMagsV_.clear();
-                bodePhsV_.clear();
-        }
-
-        ImGui::Separator();
-
-        // ---------- Bode subplots ----------
-        if (ImPlot::BeginSubplots("##bodeSP", 2, 1, ImVec2(-1.0f, -1.0f),
-                                   ImPlotSubplotFlags_LinkAllX | ImPlotSubplotFlags_NoTitle)) {
-                auto legendPopup = [](const char *label, BodeCurveStyle &style) {
-                        if (ImPlot::BeginLegendPopup(label)) {
-                                f32 colArr[4];
-                                memcpy(colArr, style.color, sizeof(colArr));
-                                if (ImGui::ColorEdit4("Color", colArr, ImGuiColorEditFlags_NoInputs)) {
-                                        style.useAutoColor = false;
-                                        memcpy(style.color, colArr, sizeof(colArr));
-                                }
-                                ImGui::SameLine();
-                                if (ImGui::Checkbox("Auto", &style.useAutoColor)) {
-                                        if (style.useAutoColor) {
-                                                static i32 bodeShuffleIdx = 0;
-                                                bodeShuffleIdx = (bodeShuffleIdx + 1) % ImPlot::GetColormapSize();
-                                                ImVec4 nc = ImPlot::GetColormapColor(bodeShuffleIdx);
-                                                memcpy(style.color, &nc.x, sizeof(f32) * 4);
-                                        }
-                                }
-                                ImGui::SetNextItemWidth(100);
-                                ImGui::SliderFloat("Width", &style.lineWeight, 0.5f, 5.0f, "%.1f");
-                                ImGui::Checkbox("Markers", &style.showMarkers);
-                                ImPlot::EndLegendPopup();
-                        }
-                };
-
-                if (ImPlot::BeginPlot("##bodeMag")) {
-                        ImPlot::SetupAxis(ImAxis_X1, "Frequency (Hz)");
-                        ImPlot::SetupAxis(ImAxis_Y1, "Magnitude (dB)");
-                        ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
-                        ImPlot::SetNextLineStyle(
-                            ImVec4(bodeMagStyle_.color[0], bodeMagStyle_.color[1],
-                                   bodeMagStyle_.color[2], bodeMagStyle_.color[3]),
-                            bodeMagStyle_.lineWeight);
-                        if (bodeMagStyle_.showMarkers)
-                                ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 3.0f);
-                        if (!bodeFreqsV_.empty())
-                                ImPlot::PlotLine("H(jw)##mag", bodeFreqsV_.data(), bodeMagsV_.data(),
-                                                 static_cast<int>(bodeFreqsV_.size()));
-                        legendPopup("H(jw)##mag", bodeMagStyle_);
-                        ImPlot::EndPlot();
-                }
-                if (ImPlot::BeginPlot("##bodePhs")) {
-                        ImPlot::SetupAxis(ImAxis_X1, "Frequency (Hz)");
-                        ImPlot::SetupAxis(ImAxis_Y1, "Phase (deg)");
-                        ImPlot::SetupAxisScale(ImAxis_X1, ImPlotScale_Log10);
-                        ImPlot::SetNextLineStyle(
-                            ImVec4(bodePhsStyle_.color[0], bodePhsStyle_.color[1],
-                                   bodePhsStyle_.color[2], bodePhsStyle_.color[3]),
-                            bodePhsStyle_.lineWeight);
-                        if (bodePhsStyle_.showMarkers)
-                                ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 3.0f);
-                        if (!bodeFreqsV_.empty())
-                                ImPlot::PlotLine("H(jw)##phs", bodeFreqsV_.data(), bodePhsV_.data(),
-                                                 static_cast<int>(bodeFreqsV_.size()));
-                        legendPopup("H(jw)##phs", bodePhsStyle_);
-                        ImPlot::EndPlot();
-                }
-                ImPlot::EndSubplots();
-        }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1079,15 +1044,6 @@ Monitor::updateDisplay()
                 if (ImGui::Button("Clear Data"))
                         clearData();
                 ImGui::PopStyleColor(3);
-
-                ImGui::SameLine();
-                if (showBode_) {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 0.8f));
-                        if (ImGui::Button("Bode")) showBode_ = false;
-                        ImGui::PopStyleColor();
-                } else {
-                        if (ImGui::Button("Bode")) showBode_ = true;
-                }
 
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(100);
@@ -1158,15 +1114,20 @@ Monitor::updateDisplay()
                 // otherwise targets the time-domain axis.
                 bool anyFft = false;
                 for (const auto &sp : scopes_)
-                        if (sp.second && sp.second->isFftEnabled()) { anyFft = true; break; }
+                        if (sp.second && sp.second->isFftEnabled()) {
+                                anyFft = true;
+                                break;
+                        }
 
                 const char *viewModeNames[] = {"FULL", "FOLLOW", "MANUAL"};
-                i32         curMode = anyFft ? (i32)fftViewMode_ : (i32)viewMode_;
+                i32         curMode         = anyFft ? (i32)fftViewMode_ : (i32)viewMode_;
 
                 ImGui::SetNextItemWidth(90);
                 if (ImGui::Combo("##Mode", &curMode, viewModeNames, 3)) {
-                        if (anyFft) fftViewMode_ = static_cast<MonitorViewMode>(curMode);
-                        else        viewMode_    = static_cast<MonitorViewMode>(curMode);
+                        if (anyFft)
+                                fftViewMode_ = static_cast<MonitorViewMode>(curMode);
+                        else
+                                viewMode_ = static_cast<MonitorViewMode>(curMode);
                 }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip(anyFft ? "Frequency Domain View Mode" : "Time Domain View Mode");
@@ -1213,15 +1174,15 @@ Monitor::updateDisplay()
                         if (ImGui::BeginChild(keys[i].c_str(), ImVec2(avail.x, scope->getHeight()), true)) {
                                 scope->menu();
 
-                                bool   isPaused = g_monitorPaused.load();
-                                f64    now      = sessionTimeSec();
+                                bool isPaused = g_monitorPaused.load();
+                                f64  now      = sessionTimeSec();
 
                                 // When FULL mode is active, always fit to exact data bounds
                                 if (viewMode_ == MonitorViewMode::FULL) {
                                         if (!isPaused) {
-                                                f64 earliest = now;
-                                                f64 latest   = 0.0;
-                                                bool   hasData  = false;
+                                                f64  earliest = now;
+                                                f64  latest   = 0.0;
+                                                bool hasData  = false;
                                                 for (const auto &[_, sc] : scopes_) {
                                                         for (const auto &[__, ch] : sc->getChannels()) {
                                                                 const f64 e = ch->earliestTs();
@@ -1310,75 +1271,6 @@ Monitor::updateDisplay()
                         for (auto &pair : scopes_)
                                 pair.second->setManual(false);
                 }
-
-                // ---- Bode sweep advancement (runs every frame while dwelling) ----
-                if (bodeSweepRunning_ && !bodeFreqList_.empty() &&
-                    bodeSweepFreqIdx_ < (int)bodeFreqList_.size()) {
-                        const double    f     = bodeFreqList_[bodeSweepFreqIdx_];
-                        MonitorChannel *inCh  = findChannelByKey_(bodeInputKey_);
-                        MonitorChannel *outCh = findChannelByKey_(bodeOutputKey_);
-
-                        if (inCh && outCh) {
-                                auto [reX, imX] = inCh->dftSlice(linkXMin_, linkXMax_, f);
-                                auto [reY, imY] = outCh->dftSlice(linkXMin_, linkXMax_, f);
-                                const double magX  = std::hypot(reX, imX);
-                                const double magY  = std::hypot(reY, imY);
-                                const double magDb = (magX > 1e-10) ? 20.0 * std::log10(magY / magX) : -120.0;
-                                double       phRad = std::atan2(imY, reY) - std::atan2(imX, reX);
-                                phRad              = std::remainder(phRad, 2.0 * M_PI);
-
-                                // Update the in-progress point for this frequency index
-                                const BodePoint pt{f, magDb, phRad * (180.0 / M_PI)};
-                                if (bodeSweepFreqIdx_ < (int)bodeData_.size()) {
-                                        bodeData_[bodeSweepFreqIdx_] = pt;
-                                } else {
-                                        bodeData_.push_back(pt);
-                                        bodeFreqsV_.push_back(0.0);
-                                        bodeMagsV_.push_back(0.0);
-                                        bodePhsV_.push_back(0.0);
-                                }
-                                bodeFreqsV_[bodeSweepFreqIdx_] = pt.freq;
-                                bodeMagsV_[bodeSweepFreqIdx_]  = pt.magDb;
-                                bodePhsV_[bodeSweepFreqIdx_]   = pt.phaseDeg;
-                        }
-
-                        // Advance frequency when dwell time expires
-                        const u64 now = get_mono_ts_us();
-                        if (now - bodeSweepStepStart_ >= static_cast<u64>(bodeDwellSec_ * 1.0e6f)) {
-                                ++bodeSweepFreqIdx_;
-                                if (bodeSweepFreqIdx_ >= (int)bodeFreqList_.size()) {
-                                        bodeSweepRunning_ = false;
-                                        MonitorChannel *inChStop = findChannelByKey_(bodeInputKey_);
-                                        if (inChStop) {
-                                                {
-                                                        std::lock_guard lk(inChStop->waveMtx_);
-                                                        inChStop->waveEnable_ = false;
-                                                }
-                                                inChStop->setWVal(0.0f);
-                                                inChStop->markWValDirty();
-                                        }
-                                } else {
-                                        MonitorChannel *inCh2 = findChannelByKey_(bodeInputKey_);
-                                        if (inCh2) {
-                                                std::lock_guard lk(inCh2->waveMtx_);
-                                                inCh2->wave_.cfg.freq =
-                                                    static_cast<float>(bodeFreqList_[bodeSweepFreqIdx_]);
-                                        }
-                                        bodeSweepStepStart_ = now;
-                                }
-                        }
-                }
         }
         ImGui::End();
-
-        // ---- Bode plot window (separate floating window) ----
-        if (showBode_) {
-                char bodeTitle[320];
-                std::snprintf(bodeTitle, sizeof(bodeTitle), "Bode Plot  [%s]##bode%s",
-                              name_.c_str(), name_.c_str());
-                ImGui::SetNextWindowSize(ImVec2(700.0f, 520.0f), ImGuiCond_FirstUseEver);
-                if (ImGui::Begin(bodeTitle, &showBode_))
-                        bodeDraw_();
-                ImGui::End();
-        }
 }

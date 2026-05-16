@@ -5,9 +5,11 @@
 
 #include "core/dwarf_parser.hpp"
 
-namespace dwarf {
+namespace dwarf
+{
 
-namespace {
+namespace
+{
 
 // DWARF tags
 constexpr u64 DW_TAG_array_type       = 0x01;
@@ -51,60 +53,60 @@ constexpr u64 DW_AT_data_bit_offset      = 0x6b;
 constexpr u64 DW_AT_linkage_name         = 0x6e;
 
 // DWARF forms
-constexpr u64 DW_FORM_addr            = 0x01;
-constexpr u64 DW_FORM_block2          = 0x03;
-constexpr u64 DW_FORM_block4          = 0x04;
-constexpr u64 DW_FORM_data2           = 0x05;
-constexpr u64 DW_FORM_data4           = 0x06;
-constexpr u64 DW_FORM_data8           = 0x07;
-constexpr u64 DW_FORM_string          = 0x08;
-constexpr u64 DW_FORM_block           = 0x09;
-constexpr u64 DW_FORM_block1          = 0x0a;
-constexpr u64 DW_FORM_data1           = 0x0b;
-constexpr u64 DW_FORM_flag            = 0x0c;
-constexpr u64 DW_FORM_sdata           = 0x0d;
-constexpr u64 DW_FORM_strp            = 0x0e;
-constexpr u64 DW_FORM_udata           = 0x0f;
-constexpr u64 DW_FORM_ref_addr        = 0x10;
-constexpr u64 DW_FORM_ref1            = 0x11;
-constexpr u64 DW_FORM_ref2            = 0x12;
-constexpr u64 DW_FORM_ref4            = 0x13;
-constexpr u64 DW_FORM_ref8            = 0x14;
-constexpr u64 DW_FORM_ref_udata       = 0x15;
-constexpr u64 DW_FORM_indirect        = 0x16;
-constexpr u64 DW_FORM_sec_offset      = 0x17;
-constexpr u64 DW_FORM_exprloc         = 0x18;
-constexpr u64 DW_FORM_flag_present    = 0x19;
-constexpr u64 DW_FORM_strx            = 0x1a;
-constexpr u64 DW_FORM_addrx           = 0x1b;
-constexpr u64 DW_FORM_ref_sup4        = 0x1c;
-constexpr u64 DW_FORM_strp_sup        = 0x1d;
-constexpr u64 DW_FORM_data16          = 0x1e;
-constexpr u64 DW_FORM_line_strp       = 0x1f;
-constexpr u64 DW_FORM_ref_sig8        = 0x20;
-constexpr u64 DW_FORM_implicit_const  = 0x21;
-constexpr u64 DW_FORM_loclistx        = 0x22;
-constexpr u64 DW_FORM_rnglistx        = 0x23;
-constexpr u64 DW_FORM_ref_sup8        = 0x24;
-constexpr u64 DW_FORM_strx1           = 0x25;
-constexpr u64 DW_FORM_strx2           = 0x26;
-constexpr u64 DW_FORM_strx3           = 0x27;
-constexpr u64 DW_FORM_strx4           = 0x28;
-constexpr u64 DW_FORM_addrx1          = 0x29;
-constexpr u64 DW_FORM_addrx2          = 0x2a;
-constexpr u64 DW_FORM_addrx3          = 0x2b;
-constexpr u64 DW_FORM_addrx4          = 0x2c;
+constexpr u64 DW_FORM_addr           = 0x01;
+constexpr u64 DW_FORM_block2         = 0x03;
+constexpr u64 DW_FORM_block4         = 0x04;
+constexpr u64 DW_FORM_data2          = 0x05;
+constexpr u64 DW_FORM_data4          = 0x06;
+constexpr u64 DW_FORM_data8          = 0x07;
+constexpr u64 DW_FORM_string         = 0x08;
+constexpr u64 DW_FORM_block          = 0x09;
+constexpr u64 DW_FORM_block1         = 0x0a;
+constexpr u64 DW_FORM_data1          = 0x0b;
+constexpr u64 DW_FORM_flag           = 0x0c;
+constexpr u64 DW_FORM_sdata          = 0x0d;
+constexpr u64 DW_FORM_strp           = 0x0e;
+constexpr u64 DW_FORM_udata          = 0x0f;
+constexpr u64 DW_FORM_ref_addr       = 0x10;
+constexpr u64 DW_FORM_ref1           = 0x11;
+constexpr u64 DW_FORM_ref2           = 0x12;
+constexpr u64 DW_FORM_ref4           = 0x13;
+constexpr u64 DW_FORM_ref8           = 0x14;
+constexpr u64 DW_FORM_ref_udata      = 0x15;
+constexpr u64 DW_FORM_indirect       = 0x16;
+constexpr u64 DW_FORM_sec_offset     = 0x17;
+constexpr u64 DW_FORM_exprloc        = 0x18;
+constexpr u64 DW_FORM_flag_present   = 0x19;
+constexpr u64 DW_FORM_strx           = 0x1a;
+constexpr u64 DW_FORM_addrx          = 0x1b;
+constexpr u64 DW_FORM_ref_sup4       = 0x1c;
+constexpr u64 DW_FORM_strp_sup       = 0x1d;
+constexpr u64 DW_FORM_data16         = 0x1e;
+constexpr u64 DW_FORM_line_strp      = 0x1f;
+constexpr u64 DW_FORM_ref_sig8       = 0x20;
+constexpr u64 DW_FORM_implicit_const = 0x21;
+constexpr u64 DW_FORM_loclistx       = 0x22;
+constexpr u64 DW_FORM_rnglistx       = 0x23;
+constexpr u64 DW_FORM_ref_sup8       = 0x24;
+constexpr u64 DW_FORM_strx1          = 0x25;
+constexpr u64 DW_FORM_strx2          = 0x26;
+constexpr u64 DW_FORM_strx3          = 0x27;
+constexpr u64 DW_FORM_strx4          = 0x28;
+constexpr u64 DW_FORM_addrx1         = 0x29;
+constexpr u64 DW_FORM_addrx2         = 0x2a;
+constexpr u64 DW_FORM_addrx3         = 0x2b;
+constexpr u64 DW_FORM_addrx4         = 0x2c;
 
 constexpr u8 DW_OP_addr  = 0x03;
 constexpr u8 DW_OP_addrx = 0xa1;
 
 struct AttrValue {
         enum Kind { INVALID, U64V, S64V, STR, BLOCK };
-        Kind             kind{INVALID};
-        u64              u{0};
-        i64              s{0};
-        std::string      str{};
-        std::vector<u8>  block{};
+        Kind            kind{INVALID};
+        u64             u{0};
+        i64             s{0};
+        std::string     str{};
+        std::vector<u8> block{};
 };
 
 struct AbbrevAttr {
@@ -122,17 +124,17 @@ struct Abbrev {
 using AbbrevTable = std::unordered_map<u64, Abbrev>;
 
 struct CuCtx {
-        const u8     *info{nullptr};
-        u64           cuStart{0};
-        u64           cuEnd{0};
-        u64           dieStart{0};
-        u8            version{0};
-        u8            addrSize{4};
-        u8            offsetSize{4};
+        const u8      *info{nullptr};
+        u64            cuStart{0};
+        u64            cuEnd{0};
+        u64            dieStart{0};
+        u8             version{0};
+        u8             addrSize{4};
+        u8             offsetSize{4};
         const ElfInfo *elf{nullptr};
-        AbbrevTable   abbrev{};
-        u64           strOffsetsBase{0};
-        u64           addrBase{0};
+        AbbrevTable    abbrev{};
+        u64            strOffsetsBase{0};
+        u64            addrBase{0};
 };
 
 inline u8
@@ -148,8 +150,8 @@ readU16(const u8 *p, u64 &off, u64 end)
 {
         if (off + 2 > end)
                 return 0;
-        const u16 v = static_cast<u16>(p[off]) | (static_cast<u16>(p[off + 1]) << 8);
-        off += 2;
+        const u16 v  = static_cast<u16>(p[off]) | (static_cast<u16>(p[off + 1]) << 8);
+        off         += 2;
         return v;
 }
 
@@ -158,9 +160,8 @@ readU24(const u8 *p, u64 &off, u64 end)
 {
         if (off + 3 > end)
                 return 0;
-        const u32 v = static_cast<u32>(p[off]) | (static_cast<u32>(p[off + 1]) << 8)
-                      | (static_cast<u32>(p[off + 2]) << 16);
-        off += 3;
+        const u32 v  = static_cast<u32>(p[off]) | (static_cast<u32>(p[off + 1]) << 8) | (static_cast<u32>(p[off + 2]) << 16);
+        off         += 3;
         return v;
 }
 
@@ -169,9 +170,9 @@ readU32(const u8 *p, u64 &off, u64 end)
 {
         if (off + 4 > end)
                 return 0;
-        const u32 v = static_cast<u32>(p[off]) | (static_cast<u32>(p[off + 1]) << 8)
-                      | (static_cast<u32>(p[off + 2]) << 16) | (static_cast<u32>(p[off + 3]) << 24);
-        off += 4;
+        const u32 v  = static_cast<u32>(p[off]) | (static_cast<u32>(p[off + 1]) << 8) | (static_cast<u32>(p[off + 2]) << 16) |
+                       (static_cast<u32>(p[off + 3]) << 24);
+        off         += 4;
         return v;
 }
 
@@ -193,8 +194,8 @@ readULEB(const u8 *p, u64 &off, u64 end)
         u64 result = 0;
         int shift  = 0;
         while (off < end) {
-                const u8 b = p[off++];
-                result |= static_cast<u64>(b & 0x7F) << shift;
+                const u8 b  = p[off++];
+                result     |= static_cast<u64>(b & 0x7F) << shift;
                 if (!(b & 0x80))
                         break;
                 shift += 7;
@@ -211,9 +212,9 @@ readSLEB(const u8 *p, u64 &off, u64 end)
         int shift  = 0;
         u8  b      = 0;
         while (off < end) {
-                b = p[off++];
+                b       = p[off++];
                 result |= static_cast<i64>(b & 0x7F) << shift;
-                shift += 7;
+                shift  += 7;
                 if (!(b & 0x80))
                         break;
                 if (shift >= 64)
@@ -288,9 +289,9 @@ parseAbbrev(const std::vector<u8> &abbrev, u64 startOff)
 AttrValue
 readAttr(const CuCtx &ctx, u64 &off, u64 form, i64 implicitConst)
 {
-        AttrValue  v;
-        const u8  *p   = ctx.info;
-        const u64  end = ctx.cuEnd;
+        AttrValue v;
+        const u8 *p   = ctx.info;
+        const u64 end = ctx.cuEnd;
 
         switch (form) {
                 case DW_FORM_addr:
@@ -403,10 +404,10 @@ readAttr(const CuCtx &ctx, u64 &off, u64 form, i64 implicitConst)
 
                         v.kind = AttrValue::STR;
                         if (!ctx.elf->debug_str_offsets.empty()) {
-                                const u8 *so      = ctx.elf->debug_str_offsets.data();
-                                const u64 soSize  = ctx.elf->debug_str_offsets.size();
+                                const u8 *so       = ctx.elf->debug_str_offsets.data();
+                                const u64 soSize   = ctx.elf->debug_str_offsets.size();
                                 const u64 entryOff = ctx.strOffsetsBase + idx * ctx.offsetSize;
-                                u64       o2      = entryOff;
+                                u64       o2       = entryOff;
                                 if (entryOff + ctx.offsetSize <= soSize) {
                                         const u64 strOff = readOff(so, o2, soSize, ctx.offsetSize);
                                         v.str            = strAt(ctx.elf->debug_str, strOff);
@@ -433,10 +434,10 @@ readAttr(const CuCtx &ctx, u64 &off, u64 form, i64 implicitConst)
 
                         v.kind = AttrValue::U64V;
                         if (!ctx.elf->debug_addr.empty()) {
-                                const u8 *ad      = ctx.elf->debug_addr.data();
-                                const u64 adSize  = ctx.elf->debug_addr.size();
+                                const u8 *ad       = ctx.elf->debug_addr.data();
+                                const u64 adSize   = ctx.elf->debug_addr.size();
                                 const u64 entryOff = ctx.addrBase + idx * ctx.addrSize;
-                                u64       o2      = entryOff;
+                                u64       o2       = entryOff;
                                 if (entryOff + ctx.addrSize <= adSize)
                                         v.u = readAddr(ad, o2, adSize, ctx.addrSize);
                         }
@@ -519,14 +520,14 @@ parseLocationAddr(const CuCtx &ctx, const std::vector<u8> &blk)
                 return addr;
         }
         if (op == DW_OP_addrx) {
-                u64       o    = 1;
-                const u64 idx  = readULEB(blk.data(), o, blk.size());
+                u64       o   = 1;
+                const u64 idx = readULEB(blk.data(), o, blk.size());
                 if (ctx.elf->debug_addr.empty())
                         return 0;
-                const u8 *ad      = ctx.elf->debug_addr.data();
-                const u64 adSize  = ctx.elf->debug_addr.size();
+                const u8 *ad       = ctx.elf->debug_addr.data();
+                const u64 adSize   = ctx.elf->debug_addr.size();
                 const u64 entryOff = ctx.addrBase + idx * ctx.addrSize;
-                u64       o2      = entryOff;
+                u64       o2       = entryOff;
                 if (entryOff + ctx.addrSize > adSize)
                         return 0;
                 return readAddr(ad, o2, adSize, ctx.addrSize);
@@ -613,7 +614,7 @@ walkChildren(CuCtx &ctx, u64 &off, Type *parent, u64 parentTag, int depth, Info 
                 std::unordered_map<u64, AttrValue> attrs;
                 attrs.reserve(ab.attrs.size());
                 for (const auto &aa : ab.attrs) {
-                        AttrValue av  = readAttr(ctx, off, aa.form, aa.implicitConst);
+                        AttrValue av   = readAttr(ctx, off, aa.form, aa.implicitConst);
                         attrs[aa.attr] = std::move(av);
                 }
 
@@ -685,12 +686,12 @@ walkChildren(CuCtx &ctx, u64 &off, Type *parent, u64 parentTag, int depth, Info 
                                 break;
                         }
                         case DW_TAG_base_type: {
-                                Type &t  = out.types[dieOff];
-                                t.kind   = TypeKind::BASE;
-                                t.name   = attrStr(attrs, DW_AT_name);
-                                t.size   = attrU64(attrs, DW_AT_byte_size, 0);
+                                Type &t    = out.types[dieOff];
+                                t.kind     = TypeKind::BASE;
+                                t.name     = attrStr(attrs, DW_AT_name);
+                                t.size     = attrU64(attrs, DW_AT_byte_size, 0);
                                 t.encoding = static_cast<u32>(attrU64(attrs, DW_AT_encoding, 0));
-                                myType   = &t;
+                                myType     = &t;
                                 break;
                         }
                         case DW_TAG_pointer_type: {
@@ -727,12 +728,12 @@ walkChildren(CuCtx &ctx, u64 &off, Type *parent, u64 parentTag, int depth, Info 
                                 break;
                         }
                         case DW_TAG_enumeration_type: {
-                                Type &t  = out.types[dieOff];
-                                t.kind   = TypeKind::ENUM;
-                                t.name   = attrStr(attrs, DW_AT_name);
-                                t.size   = attrU64(attrs, DW_AT_byte_size, 0);
-                                t.inner  = attrU64(attrs, DW_AT_type, 0);
-                                myType   = &t;
+                                Type &t = out.types[dieOff];
+                                t.kind  = TypeKind::ENUM;
+                                t.name  = attrStr(attrs, DW_AT_name);
+                                t.size  = attrU64(attrs, DW_AT_byte_size, 0);
+                                t.inner = attrU64(attrs, DW_AT_type, 0);
+                                myType  = &t;
                                 break;
                         }
                         case DW_TAG_typedef: {

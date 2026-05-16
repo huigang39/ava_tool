@@ -3,7 +3,7 @@
 
 #include "platdef.h"
 
-#ifdef __linux__
+#ifdef OS_LINUX
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <liburing.h>
@@ -13,7 +13,7 @@
 #include <unistd.h>
 typedef int sockfd_t;
 #define CLOSE_SOCKET close
-#elif defined(OS_MACOS)
+#elif defined(OS_MAC)
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,7 +24,7 @@ typedef int sockfd_t;
 #include <unistd.h>
 typedef int sockfd_t;
 #define CLOSE_SOCKET close
-#elif defined(_WIN32)
+#elif defined(OS_WIN)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 typedef SOCKET sockfd_t;
@@ -110,14 +110,14 @@ typedef struct net_async_req {
         usize          size;
         net_async_cb_f f_cb;
         ATOMIC(u8) processed;
-#if defined(_WIN32) || defined(OS_MACOS)
+#if defined(OS_WIN) || defined(OS_MAC)
         u64         timeout_us;
         list_head_t pending_node; // 待处理请求链表节点
 #endif
-#ifdef _WIN32
+#ifdef OS_WIN
         OVERLAPPED ov;
 #endif
-#ifdef OS_MACOS
+#ifdef OS_MAC
         net_op_e e_op;
 #endif
 } net_async_req_t;
@@ -135,12 +135,12 @@ typedef struct net_cfg {
 typedef struct net_lo {
         list_head_t ch_root;
         log_t       log;
-#ifdef __linux__
+#ifdef OS_LINUX
         struct io_uring ring;
-#elif defined(OS_MACOS)
+#elif defined(OS_MAC)
         int         kq;
         list_head_t pending_reqs;
-#elif defined(_WIN32)
+#elif defined(OS_WIN)
         HANDLE      iocp;
         list_head_t pending_reqs; // 待处理的异步请求列表
 #endif
@@ -311,8 +311,7 @@ isize net_send_recv(net_t *net, net_ch_t *ch, void *tx_buf, usize size, void *rx
  * @param timeout_us 超时时间(微秒)
  * @return           成功返回回复的 IP 个数, 失败返回错误码
  */
-int net_broadcast(
-    u32 ip, u16 port, const void *tx_buf, usize size, net_resp_t *resps, usize resps_cap, u32 timeout_us);
+int net_broadcast(u32 ip, u16 port, const void *tx_buf, usize size, net_resp_t *resps, usize resps_cap, u32 timeout_us);
 
 #ifdef __cplusplus
 }

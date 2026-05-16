@@ -27,7 +27,9 @@ const net_cfg_t g_net_cfg = {
     .f_get_ts = get_real_ts_us,
 };
 
-NO_ASAN ALIGN(SIZE_16KB) u8 g_mempool_buf[MEMPOOL_SIZE];
+NO_ASAN
+ALIGN(SIZE_16KB)
+u8        g_mempool_buf[MEMPOOL_SIZE];
 mempool_t g_mempool = {
     .buf = g_mempool_buf,
     .cap = sizeof(g_mempool_buf),

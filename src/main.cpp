@@ -10,14 +10,14 @@
 #include "app_log.hpp"
 #include "core/jlink_dev.hpp"
 #include "gui/gui.hpp"
-#include "wave.h"
 #include "timeops.h"
+#include "wave.h"
 
 #ifdef _WIN32
-#include <timeapi.h>
-#include <windows.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <timeapi.h>
+#include <windows.h>
 #pragma comment(lib, "shlwapi.lib")
 #endif
 
@@ -178,14 +178,12 @@ waveFunc(Gui *gui)
                                         for (auto &ch : scope->getChannels() | std::views::values) {
                                                 if (ch->isPendingDelete())
                                                         continue;
-                                                if (ch->getDevice() != "JLINK" || !ch->waveEnable_ ||
-                                                    ch->getAddr() == 0)
+                                                if (ch->getDevice() != "JLINK" || !ch->waveEnable_ || ch->getAddr() == 0)
                                                         continue;
                                                 u32 nb = ch->getNumBytes();
                                                 if (nb == 0)
                                                         nb = typeBytes(ch->getType());
-                                                groups[monitor].push_back(
-                                                    {ch, monitor, static_cast<u32>(ch->getAddr()), nb});
+                                                groups[monitor].push_back({ch, monitor, static_cast<u32>(ch->getAddr()), nb});
                                         }
                                 }
                         }
@@ -232,20 +230,20 @@ void
 threadFunc(Gui *gui)
 {
         LOG_I("Sampler thread started.");
-        u64 lastTime = get_mono_ts_us();
-        std::vector<HssBlock>         lastBlocks;
+        u64                                          lastTime = get_mono_ts_us();
+        std::vector<HssBlock>                        lastBlocks;
         std::vector<std::shared_ptr<MonitorChannel>> lastChans;
         std::vector<std::shared_ptr<Monitor>>        lastChMonitors;
-        std::vector<std::string>      lastTypes;
-        std::vector<u32>              lastOffsets;
-        i32                           lastPeriodUs = 0;
+        std::vector<std::string>                     lastTypes;
+        std::vector<u32>                             lastOffsets;
+        i32                                          lastPeriodUs = 0;
 
         static constexpr usize kBufCap = 64 * 1024;
         static u8              buf[kBufCap];
         usize                  carryLen     = 0;
         bool                   discardFirst = false;
 
-        u64                                   hzFrameAccum       = 0;
+        u64 hzFrameAccum       = 0;
         u64 hzLastTick         = get_mono_ts_ms();
         u64 lastHssStart       = get_mono_ts_ms();
         f64 lastHssSessionTime = 0;
@@ -310,7 +308,7 @@ threadFunc(Gui *gui)
                                                 if (ch->isPendingDelete())
                                                         continue;
                                                 const std::string &dev = ch->getDevice();
-                                                u32 nb = ch->getNumBytes();
+                                                u32                nb  = ch->getNumBytes();
                                                 if (nb == 0)
                                                         nb = typeBytes(ch->getType());
                                                 if (dev == "SHM" && ch->getShm().lo.spsc != nullptr) {
@@ -376,12 +374,12 @@ threadFunc(Gui *gui)
                 }
 
                 // Collect current HSS needs
-                std::vector<HssBlock>         blocks;
+                std::vector<HssBlock>                        blocks;
                 std::vector<std::shared_ptr<MonitorChannel>> chans;
                 std::vector<std::shared_ptr<Monitor>>        chMonitors;
-                std::vector<std::string>      lastTypes_current;
-                std::vector<u32>              offsets;
-                u32                           curOff = 0;
+                std::vector<std::string>                     lastTypes_current;
+                std::vector<u32>                             offsets;
+                u32                                          curOff = 0;
                 for (auto &tc : tempChs) {
                         blocks.push_back({tc.addr, tc.nb});
                         chans.push_back(tc.ch);
@@ -395,7 +393,7 @@ threadFunc(Gui *gui)
                 static bool lastConnected = false;
                 bool        isConnected   = JLinkDev::instance().isConnected();
                 bool        changed       = (blocks != lastBlocks || periodUs != lastPeriodUs || isConnected != lastConnected ||
-                                JLinkDev::instance().hasRestartReq());
+                                             JLinkDev::instance().hasRestartReq());
                 lastConnected             = isConnected;
 
                 bool desiredRunning = !blocks.empty() && !isPaused && isConnected;
@@ -412,8 +410,7 @@ threadFunc(Gui *gui)
                         auto nowTick = get_mono_ts_ms();
                         // Only cooldown if we just stopped it recently.
                         // If it's a 'cold start' (already stopped), start immediately.
-                        bool justStopped =
-                            ((nowTick - lastHssStart) < 200);
+                        bool justStopped = ((nowTick - lastHssStart) < 200);
 
                         if (!justStopped || changed) {
                                 LOG_I("Attempting hssStart with %zu blocks, period %d us", blocks.size(), periodUs);
@@ -537,8 +534,8 @@ threadFunc(Gui *gui)
 
                         for (auto &[m, tasks] : monitorPollGroups) {
                                 static std::unordered_map<std::shared_ptr<Monitor>, u64> lastMonitorPollTicks;
-                                auto nowPoll        = get_mono_ts_us();
-                                i32  targetPeriodUs = 1000000 / m->maxSampleHz_;
+                                auto                                                     nowPoll = get_mono_ts_us();
+                                i32 targetPeriodUs                                               = 1000000 / m->maxSampleHz_;
                                 if (targetPeriodUs < 1000)
                                         targetPeriodUs = 1000;
 
@@ -613,20 +610,20 @@ module_init()
 #else
         static std::string logDir = Gui::getAppDir() + "/log";
 #endif
-        log_cfg_t          cfg    = {.e_mode     = LOG_MODE_ASYNC,
-                             .e_level    = LOG_LEVEL_INFO,
-                             .e_format   = LOG_FORMAT_TEXT,
-                             .mempool    = &g_log_mp,
-                             .file_path  = logDir.c_str(),
-                             .fd         = NULL,
-                             .file_size  = SIZE_16MB,
-                             .max_files  = 10,
-                             .e_ring     = LOG_RING_ROTATE,
-                             .chunk_size = SIZE_4KB,
-                             .flush_cap  = SIZE_8KB,
-                             .nproducers = 8,
-                             .f_get_ts   = get_real_ts_ms,
-                             .f_flush    = NULL};
+        log_cfg_t cfg = {.e_mode     = LOG_MODE_ASYNC,
+                         .e_level    = LOG_LEVEL_INFO,
+                         .e_format   = LOG_FORMAT_TEXT,
+                         .mempool    = &g_log_mp,
+                         .file_path  = logDir.c_str(),
+                         .fd         = NULL,
+                         .file_size  = SIZE_16MB,
+                         .max_files  = 10,
+                         .e_ring     = LOG_RING_ROTATE,
+                         .chunk_size = SIZE_4KB,
+                         .flush_cap  = SIZE_8KB,
+                         .nproducers = 8,
+                         .f_get_ts   = get_real_ts_ms,
+                         .f_flush    = NULL};
 
         log_init(&g_log, cfg);
 
@@ -648,10 +645,10 @@ main(int argc, char **argv)
         module_init();
 
         std::string initialSession = (argc > 1) ? argv[1] : "";
-        auto gui = std::make_unique<Gui>(initialSession);
+        auto        gui            = std::make_unique<Gui>(initialSession);
 
         std::thread t1(threadFunc, gui.get());
-        std::thread t2(waveFunc,   gui.get());
+        std::thread t2(waveFunc, gui.get());
         gui->loop();
 
         LOG_I("Stopping sampler and wave-gen threads...");
@@ -666,8 +663,8 @@ main(int argc, char **argv)
 
         // Aggressive hide before anything else
         if (gui) {
-            LOG_I("Hiding window from main...");
-            gui->hide(); 
+                LOG_I("Hiding window from main...");
+                gui->hide();
         }
 
         LOG_I("Explicitly destroying Gui...");

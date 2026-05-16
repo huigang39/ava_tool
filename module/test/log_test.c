@@ -12,10 +12,14 @@ static void log_stdout(void *fp, const void *src, usize size);
 #define LOG_CHUNK_SIZE     (SIZE_4KB)
 #define LOG_FLUSH_BUF_SIZE (SIZE_1KB)
 
-NO_ASAN ALIGN(SIZE_16KB) u64 g_producers_cnts[WRITE_THREAD_NUM];
+NO_ASAN
+ALIGN(SIZE_16KB)
+u64   g_producers_cnts[WRITE_THREAD_NUM];
 log_t g_log;
 
-NO_ASAN ALIGN(SIZE_16KB) u8 g_mempool_buf[MEMPOOL_SIZE];
+NO_ASAN
+ALIGN(SIZE_16KB)
+u8        g_mempool_buf[MEMPOOL_SIZE];
 mempool_t g_mempool = {
     .buf = g_mempool_buf,
     .cap = sizeof(g_mempool_buf),
@@ -54,7 +58,7 @@ write_thread_func(void *arg)
 
         for (int i = 0; i < 1000; i++) {
 
-#ifdef _WIN32
+#ifdef OS_WIN
                 log_debug(&g_log, idx, "thread_id %10llu, cnt: %10llu\n", (usize)GetCurrentThreadId(), g_producers_cnts[idx]++);
 #else
                 log_debug(&g_log, idx, "thread_id %10llu, cnt: %10llu\n", (usize)pthread_self(), g_producers_cnts[idx]++);
@@ -76,7 +80,7 @@ main()
             .e_format = LOG_FORMAT_TEXT,
             .mempool  = &g_mempool,
 
-            //     .file_path = "test_log.log",
+            //     .file_path = "log_test.log",
             .file_size = SIZE_1MB,
             .max_files = 3,
             .e_ring    = LOG_RING_ROTATE,

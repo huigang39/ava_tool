@@ -73,38 +73,38 @@ FSA_RMA_SRC_FILES     := $(FSA_RAM_DIR)/fsa_rmaio.c
 
 all: $(BINS)
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "tool programs built successfully."
+
+	@echo [tool] programs built successfully.
 	@$(ECHO_NL)
-	@echo "make all complete."
+	@echo [tool] make all complete.
 
 clean:
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "cleaning tool build artifacts..."
+
+	@echo [tool] cleaning build artifacts...
 	$(call RMDIR,$(BUILD_DIR))
 	@$(ECHO_NL)
-	@echo "make clean complete."
+	@echo [tool] make clean complete.
 
 help:
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "usage: make [options] [target]"
+
+	@echo [tool] usage: make [options] [target]
 	@$(ECHO_NL)
-	@echo "targets:"
-	@echo "  all   - compile all .c files"
-	@echo "  clean - clean all generated files"
-	@echo "  help  - show this help message"
+	@echo targets:
+	@echo   all   - compile all .c files
+	@echo   clean - clean all generated files
+	@echo   help  - show this help message
 	@$(ECHO_NL)
-	@echo "platform: $(PLATFORM)"
-	@echo "found .c files: $(SRC_FILES)"
-	@echo "fsa_rma .c files: $(if $(FSA_RMA_SRC_FILES),$(FSA_RMA_SRC_FILES),none)"
-	@echo "targets: $(TARGETS)"
-	@echo "library: $(OUTPUT_STATIC_LIB)"
+	@echo platform: $(PLATFORM)
+	@echo found .c files: $(SRC_FILES)
+	@echo fsa_rma .c files: $(if $(FSA_RMA_SRC_FILES),$(FSA_RMA_SRC_FILES),none)
+	@echo targets: $(TARGETS)
+	@echo library: $(OUTPUT_STATIC_LIB)
 
 $(BUILD_DIR)/%: %.c $(if $(FSA_RMA_SRC_FILES),$(FSA_RMA_SRC_FILES),) | $(BUILD_DIR)
 	@$(ECHO_NL)
-	@echo "[COMPILE] $<$(if $(FSA_RMA_SRC_FILES), (with fsa_rma sources),)"
+	@echo [tool][CC] $<$(if $(FSA_RMA_SRC_FILES), (with fsa_rma sources),)
 	$(CC) $(CFLAGS) $< $(FSA_RMA_SRC_FILES) -o "$@" $(OUTPUT_STATIC_LIB) $(LDFLAGS)
 
 $(TARGETS): %: $(BUILD_DIR)/%

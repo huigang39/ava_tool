@@ -1,9 +1,11 @@
 /**/.zed/
 /**/.idea/
 /**/.vscode/
+/**/.claude/
 
 /**/.cache/
 /**/build/
+/**/bin/
 /**/cmake-*/
 
 /**/compile_commands.json

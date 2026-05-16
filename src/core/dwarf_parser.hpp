@@ -5,10 +5,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include "module.h"
 #include "core/elf_types.hpp"
+#include "module.h"
 
-namespace dwarf {
+namespace dwarf
+{
 
 enum class TypeKind {
         UNKNOWN,
@@ -24,11 +25,11 @@ enum class TypeKind {
 };
 
 struct Type {
-        TypeKind    kind{TypeKind::UNKNOWN};
-        std::string name{};
-        u64         size{0};
-        u32         encoding{0};
-        u64         inner{0};
+        TypeKind         kind{TypeKind::UNKNOWN};
+        std::string      name{};
+        u64              size{0};
+        u32              encoding{0};
+        u64              inner{0};
         std::vector<u64> dims{};
 
         struct Member {

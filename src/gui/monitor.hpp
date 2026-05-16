@@ -1,13 +1,14 @@
 #ifndef MONITOR_HPP
 #define MONITOR_HPP
 
+#include "timeops.h"
 #include <atomic>
 #include <cmath>
-#include "timeops.h"
 #include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -30,13 +31,28 @@ struct ChannelDropPayload {
 
         char      name[128];
         u64       addr;
-        char      type[8];    // "F32"/"F64"/"I8"/"I16"/"I32"/"I64"/"U8"/"U16"/"U32"/"U64"
-        char      device[8];  // "SHM" / "JLINK" / "UDP"
+        char      type[8];     // "F32"/"F64"/"I8"/"I16"/"I32"/"I64"/"U8"/"U16"/"U32"/"U64"
+        char      device[8];   // "SHM" / "JLINK" / "UDP"
         char      shmName[64]; // SHM region name (when device=="SHM"), separate from variable path
-        u8        numBytes;   // 1/2/4/8 - 派生自 type
-        u8        numEnums;   // 0 表示不是枚举
-        u64       typeOff;    // DWARF type offset
+        u8        numBytes;    // 1/2/4/8 - 派生自 type
+        u8        numEnums;    // 0 表示不是枚举
+        u64       typeOff;     // DWARF type offset
         EnumEntry enums[kMaxEnums];
+};
+
+// Payload for dragging a struct/array from the variable window to a monitor scope.
+// Each entry is one scalar leaf member, flattened from the struct/array tree.
+struct StructChannelPayload {
+        static constexpr int kMaxEntries = 48;
+        struct Entry {
+                char name[64]; // full dotted path, e.g. "foc.cfg.base_cfg.dir"
+                u64  addr;
+                char type[8]; // same codes as ChannelDropPayload::type
+        };
+        int   count;
+        char  device[8];
+        char  shmName[64];
+        Entry entries[kMaxEntries];
 };
 
 // type 字符串 → 字节数. 默认 4B.
@@ -63,9 +79,10 @@ getSessionStartUs()
 inline f64
 sessionTimeSec()
 {
-        u64 now = get_mono_ts_us();
+        u64 now   = get_mono_ts_us();
         u64 start = getSessionStartUs();
-        if (now < start) return 0.0;
+        if (now < start)
+                return 0.0;
         return static_cast<f64>(now - start) / 1000000.0;
 }
 
@@ -110,12 +127,12 @@ class MonitorChannel
         mutable std::mutex     valMutex_{};
         std::vector<EnumEntry> enums_{};
 
-        u64                                   sampleCount_{0};
-        u64                                   lastRateCount_{0};
-        u64 lastRateTime_{0};
-        bool                                  rateInited_{false};
-        f32                                   sampleHz_{0.0f};
-        usize                                 minKeepPoints_{4096};
+        u64   sampleCount_{0};
+        u64   lastRateCount_{0};
+        u64   lastRateTime_{0};
+        bool  rateInited_{false};
+        f32   sampleHz_{0.0f};
+        usize minKeepPoints_{4096};
 
         f32  color_[4]{1.0f, 1.0f, 1.0f, 1.0f};
         bool useAutoColor_{true};
@@ -273,15 +290,15 @@ class MonitorChannel
         std::pair<f64, f64> dftSlice(f64 tMin, f64 tMax, f64 f) const
         {
                 std::lock_guard lk(valMutex_);
-                const size_t si = static_cast<size_t>(
-                    std::distance(rTs_.begin(), std::lower_bound(rTs_.begin(), rTs_.end(), tMin)));
-                const size_t ei = static_cast<size_t>(
-                    std::distance(rTs_.begin(), std::upper_bound(rTs_.begin(), rTs_.end(), tMax)));
+                const size_t    si =
+                    static_cast<size_t>(std::distance(rTs_.begin(), std::lower_bound(rTs_.begin(), rTs_.end(), tMin)));
+                const size_t ei =
+                    static_cast<size_t>(std::distance(rTs_.begin(), std::upper_bound(rTs_.begin(), rTs_.end(), tMax)));
                 double re = 0.0, im = 0.0;
                 for (size_t i = si; i < ei; ++i) {
-                        const double ph = 2.0 * M_PI * f * static_cast<double>(rTs_[i]);
-                        re += static_cast<double>(rVals_[i]) * std::cos(ph);
-                        im -= static_cast<double>(rVals_[i]) * std::sin(ph);
+                        const double ph  = 2.0 * M_PI * f * static_cast<double>(rTs_[i]);
+                        re              += static_cast<double>(rVals_[i]) * std::cos(ph);
+                        im              -= static_cast<double>(rVals_[i]) * std::sin(ph);
                 }
                 return {re, im};
         }
@@ -375,25 +392,26 @@ class MonitorScope
         void               reinitFft(int newPoints);
 
       private:
-        std::string       name_{};
-        ChannelMapType    chs_{};
-        DrawEnum          e_draw{};
-        f32               height_{200.0f};
-        bool              showFft_{false};
-        int               fftPoints_{1024};
-        int               fftPeakCount_{5};
-        fft_t             fft_;
-        std::vector<f32>  fftInBuf_;
-        std::vector<f32>  fftMagF32_;
-        std::vector<f64>  fftMagBuf_;
-        std::vector<f32>  fftOutBuf_;
-        std::vector<f32>  fftLoBuf_;
-        std::atomic<bool> pendingDelete_{false};
-        std::vector<f64>  dxs_{};
-        std::vector<f64>  dys_{};
-        bool              isManualHeight_{false};
-        bool              paused_{false};
-        int               lastSelectedIndex_{-1};
+        std::string           name_{};
+        ChannelMapType        chs_{};
+        DrawEnum              e_draw{};
+        f32                   height_{200.0f};
+        bool                  showFft_{false};
+        int                   fftPoints_{1024};
+        int                   fftPeakCount_{5};
+        fft_t                 fft_;
+        std::vector<f32>      fftInBuf_;
+        std::vector<f32>      fftMagF32_;
+        std::vector<f64>      fftMagBuf_;
+        std::vector<f32>      fftOutBuf_;
+        std::vector<f32>      fftLoBuf_;
+        std::atomic<bool>     pendingDelete_{false};
+        std::vector<f64>      dxs_{};
+        std::vector<f64>      dys_{};
+        bool                  isManualHeight_{false};
+        bool                  paused_{false};
+        int                   lastSelectedIndex_{-1};
+        std::set<std::string> selectedGroupPaths_{};
 
         bool pendingAxisReset_{false};
         struct Peak {
@@ -411,7 +429,8 @@ class MonitorScope
         void drawTableRow(const std::string               &chName,
                           std::shared_ptr<MonitorChannel> &ch,
                           int                              idx,
-                          const std::vector<std::string>  &allKeys);
+                          const std::vector<std::string>  &allKeys,
+                          const std::string               &displayLabel = {});
 
       public:
         static void shmInit(MonitorChannel &ch);
@@ -495,38 +514,6 @@ class Monitor
         bool            needsLayout_{true};
         float           lastAvailY_{0.0f};
 
-        // ---- Bode Plot ----
-        struct BodePoint { f64 freq; f64 magDb; f64 phaseDeg; };
-        struct BodeCurveStyle {
-                f32  color[4]{1.0f, 1.0f, 1.0f, 1.0f};
-                bool useAutoColor{true};
-                f32  lineWeight{1.5f};
-                bool showMarkers{false};
-        };
-        bool                   showBode_{false};
-        char                   bodeInputKey_[256]{};
-        char                   bodeOutputKey_[256]{};
-        float                  bodeFStart_{1.0f};
-        float                  bodeFStop_{1000.0f};
-        float                  bodeFStep_{10.0f};
-        float                  bodeDwellSec_{1.0f};
-        float                  bodeAmp_{1.0f};
-        bool                   bodeSweepRunning_{false};
-        int                    bodeSweepFreqIdx_{0};
-        u64                    bodeSweepStepStart_{0};
-        std::vector<f64>       bodeFreqList_{};
-        std::vector<BodePoint> bodeData_{};
-        std::vector<f64>       bodeFreqsV_{};
-        std::vector<f64>       bodeMagsV_{};
-        std::vector<f64>       bodePhsV_{};
-        BodeCurveStyle         bodeMagStyle_{};
-        BodeCurveStyle         bodePhsStyle_{};
-        bool                   bodeStyleInit_{false};
-
-        void            generateBodeFreqs_();
-        MonitorChannel *findChannelByKey_(const char *key);
-        void            bodeDraw_();
-
       public:
         f64               linkXMin_{0.0}, linkXMax_{1.0};
         f64               lastNow_{0.0};
@@ -539,11 +526,11 @@ class Monitor
         int               maxSampleHz_{100};
         std::atomic<bool> pendingDelete_{false};
 
-        f32                                   actualHz_{0.0f};
-        u64                                   pointAccum_{0};
-        u64 lastHzTick_{get_mono_ts_ms()};
-        static std::vector<Monitor *>         sInstances_;
-        static std::mutex                     sMtxInstances_;
+        f32                           actualHz_{0.0f};
+        u64                           pointAccum_{0};
+        u64                           lastHzTick_{get_mono_ts_ms()};
+        static std::vector<Monitor *> sInstances_;
+        static std::mutex             sMtxInstances_;
 
       public:
         explicit Monitor(std::string monitorName) : name_(std::move(monitorName))
@@ -569,8 +556,8 @@ class Monitor
 
         void updateDisplay();
         bool isModified() const { return isModified_; }
-        void setModified()      { isModified_ = true; }
-        void clearModified()    { isModified_ = false; }
+        void setModified() { isModified_ = true; }
+        void clearModified() { isModified_ = false; }
         void clearData()
         {
                 for (auto &pair : scopes_)

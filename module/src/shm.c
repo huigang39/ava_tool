@@ -35,7 +35,7 @@ shm_init(shm_t *shm, const shm_cfg_t shm_cfg)
 
                 return -MEACCES;
         }
-#elif defined(_WIN32)
+#elif defined(OS_WIN)
         lo->fd = OpenFileMapping(FILE_MAP_ALL_ACCESS, // 读写权限
                                  0,                   // 不继承句柄
                                  cfg->name);          // 共享内存名称

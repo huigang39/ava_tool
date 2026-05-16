@@ -3,8 +3,8 @@
 
 #include "imgui.h"
 
-#include "core/jlink_dev.hpp"
 #include "app_log.hpp"
+#include "core/jlink_dev.hpp"
 
 JLinkDev &
 JLinkDev::instance()
@@ -142,15 +142,17 @@ JLinkDev::hssStart(const std::vector<HssBlock> &blocks, const i32 periodUs)
         if (effectivePeriodUs > 100000)
                 effectivePeriodUs = 100000; // clamp to 10Hz minimum
         if (effectivePeriodUs < 1000)
-                effectivePeriodUs = 1000;   // clamp to 1kHz maximum
+                effectivePeriodUs = 1000; // clamp to 1kHz maximum
 
         LOG_I("JLinkDev::hssStart(): starting with %zu blocks, period %d us", descs.size(), effectivePeriodUs);
         i32 res = JLINK_HSS_Start(descs.data(), static_cast<i32>(descs.size()), effectivePeriodUs, 1);
         if (res < 0) {
                 char buf[160];
-                snprintf(buf, sizeof(buf),
+                snprintf(buf,
+                         sizeof(buf),
                          "HSS Error: HW rejected period %dus (~%dHz). Try reducing sample rate (recommend <= 100Hz).",
-                         effectivePeriodUs, 1000000 / effectivePeriodUs);
+                         effectivePeriodUs,
+                         1000000 / effectivePeriodUs);
                 lastErr_ = buf;
                 LOG_E("JLinkDev::hssStart() FAILED: %s", buf);
                 return false;

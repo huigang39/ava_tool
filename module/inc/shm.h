@@ -8,7 +8,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#elif defined(_WIN32)
+#elif defined(OS_WIN)
 #include <windows.h>
 #endif
 
@@ -28,7 +28,7 @@ typedef enum shm_access {
         SHM_READONLY  = PROT_READ,
         SHM_WRITEONLY = PROT_WRITE,
         SHM_READWRITE = SHM_READONLY | SHM_WRITEONLY,
-#elif defined(_WIN32)
+#elif defined(OS_WIN)
         SHM_READONLY  = PAGE_READONLY,
         SHM_READWRITE = PAGE_READWRITE,
 #elif defined(MCU)
@@ -46,7 +46,7 @@ typedef struct shm_cfg {
 typedef struct shm_lo {
 #ifdef OS_POSIX
         int fd;
-#elif defined(_WIN32)
+#elif defined(OS_WIN)
         HANDLE fd;
 #endif
         void   *addr;

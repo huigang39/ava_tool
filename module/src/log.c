@@ -7,9 +7,9 @@
 #include "mempool.h"
 #include "timeops.h"
 
-#if defined(_WIN32) || defined(_WIN64)
+#ifdef OS_WIN
 #include <windows.h>
-#elif defined(__linux__) || defined(__APPLE__)
+#elif defined(OS_POSIX)
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -25,7 +25,7 @@ purge_old_logs(const char *dir, usize max_files)
         if (max_files == 0)
                 return;
 
-#if defined(_WIN32) || defined(_WIN64)
+#ifdef OS_WIN
         char search_path[256];
         snprintf(search_path, sizeof(search_path), "%s/*.log", dir);
         WIN32_FIND_DATAA find_data;
@@ -68,7 +68,7 @@ purge_old_logs(const char *dir, usize max_files)
                 }
         }
         free(files);
-#elif defined(__linux__) || defined(__APPLE__)
+#elif defined(OS_POSIX)
         DIR *dp = opendir(dir);
         if (dp == NULL)
                 return;
@@ -155,7 +155,7 @@ log_os_mmap_init(log_t *log)
                 return;
 
         if (cfg->e_ring == LOG_RING_ROTATE) {
-#if defined(_WIN32) || defined(_WIN64)
+#ifdef OS_WIN
                 CreateDirectoryA(cfg->file_path, NULL);
 #else
                 mkdir(cfg->file_path, 0755);
@@ -168,15 +168,15 @@ log_os_mmap_init(log_t *log)
         } else
                 snprintf(lo->curr_file_path, sizeof(lo->curr_file_path), "%s", cfg->file_path);
 
-#if defined(_WIN32) || defined(_WIN64)
+#ifdef OS_WIN
         DWORD  creation_disp = (cfg->e_ring == LOG_RING_ROTATE) ? CREATE_ALWAYS : OPEN_ALWAYS;
         HANDLE hFile         = CreateFileA(lo->curr_file_path,
-                                           GENERIC_READ | GENERIC_WRITE,
-                                           FILE_SHARE_READ,
-                                           NULL,
-                                           creation_disp,
-                                           FILE_ATTRIBUTE_NORMAL,
-                                           NULL);
+                                   GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_READ,
+                                   NULL,
+                                   creation_disp,
+                                   FILE_ATTRIBUTE_NORMAL,
+                                   NULL);
         if (hFile == INVALID_HANDLE_VALUE)
                 return;
 
@@ -191,7 +191,7 @@ log_os_mmap_init(log_t *log)
         lo->os_file_handle = (void *)hFile;
         lo->os_map_handle  = (void *)hMap;
 
-#elif defined(__linux__) || defined(__APPLE__)
+#elif defined(OS_POSIX)
         i32 flags = O_RDWR | O_CREAT;
         if (cfg->e_ring == LOG_RING_ROTATE)
                 flags |= O_TRUNC;
@@ -225,7 +225,7 @@ log_os_mmap_deinit(log_t *log, usize actual_size)
         if (lo->mmap_ptr == NULL)
                 return;
 
-#if defined(_WIN32) || defined(_WIN64)
+#ifdef OS_WIN
         UnmapViewOfFile(lo->mmap_ptr);
         if (lo->os_map_handle)
                 CloseHandle((HANDLE)lo->os_map_handle);
@@ -237,11 +237,12 @@ log_os_mmap_deinit(log_t *log, usize actual_size)
                 SetEndOfFile((HANDLE)lo->os_file_handle);
                 CloseHandle((HANDLE)lo->os_file_handle);
         }
-#elif defined(__linux__) || defined(__APPLE__)
+#elif defined(OS_POSIX)
         munmap(lo->mmap_ptr, cfg->file_size);
         if (lo->os_file_handle) {
                 i32 fd = (i32)(intptr_t)lo->os_file_handle;
-                ftruncate(fd, (off_t)actual_size);
+                int _r = ftruncate(fd, (off_t)actual_size);
+                (void)_r;
                 close(fd);
         }
 #endif

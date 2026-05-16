@@ -56,7 +56,7 @@ f32        foc_get_vbus(const foc_t *foc);
 
 foc_store_t foc_get_store(const foc_t *foc);
 
-foc_ref_pvct_t foc_get_ref_pvct(const foc_t *foc);
+foc_ref_pvct_t foc_get_ref_pvct(foc_t *foc);
 
 i32 foc_set_outshaft_zero(foc_t *foc);
 

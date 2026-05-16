@@ -9,12 +9,13 @@
 #include "module.h"
 
 struct HssBlock {
-        u32 addr;
-        u32 numBytes;
-        bool operator==(const HssBlock& other) const { return addr == other.addr && numBytes == other.numBytes; }
+        u32  addr;
+        u32  numBytes;
+        bool operator==(const HssBlock &other) const { return addr == other.addr && numBytes == other.numBytes; }
 };
 
-class JLinkDev {
+class JLinkDev
+{
       public:
         // J-Link HSS 固件给每帧前面加 4B timestamp/sequence header,
         // 不论 Flags 是否带 JLINK_HSS_FLAG_TIMESTAMP_US 都一样, 解析时必须跳过.
@@ -62,9 +63,9 @@ class JLinkDev {
         int                speedKHz_{4000};
         std::string        lastErr_{};
 
-        bool             hssRunning_{false};
-        int              hssPeriodUs_{1000};
-        int              hssFrameSize_{0};
+        bool              hssRunning_{false};
+        int               hssPeriodUs_{1000};
+        int               hssFrameSize_{0};
         std::atomic<f32>  hssActualHz_{0.0f};
         std::atomic<u64>  totalPoints_{0};
         std::atomic<bool> hssReqRestart_{false};

@@ -261,9 +261,9 @@ typedef struct foc_base_cfg {
 } foc_base_cfg_t;
 
 typedef struct foc_cali_cfg {
-        f32 force_id;                          // 强拖电流
-        f32 elec_theta_nonlinear_cali_vel;     // 电角度非线性误差校准速度 (出轴), 如果设为 0 将不会校准此项
-        f32 elec_theta_offset_cali_vel;        // 电角度偏置校准速度 (出轴)
+        f32 force_id;                      // 强拖电流
+        f32 elec_theta_nonlinear_cali_vel; // 电角度非线性误差校准速度 (出轴), 如果设为 0 将不会校准此项
+        f32 elec_theta_offset_cali_vel;    // 电角度偏置校准速度 (出轴)
         f32 outshaft_theta_nonlinear_cali_vel; // 出轴非线性误差校准速度 (出轴), 如果设为 0 将不会校准此项
 } foc_cali_cfg_t;
 

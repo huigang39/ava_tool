@@ -160,7 +160,7 @@ typedef int (*fftw_read_char_func_do_not_use_me)(void *);
                                              int        ostride,                                                             \
                                              int        odist,                                                               \
                                              int        sign,                                                                \
-                                             unsigned   flags);                                                              \
+                                             unsigned   flags);                                                                \
                                                                                                                              \
         FFTW_EXTERN X(plan) X(plan_guru_dft)(int rank,                                                                       \
                                              const X(iodim) * dims,                                                          \
@@ -212,7 +212,7 @@ typedef int (*fftw_read_char_func_do_not_use_me)(void *);
                                                  const int *onembed,                                                         \
                                                  int        ostride,                                                         \
                                                  int        odist,                                                           \
-                                                 unsigned   flags);                                                          \
+                                                 unsigned   flags);                                                            \
                                                                                                                              \
         FFTW_EXTERN X(plan) X(plan_dft_r2c)(int rank, const int *n, R *in, C *out, unsigned flags);                          \
                                                                                                                              \
@@ -231,7 +231,7 @@ typedef int (*fftw_read_char_func_do_not_use_me)(void *);
                                                  const int *onembed,                                                         \
                                                  int        ostride,                                                         \
                                                  int        odist,                                                           \
-                                                 unsigned   flags);                                                          \
+                                                 unsigned   flags);                                                            \
                                                                                                                              \
         FFTW_EXTERN X(plan) X(plan_dft_c2r)(int rank, const int *n, C *in, R *out, unsigned flags);                          \
                                                                                                                              \

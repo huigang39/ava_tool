@@ -281,7 +281,7 @@ foc_get_fdb_pvct(foc_t *foc)
 }
 
 foc_ref_pvct_t
-foc_get_ref_pvct(const foc_t *foc)
+foc_get_ref_pvct(foc_t *foc)
 {
         DECL(foc, cfg, in, lo);
 

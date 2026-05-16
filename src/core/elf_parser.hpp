@@ -1,11 +1,12 @@
 #ifndef ELF_PARSER_HPP
 #define ELF_PARSER_HPP
 
-#include "core/parser.hpp"
-#include "core/elf_types.hpp"
 #include "core/dwarf_parser.hpp"
+#include "core/elf_types.hpp"
+#include "core/parser.hpp"
 
-class ElfParser : public Parser {
+class ElfParser : public Parser
+{
       private:
         std::string path_{};
         DataTree    dataTree_{};
@@ -13,12 +14,12 @@ class ElfParser : public Parser {
         dwarf::Info dwarfInfo_{};
 
       public:
-        bool             parse(const std::string &path) override;
-        const DataTree  &getDataTree() const override { return dataTree_; }
+        bool               parse(const std::string &path) override;
+        const DataTree    &getDataTree() const override { return dataTree_; }
         const std::string &getPath() const override { return path_; }
-        void             setTemplate(const DataTree& tree) override { dataTree_ = tree; }
+        void               setTemplate(const DataTree &tree) override { dataTree_ = tree; }
 
-        const ElfInfo &getElfInfo() const { return elfInfo_; }
+        const ElfInfo     &getElfInfo() const { return elfInfo_; }
         const dwarf::Info &getDwarfInfo() const { return dwarfInfo_; }
 
         static const char *typeStr(u8 type);

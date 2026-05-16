@@ -2,65 +2,69 @@
 #include <fstream>
 #include <sstream>
 
-namespace {
-bool readFile(const std::string &filename, std::string &outContent)
+namespace
 {
-    std::ifstream ifs(filename);
-    if (!ifs.is_open())
-        return false;
-
-    std::stringstream ss;
-    ss << ifs.rdbuf();
-    outContent = ss.str();
-    return true;
-}
-}
-
-void JsonParser::parseRecursive(const cJSON *jsonNode, DataTree &node)
+bool
+readFile(const std::string &filename, std::string &outContent)
 {
-    const cJSON *nameItem = cJSON_GetObjectItem(jsonNode, "name");
-    const cJSON *typeItem = cJSON_GetObjectItem(jsonNode, "type");
+        std::ifstream ifs(filename);
+        if (!ifs.is_open())
+                return false;
 
-    if (!nameItem || !typeItem)
-        return;
+        std::stringstream ss;
+        ss << ifs.rdbuf();
+        outContent = ss.str();
+        return true;
+}
+} // namespace
 
-    node.name = nameItem->valuestring;
+void
+JsonParser::parseRecursive(const cJSON *jsonNode, DataTree &node)
+{
+        const cJSON *nameItem = cJSON_GetObjectItem(jsonNode, "name");
+        const cJSON *typeItem = cJSON_GetObjectItem(jsonNode, "type");
 
-    node.type = Parser::strToDataType(typeItem->valuestring);
-    if (node.type == DataType::UNKNOWN && std::string(typeItem->valuestring) == "array") {
-        node.type = DataType::ARRAY;
-    }
+        if (!nameItem || !typeItem)
+                return;
 
-    if (node.type == DataType::ARRAY) {
-        if (const cJSON *childrenJson = cJSON_GetObjectItem(jsonNode, "array")) {
-            for (const cJSON *child = childrenJson->child; child; child = child->next) {
-                DataTree childNode;
-                parseRecursive(child, childNode);
-                node.children.push_back(std::move(childNode));
-            }
+        node.name = nameItem->valuestring;
+
+        node.type = Parser::strToDataType(typeItem->valuestring);
+        if (node.type == DataType::UNKNOWN && std::string(typeItem->valuestring) == "array") {
+                node.type = DataType::ARRAY;
         }
-    }
+
+        if (node.type == DataType::ARRAY) {
+                if (const cJSON *childrenJson = cJSON_GetObjectItem(jsonNode, "array")) {
+                        for (const cJSON *child = childrenJson->child; child; child = child->next) {
+                                DataTree childNode;
+                                parseRecursive(child, childNode);
+                                node.children.push_back(std::move(childNode));
+                        }
+                }
+        }
 }
 
-bool JsonParser::parse(const std::string &path)
+bool
+JsonParser::parse(const std::string &path)
 {
-    path_ = path;
-    dataTree_ = DataTree{.name = "CFG", .type = DataType::ARRAY};
+        path_     = path;
+        dataTree_ = DataTree{.name = "CFG", .type = DataType::ARRAY};
 
-    std::string content;
-    if (!readFile(path, content))
-        return false;
+        std::string content;
+        if (!readFile(path, content))
+                return false;
 
-    cJSON *root = cJSON_Parse(content.c_str());
-    if (!root)
-        return false;
+        cJSON *root = cJSON_Parse(content.c_str());
+        if (!root)
+                return false;
 
-    for (const cJSON *child = root->child; child; child = child->next) {
-        DataTree node;
-        parseRecursive(child, node);
-        dataTree_.children.push_back(std::move(node));
-    }
+        for (const cJSON *child = root->child; child; child = child->next) {
+                DataTree node;
+                parseRecursive(child, node);
+                dataTree_.children.push_back(std::move(node));
+        }
 
-    cJSON_Delete(root);
-    return true;
+        cJSON_Delete(root);
+        return true;
 }

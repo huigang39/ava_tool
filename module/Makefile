@@ -1,3 +1,35 @@
+ifeq ($(OS),Windows_NT)
+SHELL := cmd.exe
+ifndef VCVARS_DONE
+
+_CL_OK := $(shell where cl.exe 2>NUL)
+
+ifeq ($(_CL_OK),)
+
+_PFILES86 := $(strip $(shell powershell -NoProfile -Command "[Environment]::GetFolderPath('ProgramFilesX86')" 2>NUL))
+_VSWHERE  := $(_PFILES86)\Microsoft Visual Studio\Installer\vswhere.exe
+_VS       := $(strip $(shell "$(_VSWHERE)" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>NUL))
+_VCVARS   := $(_VS)\VC\Auxiliary\Build\vcvarsall.bat
+_GOALS    := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),static)
+_MSVC_REINVOKE := 1
+
+.PHONY: _msvc_env $(_GOALS)
+
+_msvc_env:
+	@echo [MSVC] Initializing Visual Studio environment...
+	@call "$(_VCVARS)" x64 >NUL 2>&1 && $(MAKE) $(_GOALS) VCVARS_DONE=1 --no-print-directory
+
+$(_GOALS): _msvc_env
+	@:
+
+.DEFAULT_GOAL := static
+
+endif # _CL_OK
+endif # VCVARS_DONE
+endif # Windows_NT (MSVC init)
+
+ifndef _MSVC_REINVOKE
+
 PROJECT_NAME              := module
 PROJECT_DIR               := $(CURDIR)
 
@@ -103,7 +135,7 @@ MSVC_OPTIMIZATION         := /O2
 MSVC_WIN_DEFINE           := /DWIN
 MSVC_WIN_STATIC_LIB       := $(PROJECT_NAME).lib
 MSVC_WIN_SHARED_LIB       := $(PROJECT_NAME).dll
-MSVC_WIN_CFLAGS           := /c $(MSVC_OPTIMIZATION) /Zi /W3 /nologo /TC /MD
+MSVC_WIN_CFLAGS           := /c $(MSVC_OPTIMIZATION) /Z7 /W3 /nologo /TC /MD /std:clatest /utf-8 /experimental:c11atomics /FS
 MSVC_WIN_LDFLAGS          := /DLL /nologo /DEBUG
 MSVC_WIN_LIB_DIRS         := /LIBPATH:lib/win
 MSVC_WIN_LDLIBS           := libfftw3f-3.lib ws2_32.lib
@@ -249,62 +281,62 @@ OBJ_FILES                 := $(SRC_FILES:$(SRC_DIR)/%.c=$(OUTPUT_BUILD_DIR)/%.o)
 
 static: $(OUTPUT_STATIC_LIB)
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "static library created successfully: $(OUTPUT_STATIC_LIB)"
+
+	@echo [module] static library created successfully: $(OUTPUT_STATIC_LIB)
 	@$(ECHO_NL)
-	@echo "make static complete."
+	@echo [module] make static complete.
 
 shared:
 ifeq ($(SHARED_LIB),)
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "当前平台/编译器组合不支持动态库 (COMPILER=$(COMPILER), PLATFORM=$(PLATFORM))"
+
+	@echo [module] 当前平台/编译器组合不支持动态库 (COMPILER=$(COMPILER), PLATFORM=$(PLATFORM))
 	@$(ECHO_NL)
 else
 	@$(MAKE) $(OUTPUT_SHARED_LIB)
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "shared library created successfully: $(OUTPUT_SHARED_LIB)"
+
+	@echo [module] shared library created successfully: $(OUTPUT_SHARED_LIB)
 	@$(ECHO_NL)
-	@echo "make shared complete."
+	@echo [module] make shared complete.
 endif
 
 all: $(OUTPUT_STATIC_LIB) $(if $(SHARED_LIB),$(OUTPUT_SHARED_LIB),)
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "static library created successfully: $(OUTPUT_STATIC_LIB)"
+
+	@echo [module] static library created successfully: $(OUTPUT_STATIC_LIB)
 ifneq ($(SHARED_LIB),)
-	@echo "shared library created successfully: $(OUTPUT_SHARED_LIB)"
+	@echo [module] shared library created successfully: $(OUTPUT_SHARED_LIB)
 endif
 	@$(ECHO_NL)
-	@echo "make all complete."
+	@echo [module] make all complete.
 
 tool: $(OUTPUT_STATIC_LIB)
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "building tool programs..."
+
+	@echo [module] building tool programs...
 	@cd tool && "$(MAKE)"
 	@$(ECHO_NL)
-	@echo "make tool complete."
+	@echo [module] make tool complete.
 
 test: $(OUTPUT_STATIC_LIB)
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "building test programs..."
+
+	@echo [module] building test programs...
 	@cd test && "$(MAKE)"
 	@$(ECHO_NL)
-	@echo "make test complete."
+	@echo [module] make test complete.
 
 clean:
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "cleaning build artifacts..."
-	@$(MAKE) -C tool clean
-	@$(MAKE) -C test clean
+
+	@echo [module] cleaning build artifacts...
+	@$(MAKE) -C tool clean --no-print-directory -s
+	@$(MAKE) -C test clean --no-print-directory -s
 	$(call RMDIR,$(BUILD_DIR))
 	$(call RMDIR,$(LIB_DIR))
 	@$(ECHO_NL)
-	@echo "make clean complete."
+	@echo [module] make clean complete.
 
 ifeq ($(OS),Windows_NT)
     FMT_DIRS_PS           := $(foreach dir,$(FMT_DIRS),'$(dir)')
@@ -320,12 +352,12 @@ endif
 
 fmt:
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "formatting code files..."
+
+	@echo [module] formatting code files...
 ifeq ($(PLATFORM),win)
 	@where clang-format >nul 2>&1 || (echo [ERROR] clang-format not found. please install clang-format. && exit 1)
 	@powershell -NoProfile -Command "if (Get-Command dos2unix -ErrorAction SilentlyContinue) { Write-Host 'converting line endings to LF...'; $$files='$(FMT_FILES)'.Split(' '); foreach ($$file in $$files) { if ($$file -and (Test-Path $$file)) { dos2unix \"$$file\" 2>$$null } } }"
-	@echo "found $(words $(FMT_FILES)) file(s) to format"
+	@echo found $(words $(FMT_FILES)) file(s) to format
 	@$(ECHO_NL)
 	@powershell -NoProfile -Command "$$files='$(FMT_FILES)'.Split(' '); foreach ($$file in $$files) { if ($$file -and (Test-Path $$file)) { Write-Host \"formatting: $$file\"; clang-format -i -style=file \"$$file\" 2>$$null; if ($$LASTEXITCODE -ne 0) { clang-format -i \"$$file\" 2>$$null } } }"
 	@$(ECHO_NL)
@@ -335,7 +367,7 @@ else
 		echo "converting line endings to LF...";                                  \
 		for file in $(FMT_FILES); do dos2unix "$$file" 2>/dev/null || true; done; \
 	fi
-	@echo "found $(words $(FMT_FILES)) file(s) to format"
+	@echo found $(words $(FMT_FILES)) file(s) to format
 	@$(ECHO_NL)
 	@for file in $(FMT_FILES); do                                                                     \
 		if [ -n "$$file" ] && [ -f "$$file" ]; then                                                   \
@@ -345,12 +377,12 @@ else
 	done
 	@$(ECHO_NL)
 endif
-	@echo "make fmt complete."
+	@echo [module] make fmt complete.
 
 list:
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "available source files:"
+
+	@echo [module] available source files:
 ifeq ($(PLATFORM),win)
 	@powershell -NoProfile -Command "$$idx=0; Get-ChildItem -Path '$(SRC_DIR)' -Filter *.c -Recurse -File | Sort-Object FullName | ForEach-Object { $$idx++; Write-Host ('  {0,2}. {1}' -f $$idx, $$_.FullName) }" 2>nul || \
 	 cmd /c "setlocal enabledelayedexpansion & set /a idx=0 & for /r $(SRC_DIR) %%f in (*.c) do @set /a idx+=1 & echo   !idx!. %%~ff"
@@ -360,48 +392,48 @@ endif
 
 info:
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "build configuration:"
-	@echo "PLATFORM: $(PLATFORM)"
-	@echo "ARCH: $(ARCH)"
-	@echo "CC: $(CC)"
-	@echo "AR: $(AR)"
-	@echo "CFLAGS: $(CFLAGS)"
-	@echo "SRC_FILES: $(words $(SRC_FILES))"
-	@echo "OUTPUT_STATIC_LIB: $(OUTPUT_STATIC_LIB)"
-	@echo "OUTPUT_SHARED_LIB: $(OUTPUT_SHARED_LIB)"
+
+	@echo [module] build configuration:
+	@echo   PLATFORM: $(PLATFORM)
+	@echo   ARCH: $(ARCH)
+	@echo   CC: $(CC)
+	@echo   AR: $(AR)
+	@echo   CFLAGS: $(CFLAGS)
+	@echo   SRC_FILES: $(words $(SRC_FILES))
+	@echo   OUTPUT_STATIC_LIB: $(OUTPUT_STATIC_LIB)
+	@echo   OUTPUT_SHARED_LIB: $(OUTPUT_SHARED_LIB)
 
 help:
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "usage: make [options] [target]"
+
+	@echo usage: make [options] [target]
 	@$(ECHO_NL)
-	@echo "targets:"
-	@echo "  static - build static library only (default, no external deps)"
-	@echo "  shared - build shared library only (requires external deps like fftw3f)"
-	@echo "  all    - build both static and shared libraries"
-	@echo "  tool   - build the tool program"
-	@echo "  test   - build the test program"
-	@echo "  clean  - remove build artifacts"
-	@echo "  fmt    - format code files using clang-format"
-	@echo "  list   - list all available source files"
-	@echo "  info   - show build configuration"
-	@echo "  help   - show this help message"
+	@echo targets:
+	@echo   static - build static library only (default, no external deps)
+	@echo   shared - build shared library only (requires external deps like fftw3f)
+	@echo   all    - build both static and shared libraries
+	@echo   tool   - build the tool program
+	@echo   test   - build the test program
+	@echo   clean  - remove build artifacts
+	@echo   fmt    - format code files using clang-format
+	@echo   list   - list all available source files
+	@echo   info   - show build configuration
+	@echo   help   - show this help message
 	@$(ECHO_NL)
-	@echo "options:"
-	@echo "  INCLUDE_FILES=<files> - include only these files (space-separated)"
-	@echo "  EXCLUDE_FILES=<files> - exclude these files (space-separated)"
+	@echo options:
+	@echo   INCLUDE_FILES=^<files^> - include only these files (space-separated)
+	@echo   EXCLUDE_FILES=^<files^> - exclude these files (space-separated)
 	@$(ECHO_NL)
-	@echo "examples:"
-	@echo "  make           - build static lib only with host defaults (win=msvc, mac=clang, linux=gcc)"
-	@echo "  make shared    - build shared lib only (requires fftw3f etc.)"
-	@echo "  make all       - build both static and shared libs"
-	@echo "  make ac5-mcu   - cross-compile for MCU with Arm Compiler 5 (armcc)"
-	@echo "  make ac6-mcu   - cross-compile for MCU with Arm Compiler 6 (armclang)"
-	@echo "  make gcc-mcu   - cross-compile for MCU with arm-none-eabi-gcc"
-	@echo "  make msvc-win  - build for Windows with MSVC (run from x64 Native Tools Cmd)"
-	@echo "  make clang-mac - build for macOS with Apple Clang (auto x86_64/arm64)"
-	@echo "  make gcc-linux - build for Linux with gcc"
+	@echo examples:
+	@echo   make           - build static lib only with host defaults (win=msvc, mac=clang, linux=gcc)
+	@echo   make shared    - build shared lib only (requires fftw3f etc.)
+	@echo   make all       - build both static and shared libs
+	@echo   make ac5-mcu   - cross-compile for MCU with Arm Compiler 5 (armcc)
+	@echo   make ac6-mcu   - cross-compile for MCU with Arm Compiler 6 (armclang)
+	@echo   make gcc-mcu   - cross-compile for MCU with arm-none-eabi-gcc
+	@echo   make msvc-win  - build for Windows with MSVC (run from x64 Native Tools Cmd)
+	@echo   make clang-mac - build for macOS with Apple Clang (auto x86_64/arm64)
+	@echo   make gcc-linux - build for Linux with gcc
 
 ac5-mcu:
 	@$(MAKE) COMPILER=ac5 PLATFORM=mcu static
@@ -426,8 +458,8 @@ msvc-win:
 
 $(OUTPUT_STATIC_LIB): $(OBJ_FILES) | $(OUTPUT_LIB_DIR)
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "creating static library: $(STATIC_LIB)"
+
+	@echo [module] creating static library: $(STATIC_LIB)
 ifeq ($(COMPILER),msvc)
 	$(AR) /nologo /OUT:"$@" $(OBJ_FILES)
 else ifeq ($(COMPILER),gcc)
@@ -440,8 +472,8 @@ endif
 
 $(OUTPUT_SHARED_LIB): $(OBJ_FILES) | $(OUTPUT_LIB_DIR)
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "creating shared library: $(SHARED_LIB)"
+
+	@echo [module] creating shared library: $(SHARED_LIB)
 ifeq ($(COMPILER),msvc)
 	$(LD) $(LDFLAGS) /OUT:"$@" /IMPLIB:"$(OUTPUT_LIB_DIR)/$(PROJECT_NAME).lib" $(OBJ_FILES) $(LDLIBS)
 else ifeq ($(COMPILER),clang)
@@ -464,7 +496,7 @@ endif
 
 $(OUTPUT_BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(OUTPUT_BUILD_DIR)
 	@$(ECHO_NL)
-	@echo "[COMPILE] $<"
+	@echo [module][CC] $<
 	$(call MKDIR,$(dir $@))
 ifeq ($(COMPILER),msvc)
 	$(CC) $(CFLAGS) /Fo"$@" "$<"
@@ -481,3 +513,5 @@ $(OUTPUT_BUILD_DIR):
 
 $(OUTPUT_LIB_DIR):
 	$(call MKDIR,$(OUTPUT_LIB_DIR))
+
+endif # _MSVC_REINVOKE

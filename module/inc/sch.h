@@ -63,10 +63,10 @@ typedef struct sch_task_cfg {
         usize            exec_cnt_max;  // 最多执行次数
         sch_task_state_e e_init_state;  // 初始任务状态
         usize            init_delay_us; // 初始延时
-        sch_cb_f         f_init;        // 初始化函数, 新建任务 (初始状态不为 DEAD) 或从 DEAD 状态变为其他状态时调用一次
-        sch_cb_f         f_exec;        // 执行函数, 周期调用
-        sch_cb_f         f_deinit;      // 清理函数, 任务从其他状态变为 DEAD 时调用一次
-        void            *arg;           // 回调参数
+        sch_cb_f f_init; // 初始化函数, 新建任务 (初始状态不为 DEAD) 或从 DEAD 状态变为其他状态时调用一次
+        sch_cb_f f_exec;   // 执行函数, 周期调用
+        sch_cb_f f_deinit; // 清理函数, 任务从其他状态变为 DEAD 时调用一次
+        void    *arg;      // 回调参数
 } sch_task_cfg_t;
 
 typedef struct sch_task_status {

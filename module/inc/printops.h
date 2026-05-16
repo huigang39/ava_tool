@@ -76,7 +76,7 @@ HAPI void print_progress(int percent, const char *label);
 HAPI int
 supports_color(void)
 {
-#if defined(_WIN32)
+#if defined(OS_WIN)
         // Windows下默认不支持ANSI颜色，但可以通过设置支持
         return FALSE; // 暂时禁用Windows下的颜色
 #else
@@ -143,7 +143,7 @@ println(const char *fmt, ...)
 }
 
 HAPI void
-vprintln(const char *fmt, const va_list args)
+vprintln(const char *fmt, va_list args)
 {
         vprintf(fmt, args);
         printf("\n");

@@ -2,16 +2,17 @@
 #define GUI_HPP
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <mutex>
 
-#include "module.h"
 #include "GLFW/glfw3.h"
+#include "module.h"
 
-#include "gui/variable.hpp"
+#include "gui/bode.hpp"
 #include "gui/monitor.hpp"
+#include "gui/variable.hpp"
 
 class Gui
 {
@@ -46,16 +47,16 @@ class Gui
         int         windowWidth_{1280}, windowHeight_{720};
         f32         xScale_{}, yScale_{};
 
-        MonitorMapType  monitors_{};
-        mutable std::mutex      mtxMonitors_{};
-        VariableMapType vars_{};
+        MonitorMapType     monitors_{};
+        mutable std::mutex mtxMonitors_{};
+        VariableMapType    vars_{};
 
         std::string currentSessionPath_ = "session.ava";
         bool        isModified_         = false;
-        bool        showQuitModal_        = false;
-        bool        wantsToQuit_          = false;
-        bool        isFirstSave_    = true;
-        f32         saveToastAlpha_ = 0.0f;
+        bool        showQuitModal_      = false;
+        bool        wantsToQuit_        = false;
+        bool        isFirstSave_        = true;
+        f32         saveToastAlpha_     = 0.0f;
 
         void drawBar();
         void loadSession(const std::string &path = "");
@@ -78,6 +79,7 @@ class Gui
         int                       currentMotorProfile_ = 0;
 
         bool showCalculator_{false};
+        Bode bode_{};
 
       public:
         Gui(const std::string &initialPath = "");
@@ -87,7 +89,7 @@ class Gui
         void hide();
 
         MonitorMapType &getMonitors() { return monitors_; }
-        std::mutex     &getMonitorMtx() { return mtxMonitors_; } 
+        std::mutex     &getMonitorMtx() { return mtxMonitors_; }
 
         static std::vector<std::string> &getDroppedFiles() { return sDroppedFiles_; }
         static void                      clearDroppedFiles() { sDroppedFiles_.clear(); }

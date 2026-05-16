@@ -33,8 +33,12 @@ extern "C" {
 #define OPTNONE
 #define ALIGN(align) __declspec(align(align))
 #define FUNC_UNUSED
+#ifdef __cplusplus
 #define TYPEOF(var) decltype(var)
-#define PACKED      __declspec(align(1))
+#else
+#define TYPEOF(var) typeof(var)
+#endif
+#define PACKED __declspec(align(1))
 #define NO_ASAN
 #else
 #define AT(sec)      __attribute__((section(sec)))
@@ -65,7 +69,10 @@ extern "C" {
                 __set_PRIMASK(__primask);                 \
         } while (0)
 #else
-#define ATOMIC_EXEC(code) {code}
+#define ATOMIC_EXEC(code) \
+        {                 \
+                code      \
+        }
 #endif
 
 #define HAPI            static inline
@@ -101,15 +108,9 @@ extern "C" {
  */
 #define CHECK_FUNC_PTR(func_ptr) ((func_ptr) != NULL)
 
-#if defined(_MSC_VER)
-#define DECL_1(ptr, a1)       \
-        auto a1 = &(ptr)->a1; \
-        ARG_UNUSED(a1);
-#else
 #define DECL_1(ptr, a1)                     \
         TYPEOF((ptr)->a1) *a1 = &(ptr)->a1; \
         ARG_UNUSED(a1);
-#endif
 #define DECL_2(ptr, a1, a2)                           DECL_1(ptr, a1) DECL_1(ptr, a2)
 #define DECL_3(ptr, a1, a2, a3)                       DECL_2(ptr, a1, a2) DECL_1(ptr, a3)
 #define DECL_4(ptr, a1, a2, a3, a4)                   DECL_3(ptr, a1, a2, a3) DECL_1(ptr, a4)

@@ -1,21 +1,21 @@
 #include "platdef.h"
 
-#ifdef __linux__
+#ifdef OS_LINUX
 #define _GNU_SOURCE
 #endif
 
 #ifdef OS_POSIX
 #include <pthread.h>
 #endif
-#ifdef __linux__
+#ifdef OS_LINUX
 #include <sched.h>
 #endif
-#ifdef OS_MACOS
+#ifdef OS_MAC
 #include <mach/mach.h>
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
 #endif
-#ifdef _WIN32
+#ifdef OS_WIN
 #include <windows.h>
 #endif
 
@@ -44,7 +44,7 @@ sch_thread_exec(void *arg)
 static void
 sch_bind_thread_to_cpu(pthread_t thread_tid, const int cpu_id)
 {
-#ifdef __linux__
+#ifdef OS_LINUX
         cpu_set_t cpu_set;
         CPU_ZERO(&cpu_set);
         CPU_SET(cpu_id, &cpu_set);
@@ -53,7 +53,7 @@ sch_bind_thread_to_cpu(pthread_t thread_tid, const int cpu_id)
                 print_error(FALSE, "[SCH] set thread affinity failed, errcode: %d", ret);
 
         print_error(FALSE, "[SCH] bind thread to CPU %d success", cpu_id);
-#elif defined(OS_MACOS)
+#elif defined(OS_MAC)
         /* macOS pthreads don't support hard affinity; thread_policy provides hints. */
         thread_affinity_policy_data_t policy      = {.affinity_tag = cpu_id + 1};
         const mach_port_t             mach_thread = pthread_mach_thread_np(thread_tid);
@@ -68,7 +68,7 @@ sch_bind_thread_to_cpu(pthread_t thread_tid, const int cpu_id)
         ARG_UNUSED(cpu_id);
 #endif
 }
-#elif defined(_WIN32)
+#elif defined(OS_WIN)
 static DWORD WINAPI
 sch_thread_exec(LPVOID arg)
 {
@@ -105,7 +105,7 @@ sch_thread_init(void *arg, const int cpu_id)
                 return;
         }
         sch_bind_thread_to_cpu(sch_tid, cpu_id);
-#elif defined(_WIN32)
+#elif defined(OS_WIN)
         DWORD  thread_id;
         HANDLE sch_tid = CreateThread(NULL,            // 默认安全属性
                                       0,               // 默认堆栈大小

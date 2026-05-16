@@ -35,11 +35,11 @@ lazy_malloc_4GB()
 {
         size_t size = 4ULL * 1024 * 1024 * 1024; // 4GB
         void  *mem  = mmap(NULL,
-                           size,
-                           PROT_READ | PROT_WRITE, // 读写权限
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
-                           -1,
-                           0);
+                         size,
+                         PROT_READ | PROT_WRITE, // 读写权限
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+                         -1,
+                         0);
 
         if (mem == MAP_FAILED) {
                 perror("mmap failed");

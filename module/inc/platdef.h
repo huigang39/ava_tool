@@ -2,23 +2,21 @@
 #define PLATDEF_H
 
 /* 操作系统识别 */
-#if defined(MCU)
-#define OS_MCU 1
-#elif defined(_WIN32) || defined(_WIN64)
-#define OS_WINDOWS 1
+#if defined(_WIN32) || defined(_WIN64)
+#define OS_WIN 1
 #elif defined(__APPLE__) && defined(__MACH__)
-#define OS_MACOS 1
+#define OS_MAC 1
 #elif defined(__linux__)
 #define OS_LINUX 1
 #else
-#error "unsupported operating system"
+#define OS_MCU 1
 #endif
 
-#if defined(OS_LINUX) || defined(OS_MACOS)
+#if defined(OS_LINUX) || defined(OS_MAC)
 #define OS_POSIX 1
 #endif
 
-#if defined(OS_LINUX) || defined(OS_MACOS) || defined(OS_WINDOWS)
+#if defined(OS_LINUX) || defined(OS_MAC) || defined(OS_WIN)
 #define OS_HOSTED 1
 #endif
 

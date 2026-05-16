@@ -69,37 +69,37 @@ BINS                  := $(addprefix $(BUILD_DIR)/,$(TARGETS))
 
 all: $(BINS)
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "test programs built successfully."
+
+	@echo [test] programs built successfully.
 	@$(ECHO_NL)
-	@echo "make all complete."
+	@echo [test] make all complete.
 
 clean:
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "cleaning test build artifacts..."
+
+	@echo [test] cleaning build artifacts...
 	$(call RMDIR,$(BUILD_DIR))
 	@$(ECHO_NL)
-	@echo "make clean complete."
+	@echo [test] make clean complete.
 
 help:
 	@$(ECHO_NL)
-	@echo "=================================================="
-	@echo "usage: make [options] [target]"
+
+	@echo [test] usage: make [options] [target]
 	@$(ECHO_NL)
-	@echo "targets:"
-	@echo "  all   - compile all .c files"
-	@echo "  clean - clean all generated files"
-	@echo "  help  - show this help message"
+	@echo targets:
+	@echo   all   - compile all .c files
+	@echo   clean - clean all generated files
+	@echo   help  - show this help message
 	@$(ECHO_NL)
-	@echo "platform: $(PLATFORM)"
-	@echo "found .c files: $(SRC_FILES)"
-	@echo "targets: $(TARGETS)"
-	@echo "library: $(OUTPUT_STATIC_LIB)"
+	@echo platform: $(PLATFORM)
+	@echo found .c files: $(SRC_FILES)
+	@echo targets: $(TARGETS)
+	@echo library: $(OUTPUT_STATIC_LIB)
 
 $(BUILD_DIR)/%: %.c | $(BUILD_DIR)
 	@$(ECHO_NL)
-	@echo "[COMPILE] $<"
+	@echo [test][CC] $<
 	$(CC) $(CFLAGS) $< -o "$@" $(OUTPUT_STATIC_LIB) $(LDFLAGS)
 
 $(TARGETS): %: $(BUILD_DIR)/%

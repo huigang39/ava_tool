@@ -11,12 +11,12 @@
 #include <GLFW/glfw3.h>
 #endif
 
+#include "timeops.h"
 #include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <ranges>
 #include <sstream>
-#include "timeops.h"
 
 #include "cJSON.h"
 #include "imgui.h"
@@ -95,8 +95,8 @@ Gui::Gui(const std::string &initialPath)
         int winW = 1, fbW = 1;
         glfwGetWindowSize(window_, &winW, nullptr);
         glfwGetFramebufferSize(window_, &fbW, nullptr);
-        const float fbRatio  = (winW > 0) ? static_cast<float>(fbW) / static_cast<float>(winW) : 1.0f;
-        const float uiScale  = xScale_ / fbRatio;
+        const float fbRatio = (winW > 0) ? static_cast<float>(fbW) / static_cast<float>(winW) : 1.0f;
+        const float uiScale = xScale_ / fbRatio;
 
         const float fontSize = std::round(18.0f * uiScale);
         if (!io.Fonts->AddFontFromFileTTF(fontFile_.c_str(), fontSize)) {
@@ -294,9 +294,9 @@ Gui::saveSession(const std::string &path)
         cJSON_AddNumberToObject(root, "currentMotorProfile", currentMotorProfile_);
         cJSON_AddStringToObject(root, "imguiLayout", ImGui::SaveIniSettingsToMemory());
 
-        u64 pStart = get_mono_ts_ms();
-        char *out   = cJSON_PrintUnformatted(root);
-        u64 pEnd   = get_mono_ts_ms();
+        u64           pStart = get_mono_ts_ms();
+        char         *out    = cJSON_PrintUnformatted(root);
+        u64           pEnd   = get_mono_ts_ms();
         std::ofstream ofs(targetPath);
         if (ofs && out) {
                 ofs << out;
@@ -309,18 +309,13 @@ Gui::saveSession(const std::string &path)
         cJSON_Delete(root);
 
         u64 end = get_mono_ts_ms();
-        LOG_I("SaveSession Profile: Total %llu ms, JSON Print %llu ms, Size %zu bytes",
-              end - start,
-              pEnd - pStart,
-              outLen);
+        LOG_I("SaveSession Profile: Total %llu ms, JSON Print %llu ms, Size %zu bytes", end - start, pEnd - pStart, outLen);
 }
 
 bool
 Gui::saveSessionAs()
 {
-        std::string path = nativeDlgSave("Save Session As",
-                                         {{"Session Files", {"ava"}}},
-                                         "session.ava");
+        std::string path = nativeDlgSave("Save Session As", {{"Session Files", {"ava"}}}, "session.ava");
         if (path.empty())
                 return false;
         if (path.find(".ava") == std::string::npos)
@@ -334,26 +329,25 @@ Gui::saveSessionAs()
 void
 Gui::loadSession(const std::string &path)
 {
-        u64 start = get_mono_ts_ms();
+        u64             start = get_mono_ts_ms();
         std::lock_guard lk(mtxMonitors_);
         std::string     targetPath = path.empty() ? currentSessionPath_ : path;
         std::ifstream   ifs(targetPath);
         if (!ifs.is_open())
                 return;
 
-        if (!path.empty())
-                isFirstSave_ = false;
+        isFirstSave_        = false;
         currentSessionPath_ = targetPath;
 
         std::stringstream ss;
         ss << ifs.rdbuf();
         const std::string content = ss.str();
-        u64 fEnd = get_mono_ts_ms();
+        u64               fEnd    = get_mono_ts_ms();
         if (content.empty())
                 return;
 
         cJSON *root = cJSON_Parse(content.c_str());
-        u64 pEnd = get_mono_ts_ms();
+        u64    pEnd = get_mono_ts_ms();
         if (!root)
                 return;
 
@@ -596,9 +590,9 @@ Gui::drawBar()
                                 isFirstSave_        = true;
                         }
                         if (ImGui::MenuItem("Open Session...")) {
-                                std::string p = nativeDlgOpen("Open Session",
-                                                              {{"Session Files", {"ava", "json"}}});
-                                if (!p.empty()) loadSession(p);
+                                std::string p = nativeDlgOpen("Open Session", {{"Session Files", {"ava", "json"}}});
+                                if (!p.empty())
+                                        loadSession(p);
                         }
                         if (ImGui::MenuItem("Save Session", "Ctrl+S")) {
                                 saveSession();
@@ -633,6 +627,8 @@ Gui::drawBar()
 
                 if (ImGui::BeginMenu("Tools")) {
                         ImGui::MenuItem("Joint Calculator", nullptr, &showCalculator_);
+                        ImGui::Separator();
+                        ImGui::MenuItem("Bode Plot", nullptr, &bode_.show_);
                         ImGui::EndMenu();
                 }
 
@@ -703,13 +699,19 @@ Gui::loop()
                         bool anyModified = isModified_;
                         if (!anyModified) {
                                 for (const auto &v : vars_ | std::views::values) {
-                                        if (v->isModified()) { anyModified = true; break; }
+                                        if (v->isModified()) {
+                                                anyModified = true;
+                                                break;
+                                        }
                                 }
                         }
                         if (!anyModified) {
                                 std::lock_guard lk(mtxMonitors_);
                                 for (const auto &m : monitors_ | std::views::values) {
-                                        if (m->isModified()) { anyModified = true; break; }
+                                        if (m->isModified()) {
+                                                anyModified = true;
+                                                break;
+                                        }
                                 }
                         }
                         if (anyModified || isFirstSave_) {
@@ -780,7 +782,6 @@ Gui::loop()
 
                 ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
 
-
                 if (showCalculator_)
                         drawCalculator();
 
@@ -799,7 +800,7 @@ Gui::loop()
                 {
                         for (auto it = vars_.begin(); it != vars_.end();) {
                                 if (it->second->isPendingDelete()) {
-                                        it = vars_.erase(it);
+                                        it          = vars_.erase(it);
                                         isModified_ = true;
                                 } else {
                                         it->second->updateDisplay();
@@ -810,6 +811,8 @@ Gui::loop()
                                 }
                         }
                 }
+
+                bode_.updateDisplay();
 
                 for (const auto &file : sDroppedFiles_) {
                         if (file.ends_with(".ava")) {
@@ -832,7 +835,8 @@ Gui::loop()
                                         }
                                         showQuitModal_ = false;
                                         ImGui::CloseCurrentPopup();
-                                        if (saved) wantsToQuit_ = true;
+                                        if (saved)
+                                                wantsToQuit_ = true;
                                         // If user cancelled the native dialog, saved==false → stay in app
                                 }
                                 ImGui::SetItemDefaultFocus();

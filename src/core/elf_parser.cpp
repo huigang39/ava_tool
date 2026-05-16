@@ -4,7 +4,8 @@
 
 #include "core/elf_parser.hpp"
 
-namespace {
+namespace
+{
 
 constexpr u8 ELF_MAGIC[4] = {0x7F, 'E', 'L', 'F'};
 
