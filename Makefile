@@ -107,12 +107,13 @@ ifeq ($(COMPILER),msvc)
                         /EHsc /MD /nologo /Z7 /O2
         CFLAGS_C     := /c /W3 /utf-8 /FS /D_CRT_SECURE_NO_WARNINGS /MD /nologo /Z7 /O2
         LDFLAGS      := /SUBSYSTEM:WINDOWS /nologo /DEBUG
+        JLINK_DIR    ?= $(DIR_MODULE)/lib/win
         ifeq ($(ARCH),arm64)
-            JLINK_LIB := $(DIR_MODULE)/lib/win/JLink_arm64.lib
-            JLINK_DLL := $(DIR_MODULE)/lib/win/JLink_arm64.dll
+            JLINK_LIB := $(JLINK_DIR)/JLink_arm64.lib
+            JLINK_DLL := $(JLINK_DIR)/JLink_arm64.dll
         else
-            JLINK_LIB := $(DIR_MODULE)/lib/win/JLink_x64.lib
-            JLINK_DLL := $(DIR_MODULE)/lib/win/JLink_x64.dll
+            JLINK_LIB := $(JLINK_DIR)/JLink_x64.lib
+            JLINK_DLL := $(JLINK_DIR)/JLink_x64.dll
         endif
         GLFW_LIB     := $(DIR_THIRDPARTY)/GLFW/lib/win/glfw3.lib
         GLFW_DLL     := $(DIR_THIRDPARTY)/GLFW/lib/win/glfw3.dll
@@ -143,7 +144,8 @@ else ifeq ($(COMPILER),gcc)
         CXXFLAGS     := -c -Wall -Wextra -O3 -std=c++20
         CFLAGS_C     := -c -Wall -Wextra -O3 -std=c11
         GLFW_LIB     := $(DIR_THIRDPARTY)/GLFW/lib/linux/libglfw3.so
-        JLINK_LIB    := $(DIR_MODULE)/lib/linux/libjlinkarm.so.8
+        JLINK_DIR    ?= $(DIR_MODULE)/lib/linux
+        JLINK_LIB    := $(firstword $(wildcard $(JLINK_DIR)/libjlinkarm.so $(JLINK_DIR)/libjlinkarm.so.*))
         MODULE_LIB   := $(DIR_MODULE)/lib/module/linux/module.a
         IMGUI_NOTIFY := $(DIR_THIRDPARTY)/ImGuiNotify/unix
         INCLUDES     := -I$(DIR_SRC) -I$(DIR_CORE) -I$(DIR_GUI) \
@@ -176,7 +178,8 @@ else ifeq ($(COMPILER),clang)
         OBJCXXFLAGS  := -c -Wall -Wextra -O3 -std=c++20 -fobjc-arc \
                         -DGL_SILENCE_DEPRECATION \
                         -I$(MAC_BREW_PREFIX)/include
-        JLINK_LIB    := /Applications/SEGGER/JLink/libjlinkarm.dylib
+        JLINK_DIR    ?= $(DIR_MODULE)/lib/mac
+        JLINK_LIB    := $(JLINK_DIR)/libjlinkarm.dylib
         MODULE_LIB   := $(DIR_MODULE)/lib/module/mac/$(ARCH)/module.a
         IMGUI_NOTIFY := $(DIR_THIRDPARTY)/ImGuiNotify/unix
         INCLUDES     := -I$(DIR_SRC) -I$(DIR_CORE) -I$(DIR_GUI) \
@@ -190,8 +193,8 @@ else ifeq ($(COMPILER),clang)
                         -I$(DIR_THIRDPARTY)/cJSON \
                         -I$(MAC_BREW_PREFIX)/include
         LDFLAGS      := -L$(MAC_BREW_PREFIX)/lib \
-                        -L/Applications/SEGGER/JLink \
-                        -Wl,-rpath,/Applications/SEGGER/JLink
+                        -L$(JLINK_DIR) \
+                        -Wl,-rpath,$(JLINK_DIR)
         LDLIBS       := -lglfw -ljlinkarm -lfftw3f \
                         "$(MODULE_LIB)" -lpthread \
                         -framework Cocoa -framework IOKit \
@@ -274,6 +277,12 @@ ifeq ($(COMPILER),msvc)
 	@copy /Y "$(subst /,\,$(FFTW_DLL))" "$(subst /,\,$(OUTPUT_BIN_DIR))\$(notdir $(FFTW_DLL))" >nul
 else
 	$(CXX) $(LDFLAGS) -o "$@" $(OBJ_ALL) $(LDLIBS)
+ifeq ($(PLATFORM),mac)
+	@JLINK_EMBEDDED=$$(otool -L "$@" | awk '/libjlinkarm/{print $$1}'); \
+	 if [ -n "$$JLINK_EMBEDDED" ]; then \
+	     install_name_tool -change "$$JLINK_EMBEDDED" "@rpath/libjlinkarm.dylib" "$@"; \
+	 fi
+endif
 endif
 
 $(MODULE_LIB):
