@@ -12,7 +12,6 @@
 #include "implot.h"
 #include "implot_internal.h"
 
-#include "core/jlink_dev.hpp"
 #include "gui/monitor.hpp"
 
 std::atomic<bool> g_monitorPaused{false};
@@ -159,15 +158,17 @@ MonitorScope::tableMenu()
 void
 MonitorScope::tableDraw()
 {
-        if (!ImGui::BeginTable("MonitorTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
+        if (!ImGui::BeginTable("MonitorTable",
+                               6,
+                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
                 return;
 
         ImGui::TableSetupColumn("Name");
         ImGui::TableSetupColumn("Value");
-        ImGui::TableSetupColumn("Wave", ImGuiTableColumnFlags_WidthFixed, 100.0f);
         ImGui::TableSetupColumn("Type");
         ImGui::TableSetupColumn("Address");
         ImGui::TableSetupColumn("Port");
+        ImGui::TableSetupColumn("Wave", ImGuiTableColumnFlags_WidthFixed, 100.0f);
         ImGui::TableHeadersRow();
 
         std::vector<std::string> keys;
@@ -230,8 +231,7 @@ MonitorScope::tableDraw()
                         // Group header — show collapsible tree node, empty other columns.
                         ImGui::TableNextRow();
                         ImGui::TableNextColumn();
-                        ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-                        ImGuiTreeNodeFlags treeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_DefaultOpen;
+                        ImGuiTreeNodeFlags treeFlags = ImGuiTreeNodeFlags_SpanFullWidth;
                         if (isGroupSelected)
                                 treeFlags |= ImGuiTreeNodeFlags_Selected;
                         bool open = ImGui::TreeNodeEx(label.c_str(), treeFlags);
@@ -433,7 +433,25 @@ MonitorScope::drawTableRow(const std::string               &chName,
                 }
         }
 
-        // 3. Wave Control
+        // 3. Type
+        ImGui::TableNextColumn();
+        ImGui::Text("%s", ch->getType().c_str());
+
+        // 4. Address
+        ImGui::TableNextColumn();
+        ImGui::Text("0x%zX", ch->getAddr());
+
+        // 5. Port
+        ImGui::TableNextColumn();
+        const std::string &dev = ch->getDevice();
+        if (dev == "LOCAL")
+                ImGui::Text("UDP");
+        else if (dev == "JLINK")
+                ImGui::Text("J-Link");
+        else
+                ImGui::Text("%s", dev.c_str());
+
+        // 6. Wave Control
         ImGui::TableNextColumn();
         f32 availX  = ImGui::GetContentRegionAvail().x;
         f32 spacing = ImGui::GetStyle().ItemSpacing.x;
@@ -456,40 +474,46 @@ MonitorScope::drawTableRow(const std::string               &chName,
                 ImGui::OpenPopup("WaveCfg");
 
         if (ImGui::BeginPopup("WaveCfg")) {
-                std::lock_guard lk(ch->waveMtx_);
+                // Read current values from atomic shadow fields
+                auto &pending = ch->waveCfgPending_;
                 ImGui::Text("Wave Generator: %s", chName.c_str());
                 ImGui::Separator();
 
                 const char *types[]     = {"Sine", "Square", "Triangle"};
-                i32         currentType = static_cast<i32>(ch->wave_.cfg.type);
+                i32         currentType = pending.type.load();
                 if (ImGui::Combo("Type", &currentType, types, IM_ARRAYSIZE(types))) {
-                        ch->wave_.cfg.type = static_cast<wave_type_t>(currentType);
+                        pending.type.store(currentType);
+                        pending.dirty.store(true);
                 }
 
                 ImGui::SetNextItemWidth(100);
-                f32 f = ch->wave_.cfg.freq;
+                f32 f = pending.freq.load();
                 if (ImGui::InputFloat("Freq (Hz)", &f, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
                     (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
-                        ch->wave_.cfg.freq = f;
+                        pending.freq.store(f);
+                        pending.dirty.store(true);
                 }
                 ImGui::SetNextItemWidth(100);
-                f32 a = ch->wave_.cfg.amp;
+                f32 a = pending.amp.load();
                 if (ImGui::InputFloat("Amp", &a, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
                     (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
-                        ch->wave_.cfg.amp = a;
+                        pending.amp.store(a);
+                        pending.dirty.store(true);
                 }
                 ImGui::SetNextItemWidth(100);
-                f32 o = ch->wave_.cfg.offset;
+                f32 o = pending.offset.load();
                 if (ImGui::InputFloat("Offset", &o, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
                     (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
-                        ch->wave_.cfg.offset = o;
+                        pending.offset.store(o);
+                        pending.dirty.store(true);
                 }
-                if (ch->wave_.cfg.type != WAVE_TYPE_SINE) {
+                if (pending.type.load() != WAVE_TYPE_SINE) {
                         ImGui::SetNextItemWidth(100);
-                        f32 d = ch->wave_.cfg.duty;
+                        f32 d = pending.duty.load();
                         if (ImGui::InputFloat("Duty", &d, 0.0f, 0.0f, "%.2f") && ImGui::IsItemDeactivated() &&
                             (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
-                                ch->wave_.cfg.duty = d;
+                                pending.duty.store(d);
+                                pending.dirty.store(true);
                         }
                 }
 
@@ -498,24 +522,6 @@ MonitorScope::drawTableRow(const std::string               &chName,
                         ImGui::CloseCurrentPopup();
                 ImGui::EndPopup();
         }
-
-        // 3. Type
-        ImGui::TableNextColumn();
-        ImGui::Text("%s", ch->getType().c_str());
-
-        // 4. Address
-        ImGui::TableNextColumn();
-        ImGui::Text("0x%zX", ch->getAddr());
-
-        // 5. Port
-        ImGui::TableNextColumn();
-        const std::string &dev = ch->getDevice();
-        if (dev == "LOCAL")
-                ImGui::Text("UDP");
-        else if (dev == "JLINK")
-                ImGui::Text("J-Link");
-        else
-                ImGui::Text("%s", dev.c_str());
 
         ImGui::PopID();
 }
@@ -611,17 +617,19 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                         bool plotted = false;
                         if (showFft_) {
                                 if (ch->show_ && fftPoints_ > 0) {
-                                        std::lock_guard lk(ch->valMutex_);
+                                        // Read from snapshot (no lock needed, protected by mtxMonitors_)
 
                                         // Dynamic extraction: Find points within the current time-domain window
                                         const double xmin = (linkXMin) ? *linkXMin : 0.0;
                                         const double xmax = (linkXMax) ? *linkXMax : 1.0;
 
-                                        auto itStart = std::lower_bound(ch->rTs_.begin(), ch->rTs_.end(), xmin);
-                                        auto itEnd   = std::upper_bound(ch->rTs_.begin(), ch->rTs_.end(), xmax);
+                                        const auto &snapTs   = ch->snap_.ts;
+                                        const auto &snapVals = ch->snap_.vals;
+                                        auto        itStart  = std::lower_bound(snapTs.begin(), snapTs.end(), xmin);
+                                        auto        itEnd    = std::upper_bound(snapTs.begin(), snapTs.end(), xmax);
 
-                                        size_t startIdx     = std::distance(ch->rTs_.begin(), itStart);
-                                        size_t endIdx       = std::distance(ch->rTs_.begin(), itEnd);
+                                        size_t startIdx     = std::distance(snapTs.begin(), itStart);
+                                        size_t endIdx       = std::distance(snapTs.begin(), itEnd);
                                         size_t visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
 
                                         if (visibleCount > 0) {
@@ -636,7 +644,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
 
                                                 f32 mean = 0;
                                                 for (usize i = 0; i < copyCount; ++i) {
-                                                        f32 v         = ch->rVals_[startIdx + readOffset + i];
+                                                        f32 v         = snapVals[startIdx + readOffset + i];
                                                         fftLoBuf_[i]  = v;
                                                         mean         += v;
                                                 }
@@ -650,8 +658,8 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                 // Update FS based on average delta in the window
                                                 f32 fs = (parent_) ? (f32)parent_->getHz() : 1000.0f;
                                                 if (copyCount > 1) {
-                                                        f64 totalTime = ch->rTs_[startIdx + readOffset + copyCount - 1] -
-                                                                        ch->rTs_[startIdx + readOffset];
+                                                        f64 totalTime = snapTs[startIdx + readOffset + copyCount - 1] -
+                                                                        snapTs[startIdx + readOffset];
                                                         if (totalTime > 1e-9f) {
                                                                 fs = static_cast<f32>((f64)(copyCount - 1) / totalTime);
                                                         }
@@ -695,46 +703,93 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                         }
                                 }
                         } else {
-                                // Stride decimation directly on the deque under the lock.
-                                // O(maxDisplayPoints) deque random-accesses — no temp allocation.
+                                // Read from snapshot (no lock — protected by mtxMonitors_).
                                 dxs_.clear();
                                 dys_.clear();
                                 {
-                                        std::lock_guard lk(ch->valMutex_);
-                                        const size_t    total = ch->rTs_.size();
+                                        const auto  &snapTs   = ch->snap_.ts;
+                                        const auto  &snapVals = ch->snap_.vals;
+                                        const size_t total    = snapTs.size();
                                         if (total > 0) {
                                                 size_t startIdx = 0, endIdx = total;
                                                 if (linkXMin) {
-                                                        auto it = std::lower_bound(ch->rTs_.begin(), ch->rTs_.end(), *linkXMin);
-                                                        startIdx = static_cast<size_t>(std::distance(ch->rTs_.begin(), it));
+                                                        auto it  = std::lower_bound(snapTs.begin(), snapTs.end(), *linkXMin);
+                                                        startIdx = static_cast<size_t>(std::distance(snapTs.begin(), it));
                                                 }
                                                 if (linkXMax) {
                                                         auto it = std::upper_bound(
-                                                            ch->rTs_.begin() + startIdx, ch->rTs_.end(), *linkXMax);
-                                                        endIdx = static_cast<size_t>(std::distance(ch->rTs_.begin(), it));
+                                                            snapTs.begin() + startIdx, snapTs.end(), *linkXMax);
+                                                        endIdx = static_cast<size_t>(std::distance(snapTs.begin(), it));
                                                 }
                                                 const size_t visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
                                                 if (visibleCount > 0) {
                                                         if (maxDisplayPoints > 0 && visibleCount > (size_t)maxDisplayPoints) {
-                                                                // Stride-based: visit only maxDisplayPoints elements
-                                                                const usize stride = visibleCount / (usize)maxDisplayPoints;
-                                                                dxs_.reserve((usize)maxDisplayPoints + 1);
-                                                                dys_.reserve((usize)maxDisplayPoints + 1);
-                                                                for (usize i = startIdx; i < endIdx; i += stride) {
-                                                                        dxs_.push_back(ch->rTs_[i]);
-                                                                        dys_.push_back(static_cast<f64>(ch->rVals_[i]));
+                                                                const bool  stairs = ch->getPlotStyle() == 1;
+                                                                const usize pointBudget =
+                                                                    static_cast<usize>(std::max<u32>(maxDisplayPoints, 2));
+                                                                dxs_.reserve(pointBudget + 2);
+                                                                dys_.reserve(pointBudget + 2);
+
+                                                                if (stairs) {
+                                                                        const usize stride =
+                                                                            std::max<usize>(1, visibleCount / pointBudget);
+                                                                        for (usize i = startIdx; i < endIdx; i += stride) {
+                                                                                dxs_.push_back(snapTs[i]);
+                                                                                dys_.push_back(static_cast<f64>(snapVals[i]));
+                                                                        }
+                                                                } else {
+                                                                        const usize bucketCount =
+                                                                            std::max<usize>(1, pointBudget / 2);
+                                                                        for (usize b = 0; b < bucketCount; ++b) {
+                                                                                const usize bStart =
+                                                                                    startIdx + (visibleCount * b) / bucketCount;
+                                                                                const usize bEnd =
+                                                                                    startIdx +
+                                                                                    (visibleCount * (b + 1)) / bucketCount;
+                                                                                if (bStart >= bEnd)
+                                                                                        continue;
+
+                                                                                usize minIdx = bStart;
+                                                                                usize maxIdx = bStart;
+                                                                                for (usize i = bStart + 1; i < bEnd; ++i) {
+                                                                                        if (snapVals[i] < snapVals[minIdx])
+                                                                                                minIdx = i;
+                                                                                        if (snapVals[i] > snapVals[maxIdx])
+                                                                                                maxIdx = i;
+                                                                                }
+
+                                                                                if (minIdx == maxIdx) {
+                                                                                        dxs_.push_back(snapTs[minIdx]);
+                                                                                        dys_.push_back(
+                                                                                            static_cast<f64>(snapVals[minIdx]));
+                                                                                } else if (minIdx < maxIdx) {
+                                                                                        dxs_.push_back(snapTs[minIdx]);
+                                                                                        dys_.push_back(
+                                                                                            static_cast<f64>(snapVals[minIdx]));
+                                                                                        dxs_.push_back(snapTs[maxIdx]);
+                                                                                        dys_.push_back(
+                                                                                            static_cast<f64>(snapVals[maxIdx]));
+                                                                                } else {
+                                                                                        dxs_.push_back(snapTs[maxIdx]);
+                                                                                        dys_.push_back(
+                                                                                            static_cast<f64>(snapVals[maxIdx]));
+                                                                                        dxs_.push_back(snapTs[minIdx]);
+                                                                                        dys_.push_back(
+                                                                                            static_cast<f64>(snapVals[minIdx]));
+                                                                                }
+                                                                        }
                                                                 }
                                                         } else {
                                                                 dxs_.reserve(visibleCount);
                                                                 dys_.reserve(visibleCount);
                                                                 for (usize i = startIdx; i < endIdx; ++i) {
-                                                                        dxs_.push_back(ch->rTs_[i]);
-                                                                        dys_.push_back(static_cast<f64>(ch->rVals_[i]));
+                                                                        dxs_.push_back(snapTs[i]);
+                                                                        dys_.push_back(static_cast<f64>(snapVals[i]));
                                                                 }
                                                         }
                                                 }
                                         }
-                                } // valMutex_ released
+                                }
 
                                 if (!dxs_.empty()) {
                                         if (ch->getPlotStyle() == 1)
@@ -939,6 +994,12 @@ MonitorScope::dropTarget()
                                                         ch->setDevice(sp->device);
                                                         if (sp->shmName[0] != '\0')
                                                                 ch->setShmRegionName(sp->shmName);
+                                                        if (e.numEnums > 0) {
+                                                                std::vector<MonitorChannel::EnumEntry> ents;
+                                                                for (int k = 0; k < e.numEnums; ++k)
+                                                                        ents.push_back({e.enums[k].name, e.enums[k].value});
+                                                                ch->setEnums(std::move(ents));
+                                                        }
                                                         if (ch->getDevice() == "SHM")
                                                                 shmInit(*ch);
                                                         if (parent_)
@@ -1041,8 +1102,11 @@ Monitor::updateDisplay()
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.5f, 0.0f, 0.6f)); // Orange
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.6f, 0.1f, 0.8f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.7f, 0.2f, 1.0f));
-                if (ImGui::Button("Clear Data"))
-                        clearData();
+                if (ImGui::Button("Clear Data")) {
+                        requestClearData();
+                        JLinkPort::instance().reqRestart();
+                        LOG_I("Monitor[%s] clear data requested from UI", name_.c_str());
+                }
                 ImGui::PopStyleColor(3);
 
                 ImGui::SameLine();
@@ -1080,7 +1144,7 @@ Monitor::updateDisplay()
                                 maxSampleHz_ = 1;
                         if (maxSampleHz_ > 50000)
                                 maxSampleHz_ = 50000;
-                        JLinkDev::instance().reqRestart();
+                        JLinkPort::instance().reqRestart();
                 }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("HSS sample rate (Hz). Most J-Link hardware supports up to ~200Hz reliably.");
@@ -1105,8 +1169,11 @@ Monitor::updateDisplay()
                 ImGui::SetNextItemWidth(70);
                 if (ImGui::Combo("##SampMode", &curSamp, sampModes, 2)) {
                         samplingMode_ = (curSamp == 0) ? SamplingMode::HSS : SamplingMode::POLL;
-                        clearData();
-                        JLinkDev::instance().reqRestart();
+                        requestClearData();
+                        JLinkPort::instance().reqRestart();
+                        LOG_I("Monitor[%s] sampling mode changed to %s; clear requested",
+                              name_.c_str(),
+                              samplingMode_ == SamplingMode::HSS ? "HSS" : "POLL");
                 }
                 ImGui::SameLine();
 
@@ -1209,7 +1276,8 @@ Monitor::updateDisplay()
                                                 }
                                                 lastNow_ = now;
                                         }
-                                } else if (!isPaused && JLinkDev::instance().isHssRunning()) {
+                                } else if (!isPaused &&
+                                           (JLinkPort::instance().isHssRunning() || samplingMode_ == SamplingMode::POLL)) {
                                         // FOLLOW mode logic (only updates when running)
                                         // CRITICAL: If user is clicking or scrolling, STOP auto-updating to allow ImPlot to
                                         // handle interaction

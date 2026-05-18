@@ -82,12 +82,14 @@ Bode::draw_()
                         for (int i = 0; i < (int)keys.size(); ++i) {
                                 bool        sel  = (i == curIdx);
                                 std::string disp = varName(keys[i]);
+                                ImGui::PushID(i);
                                 if (ImGui::Selectable(disp.c_str(), sel, 0))
                                         std::snprintf(buf, bufSz, "%s", keys[i].c_str());
                                 if (ImGui::IsItemHovered())
                                         ImGui::SetTooltip("%s", keys[i].c_str());
                                 if (sel)
                                         ImGui::SetItemDefaultFocus();
+                                ImGui::PopID();
                         }
                         ImGui::EndCombo();
                 }
@@ -152,10 +154,10 @@ Bode::draw_()
                                 bodeSweepStepStart_  = get_mono_ts_us();
                                 MonitorChannel *wrCh = findChannelByKey_(bodeWriteKey_);
                                 if (wrCh) {
-                                        std::lock_guard lk(wrCh->waveMtx_);
-                                        wrCh->wave_.cfg.freq = static_cast<float>(bodeFreqList_[0]);
-                                        wrCh->wave_.cfg.amp  = bodeAmp_;
-                                        wrCh->waveEnable_    = true;
+                                        wrCh->waveCfgPending_.freq.store(static_cast<float>(bodeFreqList_[0]));
+                                        wrCh->waveCfgPending_.amp.store(bodeAmp_);
+                                        wrCh->waveCfgPending_.dirty.store(true);
+                                        wrCh->waveEnable_ = true;
                                 }
                         }
                 }
@@ -165,10 +167,7 @@ Bode::draw_()
                         bodeSweepRunning_    = false;
                         MonitorChannel *wrCh = findChannelByKey_(bodeWriteKey_);
                         if (wrCh) {
-                                {
-                                        std::lock_guard lk(wrCh->waveMtx_);
-                                        wrCh->waveEnable_ = false;
-                                }
+                                wrCh->waveEnable_ = false;
                                 wrCh->setWVal(0.0f);
                                 wrCh->markWValDirty();
                         }
@@ -303,18 +302,15 @@ Bode::advanceSweep_()
                         bodeSweepRunning_        = false;
                         MonitorChannel *wrChStop = findChannelByKey_(bodeWriteKey_);
                         if (wrChStop) {
-                                {
-                                        std::lock_guard lk(wrChStop->waveMtx_);
-                                        wrChStop->waveEnable_ = false;
-                                }
+                                wrChStop->waveEnable_ = false;
                                 wrChStop->setWVal(0.0f);
                                 wrChStop->markWValDirty();
                         }
                 } else {
                         MonitorChannel *wrCh2 = findChannelByKey_(bodeWriteKey_);
                         if (wrCh2) {
-                                std::lock_guard lk(wrCh2->waveMtx_);
-                                wrCh2->wave_.cfg.freq = static_cast<float>(bodeFreqList_[bodeSweepFreqIdx_]);
+                                wrCh2->waveCfgPending_.freq.store(static_cast<float>(bodeFreqList_[bodeSweepFreqIdx_]));
+                                wrCh2->waveCfgPending_.dirty.store(true);
                         }
                         bodeSweepStepStart_ = now;
                 }

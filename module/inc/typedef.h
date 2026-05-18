@@ -78,35 +78,51 @@ typedef enum dir {
 } dir_e;
 
 typedef struct motor_cfg {
-        u32 npp;
-        f32 ld;
-        f32 lq;
-        f32 rs;
-        f32 psi; // Wb
-        f32 j;   // 转子惯量
-        f32 vel_rated;
-        f32 vel_peak;
-        f32 cur_rated;
-        f32 cur_peak;
-        f32 tor_rated;
-        f32 tor_peak;
-        f32 cur2tor[4], tor2cur[4];
+        u32 npp;        // 极对数
+        f32 ld;         // d 轴电感 (H)
+        f32 lq;         // q 轴电感 (H)
+        f32 rs;         // 定子相电阻 (Ω)
+        f32 psi;        // 转子磁链 (Wb)
+        f32 j;          // 转子转动惯量 (kg·m²)
+        f32 vel_rated;  // 额定转速 (rad/s)
+        f32 vel_peak;   // 峰值转速 (rad/s)
+        f32 cur_rated;  // 额定电流 (A)
+        f32 cur_peak;   // 峰值电流 (A)
+        f32 tor_rated;  // 额定扭矩 (N·m)
+        f32 tor_peak;   // 峰值扭矩 (N·m)
+        f32 cur2tor[4]; // 电流->扭矩 多项式拟合系数
+        f32 tor2cur[4]; // 扭矩->电流 多项式拟合系数
 } motor_cfg_t;
 
 typedef struct periph_cfg {
         /* ADC */
-        u32 adc_full_cnt;
-        f32 cur_max, vbus_max;
-        f32 adc2cur, adc2vbus, adc2volt;
-        f32 volt_tau;
-        u32 cur_gain;
+        u32 adc_full_cnt;      // ADC 满量程计数值
+        f32 cur_max;           // 电流采样量程 (A)
+        f32 vbus_max;          // 母线电压采样量程 (V)
+        struct {               // NTC 分压电阻 (Ω)
+                f32 inverter;  // 逆变器 NTC 分压电阻
+                f32 stator_uv; // 定子 UV 相 NTC 分压电阻
+                f32 stator_vw; // 定子 VW 相 NTC 分压电阻
+        } ntc_r_divider;
+
+        f32 adc2cur;  // ADC 原始值 -> 电流 (A) 系数
+        f32 adc2vbus; // ADC 原始值 -> 母线电压 (V) 系数
+        f32 adc2volt; // ADC 原始值 -> 通用电压 (V) 系数
+        f32 volt_tau; // 电压采样一阶滤波时间常数 (s)
+
+        /* DRV */
+        u32 cur_gain;   // 电流采样运放增益档位
+        u32 idriven_hs; // 上桥拉低驱动电流档位
+        u32 idrivep_hs; // 上桥拉高驱动电流档位
+        u32 idriven_ls; // 下桥拉低驱动电流档位
+        u32 idrivep_ls; // 下桥拉高驱动电流档位
 
         /* PWM */
-        u32 timer_freq;
-        u32 pwm_freq;
-        u32 pwm_full_cnt;
-        f32 f32_pwm_duty_min;
-        f32 f32_pwm_duty_max;
+        u32 timer_freq;       // 定时器时钟频率 (Hz)
+        u32 pwm_freq;         // PWM 载波频率 (Hz)
+        u32 pwm_full_cnt;     // PWM 计数器周期值
+        f32 f32_pwm_duty_min; // PWM 占空比下限
+        f32 f32_pwm_duty_max; // PWM 占空比上限
 } periph_cfg_t;
 
 HAPI void

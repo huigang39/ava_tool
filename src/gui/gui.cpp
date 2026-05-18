@@ -2,9 +2,11 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+// windows.h must precede commdlg.h (commdlg.h → prsht.h needs CALLBACK/HWND from windows.h)
 #include <windows.h>
-#include <commdlg.h>
+
 #include <GLFW/glfw3.h>
+#include <commdlg.h>
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
 #else
@@ -23,10 +25,10 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "implot.h"
-#include "native_dlg.hpp"
+#include "platform/native_dlg.hpp"
 
 #include "app_log.hpp"
-#include "core/jlink_dev.hpp"
+#include "core/jlink_port.hpp"
 #include "gui/gui.hpp"
 #include "gui/monitor.hpp"
 #include "gui/variable.hpp"
@@ -91,7 +93,7 @@ Gui::Gui(const std::string &initialPath)
         // so ImGui renders in logical pixels and the backend up-scales to physical.
         // On Windows/Linux the framebuffer equals the window in pixels, so we must
         // bake the DPI scale into the font ourselves.
-        // uiScale = contentScale / (fb/window) → 1.0 on macOS Retina, 1.5 on Win 150%
+        // uiScale = contentScale / (fb/window), e.g. 1.0 on macOS Retina, 1.5 on Win 150%
         int winW = 1, fbW = 1;
         glfwGetWindowSize(window_, &winW, nullptr);
         glfwGetFramebufferSize(window_, &fbW, nullptr);
@@ -162,19 +164,9 @@ Gui::hide()
 std::string
 Gui::getAppDir()
 {
-        std::string path;
-#ifdef _WIN32
-        const char *localAppData = std::getenv("LOCALAPPDATA");
-        if (localAppData) {
-                path = std::string(localAppData) + "\\AvA_Tool";
-        } else {
-                path = ".";
-        }
-#else
-        path = "./.ava_tool";
-#endif
+        const std::filesystem::path path = std::filesystem::current_path() / ".ava_tool";
         std::filesystem::create_directories(path);
-        return path;
+        return path.string();
 }
 
 void
@@ -191,9 +183,9 @@ Gui::saveSession(const std::string &path)
         cJSON          *root       = cJSON_CreateObject();
 
         cJSON *jlink = cJSON_CreateObject();
-        cJSON_AddStringToObject(jlink, "device", JLinkDev::instance().deviceName().c_str());
-        cJSON_AddNumberToObject(jlink, "speedKHz", JLinkDev::instance().speed());
-        cJSON_AddNumberToObject(jlink, "hssPeriodUs", JLinkDev::instance().hssPeriodUs());
+        cJSON_AddStringToObject(jlink, "device", JLinkPort::instance().deviceName().c_str());
+        cJSON_AddNumberToObject(jlink, "speedKHz", JLinkPort::instance().speed());
+        cJSON_AddNumberToObject(jlink, "hssPeriodUs", JLinkPort::instance().hssPeriodUs());
         cJSON_AddItemToObject(root, "jlink", jlink);
 
         cJSON_AddBoolToObject(root, "showCalculator", showCalculator_);
@@ -357,11 +349,11 @@ Gui::loadSession(const std::string &path)
 
         if (const cJSON *jlink = cJSON_GetObjectItem(root, "jlink")) {
                 if (const cJSON *dev = cJSON_GetObjectItem(jlink, "device"); cJSON_IsString(dev))
-                        JLinkDev::instance().deviceName() = dev->valuestring;
+                        JLinkPort::instance().deviceName() = dev->valuestring;
                 if (const cJSON *spd = cJSON_GetObjectItem(jlink, "speedKHz"); cJSON_IsNumber(spd))
-                        JLinkDev::instance().speed() = spd->valueint;
+                        JLinkPort::instance().speed() = spd->valueint;
                 if (const cJSON *p = cJSON_GetObjectItem(jlink, "hssPeriodUs"); cJSON_IsNumber(p))
-                        JLinkDev::instance().hssPeriodUs() = p->valueint;
+                        JLinkPort::instance().hssPeriodUs() = p->valueint;
         }
 
         if (const cJSON *sc = cJSON_GetObjectItem(root, "showCalculator")) {
@@ -633,9 +625,9 @@ Gui::drawBar()
                 }
 
                 ImGui::Separator();
-                bool wasConnected = JLinkDev::instance().isConnected();
-                JLinkDev::instance().drawUI();
-                if (!wasConnected && JLinkDev::instance().isConnected()) {
+                bool wasConnected = JLinkPort::instance().isConnected();
+                JLinkPort::instance().drawUI();
+                if (!wasConnected && JLinkPort::instance().isConnected()) {
                         Monitor::clearAll();
                 }
                 const bool paused = g_monitorPaused.load();
@@ -653,10 +645,13 @@ Gui::drawBar()
 
                 // Total points currently in memory (across all channels)
                 u64 totalPts = 0;
-                for (const auto &m : monitors_ | std::views::values)
-                        for (const auto &s : m->getScopes() | std::views::values)
-                                for (const auto &ch : s->getChannels() | std::views::values)
-                                        totalPts += ch->storedCount();
+                {
+                        std::lock_guard lk(mtxMonitors_);
+                        for (const auto &m : monitors_ | std::views::values)
+                                for (const auto &s : m->getScopes() | std::views::values)
+                                        for (const auto &ch : s->getChannels() | std::views::values)
+                                                totalPts += ch->storedCount();
+                }
                 char ptsBuf[32];
                 if (totalPts >= 1000000)
                         snprintf(ptsBuf, sizeof(ptsBuf), "%.2f M pts", totalPts / 1000000.0);
@@ -728,37 +723,35 @@ Gui::loop()
 
                 drawBar();
 
-                static f32 spaceLastTime   = 0.0f;
-                static i32 spaceClickCount = 0;
                 if (const ImGuiIO &io = ImGui::GetIO(); !io.WantTextInput) {
                         if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-                                f32 now = static_cast<f32>(ImGui::GetTime());
-                                if (now - spaceLastTime < 0.35f) {
-                                        spaceClickCount++;
-                                } else {
-                                        spaceClickCount = 1;
-                                }
-                                spaceLastTime = now;
-
-                                if (spaceClickCount >= 3) {
-                                        // Triple Click: Reconnect J-Link
-                                        JLinkDev::instance().close();
-                                        if (JLinkDev::instance().open()) {
-                                                if (JLinkDev::instance().connect()) {
-                                                        LOG_I("J-Link Reconnected via Triple Space");
-                                                }
-                                        }
-                                        spaceClickCount = 0;
-                                } else {
-                                        // Single Click: Toggle Pause
-                                        g_monitorPaused.store(!g_monitorPaused.load());
-                                }
+                                g_monitorPaused.store(!g_monitorPaused.load());
                         }
 
                         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
                                 saveSession();
                                 saveToastAlpha_ = 2.0f;
                                 LOG_I("Session saved via Ctrl+S");
+                        }
+
+                        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L, false)) {
+                                bool wasConnected = JLinkPort::instance().isConnected();
+                                JLinkPort::instance().close();
+                                if (JLinkPort::instance().open() && JLinkPort::instance().connect()) {
+                                        LOG_I("J-Link connected via Ctrl+L");
+                                        if (!wasConnected)
+                                                Monitor::clearAll();
+                                }
+                        }
+
+                        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
+                                Monitor::clearAll();
+                                LOG_I("Clear data triggered via Ctrl+R");
+                        }
+
+                        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
+                                JLinkPort::instance().close();
+                                LOG_I("J-Link disconnected via Ctrl+C");
                         }
                 }
 
@@ -837,7 +830,7 @@ Gui::loop()
                                         ImGui::CloseCurrentPopup();
                                         if (saved)
                                                 wantsToQuit_ = true;
-                                        // If user cancelled the native dialog, saved==false → stay in app
+                                        // If user cancelled the native dialog, saved==false: stay in app
                                 }
                                 ImGui::SetItemDefaultFocus();
                                 ImGui::SameLine();
@@ -912,7 +905,7 @@ Gui::syncSymbolAddresses(const std::vector<SearchEntry> &searchPool)
 
         if (count > 0) {
                 LOG_I("Synced %d symbol addresses with new ELF", count);
-                JLinkDev::instance().reqRestart(); // Force sampler thread to rebuild HSS list
+                JLinkPort::instance().reqRestart(); // Force sampler thread to rebuild HSS list
         }
 }
 

@@ -94,7 +94,7 @@ class Variable
         std::filesystem::file_time_type elfLastWriteTime_{};
         bool                            elfReloaded_{false};
         std::atomic<bool>               isElfLoading_{false};
-        mutable std::recursive_mutex    mtxElf_{};
+        mutable std::mutex              mtxElf_{};
         std::shared_ptr<ElfLoadingTask> currentLoadingTask_;
 
         // For JSON/BIN tree display

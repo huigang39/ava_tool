@@ -25,6 +25,10 @@ purge_old_logs(const char *dir, usize max_files)
         if (max_files == 0)
                 return;
 
+#if !defined(OS_WIN) && !defined(OS_POSIX)
+        ARG_UNUSED(dir);
+#endif
+
 #ifdef OS_WIN
         char search_path[256];
         snprintf(search_path, sizeof(search_path), "%s/*.log", dir);
@@ -157,7 +161,7 @@ log_os_mmap_init(log_t *log)
         if (cfg->e_ring == LOG_RING_ROTATE) {
 #ifdef OS_WIN
                 CreateDirectoryA(cfg->file_path, NULL);
-#else
+#elif defined(OS_POSIX)
                 mkdir(cfg->file_path, 0755);
 #endif
                 purge_old_logs(cfg->file_path, cfg->max_files);

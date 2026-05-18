@@ -6,10 +6,10 @@
 
 #include "ImGuiNotify.hpp"
 #include "imgui.h"
-#include "native_dlg.hpp"
+#include "platform/native_dlg.hpp"
 
 #include "app_log.hpp"
-#include "core/jlink_dev.hpp"
+#include "core/jlink_port.hpp"
 #include "gui/gui.hpp"
 #include "gui/monitor.hpp"
 #include "gui/variable.hpp"
@@ -488,7 +488,7 @@ Variable::drawSymbolTree()
 void
 Variable::drawSymbolLeaf(const std::string &displayName, const std::string &fullPath, u64 addr, u64 typeOff, i32 depth)
 {
-        std::lock_guard lk(mtxElf_);
+        // Note: mtxElf_ is already held by drawSymbolTree()
         if (depth > 16)
                 return;
         const dwarf::Type *t          = resolveAlias(dwarfInfo_, typeOff);
@@ -595,7 +595,7 @@ Variable::drawDataTreeLeaf(DataTree &node, const int indentLevel)
         bool isArray = (node.type == DataType::ARRAY);
         bool open    = false;
         if (isArray) {
-                open = ImGui::TreeNodeEx(node.name.c_str(), ImGuiTreeNodeFlags_DefaultOpen);
+                open = ImGui::TreeNodeEx(node.name.c_str(), ImGuiTreeNodeFlags_None);
         } else {
                 ImGui::TreeNodeEx(node.name.c_str(), ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen);
                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
@@ -649,6 +649,19 @@ flattenForStructPayload(
         if (!t)
                 return;
 
+        auto fillEntryEnums = [&info](StructChannelPayload::Entry &e, u64 leafTypeOff) {
+                const dwarf::Type *lt = resolveAlias(info, leafTypeOff);
+                if (!lt || lt->kind != dwarf::TypeKind::ENUM) {
+                        e.numEnums = 0;
+                        return;
+                }
+                e.numEnums = (u8)std::min((int)lt->enums.size(), StructChannelPayload::kMaxEnums);
+                for (int i = 0; i < e.numEnums; ++i) {
+                        snprintf(e.enums[i].name, sizeof(e.enums[i].name), "%s", lt->enums[i].name.c_str());
+                        e.enums[i].value = lt->enums[i].value;
+                }
+        };
+
         if (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION) {
                 for (const auto &m : t->members) {
                         if (sp.count >= StructChannelPayload::kMaxEntries)
@@ -661,6 +674,7 @@ flattenForStructPayload(
                                 snprintf(e.name, sizeof(e.name), "%s", mPath.c_str());
                                 e.addr = mAddr;
                                 snprintf(e.type, sizeof(e.type), "%s", sType);
+                                fillEntryEnums(e, m.type);
                         } else {
                                 flattenForStructPayload(info, mPath, mAddr, m.type, sp, maxDepth - 1);
                         }
@@ -677,6 +691,7 @@ flattenForStructPayload(
                                 snprintf(e.name, sizeof(e.name), "%s", idxPath.c_str());
                                 e.addr = eAddr;
                                 snprintf(e.type, sizeof(e.type), "%s", sType);
+                                fillEntryEnums(e, t->inner);
                         } else {
                                 flattenForStructPayload(info, idxPath, eAddr, t->inner, sp, maxDepth - 1);
                         }
@@ -1317,7 +1332,7 @@ Variable::updateVariables()
 
                 const dwarf::Type *t         = resolveAlias(dwarfInfo_, v.typeOff);
                 const bool         isComplex = t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
-                                                     t->kind == dwarf::TypeKind::ARRAY);
+                                             t->kind == dwarf::TypeKind::ARRAY);
                 if (isComplex) {
                         v.valueStr = "...";
                         // For SHM structs: read the full blob and populate the member cache so the
@@ -1344,8 +1359,8 @@ Variable::updateVariables()
                 u8  buf[8];
                 int ret = -2; // -2: No update, -1: Error, 0: Success
                 u32 sz  = Parser::typeBytes(v.type);
-                if (v.port == PortType::JLINK && JLinkDev::instance().isConnected()) {
-                        if (JLinkDev::instance().readMem((u32)v.addr, sz, buf))
+                if (v.port == PortType::JLINK && JLinkPort::instance().isConnected()) {
+                        if (JLinkPort::instance().readMem((u32)v.addr, sz, buf))
                                 ret = 0;
                         else
                                 ret = -1;
@@ -1424,7 +1439,7 @@ Variable::writeVariable(const VarEntry &v, const std::string &newVal)
                 else if (v.type == DataType::I64)
                         *(i64 *)buf = std::stoll(newVal);
 
-                if (v.port == PortType::JLINK && JLinkDev::instance().isConnected()) {
+                if (v.port == PortType::JLINK && JLinkPort::instance().isConnected()) {
                         jlink_port_write_mem((u32)v.addr, sz, buf);
                 } else if (v.port == PortType::SHM && v.shm.inited) {
                         shm_write(const_cast<shm_t *>(&v.shm.handle), buf, sz);
@@ -1688,8 +1703,8 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         u32  sz         = Parser::typeBytes(Parser::strToDataType(sType));
                         u64  now        = get_mono_ts_ms();
                         bool shouldRead = (now - lastUpdateTs_ < 20);
-                        if (shouldRead && JLinkDev::instance().isConnected() &&
-                            JLinkDev::instance().readMem((u32)memberAddr, sz, buf)) {
+                        if (shouldRead && JLinkPort::instance().isConnected() &&
+                            JLinkPort::instance().readMem((u32)memberAddr, sz, buf)) {
                                 std::string val               = decodeWithEnum(buf, sz);
                                 memberValueCache_[memberAddr] = val;
                                 ImGui::TextUnformatted(val.c_str());
@@ -1699,7 +1714,7 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                 ImGui::TextUnformatted("...");
                         }
                 } else {
-                        // SHM/UDP: cache is populated by updateVariables — just display
+                        // SHM/UDP: cache is populated by updateVariables �?just display
                         if (it != memberValueCache_.end())
                                 ImGui::TextUnformatted(it->second.c_str());
                         else

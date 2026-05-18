@@ -36,6 +36,7 @@ PROJECT_DIR    := $(CURDIR)
 DIR_SRC        := src
 DIR_GUI        := src/gui
 DIR_CORE       := src/core
+DIR_PLATFORM   := src/platform
 DIR_THIRDPARTY := thirdparty
 DIR_MODULE     := module
 
@@ -217,11 +218,11 @@ OUTPUT_EXE       := $(OUTPUT_BIN_DIR)/$(PROJECT_NAME)$(EXE_EXT)
 # ─── Source files ─────────────────────────────────────────────────────────────
 
 ifeq ($(PLATFORM),mac)
-    SRC_NATIVE := $(DIR_SRC)/native_dlg_mac.mm
+    SRC_NATIVE := $(DIR_PLATFORM)/native_dlg_mac.mm
 else ifeq ($(PLATFORM),linux)
-    SRC_NATIVE := $(DIR_SRC)/native_dlg_linux.cpp
+    SRC_NATIVE := $(DIR_PLATFORM)/native_dlg_linux.cpp
 else
-    SRC_NATIVE := $(DIR_SRC)/native_dlg_win.cpp
+    SRC_NATIVE := $(DIR_PLATFORM)/native_dlg_win.cpp
 endif
 
 SRC_CXX := \
@@ -234,7 +235,8 @@ SRC_CXX := \
     $(DIR_CORE)/dwarf_parser.cpp \
     $(DIR_CORE)/json_parser.cpp \
     $(DIR_CORE)/bin_parser.cpp \
-    $(DIR_CORE)/jlink_dev.cpp \
+    $(DIR_CORE)/jlink_port.cpp \
+    $(DIR_CORE)/sampler.cpp \
     $(filter %.cpp,$(SRC_NATIVE)) \
     $(DIR_THIRDPARTY)/imgui/imgui.cpp \
     $(DIR_THIRDPARTY)/imgui/imgui_demo.cpp \

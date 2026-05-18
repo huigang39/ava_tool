@@ -64,6 +64,13 @@ typedef enum foc_theta {
         FOC_ELEC_THETA_SENSORFUSION, // 融合角度
 } foc_elec_theta_e;
 
+typedef enum foc_ntc {
+        FOC_NTC_TYPE_NONE,
+        FOC_NTC_TYPE_PT5_25E2,
+        FOC_NTC_TYPE_NCP15XV103J03RC,
+        FOC_NTC_TYPE_MAX,
+} foc_ntc_e;
+
 typedef union foc_obs_flag {
         u32 val;
         struct {
@@ -261,9 +268,9 @@ typedef struct foc_base_cfg {
 } foc_base_cfg_t;
 
 typedef struct foc_cali_cfg {
-        f32 force_id;                      // 强拖电流
-        f32 elec_theta_nonlinear_cali_vel; // 电角度非线性误差校准速度 (出轴), 如果设为 0 将不会校准此项
-        f32 elec_theta_offset_cali_vel;    // 电角度偏置校准速度 (出轴)
+        f32 force_id;                          // 强拖电流
+        f32 elec_theta_nonlinear_cali_vel;     // 电角度非线性误差校准速度 (出轴), 如果设为 0 将不会校准此项
+        f32 elec_theta_offset_cali_vel;        // 电角度偏置校准速度 (出轴)
         f32 outshaft_theta_nonlinear_cali_vel; // 出轴非线性误差校准速度 (出轴), 如果设为 0 将不会校准此项
 } foc_cali_cfg_t;
 
@@ -279,6 +286,11 @@ typedef struct foc_sensor_cfg {
         u32              terminal_volt_sample_enable;  // 启用端电压采样
         f32              motor_theta_delay_comp_cycle; // 电机轴角度补偿增益
         f32              elec_theta_delay_comp_cycle;  // 电角度补偿增益
+        struct {
+                foc_ntc_e e_inverter;
+                foc_ntc_e e_stator_uv;
+                foc_ntc_e e_stator_vw;
+        } ntc_type;
 } foc_sensor_cfg_t;
 
 typedef struct foc_ctl_cfg {

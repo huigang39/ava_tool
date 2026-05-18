@@ -170,9 +170,9 @@ readU32(const u8 *p, u64 &off, u64 end)
 {
         if (off + 4 > end)
                 return 0;
-        const u32 v  = static_cast<u32>(p[off]) | (static_cast<u32>(p[off + 1]) << 8) | (static_cast<u32>(p[off + 2]) << 16) |
-                       (static_cast<u32>(p[off + 3]) << 24);
-        off         += 4;
+        const u32 v = static_cast<u32>(p[off]) | (static_cast<u32>(p[off + 1]) << 8) | (static_cast<u32>(p[off + 2]) << 16) |
+                      (static_cast<u32>(p[off + 3]) << 24);
+        off += 4;
         return v;
 }
 

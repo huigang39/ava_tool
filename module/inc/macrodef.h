@@ -69,10 +69,7 @@ extern "C" {
                 __set_PRIMASK(__primask);                 \
         } while (0)
 #else
-#define ATOMIC_EXEC(code) \
-        {                 \
-                code      \
-        }
+#define ATOMIC_EXEC(code) {code}
 #endif
 
 #define HAPI            static inline
