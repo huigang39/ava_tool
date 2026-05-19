@@ -3,12 +3,12 @@
 
 #include "platdef.h"
 
-#ifdef OS_POSIX
+#if OS(POSIX)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#elif defined(OS_WIN)
+#elif OS(WIN)
 #include <windows.h>
 #endif
 
@@ -24,14 +24,14 @@ extern "C" {
 /* -------------------------------------------------------------------------- */
 
 typedef enum shm_access {
-#ifdef OS_POSIX
+#if OS(POSIX)
         SHM_READONLY  = PROT_READ,
         SHM_WRITEONLY = PROT_WRITE,
         SHM_READWRITE = SHM_READONLY | SHM_WRITEONLY,
-#elif defined(OS_WIN)
+#elif OS(WIN)
         SHM_READONLY  = PAGE_READONLY,
         SHM_READWRITE = PAGE_READWRITE,
-#elif defined(MCU)
+#elif OS(NONE)
         SHM_READONLY,
         SHM_READWRITE,
 #endif
@@ -44,9 +44,9 @@ typedef struct shm_cfg {
 } shm_cfg_t;
 
 typedef struct shm_lo {
-#ifdef OS_POSIX
+#if OS(POSIX)
         int fd;
-#elif defined(OS_WIN)
+#elif OS(WIN)
         HANDLE fd;
 #endif
         void   *addr;

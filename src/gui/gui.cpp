@@ -7,6 +7,7 @@
 
 #include <GLFW/glfw3.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
 #else
@@ -29,11 +30,13 @@
 
 #include "app_log.hpp"
 #include "core/jlink_port.hpp"
+#include "core/sampler.hpp"
 #include "gui/gui.hpp"
 #include "gui/monitor.hpp"
 #include "gui/variable.hpp"
 #include <cstdlib>
 #include <filesystem>
+#include <thread>
 
 std::vector<std::string> Gui::sDroppedFiles_{};
 
@@ -208,6 +211,13 @@ Gui::saveSession(const std::string &path)
                         cJSON_AddBoolToObject(sObj, "showFft", s->getShowFft());
                         cJSON_AddNumberToObject(sObj, "fftPoints", static_cast<f64>(s->getFftPoints()));
                         cJSON_AddNumberToObject(sObj, "fftPeakCount", static_cast<f64>(s->getFftPeakCount()));
+
+                        if (!s->getExpandedGroups().empty()) {
+                                cJSON *egArr = cJSON_CreateArray();
+                                for (const auto &p : s->getExpandedGroups())
+                                        cJSON_AddItemToArray(egArr, cJSON_CreateString(p.c_str()));
+                                cJSON_AddItemToObject(sObj, "expandedGroups", egArr);
+                        }
 
                         cJSON *chsArr = cJSON_CreateArray();
                         for (auto &ch : s->getChannels() | std::views::values) {
@@ -421,6 +431,14 @@ Gui::loadSession(const std::string &path)
                                     cJSON_IsNumber(fftPkItem))
                                         scope->getFftPeakCount() = fftPkItem->valueint;
 
+                                if (const cJSON *egArr = cJSON_GetObjectItem(sItem, "expandedGroups"); cJSON_IsArray(egArr)) {
+                                        for (int k = 0; k < cJSON_GetArraySize(egArr); ++k) {
+                                                const cJSON *e = cJSON_GetArrayItem(egArr, k);
+                                                if (cJSON_IsString(e))
+                                                        scope->getExpandedGroups().insert(e->valuestring);
+                                        }
+                                }
+
                                 const cJSON *chsArr = cJSON_GetObjectItem(sItem, "channels");
                                 if (!cJSON_IsArray(chsArr))
                                         continue;
@@ -624,6 +642,63 @@ Gui::drawBar()
                         ImGui::EndMenu();
                 }
 
+                if (ImGui::BeginMenu("Settings")) {
+                        if (ImGui::BeginMenu("Sampler CPU Core")) {
+#ifdef _WIN32
+                                // Show elevation status
+                                BOOL                     isAdmin    = FALSE;
+                                PSID                     adminGroup = NULL;
+                                SID_IDENTIFIER_AUTHORITY ntAuth     = SECURITY_NT_AUTHORITY;
+                                if (AllocateAndInitializeSid(&ntAuth,
+                                                             2,
+                                                             SECURITY_BUILTIN_DOMAIN_RID,
+                                                             DOMAIN_ALIAS_RID_ADMINS,
+                                                             0,
+                                                             0,
+                                                             0,
+                                                             0,
+                                                             0,
+                                                             0,
+                                                             &adminGroup)) {
+                                        CheckTokenMembership(NULL, adminGroup, &isAdmin);
+                                        FreeSid(adminGroup);
+                                }
+                                if (!isAdmin) {
+                                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Not Admin (priority capped)");
+                                        ImGui::Separator();
+                                }
+#endif
+                                const int cur = g_samplerCpuCore.load();
+                                const int n   = static_cast<int>(std::thread::hardware_concurrency());
+
+                                auto applyCoreChange = [&](int newCore) {
+#ifdef _WIN32
+                                        if (!isAdmin) {
+                                                pendingElevationCore_ = newCore;
+                                                showElevationModal_   = true;
+                                                return;
+                                        }
+#endif
+                                        g_samplerCpuCore.store(newCore);
+                                        g_samplerCpuRebind.store(true);
+                                };
+
+                                if (ImGui::MenuItem("Auto (highest)", nullptr, cur < 0)) {
+                                        applyCoreChange(-1);
+                                }
+                                ImGui::Separator();
+                                for (int i = 0; i < n; ++i) {
+                                        char label[32];
+                                        snprintf(label, sizeof(label), "Core %d", i);
+                                        if (ImGui::MenuItem(label, nullptr, cur == i)) {
+                                                applyCoreChange(i);
+                                        }
+                                }
+                                ImGui::EndMenu();
+                        }
+                        ImGui::EndMenu();
+                }
+
                 ImGui::Separator();
                 bool wasConnected = JLinkPort::instance().isConnected();
                 JLinkPort::instance().drawUI();
@@ -798,7 +873,7 @@ Gui::loop()
                                 } else {
                                         it->second->updateDisplay();
                                         if (it->second->consumeElfReloaded()) {
-                                                syncSymbolAddresses(it->second->searchPool_);
+                                                syncSymbolAddresses(it->second.get());
                                         }
                                         ++it;
                                 }
@@ -813,6 +888,48 @@ Gui::loop()
                         }
                 }
                 sDroppedFiles_.clear();
+#ifdef _WIN32
+                if (showElevationModal_) {
+                        ImGui::OpenPopup("Elevate?");
+                        if (ImGui::BeginPopupModal("Elevate?", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                                ImGui::Text("Changing the sampler core requires administrator privileges.");
+                                ImGui::Text("The app will save the current session and relaunch elevated.");
+                                ImGui::Separator();
+                                if (ImGui::Button("Relaunch as Admin", ImVec2(160, 0))) {
+                                        const int newCore = pendingElevationCore_;
+                                        saveSession();
+                                        LOG_I("UAC elevation: relaunching as admin (core=%d)", newCore);
+
+                                        char exePath[MAX_PATH];
+                                        GetModuleFileNameA(NULL, exePath, MAX_PATH);
+
+                                        SHELLEXECUTEINFOA sei = {};
+                                        sei.cbSize            = sizeof(sei);
+                                        sei.lpVerb            = "runas";
+                                        sei.lpFile            = exePath;
+                                        sei.lpParameters      = currentSessionPath_.c_str();
+                                        sei.nShow             = SW_SHOWNORMAL;
+                                        sei.fMask             = SEE_MASK_NOASYNC;
+
+                                        if (ShellExecuteExA(&sei)) {
+                                                glfwSetWindowShouldClose(window_, GLFW_TRUE);
+                                                wantsToQuit_ = true;
+                                        } else {
+                                                LOG_W("UAC elevation cancelled or failed");
+                                        }
+                                        showElevationModal_ = false;
+                                        ImGui::CloseCurrentPopup();
+                                }
+                                ImGui::SetItemDefaultFocus();
+                                ImGui::SameLine();
+                                if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                                        showElevationModal_ = false;
+                                        ImGui::CloseCurrentPopup();
+                                }
+                                ImGui::EndPopup();
+                        }
+                }
+#endif
                 if (showQuitModal_) {
                         ImGui::OpenPopup("Quit?");
                         if (ImGui::BeginPopupModal("Quit?", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
@@ -865,10 +982,14 @@ Gui::loop()
 }
 
 void
-Gui::syncSymbolAddresses(const std::vector<SearchEntry> &searchPool)
+Gui::syncSymbolAddresses(Variable *reloadedVar)
 {
+        if (!reloadedVar)
+                return;
+        const auto     &searchPool = reloadedVar->searchPool_;
         std::lock_guard lk(mtxMonitors_);
-        i32             count = 0;
+        i32             count     = 0;
+        i32             enumCount = 0;
         for (auto &pair : monitors_) {
                 for (auto &spair : pair.second->getScopes()) {
                         for (auto &cpair : spair.second->getChannels()) {
@@ -883,6 +1004,10 @@ Gui::syncSymbolAddresses(const std::vector<SearchEntry> &searchPool)
                                                 break;
                                         }
                                 }
+                                // Refresh enum entries from the reloaded ELF +
+                                // any user overrides on the owning VarEntry.
+                                if (reloadedVar->refreshChannelEnums(ch))
+                                        enumCount++;
                         }
                 }
         }
@@ -903,8 +1028,8 @@ Gui::syncSymbolAddresses(const std::vector<SearchEntry> &searchPool)
                 }
         }
 
-        if (count > 0) {
-                LOG_I("Synced %d symbol addresses with new ELF", count);
+        if (count > 0 || enumCount > 0) {
+                LOG_I("Synced %d symbol addresses, refreshed %d channel enums with new ELF", count, enumCount);
                 JLinkPort::instance().reqRestart(); // Force sampler thread to rebuild HSS list
         }
 }

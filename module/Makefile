@@ -101,24 +101,20 @@ endif
 AC5_COMPILER_PATH         := $(KEIL_PATH)/ARM/ARMCC/bin
 AC5_COMPILER_EXE          := armcc.exe
 AC5_ARCHIVER_EXE          := armar.exe
-AC5_MCU_DEFINE            := -DMCU
 AC5_MCU_STATIC_LIB        := $(PROJECT_NAME).lib
 AC5_MCU_CFLAGS            := -c $(OPTIMIZATION) -g --cpu=Cortex-M7 --apcs=interwork
 
 AC6_COMPILER_PATH         := $(KEIL_PATH)/ARM/ARMCLANG/bin
 AC6_COMPILER_EXE          := armclang.exe
 AC6_ARCHIVER_EXE          := armar.exe
-AC6_MCU_DEFINE            := -DMCU
 AC6_MCU_STATIC_LIB        := $(PROJECT_NAME).lib
 AC6_MCU_CFLAGS            := -c $(OPTIMIZATION) -g --target=arm-arm-none-eabi -mcpu=Cortex-M7 -mfloat-abi=hard -mfpu=fpv5-d16
 
 GCC_COMPILER_EXE          := gcc
 GCC_ARCHIVER_EXE          := ar
-GCC_MCU_DEFINE            := -DMCU
 GCC_MCU_STATIC_LIB        := $(PROJECT_NAME).a
 GCC_MCU_CFLAGS            := -c $(OPTIMIZATION) -g -Wall -mcpu=cortex-m7 -mfloat-abi=hard -mfpu=fpv5-d16
 
-GCC_LINUX_DEFINE          := -DLINUX
 GCC_LINUX_STATIC_LIB      := $(PROJECT_NAME).a
 GCC_LINUX_SHARED_LIB      := $(PROJECT_NAME).so
 GCC_LINUX_CFLAGS          := -c $(OPTIMIZATION) -g -Wall -Wextra -fPIC
@@ -132,7 +128,6 @@ MSVC_COMPILER_EXE         := cl.exe
 MSVC_ARCHIVER_EXE         := lib.exe
 MSVC_LINKER_EXE           := link.exe
 MSVC_OPTIMIZATION         := /O2
-MSVC_WIN_DEFINE           := /DWIN
 MSVC_WIN_STATIC_LIB       := $(PROJECT_NAME).lib
 MSVC_WIN_SHARED_LIB       := $(PROJECT_NAME).dll
 MSVC_WIN_CFLAGS           := /c $(MSVC_OPTIMIZATION) /Z7 /W3 /nologo /TC /MD /std:clatest /utf-8 /experimental:c11atomics /FS
@@ -146,7 +141,6 @@ ifeq ($(ARCH),arm64)
 else
     MAC_BREW_PREFIX       ?= /usr/local
 endif
-CLANG_MAC_DEFINE          := -DMAC
 CLANG_MAC_STATIC_LIB      := $(PROJECT_NAME).a
 CLANG_MAC_SHARED_LIB      := $(PROJECT_NAME).dylib
 CLANG_MAC_CFLAGS          := -c $(OPTIMIZATION) -g -Wall -Wextra -fPIC -I$(MAC_BREW_PREFIX)/include
@@ -159,7 +153,7 @@ ifneq ($(COMPILER),)
         ifeq ($(PLATFORM),mcu)
             CC            := $(AC5_COMPILER_PATH)/$(AC5_COMPILER_EXE)
             AR            := $(AC5_COMPILER_PATH)/$(AC5_ARCHIVER_EXE)
-            CFLAGS        := $(AC5_MCU_CFLAGS) $(AC5_MCU_DEFINE)
+            CFLAGS        := $(AC5_MCU_CFLAGS)
             STATIC_LIB    := $(AC5_MCU_STATIC_LIB)
             PLATFORM_DIR  := mcu
         else
@@ -169,7 +163,7 @@ ifneq ($(COMPILER),)
         ifeq ($(PLATFORM),mcu)
             CC            := $(AC6_COMPILER_PATH)/$(AC6_COMPILER_EXE)
             AR            := $(AC6_COMPILER_PATH)/$(AC6_ARCHIVER_EXE)
-            CFLAGS        := $(AC6_MCU_CFLAGS) $(AC6_MCU_DEFINE)
+            CFLAGS        := $(AC6_MCU_CFLAGS)
             STATIC_LIB    := $(AC6_MCU_STATIC_LIB)
             PLATFORM_DIR  := mcu
         else
@@ -179,13 +173,13 @@ ifneq ($(COMPILER),)
         ifeq ($(PLATFORM),mcu)
             CC            := $(GCC_COMPILER_EXE)
             AR            := $(GCC_ARCHIVER_EXE)
-            CFLAGS        := $(GCC_MCU_CFLAGS) $(GCC_MCU_DEFINE)
+            CFLAGS        := $(GCC_MCU_CFLAGS)
             STATIC_LIB    := $(GCC_MCU_STATIC_LIB)
             PLATFORM_DIR  := mcu
         else ifeq ($(PLATFORM),linux)
             CC            := $(GCC_COMPILER_EXE)
             AR            := $(GCC_ARCHIVER_EXE)
-            CFLAGS        := $(GCC_LINUX_CFLAGS) $(GCC_LINUX_DEFINE)
+            CFLAGS        := $(GCC_LINUX_CFLAGS)
             LDFLAGS       := $(GCC_LINUX_LDFLAGS) $(GCC_LINUX_LIB_DIRS)
             LDLIBS        := $(GCC_LINUX_LDLIBS)
             STATIC_LIB    := $(GCC_LINUX_STATIC_LIB)
@@ -198,7 +192,7 @@ ifneq ($(COMPILER),)
         ifeq ($(PLATFORM),mac)
             CC            := clang
             AR            := ar
-            CFLAGS        := $(CLANG_MAC_CFLAGS) $(CLANG_MAC_DEFINE)
+            CFLAGS        := $(CLANG_MAC_CFLAGS)
             LDFLAGS       := $(CLANG_MAC_LDFLAGS)
             LDLIBS        := $(CLANG_MAC_LDLIBS)
             STATIC_LIB    := $(CLANG_MAC_STATIC_LIB)
@@ -207,7 +201,7 @@ ifneq ($(COMPILER),)
         else ifeq ($(PLATFORM),linux)
             CC            := clang
             AR            := ar
-            CFLAGS        := $(GCC_LINUX_CFLAGS) $(GCC_LINUX_DEFINE)
+            CFLAGS        := $(GCC_LINUX_CFLAGS)
             LDFLAGS       := $(GCC_LINUX_LDFLAGS) $(GCC_LINUX_LIB_DIRS)
             LDLIBS        := $(GCC_LINUX_LDLIBS)
             STATIC_LIB    := $(GCC_LINUX_STATIC_LIB)
@@ -221,7 +215,7 @@ ifneq ($(COMPILER),)
             CC            := $(MSVC_COMPILER_EXE)
             AR            := $(MSVC_ARCHIVER_EXE)
             LD            := $(MSVC_LINKER_EXE)
-            CFLAGS        := $(MSVC_WIN_CFLAGS) $(MSVC_WIN_DEFINE)
+            CFLAGS        := $(MSVC_WIN_CFLAGS)
             LDFLAGS       := $(MSVC_WIN_LDFLAGS) $(MSVC_WIN_LIB_DIRS)
             LDLIBS        := $(MSVC_WIN_LDLIBS)
             STATIC_LIB    := $(MSVC_WIN_STATIC_LIB)

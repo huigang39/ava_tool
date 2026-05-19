@@ -140,7 +140,7 @@ foc_nonlinear_elec_theta_cali(foc_t *foc)
 {
         DECL(foc, cfg, in, lo, tmp);
 
-        if (cfg->sensor_cfg.e_sensor == FOC_SENSOR_ELEC)
+        if (cfg->sensor_cfg.e_motor_sensor == FOC_SENSOR_ELEC)
                 return -MEACCES;
 
         switch (lo->e_cali_state) {
@@ -274,8 +274,9 @@ foc_cali(foc_t *foc)
         /* --------------------------------- 出轴角度校准 --------------------------------- */
 
         if (lo->u_cali_flag.val == 0) {
-                ret         = cfg->func_cfg.f_store();
-                lo->e_state = FOC_STATE_DISABLE;
+                lo->e_cali_state = FOC_CALI_STATE_INIT;
+                ret              = cfg->func_cfg.f_store();
+                lo->e_state      = FOC_STATE_DISABLE;
                 return ret;
         }
         return -MEBUSY;

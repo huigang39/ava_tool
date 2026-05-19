@@ -7,9 +7,9 @@
 #include "arm_math.h"
 #endif
 
-#if defined(OS_HOSTED) && defined(ARCH_X86_FAMILY)
+#if OS(HOSTED) && ARCH(X86_FAMILY)
 #include <immintrin.h>
-#elif defined(OS_HOSTED) && defined(ARCH_ARM64) && defined(HAS_NEON)
+#elif OS(HOSTED) && ARCH(ARM64) && HAS(NEON)
 #include <arm_neon.h>
 #endif
 
@@ -454,7 +454,7 @@ find_max(const f32 *arr, const usize n, f32 *max_val, usize *max_idx)
         *max_val = tmp_max;
         *max_idx = idx_max;
 
-#elif defined(HAS_NEON)
+#elif HAS(NEON)
         usize       i       = 0;
         float32x4_t max_vec = vdupq_n_f32(arr[0]);
         f32         tmp_max = arr[0];

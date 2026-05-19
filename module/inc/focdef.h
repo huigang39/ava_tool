@@ -65,11 +65,35 @@ typedef enum foc_theta {
 } foc_elec_theta_e;
 
 typedef enum foc_ntc {
-        FOC_NTC_TYPE_NONE,
-        FOC_NTC_TYPE_PT5_25E2,
-        FOC_NTC_TYPE_NCP15XV103J03RC,
+        FOC_NTC_NONE,
+        FOC_NTC_PT5_25E2,
+        FOC_NTC_NCP15XV103J03RC,
         FOC_NTC_TYPE_MAX,
 } foc_ntc_e;
+
+typedef enum {
+        FUNC_BACKUP_NONE,
+        FUNC_BACKUP_FLASH,
+        FUNC_BACKUP_M4,
+} foc_func_backup_e;
+
+typedef enum {
+        FUNC_DRV_NONE,
+        FUNC_DRV_8353,
+        FUNC_DRV_INDEPENDENT,
+} foc_func_drv_e;
+
+typedef enum {
+        FUNC_THETA_SENSOR_NONE,
+        FUNC_THETA_SENSOR_GW_INNER, // 弓望内圈
+        FUNC_THETA_SENSOR_GW_OUTER, // 弓望外圈
+} foc_func_theta_sensor_e;
+
+typedef enum {
+        FUNC_TOR_SENSOR_NONE,
+        FUNC_TOR_SENSOR_LD, // 蓝点
+        FUNC_TOR_SENSOR_XH, // 星汇
+} foc_func_tor_sensor_e;
 
 typedef union foc_obs_flag {
         u32 val;
@@ -169,6 +193,7 @@ typedef struct foc_store_theta {
         dir_e outshaft_sensor_dir;   // 出轴编码器方向
         f32   elec_offset_theta;     // 电角度偏置
         f32   outshaft_offset_theta; // 出轴角度偏置 (标零用)
+        f32   tor_sensor_offset;     // 扭矩传感器零偏 (标零用)
 } foc_store_sensor_t;
 
 typedef struct foc_rotor {
@@ -256,15 +281,15 @@ typedef struct foc_freq_div {
 } foc_freq_div_t;
 
 typedef struct foc_base_cfg {
-        f32          fs;             // FOC 运行频率 (定时器中断频率)
-        motor_cfg_t  motor;          // 电机参数
-        periph_cfg_t periph;         // 硬件/外设参数
-        dir_e        dir;            // 执行器方向
-        f32          outshaft_ratio; // 减速比
-        f32          acc_max;        // 最大加速度 (出轴)
-        f32          home_vel;       // 回零速度 (出轴)
-        f32          v_bus_rate;     // 母线电压利用率
-        u32          self_check_enable;
+        f32          fs;                // FOC 运行频率 (定时器中断频率)
+        motor_cfg_t  motor;             // 电机参数
+        periph_cfg_t periph;            // 硬件/外设参数
+        dir_e        dir;               // 执行器方向
+        f32          outshaft_ratio;    // 减速比
+        f32          acc_max;           // 最大加速度 (出轴)
+        f32          home_vel;          // 回零速度 (出轴)
+        f32          v_bus_rate;        // 母线电压利用率
+        u32          self_check_enable; // 启用上电自检
 } foc_base_cfg_t;
 
 typedef struct foc_cali_cfg {
@@ -275,7 +300,7 @@ typedef struct foc_cali_cfg {
 } foc_cali_cfg_t;
 
 typedef struct foc_sensor_cfg {
-        foc_sensor_e     e_sensor;                     // 编码器类型
+        foc_sensor_e     e_motor_sensor;               // 电机轴编码器类型
         foc_elec_theta_e e_elec_theta;                 // 电角度源
         u32              theta_uart_baudrate;          // 角度传感器串口波特率
         u32              tor_uart_baudrate;            // 转矩传感器串口波特率
@@ -306,13 +331,14 @@ typedef struct foc_ctl_cfg {
 } foc_ctl_cfg_t;
 
 typedef struct foc_comm {
-        void *periph;       // 外设
-        u8    busy;         // 忙碌标志
-        u64   tx_tick;      // 发送时 FOC 运行计数
-        u64   rx_tick;      // 接收时 FOC 运行计数
-        u32   elapsed_tick; // 单次收发消耗的计数值
-        u32   rx_err_cnt;   // FOC 周期内未接收到值产生的错误计数
-        u32   errcode;      // 错误码
+        void *periph;         // 外设
+        u8    busy;           // 忙碌标志
+        u64   tx_tick;        // 发送时 FOC 运行计数
+        u64   rx_tick;        // 接收时 FOC 运行计数
+        u32   elapsed_tick;   // 单次收发消耗的计数值
+        u32   timeout_cnt;    // 接收超时计数 (FOC 周期内未收到响应)
+        u32   verify_err_cnt; // 校验失败计数 (收到了但数据损坏)
+        u32   errcode;        // 错误码
 } foc_comm_t;
 
 typedef int (*foc_store_f)(void);
@@ -327,7 +353,22 @@ typedef int (*foc_set_status_f)(u8 status);
 typedef int (*foc_set_pwm_status_f)(foc_pwm_ch_e pwm_ch, u8 status);
 typedef void (*foc_set_pwm_duty_f)(u32_uvw_t u32_pwm_duty, u32 pwm_full_cnt);
 
+typedef struct {
+        foc_func_backup_e       e_backup;
+        foc_func_drv_e          e_drv;
+        foc_func_theta_sensor_e e_motor_theta_sensor;
+        foc_func_theta_sensor_e e_outshaft_sensor;
+        foc_func_tor_sensor_e   e_tor_sensor;
+} foc_func_opt_t;
+
+/* user 侧实现的解析回调: 根据 opt 填充 func_cfg 中所有具体函数指针 */
+typedef struct foc_func_cfg foc_func_cfg_t;
+typedef void (*foc_func_resolve_f)(foc_func_cfg_t *func_cfg);
+
 typedef struct foc_func_cfg {
+        foc_func_opt_t     opt;
+        foc_func_resolve_f f_resolve; // 解析回调: 据 opt 重填本结构其他字段
+
         foc_load_f  f_load;  // 数据加载
         foc_store_f f_store; // 数据保存
 
@@ -363,7 +404,7 @@ typedef struct foc_cfg {
         foc_ctl_cfg_t    ctl_cfg;    // 控制参数
         foc_obs_cfg_t    obs_cfg;    // 观测器参数
         foc_cali_cfg_t   cali_cfg;   // 校准参数
-        foc_func_cfg_t   func_cfg;   // 函数参数
+        foc_func_cfg_t   func_cfg;   // 函数参数 (由 func_opt 经 f_resolve 解析得到)
 } foc_cfg_t;
 
 typedef struct foc_in {
@@ -423,6 +464,8 @@ typedef struct foc_lo {
         f32_dq_t ref_i_dq;  // 目标 d-q 轴电流
         f32_dq_t comp_i_dq; // 补偿 d-q 轴电流
         f32_dq_t ffd_v_dq;  // 前馈 d-q 轴电压
+
+        foc_func_opt_t prev_func_opt; // 上次已应用的 func_opt 快照, foc_sync_func_opt 据此检测变更
 } foc_lo_t;
 
 typedef struct foc_tmp {

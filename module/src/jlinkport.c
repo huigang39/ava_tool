@@ -5,7 +5,7 @@
 #include "macrodef.h"
 #include "platdef.h"
 
-#ifdef OS_WIN
+#if OS(WIN)
 #include <windows.h>
 typedef HMODULE jlink_lib_t;
 typedef FARPROC jlink_sym_t;
@@ -13,7 +13,7 @@ typedef FARPROC jlink_sym_t;
 #define JLINK_LOAD(p)   LoadLibraryA(p)
 #define JLINK_SYM(h, n) (jlink_sym_t) GetProcAddress((h), (n))
 #define JLINK_FREE(h)   FreeLibrary(h)
-#elif defined(OS_POSIX)
+#elif OS(POSIX)
 #include <dlfcn.h>
 typedef void *jlink_lib_t;
 typedef void *jlink_sym_t;
@@ -23,9 +23,9 @@ typedef void *jlink_sym_t;
 #define JLINK_FREE(h)   dlclose(h)
 #endif
 
-#if defined(OS_WIN) || defined(OS_POSIX)
+#if OS(WIN) || OS(POSIX)
 
-#ifdef OS_WIN
+#if OS(WIN)
 #define JLINK_CC __cdecl
 #else
 #define JLINK_CC
@@ -74,16 +74,16 @@ static i32
 jlink_dll_load(const char *dll_path)
 {
         static const char *candidates[] = {
-#ifdef OS_WIN
+#if OS(WIN)
             "JLink_x64.dll",
             "JLinkARM.dll",
             "JLink.dll",
             "lib/win/JLink_x64.dll",
-#elif defined(OS_MAC)
+#elif OS(MAC)
             "libjlinkarm.dylib",
             "lib/mac/libjlinkarm.dylib",
             "/Applications/SEGGER/JLink/libjlinkarm.dylib",
-#elif defined(OS_LINUX)
+#elif OS(LINUX)
             "libjlinkarm.so",
             "libjlinkarm.so.8",
             "lib/linux/libjlinkarm.so.8",

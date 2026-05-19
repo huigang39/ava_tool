@@ -77,6 +77,7 @@ class JLinkPort
         bool open();
         void close();
         bool connect(); // uses deviceName_ + speed_
+        bool resetTarget();
         bool readMem(u32 addr, u32 numBytes, void *dst);
         bool writeMem(u32 addr, u32 numBytes, const void *src);
 

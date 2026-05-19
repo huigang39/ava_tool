@@ -131,7 +131,7 @@ ifeq ($(COMPILER),msvc)
                         /I"$(IMGUI_NOTIFY)/fonts" \
                         /I"$(DIR_THIRDPARTY)/GLFW/inc" \
                         /I"$(DIR_THIRDPARTY)/cJSON"
-        LDLIBS       := ws2_32.lib winmm.lib shlwapi.lib comdlg32.lib OpenGL32.lib \
+        LDLIBS       := ws2_32.lib winmm.lib shlwapi.lib comdlg32.lib OpenGL32.lib advapi32.lib \
                         "$(GLFW_LIB)" "$(JLINK_LIB)" "$(FFTW_LIB)" "$(MODULE_LIB)"
         PLATFORM_DIR := win
     else

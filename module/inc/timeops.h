@@ -3,9 +3,9 @@
 
 #include "platdef.h"
 
-#ifdef OS_POSIX
+#if OS(POSIX)
 #include <unistd.h>
-#elif defined(OS_WIN)
+#elif OS(WIN)
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -62,7 +62,7 @@ extern "C" {
 HAPI u64
 get_mono_ts_ns(void)
 {
-#ifdef OS_POSIX
+#if OS(POSIX)
         struct timespec ts;
 #ifdef CLOCK_MONOTONIC_RAW
         clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
@@ -70,7 +70,7 @@ get_mono_ts_ns(void)
         clock_gettime(CLOCK_MONOTONIC, &ts);
 #endif
         return ts.tv_sec * NANO_PER_SEC + ts.tv_nsec;
-#elif defined(OS_WIN)
+#elif OS(WIN)
         LARGE_INTEGER frequency, counter;
         QueryPerformanceFrequency(&frequency);
         QueryPerformanceCounter(&counter);
@@ -102,11 +102,11 @@ get_mono_ts_s(void)
 HAPI u64
 get_real_ts_ns(void)
 {
-#ifdef OS_POSIX
+#if OS(POSIX)
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         return ts.tv_sec * NANO_PER_SEC + ts.tv_nsec;
-#elif defined(OS_WIN)
+#elif OS(WIN)
         FILETIME ft;
         GetSystemTimeAsFileTime(&ft);
 
@@ -150,13 +150,13 @@ spin(u32 us)
                 ;
 }
 
-#ifdef OS_POSIX
+#if OS(POSIX)
 HAPI void
 yield(const u32 ms)
 {
         usleep((u32)(ms) * 1000);
 }
-#elif defined(OS_WIN)
+#elif OS(WIN)
 HAPI void
 yield(const u32 ms)
 {

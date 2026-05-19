@@ -51,19 +51,21 @@ class Gui
         mutable std::mutex mtxMonitors_{};
         VariableMapType    vars_{};
 
-        std::string currentSessionPath_ = "session.ava";
-        bool        isModified_         = false;
-        bool        showQuitModal_      = false;
-        bool        wantsToQuit_        = false;
-        bool        isFirstSave_        = true;
-        f32         saveToastAlpha_     = 0.0f;
+        std::string currentSessionPath_   = "session.ava";
+        bool        isModified_           = false;
+        bool        showQuitModal_        = false;
+        bool        showElevationModal_   = false;
+        int         pendingElevationCore_ = -1;
+        bool        wantsToQuit_          = false;
+        bool        isFirstSave_          = true;
+        f32         saveToastAlpha_       = 0.0f;
 
         void drawBar();
         void loadSession(const std::string &path = "");
         void saveSession(const std::string &path = "");
         bool saveSessionAs(); // returns false if user cancelled the dialog
         void drawCalculator();
-        void syncSymbolAddresses(const std::vector<SearchEntry> &searchPool);
+        void syncSymbolAddresses(Variable *reloadedVar);
 
         struct MotorProfile {
                 char  modelName[64] = "Motor_A";

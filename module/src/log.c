@@ -7,9 +7,9 @@
 #include "mempool.h"
 #include "timeops.h"
 
-#ifdef OS_WIN
+#if OS(WIN)
 #include <windows.h>
-#elif defined(OS_POSIX)
+#elif OS(POSIX)
 #include <dirent.h>
 #include <fcntl.h>
 #include <stdlib.h>
@@ -25,11 +25,11 @@ purge_old_logs(const char *dir, usize max_files)
         if (max_files == 0)
                 return;
 
-#if !defined(OS_WIN) && !defined(OS_POSIX)
+#if !OS(WIN) && !OS(POSIX)
         ARG_UNUSED(dir);
 #endif
 
-#ifdef OS_WIN
+#if OS(WIN)
         char search_path[256];
         snprintf(search_path, sizeof(search_path), "%s/*.log", dir);
         WIN32_FIND_DATAA find_data;
@@ -72,7 +72,7 @@ purge_old_logs(const char *dir, usize max_files)
                 }
         }
         free(files);
-#elif defined(OS_POSIX)
+#elif OS(POSIX)
         DIR *dp = opendir(dir);
         if (dp == NULL)
                 return;
@@ -159,9 +159,9 @@ log_os_mmap_init(log_t *log)
                 return;
 
         if (cfg->e_ring == LOG_RING_ROTATE) {
-#ifdef OS_WIN
+#if OS(WIN)
                 CreateDirectoryA(cfg->file_path, NULL);
-#elif defined(OS_POSIX)
+#elif OS(POSIX)
                 mkdir(cfg->file_path, 0755);
 #endif
                 purge_old_logs(cfg->file_path, cfg->max_files);
@@ -172,7 +172,7 @@ log_os_mmap_init(log_t *log)
         } else
                 snprintf(lo->curr_file_path, sizeof(lo->curr_file_path), "%s", cfg->file_path);
 
-#ifdef OS_WIN
+#if OS(WIN)
         DWORD  creation_disp = (cfg->e_ring == LOG_RING_ROTATE) ? CREATE_ALWAYS : OPEN_ALWAYS;
         HANDLE hFile         = CreateFileA(lo->curr_file_path,
                                    GENERIC_READ | GENERIC_WRITE,
@@ -195,7 +195,7 @@ log_os_mmap_init(log_t *log)
         lo->os_file_handle = (void *)hFile;
         lo->os_map_handle  = (void *)hMap;
 
-#elif defined(OS_POSIX)
+#elif OS(POSIX)
         i32 flags = O_RDWR | O_CREAT;
         if (cfg->e_ring == LOG_RING_ROTATE)
                 flags |= O_TRUNC;
@@ -229,7 +229,7 @@ log_os_mmap_deinit(log_t *log, usize actual_size)
         if (lo->mmap_ptr == NULL)
                 return;
 
-#ifdef OS_WIN
+#if OS(WIN)
         UnmapViewOfFile(lo->mmap_ptr);
         if (lo->os_map_handle)
                 CloseHandle((HANDLE)lo->os_map_handle);
@@ -241,7 +241,7 @@ log_os_mmap_deinit(log_t *log, usize actual_size)
                 SetEndOfFile((HANDLE)lo->os_file_handle);
                 CloseHandle((HANDLE)lo->os_file_handle);
         }
-#elif defined(OS_POSIX)
+#elif OS(POSIX)
         munmap(lo->mmap_ptr, cfg->file_size);
         if (lo->os_file_handle) {
                 i32 fd = (i32)(intptr_t)lo->os_file_handle;
@@ -474,7 +474,12 @@ log_flush(log_t *log)
 {
         DECL(log, cfg, lo);
 
-        while (!lo->busy) {
+        // Re-entrancy guard: only one thread drains the queue at a time.
+        if (lo->busy)
+                return;
+        lo->busy = 1;
+
+        while (1) {
                 mpsc_node_t *node = mpsc_pop(&lo->mpsc);
                 if (node == NULL)
                         break;
@@ -490,7 +495,7 @@ log_flush(log_t *log)
                                 const char *payload  = (char *)(log_chunk_data(chunk) + parse_offset);
                                 parse_offset        += header->size;
 
-#ifdef MCU
+#if OS(NONE)
                                 const usize prefix_size =
                                     snprintf((char *)lo->flush_buf, cfg->flush_cap, "[%llu][%u] ", header->ts, (u32)header->id);
 #else
@@ -510,8 +515,8 @@ log_flush(log_t *log)
                         log_flush_ring(log, log_chunk_data(chunk), chunk->offset);
 
                 mempool_free(cfg->mempool, chunk);
-                lo->busy = cfg->e_mode == LOG_MODE_ASYNC;
         }
+        lo->busy = 0;
 }
 
 void

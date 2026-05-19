@@ -15,13 +15,13 @@
 
 #include "core/session_time.hpp"
 #include "core/type_codec.hpp"
+#include "gui/time_series_buffer.hpp"
 #include "module.h"
 #include "timeops.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
-#include <deque>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -62,15 +62,15 @@ class MonitorChannel
         std::atomic<bool> pendingDelete_{false};
 
         // Primary data store — written ONLY by sampler thread (no lock needed).
-        std::deque<f32> rVals_{};
-        std::deque<f64> rTs_{};
+        MmapVector<f32> rVals_{};
+        MmapVector<f64> rTs_{};
 
         std::vector<EnumEntry> enums_{};
 
         u64   sampleCount_{0};
         u64   lastRateCount_{0};
         u64   lastRateTime_{0};
-        u64   snapStartSample_{0};
+        u64   publishedEnd_{0}; // abs idx (exclusive) of last sample mirrored to read_
         bool  rateInited_{false};
         f32   sampleHz_{0.0f};
         usize minKeepPoints_{4096};
@@ -85,57 +85,41 @@ class MonitorChannel
         shm_t shm_{};
 
       public:
-        // --- Snapshot for GUI rendering (read by GUI, written by publishSnapshot) ---
-        struct Snapshot {
-                std::vector<f64> ts;
-                std::vector<f32> vals;
-                f32              lastVal{0};
-        };
-        Snapshot snap_;
+        // GUI-side view of the channel. Built incrementally by publishSnapshot
+        // under mtxMonitors_; read by GUI under the same lock. Combines a raw
+        // ring (for FFT / high-zoom rendering) with a min/max LOD pyramid
+        // (for downsampled plot rendering).
+        TimeSeriesBuffer read_;
 
         // Called by sampler thread inside Gui::mtxMonitors_ to publish current
-        // data for GUI consumption. This replaces the old valMutex_ approach.
+        // data for GUI consumption. O(delta) — only mirrors samples appended
+        // since the previous publish, and drops aged-out samples by advancing
+        // ring heads.
         void publishSnapshot()
         {
-                const u64 storedStart = sampleCount_ - static_cast<u64>(rTs_.size());
+                const u64 storedStart  = sampleCount_ - static_cast<u64>(rTs_.size());
+                const u64 readSize     = static_cast<u64>(read_.rawSize());
+                const u64 readFirstAbs = (publishedEnd_ >= readSize) ? (publishedEnd_ - readSize) : 0;
 
-                if (snap_.ts.empty()) {
-                        snapStartSample_ = storedStart;
-                } else if (storedStart > snapStartSample_) {
-                        const u64   staleCount64 = storedStart - snapStartSample_;
-                        const usize staleCount   = static_cast<usize>(std::min<u64>(staleCount64, snap_.ts.size()));
-                        snap_.ts.erase(snap_.ts.begin(), snap_.ts.begin() + staleCount);
-                        snap_.vals.erase(snap_.vals.begin(), snap_.vals.begin() + staleCount);
-                        snapStartSample_ += staleCount;
-                        if (snapStartSample_ < storedStart) {
-                                snap_.ts.clear();
-                                snap_.vals.clear();
-                                snapStartSample_ = storedStart;
+                // Detect divergence (clearData / huge gap) — hard reset.
+                if (publishedEnd_ > sampleCount_ || publishedEnd_ < storedStart || readFirstAbs > sampleCount_) {
+                        read_.clear();
+                        publishedEnd_ = storedStart;
+                } else if (readFirstAbs < storedStart) {
+                        // Drop samples that aged out of the writer's front.
+                        const u64 toDrop = std::min<u64>(storedStart - readFirstAbs, readSize);
+                        read_.dropFront(static_cast<usize>(toDrop));
+                }
+
+                // Append newly arrived samples (writer's tail since last publish).
+                if (publishedEnd_ < sampleCount_) {
+                        const usize srcStart = static_cast<usize>(publishedEnd_ - storedStart);
+                        const usize n        = static_cast<usize>(sampleCount_ - publishedEnd_);
+                        for (usize i = 0; i < n; ++i) {
+                                read_.push(rVals_[srcStart + i], rTs_[srcStart + i]);
                         }
-                } else if (storedStart < snapStartSample_) {
-                        snap_.ts.clear();
-                        snap_.vals.clear();
-                        snapStartSample_ = storedStart;
+                        publishedEnd_ = sampleCount_;
                 }
-
-                const u64 publishedEnd = snapStartSample_ + static_cast<u64>(snap_.ts.size());
-                if (publishedEnd < storedStart || publishedEnd > sampleCount_) {
-                        snap_.ts.clear();
-                        snap_.vals.clear();
-                        snapStartSample_ = storedStart;
-                }
-
-                const usize appendStart = static_cast<usize>(snapStartSample_ + snap_.ts.size() - storedStart);
-                if (appendStart < rTs_.size()) {
-                        const usize appendCount = rTs_.size() - appendStart;
-                        snap_.ts.reserve(snap_.ts.size() + appendCount);
-                        snap_.vals.reserve(snap_.vals.size() + appendCount);
-                        for (usize i = appendStart; i < rTs_.size(); ++i) {
-                                snap_.ts.push_back(rTs_[i]);
-                                snap_.vals.push_back(rVals_[i]);
-                        }
-                }
-                snap_.lastVal = rVal_;
         }
 
       public:
@@ -239,17 +223,13 @@ class MonitorChannel
                 // Optimized block pruning
                 if (historySeconds_ > 0.0f) {
                         const f64 cutoff   = ts[count - 1] - (f64)historySeconds_;
-                        auto      itTs     = rTs_.begin();
-                        auto      itVal    = rVals_.begin();
                         usize     popCount = 0;
-                        while (rTs_.size() - popCount > minKeepPoints_ && itTs != rTs_.end() && *itTs < cutoff) {
-                                ++itTs;
-                                ++itVal;
+                        while (rTs_.size() - popCount > minKeepPoints_ && popCount < rTs_.size() && rTs_[popCount] < cutoff) {
                                 ++popCount;
                         }
-                        if (popCount > 0) {
-                                rTs_.erase(rTs_.begin(), itTs);
-                                rVals_.erase(rVals_.begin(), itVal);
+                        for (usize i = 0; i < popCount; ++i) {
+                                rTs_.pop_front();
+                                rVals_.pop_front();
                         }
                 }
 
@@ -283,18 +263,18 @@ class MonitorChannel
         }
 
         // Returns (re, im) of the DFT at frequency f for samples within [tMin, tMax].
-        // Reads from snapshot (call from GUI thread).
+        // Reads from the GUI-side raw ring (call from GUI thread under mtxMonitors_).
         std::pair<f64, f64> dftSlice(f64 tMin, f64 tMax, f64 f) const
         {
-                const auto  &ts   = snap_.ts;
-                const auto  &vals = snap_.vals;
-                const size_t si = static_cast<size_t>(std::distance(ts.begin(), std::lower_bound(ts.begin(), ts.end(), tMin)));
-                const size_t ei = static_cast<size_t>(std::distance(ts.begin(), std::upper_bound(ts.begin(), ts.end(), tMax)));
-                double       re = 0.0, im = 0.0;
-                for (size_t i = si; i < ei; ++i) {
-                        const double ph  = 2.0 * M_PI * f * static_cast<double>(ts[i]);
-                        re              += static_cast<double>(vals[i]) * std::cos(ph);
-                        im              -= static_cast<double>(vals[i]) * std::sin(ph);
+                const usize si = read_.rawLowerBound(tMin);
+                const usize ei = read_.rawUpperBound(tMax);
+                double      re = 0.0, im = 0.0;
+                for (usize i = si; i < ei; ++i) {
+                        const double t   = read_.rawTs(i);
+                        const double v   = static_cast<double>(read_.rawVal(i));
+                        const double ph  = 2.0 * M_PI * f * t;
+                        re              += v * std::cos(ph);
+                        im              -= v * std::sin(ph);
                 }
                 return {re, im};
         }
@@ -338,22 +318,20 @@ class MonitorChannel
         usize storedCount() const { return rVals_.size(); }
 
         // Earliest / latest timestamp in memory (sampler thread context).
-        f64 earliestTs() const { return rTs_.empty() ? -1.0 : rTs_.front(); }
-        f64 latestTs() const { return rTs_.empty() ? -1.0 : rTs_.back(); }
+        f64 earliestTs() const { return read_.firstTs(); }
+        f64 latestTs() const { return read_.lastTs(); }
 
         // Clear all stored data points.
         void clearData()
         {
                 rVals_.clear();
                 rTs_.clear();
-                snap_.ts.clear();
-                snap_.vals.clear();
-                snap_.lastVal    = 0;
-                sampleCount_     = 0;
-                lastRateCount_   = 0;
-                rateInited_      = false;
-                sampleHz_        = 0.0f;
-                snapStartSample_ = 0;
+                read_.clear();
+                sampleCount_   = 0;
+                lastRateCount_ = 0;
+                rateInited_    = false;
+                sampleHz_      = 0.0f;
+                publishedEnd_  = 0;
         }
 
         f32 historySeconds_{1.0f};

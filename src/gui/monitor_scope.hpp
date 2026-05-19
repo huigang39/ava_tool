@@ -32,15 +32,16 @@ class MonitorScope
                 TABLE,
         };
         using ChannelMapType = std::unordered_map<std::string, std::shared_ptr<MonitorChannel>>;
-        const std::string &getName() const { return name_; }
-        void               setDraw(DrawEnum d) { e_draw = d; }
-        DrawEnum           getDraw() const { return e_draw; }
-        f32               &getHeight() { return height_; }
-        bool              &getShowFft() { return showFft_; }
-        int               &getFftPoints() { return fftPoints_; }
-        int               &getFftPeakCount() { return fftPeakCount_; }
-        ChannelMapType    &getChannels() { return chs_; }
-        void               reinitFft(int newPoints);
+        const std::string     &getName() const { return name_; }
+        void                   setDraw(DrawEnum d) { e_draw = d; }
+        DrawEnum               getDraw() const { return e_draw; }
+        f32                   &getHeight() { return height_; }
+        bool                  &getShowFft() { return showFft_; }
+        int                   &getFftPoints() { return fftPoints_; }
+        int                   &getFftPeakCount() { return fftPeakCount_; }
+        ChannelMapType        &getChannels() { return chs_; }
+        std::set<std::string> &getExpandedGroups() { return expandedGroups_; }
+        void                   reinitFft(int newPoints);
 
       private:
         std::string           name_{};
@@ -63,6 +64,9 @@ class MonitorScope
         bool                  paused_{false};
         int                   lastSelectedIndex_{-1};
         std::set<std::string> selectedGroupPaths_{};
+        // Full paths (e.g. "foo.bar") of group nodes the user has expanded;
+        // persisted across sessions via Gui save/load.
+        std::set<std::string> expandedGroups_{};
 
         bool pendingAxisReset_{false};
         struct Peak {

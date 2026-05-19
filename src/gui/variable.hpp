@@ -21,6 +21,8 @@
 #include "core/parser.hpp"
 #include "module.h"
 
+class MonitorChannel;
+
 enum class PortType { JLINK, UDP, SHM, MANUAL };
 
 struct VarEntry {
@@ -57,6 +59,11 @@ struct VarEntry {
         std::unordered_map<std::string, std::vector<EnumDef>> memberEnumDefs;
         // Paths of sub-variables hidden by the user (right-click → Delete)
         std::set<std::string> hiddenMembers;
+        // Paths of struct/array nodes the user has expanded; persisted so the
+        // tree restores its open state across sessions. Key = full member path
+        // (same format as hiddenMembers / memberEnumDefs). The top-level row
+        // is keyed by `name`.
+        std::set<std::string> expandedMembers;
 };
 
 struct SearchEntry {
@@ -171,6 +178,13 @@ class Variable
         // Port interaction
         void updateVariables();
         void writeVariable(const VarEntry &v, const std::string &newVal);
+
+        // After ELF reload: refresh `ch`'s enum entries from this Variable's
+        // current DWARF info + user overrides (enumDefs / memberEnumDefs).
+        // Returns true if the channel's symbol path belongs to this Variable
+        // (i.e. is present in searchPool_), false otherwise — callers should
+        // try other Variable instances when false.
+        bool refreshChannelEnums(MonitorChannel *ch);
 
       public:
         explicit Variable(std::string name) : name_(std::move(name)) { LOG_I("Variable Window Created: %s", name_.c_str()); }

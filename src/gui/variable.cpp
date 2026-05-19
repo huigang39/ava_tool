@@ -311,8 +311,21 @@ scalarPayloadType(const dwarf::Info &info, u64 typeOff)
 }
 
 static void
-fillEnumPayload(const dwarf::Info &info, u64 typeOff, ChannelDropPayload &p)
+fillEnumPayload(const dwarf::Info                    &info,
+                u64                                   typeOff,
+                ChannelDropPayload                   &p,
+                const std::vector<VarEntry::EnumDef> *overrideDefs = nullptr)
 {
+        // User-defined overrides win over DWARF — they reflect the latest edits
+        // in the Variable window.
+        if (overrideDefs && !overrideDefs->empty()) {
+                p.numEnums = (u8)std::min((int)overrideDefs->size(), ChannelDropPayload::kMaxEnums);
+                for (int i = 0; i < p.numEnums; ++i) {
+                        snprintf(p.enums[i].name, sizeof(p.enums[i].name), "%s", (*overrideDefs)[i].name.c_str());
+                        p.enums[i].value = (*overrideDefs)[i].value;
+                }
+                return;
+        }
         const dwarf::Type *t = resolveAlias(info, typeOff);
         if (!t || t->kind != dwarf::TypeKind::ENUM) {
                 p.numEnums = 0;
@@ -358,6 +371,69 @@ Variable::rebuildSearchPool()
                 }
         }
         searchPool_ = std::move(newPool);
+}
+
+bool
+Variable::refreshChannelEnums(MonitorChannel *ch)
+{
+        if (!ch)
+                return false;
+        const std::string &chPath = ch->getSymbolName();
+        if (chPath.empty())
+                return false;
+
+        // 1. Locate the leaf typeOff via searchPool_ — established truth for
+        //    every flattened path under this Variable.
+        u64  leafTypeOff = 0;
+        bool foundInPool = false;
+        for (const auto &se : searchPool_) {
+                if (se.path == chPath) {
+                        leafTypeOff = se.typeOff;
+                        foundInPool = true;
+                        break;
+                }
+        }
+        if (!foundInPool)
+                return false; // Not this Variable's symbol — let caller try the next.
+
+        // 2. Find user override (exact match first, then parent member match).
+        const std::vector<VarEntry::EnumDef> *override_ = nullptr;
+        for (const auto &v : vars_) {
+                if (v.name == chPath) {
+                        if (!v.enumDefs.empty())
+                                override_ = &v.enumDefs;
+                        break;
+                }
+                if (chPath.size() > v.name.size() + 1 && chPath.compare(0, v.name.size(), v.name) == 0 &&
+                    (chPath[v.name.size()] == '.' || chPath[v.name.size()] == '[')) {
+                        auto it = v.memberEnumDefs.find(chPath);
+                        if (it != v.memberEnumDefs.end() && !it->second.empty()) {
+                                override_ = &it->second;
+                                break;
+                        }
+                        // No override for this leaf — fall through to DWARF below.
+                }
+        }
+
+        // 3. Build new enum entries: override wins; otherwise DWARF at the leaf
+        //    type. If DWARF says not-an-enum and there's no override, clear —
+        //    the type may have changed in the reloaded ELF.
+        std::vector<MonitorChannel::EnumEntry> ents;
+        if (override_) {
+                ents.reserve(override_->size());
+                for (const auto &e : *override_)
+                        ents.push_back({e.name, e.value});
+        } else {
+                std::lock_guard    lk(mtxElf_);
+                const dwarf::Type *t = resolveAlias(dwarfInfo_, leafTypeOff);
+                if (t && t->kind == dwarf::TypeKind::ENUM) {
+                        ents.reserve(t->enums.size());
+                        for (const auto &e : t->enums)
+                                ents.push_back({e.name, e.value});
+                }
+        }
+        ch->setEnums(std::move(ents));
+        return true;
 }
 
 void
@@ -640,8 +716,13 @@ Variable::drawDataTreeLeaf(DataTree &node, const int indentLevel)
 }
 
 static void
-flattenForStructPayload(
-    const dwarf::Info &info, const std::string &prefix, u64 baseAddr, u64 typeOff, StructChannelPayload &sp, int maxDepth = 8)
+flattenForStructPayload(const dwarf::Info                                                     &info,
+                        const std::string                                                     &prefix,
+                        u64                                                                    baseAddr,
+                        u64                                                                    typeOff,
+                        StructChannelPayload                                                  &sp,
+                        const std::unordered_map<std::string, std::vector<VarEntry::EnumDef>> *memberOverrides = nullptr,
+                        int                                                                    maxDepth        = 8)
 {
         if (sp.count >= StructChannelPayload::kMaxEntries || maxDepth <= 0)
                 return;
@@ -649,7 +730,20 @@ flattenForStructPayload(
         if (!t)
                 return;
 
-        auto fillEntryEnums = [&info](StructChannelPayload::Entry &e, u64 leafTypeOff) {
+        // Fill a leaf entry's enum array: user override (if any) wins over DWARF.
+        auto fillEntryEnums = [&info,
+                               memberOverrides](StructChannelPayload::Entry &e, u64 leafTypeOff, const std::string &leafPath) {
+                if (memberOverrides) {
+                        auto it = memberOverrides->find(leafPath);
+                        if (it != memberOverrides->end() && !it->second.empty()) {
+                                e.numEnums = (u8)std::min((int)it->second.size(), StructChannelPayload::kMaxEnums);
+                                for (int i = 0; i < e.numEnums; ++i) {
+                                        snprintf(e.enums[i].name, sizeof(e.enums[i].name), "%s", it->second[i].name.c_str());
+                                        e.enums[i].value = it->second[i].value;
+                                }
+                                return;
+                        }
+                }
                 const dwarf::Type *lt = resolveAlias(info, leafTypeOff);
                 if (!lt || lt->kind != dwarf::TypeKind::ENUM) {
                         e.numEnums = 0;
@@ -674,9 +768,9 @@ flattenForStructPayload(
                                 snprintf(e.name, sizeof(e.name), "%s", mPath.c_str());
                                 e.addr = mAddr;
                                 snprintf(e.type, sizeof(e.type), "%s", sType);
-                                fillEntryEnums(e, m.type);
+                                fillEntryEnums(e, m.type, mPath);
                         } else {
-                                flattenForStructPayload(info, mPath, mAddr, m.type, sp, maxDepth - 1);
+                                flattenForStructPayload(info, mPath, mAddr, m.type, sp, memberOverrides, maxDepth - 1);
                         }
                 }
         } else if (t->kind == dwarf::TypeKind::ARRAY) {
@@ -691,9 +785,9 @@ flattenForStructPayload(
                                 snprintf(e.name, sizeof(e.name), "%s", idxPath.c_str());
                                 e.addr = eAddr;
                                 snprintf(e.type, sizeof(e.type), "%s", sType);
-                                fillEntryEnums(e, t->inner);
+                                fillEntryEnums(e, t->inner, idxPath);
                         } else {
-                                flattenForStructPayload(info, idxPath, eAddr, t->inner, sp, maxDepth - 1);
+                                flattenForStructPayload(info, idxPath, eAddr, t->inner, sp, memberOverrides, maxDepth - 1);
                         }
                 }
         }
@@ -879,7 +973,17 @@ Variable::drawVariableList()
                         if (!isComplex)
                                 nodeFlags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
 
+                        const bool wasOpenTop = isComplex && v.expandedMembers.count(v.name) > 0;
+                        if (isComplex)
+                                ImGui::SetNextItemOpen(wasOpenTop);
                         bool open = ImGui::TreeNodeEx(v.name.c_str(), nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
+                        if (isComplex && open != wasOpenTop) {
+                                if (open)
+                                        v.expandedMembers.insert(v.name);
+                                else
+                                        v.expandedMembers.erase(v.name);
+                                isModified_ = true;
+                        }
 
                         // Selection logic
                         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
@@ -955,7 +1059,8 @@ Variable::drawVariableList()
                                                 snprintf(sp.shmName, sizeof(sp.shmName), "%s", v.shm.name);
                                         {
                                                 std::lock_guard lk(mtxElf_);
-                                                flattenForStructPayload(dwarfInfo_, v.name, v.addr, v.typeOff, sp);
+                                                flattenForStructPayload(
+                                                    dwarfInfo_, v.name, v.addr, v.typeOff, sp, &v.memberEnumDefs);
                                         }
                                         ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
                                 } else {
@@ -972,7 +1077,7 @@ Variable::drawVariableList()
                                                 snprintf(p.shmName, sizeof(p.shmName), "%s", v.shm.name);
                                         p.numBytes = (u8)Parser::typeBytes(v.type);
                                         p.typeOff  = v.typeOff;
-                                        fillEnumPayload(dwarfInfo_, v.typeOff, p);
+                                        fillEnumPayload(dwarfInfo_, v.typeOff, p, &v.enumDefs);
                                         ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                                 }
                                 ImGui::Text("Dragging %s", v.name.c_str());
@@ -1543,6 +1648,12 @@ Variable::save(void *node) const
                                 cJSON_AddItemToArray(hmArr, cJSON_CreateString(p.c_str()));
                         cJSON_AddItemToObject(vObj, "hiddenMembers", hmArr);
                 }
+                if (!v.expandedMembers.empty()) {
+                        cJSON *emArr = cJSON_CreateArray();
+                        for (const auto &p : v.expandedMembers)
+                                cJSON_AddItemToArray(emArr, cJSON_CreateString(p.c_str()));
+                        cJSON_AddItemToObject(vObj, "expandedMembers", emArr);
+                }
                 if (!v.memberEnumDefs.empty()) {
                         cJSON *medObj = cJSON_CreateObject();
                         for (const auto &[mpath, mdefs] : v.memberEnumDefs) {
@@ -1599,6 +1710,11 @@ Variable::load(const void *node)
                                 for (int k = 0; k < cJSON_GetArraySize(hmArr); ++k)
                                         if (cJSON_IsString(cJSON_GetArrayItem(hmArr, k)))
                                                 v.hiddenMembers.insert(cJSON_GetArrayItem(hmArr, k)->valuestring);
+                        cJSON *emArr = cJSON_GetObjectItem(vObj, "expandedMembers");
+                        if (cJSON_IsArray(emArr))
+                                for (int k = 0; k < cJSON_GetArraySize(emArr); ++k)
+                                        if (cJSON_IsString(cJSON_GetArrayItem(emArr, k)))
+                                                v.expandedMembers.insert(cJSON_GetArrayItem(emArr, k)->valuestring);
                         cJSON *medObj = cJSON_GetObjectItem(vObj, "memberEnumDefs");
                         if (cJSON_IsObject(medObj)) {
                                 for (cJSON *child = medObj->child; child; child = child->next) {
@@ -1739,8 +1855,21 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_OpenOnArrow;
                         if (!isComplex)
                                 nodeFlags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                        std::set<std::string> *expSetM  = (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size())
+                                                              ? &vars_[parentVarIdx].expandedMembers
+                                                              : nullptr;
+                        const bool             wasOpenM = isComplex && expSetM && expSetM->count(memberPath) > 0;
+                        if (isComplex && expSetM)
+                                ImGui::SetNextItemOpen(wasOpenM);
                         bool open = ImGui::TreeNodeEx(m.name.empty() ? "<anon>" : m.name.c_str(),
                                                       nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
+                        if (isComplex && expSetM && open != wasOpenM) {
+                                if (open)
+                                        expSetM->insert(memberPath);
+                                else
+                                        expSetM->erase(memberPath);
+                                isModified_ = true;
+                        }
 
                         {
                                 const dwarf::Type *mt           = resolveAlias(dwarfInfo_, m.type);
@@ -1760,12 +1889,16 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                         ImGui::EndPopup();
                                 }
                                 if (ImGui::BeginDragDropSource()) {
+                                        const std::unordered_map<std::string, std::vector<VarEntry::EnumDef>> *memOvr =
+                                            (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size())
+                                                ? &vars_[parentVarIdx].memberEnumDefs
+                                                : nullptr;
                                         if (!sType) {
                                                 StructChannelPayload sp{};
                                                 snprintf(sp.device, sizeof(sp.device), "%s", devLabel);
                                                 if (!shmRegionName.empty())
                                                         snprintf(sp.shmName, sizeof(sp.shmName), "%s", shmRegionName.c_str());
-                                                flattenForStructPayload(dwarfInfo_, memberPath, memberAddr, m.type, sp);
+                                                flattenForStructPayload(dwarfInfo_, memberPath, memberAddr, m.type, sp, memOvr);
                                                 ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
                                         } else {
                                                 ChannelDropPayload p{};
@@ -1777,7 +1910,13 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                                         snprintf(p.shmName, sizeof(p.shmName), "%s", shmRegionName.c_str());
                                                 p.numBytes = (u8)typeSize(dwarfInfo_, m.type);
                                                 p.typeOff  = m.type;
-                                                fillEnumPayload(dwarfInfo_, m.type, p);
+                                                const std::vector<VarEntry::EnumDef> *leafOvr = nullptr;
+                                                if (memOvr) {
+                                                        auto it = memOvr->find(memberPath);
+                                                        if (it != memOvr->end() && !it->second.empty())
+                                                                leafOvr = &it->second;
+                                                }
+                                                fillEnumPayload(dwarfInfo_, m.type, p, leafOvr);
                                                 ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                                         }
                                         ImGui::Text("Dragging %s", memberPath.c_str());
@@ -1822,7 +1961,20 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_OpenOnArrow;
                         if (!isComplex)
                                 nodeFlags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                        std::set<std::string> *expSetA  = (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size())
+                                                              ? &vars_[parentVarIdx].expandedMembers
+                                                              : nullptr;
+                        const bool             wasOpenA = isComplex && expSetA && expSetA->count(memberPath) > 0;
+                        if (isComplex && expSetA)
+                                ImGui::SetNextItemOpen(wasOpenA);
                         bool open = ImGui::TreeNodeEx(idxStr.c_str(), nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
+                        if (isComplex && expSetA && open != wasOpenA) {
+                                if (open)
+                                        expSetA->insert(memberPath);
+                                else
+                                        expSetA->erase(memberPath);
+                                isModified_ = true;
+                        }
 
                         {
                                 const dwarf::Type *et2        = resolveAlias(dwarfInfo_, t->inner);
@@ -1842,12 +1994,17 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                         ImGui::EndPopup();
                                 }
                                 if (ImGui::BeginDragDropSource()) {
+                                        const std::unordered_map<std::string, std::vector<VarEntry::EnumDef>> *memOvr =
+                                            (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size())
+                                                ? &vars_[parentVarIdx].memberEnumDefs
+                                                : nullptr;
                                         if (!sType) {
                                                 StructChannelPayload sp{};
                                                 snprintf(sp.device, sizeof(sp.device), "%s", devLabel);
                                                 if (!shmRegionName.empty())
                                                         snprintf(sp.shmName, sizeof(sp.shmName), "%s", shmRegionName.c_str());
-                                                flattenForStructPayload(dwarfInfo_, memberPath, memberAddr, t->inner, sp);
+                                                flattenForStructPayload(
+                                                    dwarfInfo_, memberPath, memberAddr, t->inner, sp, memOvr);
                                                 ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
                                         } else {
                                                 ChannelDropPayload p{};
@@ -1859,7 +2016,13 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                                         snprintf(p.shmName, sizeof(p.shmName), "%s", shmRegionName.c_str());
                                                 p.numBytes = (u8)typeSize(dwarfInfo_, t->inner);
                                                 p.typeOff  = t->inner;
-                                                fillEnumPayload(dwarfInfo_, t->inner, p);
+                                                const std::vector<VarEntry::EnumDef> *leafOvr = nullptr;
+                                                if (memOvr) {
+                                                        auto it = memOvr->find(memberPath);
+                                                        if (it != memOvr->end() && !it->second.empty())
+                                                                leafOvr = &it->second;
+                                                }
+                                                fillEnumPayload(dwarfInfo_, t->inner, p, leafOvr);
                                                 ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                                         }
                                         ImGui::Text("Dragging %s", memberPath.c_str());

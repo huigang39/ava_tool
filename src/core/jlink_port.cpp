@@ -54,6 +54,16 @@ JLinkPort::close()
         }
         if (isOpen_) {
                 LOG_I("Closing JLink connection...");
+                if (isConnected_) {
+                        if (JLINKARM_IsHalted()) {
+                                LOG_I("JLinkPort::close(): Target was halted, resuming before close...");
+                                JLINKARM_Go();
+                        }
+                        // Clear C_DEBUGEN in DHCSR (0xE000EDF0) to cleanly detach from Cortex-M
+                        u32 dhcsr = 0xA05F0000;
+                        JLINKARM_WriteMemEx(0xE000EDF0, 4, &dhcsr, 0);
+                        LOG_I("JLinkPort::close(): Cleared C_DEBUGEN in DHCSR.");
+                }
                 JLINKARM_Close();
                 isOpen_ = false;
                 LOG_I("JLink closed.");
@@ -98,8 +108,31 @@ JLinkPort::connect()
                 LOG_E("JLinkPort::connect() FAILED: JLINKARM_Connect() < 0");
                 return false;
         }
+
+        // Ensure the MCU keeps running and doesn't get stuck in halted state upon connection
+        if (JLINKARM_IsHalted()) {
+                LOG_I("JLinkPort::connect(): Target was halted, resuming...");
+                JLINKARM_Go();
+        }
+
         isConnected_ = true;
         LOG_I("JLinkPort::connect() SUCCEEDED");
+        return true;
+}
+
+bool
+JLinkPort::resetTarget()
+{
+        std::lock_guard lk(mtx_);
+        if (!isOpen_ || !isConnected_)
+                return false;
+        LOG_I("JLinkPort::resetTarget() requested");
+
+        // Use normal reset (not halting)
+        JLINKARM_SetResetType(0);
+        JLINKARM_Reset();
+        JLINKARM_Go();
+
         return true;
 }
 
@@ -265,6 +298,13 @@ JLinkPort::drawUI()
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f)); // Green
                 if (ImGui::SmallButton("DISCONNECT")) {
                         close();
+                }
+                ImGui::PopStyleColor();
+
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.6f, 0.2f, 1.0f)); // Orange
+                if (ImGui::SmallButton("RESET MCU")) {
+                        resetTarget();
                 }
                 ImGui::PopStyleColor();
         }

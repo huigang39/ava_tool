@@ -158,9 +158,7 @@ MonitorScope::tableMenu()
 void
 MonitorScope::tableDraw()
 {
-        if (!ImGui::BeginTable("MonitorTable",
-                               6,
-                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
+        if (!ImGui::BeginTable("MonitorTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
                 return;
 
         ImGui::TableSetupColumn("Name");
@@ -234,7 +232,17 @@ MonitorScope::tableDraw()
                         ImGuiTreeNodeFlags treeFlags = ImGuiTreeNodeFlags_SpanFullWidth;
                         if (isGroupSelected)
                                 treeFlags |= ImGuiTreeNodeFlags_Selected;
+                        const bool wasOpen = expandedGroups_.count(fullPath) > 0;
+                        ImGui::SetNextItemOpen(wasOpen);
                         bool open = ImGui::TreeNodeEx(label.c_str(), treeFlags);
+                        if (open != wasOpen) {
+                                if (open)
+                                        expandedGroups_.insert(fullPath);
+                                else
+                                        expandedGroups_.erase(fullPath);
+                                if (parent_)
+                                        parent_->setModified();
+                        }
 
                         // Left-click on header row (not the expand arrow) → select this group.
                         if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen()) {
@@ -614,57 +622,44 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 3.0f);
 
                         // 3. Prepare and Plot Data
-                        bool plotted = false;
+                        bool        plotted = false;
+                        const auto &rd      = ch->read_;
                         if (showFft_) {
                                 if (ch->show_ && fftPoints_ > 0) {
-                                        // Read from snapshot (no lock needed, protected by mtxMonitors_)
-
-                                        // Dynamic extraction: Find points within the current time-domain window
+                                        // FFT reads from the raw ring under mtxMonitors_.
                                         const double xmin = (linkXMin) ? *linkXMin : 0.0;
                                         const double xmax = (linkXMax) ? *linkXMax : 1.0;
 
-                                        const auto &snapTs   = ch->snap_.ts;
-                                        const auto &snapVals = ch->snap_.vals;
-                                        auto        itStart  = std::lower_bound(snapTs.begin(), snapTs.end(), xmin);
-                                        auto        itEnd    = std::upper_bound(snapTs.begin(), snapTs.end(), xmax);
-
-                                        size_t startIdx     = std::distance(snapTs.begin(), itStart);
-                                        size_t endIdx       = std::distance(snapTs.begin(), itEnd);
-                                        size_t visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
+                                        const usize startIdx     = rd.rawLowerBound(xmin);
+                                        const usize endIdx       = rd.rawUpperBound(xmax);
+                                        const usize visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
 
                                         if (visibleCount > 0) {
-                                                // Prepare buffer: Zero-fill first
                                                 std::fill(fftLoBuf_.begin(), fftLoBuf_.end(), 0.0f);
 
-                                                // Copy up to fftPoints_ points
-                                                size_t copyCount = std::min(visibleCount, static_cast<size_t>(fftPoints_));
-                                                // If window has more points than FFT resolution, take the latest ones in that
-                                                // window
-                                                size_t readOffset = (visibleCount > copyCount) ? (visibleCount - copyCount) : 0;
+                                                const usize copyCount = std::min(visibleCount, static_cast<usize>(fftPoints_));
+                                                const usize readOffset =
+                                                    (visibleCount > copyCount) ? (visibleCount - copyCount) : 0;
 
                                                 f32 mean = 0;
                                                 for (usize i = 0; i < copyCount; ++i) {
-                                                        f32 v         = snapVals[startIdx + readOffset + i];
+                                                        f32 v         = rd.rawVal(startIdx + readOffset + i);
                                                         fftLoBuf_[i]  = v;
                                                         mean         += v;
                                                 }
                                                 mean /= (f32)copyCount;
-
-                                                // DC removal
-                                                for (size_t i = 0; i < copyCount; ++i) {
+                                                for (usize i = 0; i < copyCount; ++i) {
                                                         fftLoBuf_[i] -= mean;
                                                 }
 
-                                                // Update FS based on average delta in the window
                                                 f32 fs = (parent_) ? (f32)parent_->getHz() : 1000.0f;
                                                 if (copyCount > 1) {
-                                                        f64 totalTime = snapTs[startIdx + readOffset + copyCount - 1] -
-                                                                        snapTs[startIdx + readOffset];
+                                                        f64 totalTime = rd.rawTs(startIdx + readOffset + copyCount - 1) -
+                                                                        rd.rawTs(startIdx + readOffset);
                                                         if (totalTime > 1e-9f) {
                                                                 fs = static_cast<f32>((f64)(copyCount - 1) / totalTime);
                                                         }
                                                 }
-                                                // Sanity check for FS
                                                 if (fs < 0.1f)
                                                         fs = 0.1f;
                                                 if (fs > 10000000.0f)
@@ -703,96 +698,49 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                         }
                                 }
                         } else {
-                                // Read from snapshot (no lock — protected by mtxMonitors_).
+                                // Time-domain: pick an LOD level whose visible bucket count fits the
+                                // display budget. -1 = use raw level directly.
                                 dxs_.clear();
                                 dys_.clear();
-                                {
-                                        const auto  &snapTs   = ch->snap_.ts;
-                                        const auto  &snapVals = ch->snap_.vals;
-                                        const size_t total    = snapTs.size();
-                                        if (total > 0) {
-                                                size_t startIdx = 0, endIdx = total;
-                                                if (linkXMin) {
-                                                        auto it  = std::lower_bound(snapTs.begin(), snapTs.end(), *linkXMin);
-                                                        startIdx = static_cast<size_t>(std::distance(snapTs.begin(), it));
+
+                                const f64 xmin   = (linkXMin) ? *linkXMin : 0.0;
+                                const f64 xmax   = (linkXMax) ? *linkXMax : 1.0;
+                                const u32 budget = (maxDisplayPoints > 0) ? maxDisplayPoints : 5000;
+                                const int level  = rd.pickLevel(xmin, xmax, budget);
+
+                                if (level < 0) {
+                                        // Raw level fits — iterate the raw ring directly.
+                                        const usize si = rd.rawLowerBound(xmin);
+                                        const usize ei = rd.rawUpperBound(xmax);
+                                        if (ei > si) {
+                                                const usize n = ei - si;
+                                                dxs_.reserve(n);
+                                                dys_.reserve(n);
+                                                for (usize i = si; i < ei; ++i) {
+                                                        dxs_.push_back(rd.rawTs(i));
+                                                        dys_.push_back(static_cast<f64>(rd.rawVal(i)));
                                                 }
-                                                if (linkXMax) {
-                                                        auto it = std::upper_bound(
-                                                            snapTs.begin() + startIdx, snapTs.end(), *linkXMax);
-                                                        endIdx = static_cast<size_t>(std::distance(snapTs.begin(), it));
-                                                }
-                                                const size_t visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
-                                                if (visibleCount > 0) {
-                                                        if (maxDisplayPoints > 0 && visibleCount > (size_t)maxDisplayPoints) {
-                                                                const bool  stairs = ch->getPlotStyle() == 1;
-                                                                const usize pointBudget =
-                                                                    static_cast<usize>(std::max<u32>(maxDisplayPoints, 2));
-                                                                dxs_.reserve(pointBudget + 2);
-                                                                dys_.reserve(pointBudget + 2);
-
-                                                                if (stairs) {
-                                                                        const usize stride =
-                                                                            std::max<usize>(1, visibleCount / pointBudget);
-                                                                        for (usize i = startIdx; i < endIdx; i += stride) {
-                                                                                dxs_.push_back(snapTs[i]);
-                                                                                dys_.push_back(static_cast<f64>(snapVals[i]));
-                                                                        }
-                                                                } else {
-                                                                        const usize bucketCount =
-                                                                            std::max<usize>(1, pointBudget / 2);
-                                                                        for (usize b = 0; b < bucketCount; ++b) {
-                                                                                const usize bStart =
-                                                                                    startIdx + (visibleCount * b) / bucketCount;
-                                                                                const usize bEnd =
-                                                                                    startIdx +
-                                                                                    (visibleCount * (b + 1)) / bucketCount;
-                                                                                if (bStart >= bEnd)
-                                                                                        continue;
-
-                                                                                usize minIdx = bStart;
-                                                                                usize maxIdx = bStart;
-                                                                                for (usize i = bStart + 1; i < bEnd; ++i) {
-                                                                                        if (snapVals[i] < snapVals[minIdx])
-                                                                                                minIdx = i;
-                                                                                        if (snapVals[i] > snapVals[maxIdx])
-                                                                                                maxIdx = i;
-                                                                                }
-
-                                                                                if (minIdx == maxIdx) {
-                                                                                        dxs_.push_back(snapTs[minIdx]);
-                                                                                        dys_.push_back(
-                                                                                            static_cast<f64>(snapVals[minIdx]));
-                                                                                } else if (minIdx < maxIdx) {
-                                                                                        dxs_.push_back(snapTs[minIdx]);
-                                                                                        dys_.push_back(
-                                                                                            static_cast<f64>(snapVals[minIdx]));
-                                                                                        dxs_.push_back(snapTs[maxIdx]);
-                                                                                        dys_.push_back(
-                                                                                            static_cast<f64>(snapVals[maxIdx]));
-                                                                                } else {
-                                                                                        dxs_.push_back(snapTs[maxIdx]);
-                                                                                        dys_.push_back(
-                                                                                            static_cast<f64>(snapVals[maxIdx]));
-                                                                                        dxs_.push_back(snapTs[minIdx]);
-                                                                                        dys_.push_back(
-                                                                                            static_cast<f64>(snapVals[minIdx]));
-                                                                                }
-                                                                        }
-                                                                }
-                                                        } else {
-                                                                dxs_.reserve(visibleCount);
-                                                                dys_.reserve(visibleCount);
-                                                                for (usize i = startIdx; i < endIdx; ++i) {
-                                                                        dxs_.push_back(snapTs[i]);
-                                                                        dys_.push_back(static_cast<f64>(snapVals[i]));
-                                                                }
-                                                        }
+                                        }
+                                } else {
+                                        // Walk LOD level: each bucket emits (t, vmin) then (t, vmax).
+                                        const usize si = rd.lodLowerBound(level, xmin);
+                                        const usize ei = rd.lodUpperBound(level, xmax);
+                                        if (ei > si) {
+                                                const usize n = ei - si;
+                                                dxs_.reserve(n * 2);
+                                                dys_.reserve(n * 2);
+                                                for (usize i = si; i < ei; ++i) {
+                                                        const LodSample &s = rd.lodAt(level, i);
+                                                        dxs_.push_back(s.t);
+                                                        dys_.push_back(static_cast<f64>(s.vmin));
+                                                        dxs_.push_back(s.t);
+                                                        dys_.push_back(static_cast<f64>(s.vmax));
                                                 }
                                         }
                                 }
 
                                 if (!dxs_.empty()) {
-                                        if (ch->getPlotStyle() == 1)
+                                        if (ch->getPlotStyle() == 1 && level < 0)
                                                 ImPlot::PlotStairs(
                                                     chName.c_str(), dxs_.data(), dys_.data(), static_cast<i32>(dxs_.size()));
                                         else
@@ -1244,25 +1192,27 @@ Monitor::updateDisplay()
                                 bool isPaused = g_monitorPaused.load();
                                 f64  now      = sessionTimeSec();
 
+                                // Find real data bounds
+                                f64  earliest = now;
+                                f64  latest   = 0.0;
+                                bool hasData  = false;
+                                for (const auto &[_, sc] : scopes_) {
+                                        for (const auto &[__, ch] : sc->getChannels()) {
+                                                const f64 e = ch->earliestTs();
+                                                const f64 l = ch->latestTs();
+                                                if (e >= 0.0f) {
+                                                        hasData = true;
+                                                        if (e < earliest)
+                                                                earliest = static_cast<f64>(e);
+                                                        if (l >= 0.0f && l > latest)
+                                                                latest = static_cast<f64>(l);
+                                                }
+                                        }
+                                }
+
                                 // When FULL mode is active, always fit to exact data bounds
                                 if (viewMode_ == MonitorViewMode::FULL) {
                                         if (!isPaused) {
-                                                f64  earliest = now;
-                                                f64  latest   = 0.0;
-                                                bool hasData  = false;
-                                                for (const auto &[_, sc] : scopes_) {
-                                                        for (const auto &[__, ch] : sc->getChannels()) {
-                                                                const f64 e = ch->earliestTs();
-                                                                const f64 l = ch->latestTs();
-                                                                if (e >= 0.0f) {
-                                                                        hasData = true;
-                                                                        if (e < earliest)
-                                                                                earliest = static_cast<f64>(e);
-                                                                        if (l >= 0.0f && l > latest)
-                                                                                latest = static_cast<f64>(l);
-                                                                }
-                                                        }
-                                                }
                                                 if (hasData) {
                                                         if (latest < dataStartTime_)
                                                                 latest = dataStartTime_;
@@ -1288,11 +1238,12 @@ Monitor::updateDisplay()
                                                 if (historySeconds_ > 0.0f && currentSpan > historySeconds_) {
                                                         currentSpan = historySeconds_;
                                                 }
-                                                linkXMax_ = now;
-                                                linkXMin_ = now - currentSpan;
+                                                f64 refTime = hasData ? latest : now;
+                                                linkXMax_   = refTime;
+                                                linkXMin_   = refTime - currentSpan;
                                                 if (linkXMin_ < 0.0)
                                                         linkXMin_ = 0.0;
-                                                lastNow_ = now;
+                                                lastNow_ = refTime;
                                         }
                                 }
 

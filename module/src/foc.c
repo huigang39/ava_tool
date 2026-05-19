@@ -24,7 +24,12 @@ foc_init(foc_t *foc, const foc_cfg_t foc_cfg)
         DECL(foc, cfg, in, lo);
         CFG_INIT(foc, foc_cfg);
 
-        foc_init_param(foc);
+        if (!CHECK_FUNC_PTR(cfg->func_cfg.f_resolve)) {
+                lo->u_err.bit.null_ptr = TRUE;
+                return;
+        }
+
+        cfg->func_cfg.f_resolve(&foc->cfg.func_cfg);
 
         if (!CHECK_FUNC_PTR(cfg->func_cfg.f_load) || !CHECK_FUNC_PTR(cfg->func_cfg.f_init_periph) ||
             !CHECK_FUNC_PTR(cfg->func_cfg.f_init_tor_sensor) || !CHECK_FUNC_PTR(cfg->func_cfg.f_get_tor) ||
@@ -50,8 +55,17 @@ foc_init(foc_t *foc, const foc_cfg_t foc_cfg)
                 cfg->func_cfg.f_set_irq_status(TRUE);
         }
 
+        /* 加载保存的传感器校准数据 */
+        if (IS_NAN(lo->store.sensor.elec_offset_theta))
+                lo->store.sensor.elec_offset_theta = 0.0f;
+        if (IS_NAN(lo->store.sensor.outshaft_offset_theta))
+                lo->store.sensor.outshaft_offset_theta = 0.0f;
+        if (IS_NAN(lo->store.sensor.tor_sensor_offset))
+                lo->store.sensor.tor_sensor_offset = 0.0f;
+
         in->rotor.sensor = lo->store.sensor;
 
+        foc_init_param(foc);
         foc_self_check_init(foc);
 
         /* 默认电角度源 */
@@ -70,6 +84,7 @@ foc_exec(foc_t *foc)
                 return;
         }
 
+        foc_sync_func_opt(foc);
         foc_self_check_exec(foc);
 
         foc_get_adc_value(foc);
@@ -197,6 +212,33 @@ foc_set_outshaft_zero(foc_t *foc)
 
         cfg->func_cfg.f_store();
         return 0;
+}
+
+i32
+foc_set_tor_zero(foc_t *foc)
+{
+        DECL(foc, cfg, lo);
+
+        /* 捕获当前扭矩传感器原始读数作为零偏, 之后 in->load_tor 会被扣减为 0 */
+        lo->store.sensor.tor_sensor_offset = cfg->func_cfg.f_get_tor();
+
+        cfg->func_cfg.f_store();
+        return 0;
+}
+
+void
+foc_sync_func_opt(foc_t *foc)
+{
+        /* 仅在 FOC 失能时切换函数指针, 避免 ISR 用到撕裂的指针组合 */
+        if (foc->lo.e_state != FOC_STATE_DISABLE)
+                return;
+
+        if (memcmp(&foc->cfg.func_cfg.opt, &foc->lo.prev_func_opt, sizeof(foc_func_opt_t)) != 0) {
+                if (foc->cfg.func_cfg.f_resolve)
+                        foc->cfg.func_cfg.f_resolve(&foc->cfg.func_cfg);
+
+                foc->lo.prev_func_opt = foc->cfg.func_cfg.opt;
+        }
 }
 
 void
@@ -371,7 +413,7 @@ foc_get_theta(foc_t *foc)
             (f32)in->rotor.motor_cycle_cnt * TAU + in->rotor.motor_theta - in->rotor.motor_offset_theta;
 
         /* 始终读取角度传感器反馈的角度 */
-        switch (cfg->sensor_cfg.e_sensor) {
+        switch (cfg->sensor_cfg.e_motor_sensor) {
                 case FOC_SENSOR_ELEC: {
                         /* 电气角度 -> 机械角度 */
                         WARP_TAU(in->rotor.motor_elec_theta, in->rotor.motor_total_theta);
@@ -471,7 +513,7 @@ foc_get_tor(foc_t *foc)
         if (++tmp->freq_div_cnt.tor_sensor >= cfg->ctl_cfg.div.tor_sensor)
                 tmp->freq_div_cnt.tor_sensor = 0;
 
-        in->load_tor = cfg->func_cfg.f_get_tor();
+        in->load_tor = cfg->func_cfg.f_get_tor() - lo->store.sensor.tor_sensor_offset;
 }
 
 /**

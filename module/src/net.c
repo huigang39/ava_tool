@@ -1,4 +1,6 @@
-#ifndef MCU
+#include "platdef.h"
+
+#if !OS(NONE)
 
 #include "net.h"
 
@@ -16,14 +18,14 @@ net_init(net_t *net, const net_cfg_t net_cfg)
         list_init(&lo->ch_root);
 
         i32 ret = 0;
-#ifdef OS_LINUX
+#if OS(LINUX)
         ret = io_uring_queue_init(cfg->ring_len, &lo->ring, 0);
-#elif defined(OS_MAC)
+#elif OS(MAC)
         lo->kq = kqueue();
         if (lo->kq < 0)
                 ret = -1;
         list_init(&lo->pending_reqs);
-#elif defined(OS_WIN)
+#elif OS(WIN)
         WSADATA wsaData;
         ret = WSAStartup(MAKEWORD(2, 2), &wsaData);
         if (ret != 0)
@@ -54,12 +56,12 @@ net_destroy(net_t *net)
                 CLOSE_SOCKET(ch->fd);
         }
 
-#ifdef OS_LINUX
+#if OS(LINUX)
         io_uring_queue_exit(&lo->ring);
-#elif defined(OS_MAC)
+#elif OS(MAC)
         if (lo->kq >= 0)
                 close(lo->kq);
-#elif defined(OS_WIN)
+#elif OS(WIN)
         WSACleanup();
 #endif
 }
@@ -67,14 +69,14 @@ net_destroy(net_t *net)
 i32
 net_set_nonblock(sockfd_t fd)
 {
-#ifdef OS_POSIX
+#if OS(POSIX)
         i32 flags = fcntl(fd, F_GETFL, 0);
         if (flags < 0)
                 return flags;
 
         flags |= O_NONBLOCK;
         return fcntl(fd, F_SETFL, flags);
-#elif defined(OS_WIN)
+#elif OS(WIN)
         u_long mode = 1;
         return ioctlsocket(fd, FIONBIO, &mode);
 #endif
@@ -98,11 +100,11 @@ net_add_ch(net_t *net, net_ch_t *ch)
 
         switch (cfg->e_type) {
                 case NET_TYPE_UDP: {
-#ifdef OS_POSIX
+#if OS(POSIX)
                         ch->fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
                         if (ch->fd < 0)
                                 return -MESYSERR;
-#elif defined(OS_WIN)
+#elif OS(WIN)
                         ch->fd = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_OVERLAPPED);
                         if (ch->fd == INVALID_SOCKET)
                                 return -MESYSERR;
@@ -110,11 +112,11 @@ net_add_ch(net_t *net, net_ch_t *ch)
                         break;
                 }
                 case NET_TYPE_TCP: {
-#ifdef OS_POSIX
+#if OS(POSIX)
                         ch->fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
                         if (ch->fd < 0)
                                 return -MESYSERR;
-#elif defined(OS_WIN)
+#elif OS(WIN)
                         ch->fd = WSASocketW(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
                         if (ch->fd == INVALID_SOCKET)
                                 return -MESYSERR;
@@ -153,7 +155,7 @@ net_add_ch(net_t *net, net_ch_t *ch)
 
         list_add(&ch->ch_node, &lo->ch_root);
 
-#ifdef OS_WIN
+#if OS(WIN)
         CreateIoCompletionPort((HANDLE)ch->fd, lo->iocp, (ULONG_PTR)ch, 0);
 #endif
 
@@ -167,9 +169,9 @@ cleanup:
 isize
 net_sync_send(const net_ch_t *ch, const void *tx_buf, const usize size)
 {
-#ifdef OS_POSIX
+#if OS(POSIX)
         return send(ch->fd, tx_buf, size, 0);
-#elif defined(OS_WIN)
+#elif OS(WIN)
         return send(ch->fd, (const char *)tx_buf, (int)size, 0);
 #endif
 }
@@ -177,14 +179,14 @@ net_sync_send(const net_ch_t *ch, const void *tx_buf, const usize size)
 isize
 net_sync_recv_yield(const net_ch_t *ch, void *rx_buf, const usize cap, const u32 timeout_us)
 {
-#ifdef OS_POSIX
+#if OS(POSIX)
         const struct timeval tv = {
             .tv_sec  = (i32)US2S(timeout_us),
             .tv_usec = (i32)(timeout_us % 1000000),
         };
         setsockopt(ch->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
         return recv(ch->fd, rx_buf, cap, 0);
-#elif defined(OS_WIN)
+#elif OS(WIN)
         DWORD tv_ms = (DWORD)US2MS(timeout_us);
         if (tv_ms == 0 && timeout_us > 0)
                 tv_ms = 1;
@@ -200,9 +202,9 @@ net_sync_recv_spin(const net_ch_t *ch, void *rx_buf, const usize cap, const u32 
         const u64 start_ns = get_mono_ts_ns();
         u64       curr_ns  = 0;
         while (curr_ns < start_ns + US2NS(timeout_us)) {
-#ifdef OS_POSIX
+#if OS(POSIX)
                 const i32 ret = recv(ch->fd, rx_buf, cap, MSG_DONTWAIT);
-#elif defined(OS_WIN)
+#elif OS(WIN)
                 fd_set read_fds;
                 FD_ZERO(&read_fds);
                 FD_SET(ch->fd, &read_fds);
@@ -227,7 +229,7 @@ net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size)
 {
         DECL(net, cfg, lo);
 
-#ifdef OS_LINUX
+#if OS(LINUX)
         struct io_uring_sqe *send_sqe = io_uring_get_sqe(&lo->ring);
         if (!send_sqe)
                 return -1;
@@ -247,7 +249,7 @@ net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size)
 
         io_uring_submit(&lo->ring);
         return size;
-#elif defined(OS_MAC)
+#elif OS(MAC)
         /* macOS: try non-blocking send immediately (fd already non-blocking from net_add_ch),
          * fall back to EVFILT_WRITE if EAGAIN */
         const isize n = send(ch->fd, tx_buf, size, 0);
@@ -279,7 +281,7 @@ net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size)
         }
         list_add_tail(&req->pending_node, &lo->pending_reqs);
         return (isize)size;
-#elif defined(OS_WIN)
+#elif OS(WIN)
         net_async_req_t *req = (net_async_req_t *)mempool_alloc(cfg->mempool, sizeof(net_async_req_t));
         if (!req)
                 return -MEALLOC;
@@ -311,7 +313,7 @@ net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
 {
         DECL(net, cfg, lo);
 
-#ifdef OS_LINUX
+#if OS(LINUX)
         net_async_req_t *req = (net_async_req_t *)mempool_alloc(cfg->mempool, sizeof(net_async_req_t));
         if (!req)
                 return -MEALLOC;
@@ -345,7 +347,7 @@ net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
         io_uring_sqe_set_data(timeout_sqe, req);
 
         return io_uring_submit(&lo->ring);
-#elif defined(OS_MAC)
+#elif OS(MAC)
         /* fd already non-blocking from net_add_ch */
         const isize n = recv(ch->fd, rx_buf, cap, 0);
         if (n > 0) {
@@ -378,7 +380,7 @@ net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
         }
         list_add_tail(&req->pending_node, &lo->pending_reqs);
         return (isize)cap;
-#elif defined(OS_WIN)
+#elif OS(WIN)
         net_async_req_t *req = (net_async_req_t *)mempool_alloc(cfg->mempool, sizeof(net_async_req_t));
         if (!req)
                 return -MEALLOC;
@@ -415,7 +417,7 @@ net_poll(net_t *net)
 {
         DECL(net, cfg, lo);
 
-#ifdef OS_LINUX
+#if OS(LINUX)
         struct io_uring_cqe *cqe;
         while (io_uring_peek_cqe(&lo->ring, &cqe) == 0) {
                 net_async_req_t *req = (net_async_req_t *)io_uring_cqe_get_data(cqe);
@@ -433,7 +435,7 @@ net_poll(net_t *net)
                 io_uring_cqe_seen(&lo->ring, cqe);
         }
         return 0;
-#elif defined(OS_MAC)
+#elif OS(MAC)
         const u64    curr_ts = get_mono_ts_us();
         list_head_t *node, *next;
 
@@ -515,7 +517,7 @@ net_poll(net_t *net)
                 mempool_free(cfg->mempool, req);
         }
         return 0;
-#elif defined(OS_WIN)
+#elif OS(WIN)
         DWORD       size;
         ULONG_PTR   key;
         OVERLAPPED *ov = NULL;
@@ -684,9 +686,9 @@ net_broadcast(const u32   ip,
         if (resps == NULL || resps_cap == 0)
                 return -MEINVAL;
 
-#ifdef OS_POSIX
+#if OS(POSIX)
         fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-#elif defined(OS_WIN)
+#elif OS(WIN)
         fd = WSASocketW(AF_INET, SOCK_DGRAM, IPPROTO_UDP, NULL, 0, WSA_FLAG_OVERLAPPED);
 #endif
 

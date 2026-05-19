@@ -58,7 +58,7 @@ write_thread_func(void *arg)
 
         for (int i = 0; i < 1000; i++) {
 
-#ifdef OS_WIN
+#if OS(WIN)
                 log_debug(&g_log, idx, "thread_id %10llu, cnt: %10llu\n", (usize)GetCurrentThreadId(), g_producers_cnts[idx]++);
 #else
                 log_debug(&g_log, idx, "thread_id %10llu, cnt: %10llu\n", (usize)pthread_self(), g_producers_cnts[idx]++);

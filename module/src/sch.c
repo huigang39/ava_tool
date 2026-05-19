@@ -1,21 +1,21 @@
 #include "platdef.h"
 
-#ifdef OS_LINUX
+#if OS(LINUX)
 #define _GNU_SOURCE
 #endif
 
-#ifdef OS_POSIX
+#if OS(POSIX)
 #include <pthread.h>
 #endif
-#ifdef OS_LINUX
+#if OS(LINUX)
 #include <sched.h>
 #endif
-#ifdef OS_MAC
+#if OS(MAC)
 #include <mach/mach.h>
 #include <mach/thread_act.h>
 #include <mach/thread_policy.h>
 #endif
-#ifdef OS_WIN
+#if OS(WIN)
 #include <windows.h>
 #endif
 
@@ -30,7 +30,7 @@
 /*                                  内部函数                                  */
 /* -------------------------------------------------------------------------- */
 
-#ifdef OS_POSIX
+#if OS(POSIX)
 static void *
 sch_thread_exec(void *arg)
 {
@@ -44,7 +44,7 @@ sch_thread_exec(void *arg)
 static void
 sch_bind_thread_to_cpu(pthread_t thread_tid, const int cpu_id)
 {
-#ifdef OS_LINUX
+#if OS(LINUX)
         cpu_set_t cpu_set;
         CPU_ZERO(&cpu_set);
         CPU_SET(cpu_id, &cpu_set);
@@ -53,7 +53,7 @@ sch_bind_thread_to_cpu(pthread_t thread_tid, const int cpu_id)
                 print_error(FALSE, "[SCH] set thread affinity failed, errcode: %d", ret);
 
         print_error(FALSE, "[SCH] bind thread to CPU %d success", cpu_id);
-#elif defined(OS_MAC)
+#elif OS(MAC)
         /* macOS pthreads don't support hard affinity; thread_policy provides hints. */
         thread_affinity_policy_data_t policy      = {.affinity_tag = cpu_id + 1};
         const mach_port_t             mach_thread = pthread_mach_thread_np(thread_tid);
@@ -68,7 +68,7 @@ sch_bind_thread_to_cpu(pthread_t thread_tid, const int cpu_id)
         ARG_UNUSED(cpu_id);
 #endif
 }
-#elif defined(OS_WIN)
+#elif OS(WIN)
 static DWORD WINAPI
 sch_thread_exec(LPVOID arg)
 {
@@ -97,7 +97,7 @@ sch_thread_init(void *arg, const int cpu_id)
         ARG_UNUSED(arg);
         ARG_UNUSED(cpu_id);
 
-#ifdef OS_POSIX
+#if OS(POSIX)
         pthread_t sch_tid;
         int       ret = pthread_create(&sch_tid, NULL, sch_thread_exec, arg);
         if (ret != 0) {
@@ -105,7 +105,7 @@ sch_thread_init(void *arg, const int cpu_id)
                 return;
         }
         sch_bind_thread_to_cpu(sch_tid, cpu_id);
-#elif defined(OS_WIN)
+#elif OS(WIN)
         DWORD  thread_id;
         HANDLE sch_tid = CreateThread(NULL,            // 默认安全属性
                                       0,               // 默认堆栈大小

@@ -11,7 +11,7 @@ shm_init(shm_t *shm, const shm_cfg_t shm_cfg)
         DECL(shm, cfg, lo);
         CFG_INIT(shm, shm_cfg);
 
-#ifdef OS_POSIX
+#if OS(POSIX)
         lo->fd = shm_open(cfg->name, O_RDWR, 0666);
         if (lo->fd == -1) {
                 lo->fd = shm_open(cfg->name, O_CREAT | O_RDWR, 0666);
@@ -35,7 +35,7 @@ shm_init(shm_t *shm, const shm_cfg_t shm_cfg)
 
                 return -MEACCES;
         }
-#elif defined(OS_WIN)
+#elif OS(WIN)
         lo->fd = OpenFileMapping(FILE_MAP_ALL_ACCESS, // 读写权限
                                  0,                   // 不继承句柄
                                  cfg->name);          // 共享内存名称

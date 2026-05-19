@@ -3,7 +3,7 @@
 
 #include "platdef.h"
 
-#if defined(OS_HOSTED)
+#if OS(HOSTED)
 #include "fftw3.h"
 #define FFT_HAS_FFTW3 1
 #elif defined(ARM_MATH)

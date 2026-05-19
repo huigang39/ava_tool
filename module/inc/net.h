@@ -3,7 +3,7 @@
 
 #include "platdef.h"
 
-#ifdef OS_LINUX
+#if OS(LINUX)
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <liburing.h>
@@ -13,7 +13,7 @@
 #include <unistd.h>
 typedef int sockfd_t;
 #define CLOSE_SOCKET close
-#elif defined(OS_MAC)
+#elif OS(MAC)
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -24,7 +24,7 @@ typedef int sockfd_t;
 #include <unistd.h>
 typedef int sockfd_t;
 #define CLOSE_SOCKET close
-#elif defined(OS_WIN)
+#elif OS(WIN)
 #include <winsock2.h>
 #include <ws2tcpip.h>
 typedef SOCKET sockfd_t;
@@ -110,14 +110,14 @@ typedef struct net_async_req {
         usize          size;
         net_async_cb_f f_cb;
         ATOMIC(u8) processed;
-#if defined(OS_WIN) || defined(OS_MAC)
+#if OS(WIN) || OS(MAC)
         u64         timeout_us;
         list_head_t pending_node; // 待处理请求链表节点
 #endif
-#ifdef OS_WIN
+#if OS(WIN)
         OVERLAPPED ov;
 #endif
-#ifdef OS_MAC
+#if OS(MAC)
         net_op_e e_op;
 #endif
 } net_async_req_t;
@@ -135,12 +135,12 @@ typedef struct net_cfg {
 typedef struct net_lo {
         list_head_t ch_root;
         log_t       log;
-#ifdef OS_LINUX
+#if OS(LINUX)
         struct io_uring ring;
-#elif defined(OS_MAC)
+#elif OS(MAC)
         int         kq;
         list_head_t pending_reqs;
-#elif defined(OS_WIN)
+#elif OS(WIN)
         HANDLE      iocp;
         list_head_t pending_reqs; // 待处理的异步请求列表
 #endif

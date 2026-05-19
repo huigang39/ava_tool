@@ -1,6 +1,6 @@
 #include "module.h"
 
-#ifdef OS_WIN
+#if OS(WIN)
 #include <windows.h>
 #endif
 
@@ -367,7 +367,7 @@ test_data_integrity(void)
 int
 main(void)
 {
-#ifdef OS_WIN
+#if OS(WIN)
         SetConsoleOutputCP(65001); // 设置控制台代码页为 UTF-8
 #endif
         println("----------------------------------------");

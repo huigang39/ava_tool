@@ -252,6 +252,12 @@ uint16_t    JLINKARM_GetSpeed(void);
 int32_t     JLINKARM_DEVICE_SelectDialog(void *hParent, uint32_t Flags, JLINKARM_DEVICE_SELECT_INFO *pInfo);
 int32_t     JLINKARM_DEVICE_GetInfo(int32_t DeviceIndex, JLINKARM_DEVICE_INFO *pDeviceInfo);
 
+int32_t JLINKARM_Reset(void);
+int32_t JLINKARM_Go(void);
+int32_t JLINKARM_Halt(void);
+char    JLINKARM_IsHalted(void);
+int32_t JLINKARM_SetResetType(int32_t ResetType);
+
 int32_t JLINK_HSS_Start(JLINK_HSS_MEM_BLOCK_DESC *paDesc, int32_t NumBlocks, int32_t Period_us, int32_t Flags);
 int32_t JLINK_HSS_Stop(void);
 int32_t JLINK_HSS_Read(void *pBuffer, uint32_t BufferSize);

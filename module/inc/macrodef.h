@@ -60,7 +60,7 @@ extern "C" {
 #endif
 #endif
 
-#ifdef MCU
+#if OS(NONE)
 #define ATOMIC_EXEC(code)                                 \
         do {                                              \
                 volatile u32 __primask = __get_PRIMASK(); \
@@ -151,16 +151,14 @@ extern "C" {
 
 #define SPINLOCK_BACKOFF_MIN (4)
 #define SPINLOCK_BACKOFF_MAX (128)
-#if defined(ARCH_X86_64) || defined(ARCH_X86)
-#if defined(_MSC_VER)
+#if ARCH(X86_FAMILY)
+#if COMPILER(MSVC)
 #include <intrin.h>
 #define SPINLOCK_BACKOFF_HOOK _mm_pause()
 #else
 #define SPINLOCK_BACKOFF_HOOK __asm volatile("pause" ::: "memory")
 #endif
-#elif defined(ARCH_ARM64)
-#define SPINLOCK_BACKOFF_HOOK __asm volatile("yield" ::: "memory")
-#elif defined(ARCH_ARM32)
+#elif ARCH(ARM_FAMILY)
 #define SPINLOCK_BACKOFF_HOOK __asm volatile("yield" ::: "memory")
 #else
 #define SPINLOCK_BACKOFF_HOOK
