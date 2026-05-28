@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <functional>
+#include <limits>
 #include <map>
 #include <vector>
 
@@ -13,6 +15,7 @@
 #include "implot_internal.h"
 
 #include "gui/monitor.hpp"
+#include "platform/native_dlg.hpp"
 
 std::atomic<bool> g_monitorPaused{false};
 
@@ -103,12 +106,14 @@ MonitorScope::menu()
                 }
         }
 
-        // Right-aligned buttons: Delete Scope and Pause/Resume
-        float delBtnWidth = ImGui::CalcTextSize("Delete Scope").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        // Right-aligned buttons: Delete Scope, Hide Scope, and Pause/Resume
+        float delBtnWidth  = ImGui::CalcTextSize("Delete Scope").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        float hideBtnWidth = std::max(ImGui::CalcTextSize("Hide Scope").x, ImGui::CalcTextSize("Show Scope").x) +
+                             ImGui::GetStyle().FramePadding.x * 2.0f;
         float pauseBtnWidth =
             std::max(ImGui::CalcTextSize("PAUSE").x, ImGui::CalcTextSize("RESUME").x) + ImGui::GetStyle().FramePadding.x * 2.0f;
         float spacing         = ImGui::GetStyle().ItemSpacing.x;
-        float totalRightWidth = delBtnWidth + spacing + pauseBtnWidth;
+        float totalRightWidth = delBtnWidth + spacing + hideBtnWidth + spacing + pauseBtnWidth;
         float availWidth      = ImGui::GetContentRegionAvail().x;
 
         if (availWidth > totalRightWidth) {
@@ -124,6 +129,19 @@ MonitorScope::menu()
                 markPendingDelete();
         }
         ImGui::PopStyleColor(3);
+
+        ImGui::SameLine();
+        if (hidden_) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.4f, 0.4f, 0.4f, 0.8f));
+                if (ImGui::Button("Show Scope"))
+                        hidden_ = false;
+                ImGui::PopStyleColor();
+        } else {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 0.6f));
+                if (ImGui::Button("Hide Scope"))
+                        hidden_ = true;
+                ImGui::PopStyleColor();
+        }
 
         ImGui::SameLine();
         if (paused_) {
@@ -550,15 +568,13 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 ImPlot::SetNextAxesToFit();
         }
 
-        if (showFft_) {
-                if (!ImGui::BeginTable("##fftLayoutTable", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-                        return;
-                }
-                ImGui::TableSetupColumn("Plot", ImGuiTableColumnFlags_WidthStretch, 0.75f);
-                ImGui::TableSetupColumn("Peaks", ImGuiTableColumnFlags_WidthFixed, 150.0f);
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
+        if (!ImGui::BeginTable("##plotLayoutTable", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+                return;
         }
+        ImGui::TableSetupColumn("Plot", ImGuiTableColumnFlags_WidthStretch, 0.75f);
+        ImGui::TableSetupColumn(showFft_ ? "Peaks" : "Stats", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
 
         if (ImPlot::BeginPlot("##plot", ImVec2(-1, -1), ImPlotFlags_NoTitle)) {
                 if (!showFft_ && linkXMin && linkXMax)
@@ -611,6 +627,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 }
 
                 channelPeaks_.clear();
+                channelStats_.clear();
                 for (auto &[chName, ch] : chs_) {
                         // 1. Handle Visibility
                         ImPlot::HideNextItem(!ch->show_, ImPlotCond_Once);
@@ -748,6 +765,51 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                     chName.c_str(), dxs_.data(), dys_.data(), static_cast<i32>(dxs_.size()));
                                         plotted = true;
                                 }
+
+                                // Window stats: min/max are exact; mean/RMS are exact at raw level and
+                                // approximated from LOD bucket midpoints when downsampled.
+                                if (ch->show_) {
+                                        Stats s;
+                                        s.min     = std::numeric_limits<f64>::infinity();
+                                        s.max     = -std::numeric_limits<f64>::infinity();
+                                        f64 sum   = 0.0;
+                                        f64 sumSq = 0.0;
+                                        if (level < 0) {
+                                                const usize si = rd.rawLowerBound(xmin);
+                                                const usize ei = rd.rawUpperBound(xmax);
+                                                for (usize i = si; i < ei; ++i) {
+                                                        const f64 v = static_cast<f64>(rd.rawVal(i));
+                                                        if (v < s.min)
+                                                                s.min = v;
+                                                        if (v > s.max)
+                                                                s.max = v;
+                                                        sum   += v;
+                                                        sumSq += v * v;
+                                                        ++s.count;
+                                                }
+                                        } else {
+                                                const usize si = rd.lodLowerBound(level, xmin);
+                                                const usize ei = rd.lodUpperBound(level, xmax);
+                                                for (usize i = si; i < ei; ++i) {
+                                                        const LodSample &ls = rd.lodAt(level, i);
+                                                        if (ls.vmin < s.min)
+                                                                s.min = ls.vmin;
+                                                        if (ls.vmax > s.max)
+                                                                s.max = ls.vmax;
+                                                        const f64 mid =
+                                                            (static_cast<f64>(ls.vmin) + static_cast<f64>(ls.vmax)) * 0.5;
+                                                        sum   += mid;
+                                                        sumSq += mid * mid;
+                                                        ++s.count;
+                                                }
+                                        }
+                                        if (s.count > 0) {
+                                                s.pkpk                = s.max - s.min;
+                                                s.mean                = sum / static_cast<f64>(s.count);
+                                                s.rms                 = std::sqrt(sumSq / static_cast<f64>(s.count));
+                                                channelStats_[chName] = s;
+                                        }
+                                }
                         }
 
                         if (!plotted) {
@@ -815,8 +877,8 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 }
         }
 
+        ImGui::TableSetColumnIndex(1);
         if (showFft_) {
-                ImGui::TableSetColumnIndex(1);
                 if (!channelPeaks_.empty()) {
                         for (auto &[chName, peaks] : channelPeaks_) {
                                 if (peaks.empty())
@@ -842,8 +904,42 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 } else {
                         ImGui::Text("No peaks detected");
                 }
-                ImGui::EndTable();
+        } else {
+                if (!channelStats_.empty()) {
+                        for (auto &[chName, s] : channelStats_) {
+                                ImGui::Text("%s", chName.c_str());
+                                if (ImGui::BeginTable(("##statsTable_" + chName).c_str(),
+                                                      2,
+                                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                                        ImGui::TableSetupColumn("Metric");
+                                        ImGui::TableSetupColumn("Value");
+                                        ImGui::TableHeadersRow();
+                                        auto row = [](const char *k, const char *fmt, f64 v) {
+                                                ImGui::TableNextRow();
+                                                ImGui::TableSetColumnIndex(0);
+                                                ImGui::TextUnformatted(k);
+                                                ImGui::TableSetColumnIndex(1);
+                                                ImGui::Text(fmt, v);
+                                        };
+                                        row("Min", "%.4f", s.min);
+                                        row("Max", "%.4f", s.max);
+                                        row("Pk-Pk", "%.4f", s.pkpk);
+                                        row("Mean", "%.4f", s.mean);
+                                        row("RMS", "%.4f", s.rms);
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::TextUnformatted("N");
+                                        ImGui::TableSetColumnIndex(1);
+                                        ImGui::Text("%zu", s.count);
+                                        ImGui::EndTable();
+                                }
+                                ImGui::Spacing();
+                        }
+                } else {
+                        ImGui::Text("No data in window");
+                }
         }
+        ImGui::EndTable();
 }
 
 int
@@ -1058,6 +1154,75 @@ Monitor::updateDisplay()
                 ImGui::PopStyleColor(3);
 
                 ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f)); // Green
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 0.3f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
+                if (ImGui::Button("Export CSV")) {
+                        char dfltBuf[128];
+                        auto now = std::time(nullptr);
+                        std::strftime(dfltBuf, sizeof(dfltBuf), "%Y%m%d_%H%M%S_", std::localtime(&now));
+                        std::string defaultName = std::string(dfltBuf) + name_ + ".csv";
+
+                        std::string fullpath = nativeDlgSave("Export CSV", {{"CSV Files", {"csv"}}}, defaultName);
+                        if (fullpath.empty()) {
+                                LOG_I("Monitor[%s] export cancelled", name_.c_str());
+                        } else {
+                                if (fullpath.find(".csv") == std::string::npos)
+                                        fullpath += ".csv";
+
+                                FILE *f = fopen(fullpath.c_str(), "w");
+                                if (f) {
+                                        std::vector<std::pair<std::string, MonitorChannel *>> channels;
+                                        for (auto &[scopeName, scope] : scopes_) {
+                                                for (auto &[chName, ch] : scope->getChannels()) {
+                                                        channels.push_back({scopeName + "_" + chName, ch.get()});
+                                                }
+                                        }
+
+                                        // Write header
+                                        for (size_t i = 0; i < channels.size(); ++i) {
+                                                fprintf(f,
+                                                        "%s_Time,%s_Value%s",
+                                                        channels[i].first.c_str(),
+                                                        channels[i].first.c_str(),
+                                                        (i == channels.size() - 1) ? "" : ",");
+                                        }
+                                        fprintf(f, "\n");
+
+                                        // Find max length
+                                        size_t maxLen = 0;
+                                        for (auto &c : channels) {
+                                                if (c.second->read_.rawSize() > maxLen) {
+                                                        maxLen = c.second->read_.rawSize();
+                                                }
+                                        }
+
+                                        // Write data
+                                        for (size_t row = 0; row < maxLen; ++row) {
+                                                for (size_t i = 0; i < channels.size(); ++i) {
+                                                        if (row < channels[i].second->read_.rawSize()) {
+                                                                fprintf(f,
+                                                                        "%.6f,%.6f",
+                                                                        channels[i].second->read_.rawTs(row),
+                                                                        channels[i].second->read_.rawVal(row));
+                                                        } else {
+                                                                fprintf(f, ",");
+                                                        }
+                                                        if (i < channels.size() - 1)
+                                                                fprintf(f, ",");
+                                                }
+                                                fprintf(f, "\n");
+                                        }
+                                        fclose(f);
+                                        LOG_I("Monitor[%s] exported to %s", name_.c_str(), fullpath.c_str());
+                                } else {
+                                        LOG_E("Monitor[%s] failed to open %s for export", name_.c_str(), fullpath.c_str());
+                                }
+                        }
+                }
+                ImGui::PopStyleColor(3);
+
+                ImGui::SameLine();
                 ImGui::SetNextItemWidth(100);
                 f32 h = historySeconds_;
                 if (ImGui::InputFloat("##History", &h, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
@@ -1183,75 +1348,75 @@ Monitor::updateDisplay()
                 }
                 lastAvailY_ = avail.y;
 
+                // Compute data bounds ONCE per frame (was O(scopes² × channels) — hoisted out of the per-scope loop).
+                const bool isPaused = g_monitorPaused.load();
+                const f64  now      = sessionTimeSec();
+                f64        earliest = now;
+                f64        latest   = 0.0;
+                bool       hasData  = false;
+                for (const auto &[_, sc] : scopes_) {
+                        for (const auto &[__, ch] : sc->getChannels()) {
+                                const f64 e = ch->earliestTs();
+                                const f64 l = ch->latestTs();
+                                if (e >= 0.0f) {
+                                        hasData = true;
+                                        if (e < earliest)
+                                                earliest = e;
+                                        if (l >= 0.0f && l > latest)
+                                                latest = l;
+                                }
+                        }
+                }
+
+                // Drive linkXMin_ / linkXMax_ from the view mode (also once per frame).
+                if (viewMode_ == MonitorViewMode::FULL) {
+                        if (!isPaused) {
+                                if (hasData) {
+                                        if (latest < dataStartTime_)
+                                                latest = dataStartTime_;
+                                        linkXMin_ = earliest;
+                                        linkXMax_ = latest;
+                                        if (linkXMax_ - linkXMin_ < 1.0)
+                                                linkXMax_ = linkXMin_ + 1.0;
+                                } else {
+                                        linkXMin_ = dataStartTime_;
+                                        linkXMax_ = dataStartTime_ + 1.0;
+                                }
+                                lastNow_ = now;
+                        }
+                } else if (!isPaused && (JLinkPort::instance().isHssRunning() || samplingMode_ == SamplingMode::POLL)) {
+                        // FOLLOW mode: don't auto-update while the user is interacting with the plot.
+                        if (viewMode_ == MonitorViewMode::FOLLOW && !ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
+                            ImGui::GetIO().MouseWheel == 0) {
+                                f64 span        = linkXMax_ - linkXMin_;
+                                f64 currentSpan = (span > 0.001) ? span : 1.0;
+                                if (historySeconds_ > 0.0f && currentSpan > historySeconds_) {
+                                        currentSpan = historySeconds_;
+                                }
+                                f64 refTime = hasData ? latest : now;
+                                linkXMax_   = refTime;
+                                linkXMin_   = refTime - currentSpan;
+                                if (linkXMin_ < 0.0)
+                                        linkXMin_ = 0.0;
+                                lastNow_ = refTime;
+                        }
+                }
+                wasPaused_ = isPaused;
+
                 for (size_t i = 0; i < keys.size(); ++i) {
                         auto &scope = scopes_[keys[i]];
 
-                        if (ImGui::BeginChild(keys[i].c_str(), ImVec2(avail.x, scope->getHeight()), true)) {
+                        float childHeight =
+                            scope->isHidden() ? (ImGui::GetFrameHeightWithSpacing() + 15.0f) : scope->getHeight();
+                        if (ImGui::BeginChild(keys[i].c_str(), ImVec2(avail.x, childHeight), true)) {
                                 scope->menu();
 
-                                bool isPaused = g_monitorPaused.load();
-                                f64  now      = sessionTimeSec();
-
-                                // Find real data bounds
-                                f64  earliest = now;
-                                f64  latest   = 0.0;
-                                bool hasData  = false;
-                                for (const auto &[_, sc] : scopes_) {
-                                        for (const auto &[__, ch] : sc->getChannels()) {
-                                                const f64 e = ch->earliestTs();
-                                                const f64 l = ch->latestTs();
-                                                if (e >= 0.0f) {
-                                                        hasData = true;
-                                                        if (e < earliest)
-                                                                earliest = static_cast<f64>(e);
-                                                        if (l >= 0.0f && l > latest)
-                                                                latest = static_cast<f64>(l);
-                                                }
+                                if (!scope->isHidden()) {
+                                        if (scope->isFftEnabled()) {
+                                                scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, fftViewMode_);
+                                        } else {
+                                                scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, viewMode_);
                                         }
-                                }
-
-                                // When FULL mode is active, always fit to exact data bounds
-                                if (viewMode_ == MonitorViewMode::FULL) {
-                                        if (!isPaused) {
-                                                if (hasData) {
-                                                        if (latest < dataStartTime_)
-                                                                latest = dataStartTime_;
-                                                        linkXMin_ = earliest;
-                                                        linkXMax_ = latest;
-                                                        if (linkXMax_ - linkXMin_ < 1.0)
-                                                                linkXMax_ = linkXMin_ + 1.0;
-                                                } else {
-                                                        linkXMin_ = dataStartTime_;
-                                                        linkXMax_ = dataStartTime_ + 1.0;
-                                                }
-                                                lastNow_ = now;
-                                        }
-                                } else if (!isPaused &&
-                                           (JLinkPort::instance().isHssRunning() || samplingMode_ == SamplingMode::POLL)) {
-                                        // FOLLOW mode logic (only updates when running)
-                                        // CRITICAL: If user is clicking or scrolling, STOP auto-updating to allow ImPlot to
-                                        // handle interaction
-                                        if (viewMode_ == MonitorViewMode::FOLLOW &&
-                                            !ImGui::IsMouseDown(ImGuiMouseButton_Left) && ImGui::GetIO().MouseWheel == 0) {
-                                                f64 span        = linkXMax_ - linkXMin_;
-                                                f64 currentSpan = (span > 0.001) ? span : 1.0;
-                                                if (historySeconds_ > 0.0f && currentSpan > historySeconds_) {
-                                                        currentSpan = historySeconds_;
-                                                }
-                                                f64 refTime = hasData ? latest : now;
-                                                linkXMax_   = refTime;
-                                                linkXMin_   = refTime - currentSpan;
-                                                if (linkXMin_ < 0.0)
-                                                        linkXMin_ = 0.0;
-                                                lastNow_ = refTime;
-                                        }
-                                }
-
-                                wasPaused_ = isPaused;
-                                if (scope->isFftEnabled()) {
-                                        scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, fftViewMode_);
-                                } else {
-                                        scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, viewMode_);
                                 }
                                 scope->dropTarget();
                         }

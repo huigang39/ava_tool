@@ -639,6 +639,9 @@ Gui::drawBar()
                         ImGui::MenuItem("Joint Calculator", nullptr, &showCalculator_);
                         ImGui::Separator();
                         ImGui::MenuItem("Bode Plot", nullptr, &bode_.show_);
+                        ImGui::Separator();
+                        ImGui::MenuItem("Assembly Viewer", nullptr, &asmViewer_.show_);
+                        ImGui::MenuItem("Registers", nullptr, &regViewer_.show_);
                         ImGui::EndMenu();
                 }
 
@@ -881,6 +884,8 @@ Gui::loop()
                 }
 
                 bode_.updateDisplay();
+                asmViewer_.draw(this);
+                regViewer_.draw();
 
                 for (const auto &file : sDroppedFiles_) {
                         if (file.ends_with(".ava")) {

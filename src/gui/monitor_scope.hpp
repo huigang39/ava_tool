@@ -66,6 +66,7 @@ class MonitorScope
         std::set<std::string> selectedGroupPaths_{};
         // Full paths (e.g. "foo.bar") of group nodes the user has expanded;
         // persisted across sessions via Gui save/load.
+        bool                  hidden_{false};
         std::set<std::string> expandedGroups_{};
 
         bool pendingAxisReset_{false};
@@ -74,6 +75,16 @@ class MonitorScope
                 f64 mag;
         };
         std::map<std::string, std::vector<Peak>> channelPeaks_;
+
+        struct Stats {
+                f64   rms{0};
+                f64   max{0};
+                f64   min{0};
+                f64   mean{0};
+                f64   pkpk{0};
+                usize count{0};
+        };
+        std::map<std::string, Stats> channelStats_;
 
         void tableDraw();
         void tableMenu();
@@ -123,6 +134,9 @@ class MonitorScope
         bool isPaused() const { return paused_; }
         void setPaused(bool p) { paused_ = p; }
         bool isFftEnabled() const { return showFft_; }
+
+        bool isHidden() const { return hidden_; }
+        void setHidden(bool h) { hidden_ = h; }
 
         // Purge channels marked for deletion (called by sampler at safe point).
         void purgeDeleted()

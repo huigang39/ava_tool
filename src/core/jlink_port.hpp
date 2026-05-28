@@ -81,6 +81,11 @@ class JLinkPort
         bool readMem(u32 addr, u32 numBytes, void *dst);
         bool writeMem(u32 addr, u32 numBytes, const void *src);
 
+        u32  readReg(u32 regIndex);
+        bool isHalted();
+        bool halt();
+        bool resume();
+
         bool hssStart(const std::vector<HssBlock> &blocks, int periodUs);
         void hssStop();
         int  hssRead(void *buf, u32 bufSize);

@@ -10,8 +10,10 @@
 #include "GLFW/glfw3.h"
 #include "module.h"
 
+#include "gui/assembly_viewer.hpp"
 #include "gui/bode.hpp"
 #include "gui/monitor.hpp"
+#include "gui/register_viewer.hpp"
 #include "gui/variable.hpp"
 
 class Gui
@@ -80,8 +82,10 @@ class Gui
         std::vector<MotorProfile> motorProfiles_;
         int                       currentMotorProfile_ = 0;
 
-        bool showCalculator_{false};
-        Bode bode_{};
+        bool           showCalculator_{false};
+        Bode           bode_{};
+        RegisterViewer regViewer_{};
+        AssemblyViewer asmViewer_{};
 
       public:
         Gui(const std::string &initialPath = "");
@@ -90,8 +94,9 @@ class Gui
         void loop();
         void hide();
 
-        MonitorMapType &getMonitors() { return monitors_; }
-        std::mutex     &getMonitorMtx() { return mtxMonitors_; }
+        MonitorMapType  &getMonitors() { return monitors_; }
+        std::mutex      &getMonitorMtx() { return mtxMonitors_; }
+        VariableMapType &getVars() { return vars_; }
 
         static std::vector<std::string> &getDroppedFiles() { return sDroppedFiles_; }
         static void                      clearDroppedFiles() { sDroppedFiles_.clear(); }

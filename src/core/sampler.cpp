@@ -67,16 +67,12 @@ setupRealtimeThread(int coreId)
 #ifdef _WIN32
         // ---- 1. Elevate process priority class ----
         HANDLE hProc = GetCurrentProcess();
-        if (!SetPriorityClass(hProc, REALTIME_PRIORITY_CLASS)) {
-                SetPriorityClass(hProc, HIGH_PRIORITY_CLASS);
-                LOG_I("Sampler: process class set to HIGH (REALTIME needs admin)");
-        } else {
-                LOG_I("Sampler: process class set to REALTIME");
-        }
+        SetPriorityClass(hProc, HIGH_PRIORITY_CLASS);
+        LOG_I("Sampler: process class set to HIGH");
 
-        // ---- 2. Thread priority to TIME_CRITICAL ----
+        // ---- 2. Thread priority to HIGHEST ----
         HANDLE hThread = GetCurrentThread();
-        SetThreadPriority(hThread, THREAD_PRIORITY_TIME_CRITICAL);
+        SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST);
 
         // ---- 3. Determine target core ----
         DWORD_PTR procMask = 0, sysMask = 0;

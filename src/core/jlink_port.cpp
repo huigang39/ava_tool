@@ -2,8 +2,10 @@
  * @file  jlink_port.cpp
  * @brief JLinkPort implementation — J-Link SDK wrapper.
  */
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 #include "imgui.h"
 
@@ -45,6 +47,14 @@ void
 JLinkPort::close()
 {
         std::lock_guard lk(mtx_);
+
+        // Flip state flags BEFORE any J-Link API calls so a concurrent isConnected()
+        // / isOpen() check from the sampler sees the new state immediately.
+        const bool wasOpen      = isOpen_;
+        const bool wasConnected = isConnected_;
+        isConnected_            = false;
+        isOpen_                 = false;
+
         if (hssRunning_) {
                 LOG_I("Stopping HSS...");
                 JLINK_HSS_Stop();
@@ -52,23 +62,28 @@ JLinkPort::close()
                 hssFrameSize_ = 0;
                 hssActualHz_.store(0.0f, std::memory_order_relaxed);
         }
-        if (isOpen_) {
+        if (wasOpen) {
                 LOG_I("Closing JLink connection...");
-                if (isConnected_) {
+                // Best-effort C_DEBUGEN detach. Skipped when the link looks dead —
+                // touching MCU memory on a stalled USB connection can hang inside
+                // the SDK and leave it in a state where re-Open() permanently
+                // returns a stale handle (requires app restart to recover).
+                if (wasConnected && JLINKARM_IsOpen()) {
                         if (JLINKARM_IsHalted()) {
                                 LOG_I("JLinkPort::close(): Target was halted, resuming before close...");
                                 JLINKARM_Go();
                         }
-                        // Clear C_DEBUGEN in DHCSR (0xE000EDF0) to cleanly detach from Cortex-M
                         u32 dhcsr = 0xA05F0000;
                         JLINKARM_WriteMemEx(0xE000EDF0, 4, &dhcsr, 0);
                         LOG_I("JLinkPort::close(): Cleared C_DEBUGEN in DHCSR.");
                 }
                 JLINKARM_Close();
-                isOpen_ = false;
+                // Give the SDK time to release the USB handle. Without this, an
+                // immediately-following Open() sometimes returns a stale handle
+                // that can never Connect() until the process is restarted.
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 LOG_I("JLink closed.");
         }
-        isConnected_ = false;
 }
 
 bool
@@ -84,12 +99,24 @@ JLinkPort::connect()
                 return false;
         }
 
+        // On any failure below: tear down the SDK state so the next CONNECT click
+        // does a clean Open()+Connect() cycle. Without this, a partial connect
+        // leaves the SDK holding a stale USB handle that never recovers — even
+        // after the user unplugs and replugs the J-Link — until the app restarts.
+        auto resetSdk = [&]() {
+                JLINKARM_Close();
+                isOpen_      = false;
+                isConnected_ = false;
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        };
+
         char cmd[160];
         snprintf(cmd, sizeof(cmd), "Device = %s", deviceName_.c_str());
         char ack[256] = {0};
         if (JLINKARM_ExecCommand(cmd, ack, sizeof(ack)) < 0) {
                 lastErr_ = std::string("ExecCommand(Device): ") + ack;
                 LOG_E("JLinkPort::connect() FAILED: ExecCommand Device failed: %s", ack);
+                resetSdk();
                 return false;
         }
         LOG_I("JLinkPort::connect(): Device set to %s", deviceName_.c_str());
@@ -97,15 +124,16 @@ JLinkPort::connect()
         if (JLINKARM_TIF_Select(JLINKARM_TIF_SWD) < 0) {
                 lastErr_ = "TIF_Select(SWD) failed";
                 LOG_E("JLinkPort::connect() FAILED: TIF_Select(SWD) failed");
+                resetSdk();
                 return false;
         }
         JLINKARM_SetSpeed(static_cast<u32>(speedKHz_));
         LOG_I("JLinkPort::connect(): TIF SWD selected, speed %d KHz", speedKHz_);
 
         if (JLINKARM_Connect() < 0) {
-                lastErr_     = "Connect failed (Check power/cable or replug J-Link)";
-                isConnected_ = false;
-                LOG_E("JLinkPort::connect() FAILED: JLINKARM_Connect() < 0");
+                lastErr_ = "Connect failed (Check power/cable or replug J-Link)";
+                LOG_E("JLinkPort::connect() FAILED: JLINKARM_Connect() < 0; resetting SDK");
+                resetSdk();
                 return false;
         }
 
@@ -152,6 +180,42 @@ JLinkPort::writeMem(const u32 addr, const u32 numBytes, const void *src)
         if (!isOpen_ || !isConnected_)
                 return false;
         return JLINKARM_WriteMemEx(addr, numBytes, src, 0) >= 0;
+}
+
+u32
+JLinkPort::readReg(u32 regIndex)
+{
+        std::lock_guard lk(mtx_);
+        if (!isOpen_ || !isConnected_)
+                return 0;
+        return JLINKARM_ReadReg(regIndex);
+}
+
+bool
+JLinkPort::isHalted()
+{
+        std::lock_guard lk(mtx_);
+        if (!isOpen_ || !isConnected_)
+                return false;
+        return JLINKARM_IsHalted() != 0;
+}
+
+bool
+JLinkPort::halt()
+{
+        std::lock_guard lk(mtx_);
+        if (!isOpen_ || !isConnected_)
+                return false;
+        return JLINKARM_Halt() >= 0;
+}
+
+bool
+JLinkPort::resume()
+{
+        std::lock_guard lk(mtx_);
+        if (!isOpen_ || !isConnected_)
+                return false;
+        return JLINKARM_Go() >= 0;
 }
 
 bool

@@ -231,6 +231,8 @@ SRC_CXX := \
     $(DIR_GUI)/monitor.cpp \
     $(DIR_GUI)/variable.cpp \
     $(DIR_GUI)/bode.cpp \
+    $(DIR_GUI)/assembly_viewer.cpp \
+    $(DIR_GUI)/register_viewer.cpp \
     $(DIR_CORE)/elf_parser.cpp \
     $(DIR_CORE)/dwarf_parser.cpp \
     $(DIR_CORE)/json_parser.cpp \
