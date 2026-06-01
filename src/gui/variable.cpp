@@ -970,9 +970,11 @@ Variable::drawVariableList()
                 state_ = WindowState::LoadElf;
         ImGui::SameLine();
         ImGui::SetNextItemWidth(100);
-        if (ImGui::SliderInt("Refresh(ms)", (int *)&updateIntervalMs_, 10, 2000)) {
+        if (ImGui::SliderInt("##RefreshMs", (int *)&updateIntervalMs_, 10, 2000)) {
                 isModified_ = true;
         }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Refresh(ms)");
 
         constexpr ImGuiTableFlags flags =
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
@@ -1229,35 +1231,53 @@ Variable::drawAddVariableDialog()
                 return;
         ImGui::OpenPopup("Add New Variable");
         if (ImGui::BeginPopupModal("Add New Variable", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::InputText("Name", newVar_.name, sizeof(newVar_.name));
+                ImGui::InputText("##newVarName", newVar_.name, sizeof(newVar_.name));
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Name");
                 static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
                 static int         typeIdx = 2;
-                if (ImGui::Combo("Type", &typeIdx, types, IM_ARRAYSIZE(types)))
+                if (ImGui::Combo("##newVarType", &typeIdx, types, IM_ARRAYSIZE(types)))
                         newVar_.type = Parser::strToDataType(types[typeIdx]);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Type");
                 static const char *ports[] = {"JLINK", "UDP", "SHM"};
                 static int         portIdx = 0;
-                if (ImGui::Combo("Port", &portIdx, ports, IM_ARRAYSIZE(ports)))
+                if (ImGui::Combo("##newVarPort", &portIdx, ports, IM_ARRAYSIZE(ports)))
                         newVar_.port = (PortType)portIdx;
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Port");
 
                 if (newVar_.port == PortType::JLINK) {
-                        ImGui::InputText("Address (Hex)", newVar_.addrBuf, sizeof(newVar_.addrBuf));
+                        ImGui::InputText("##newVarAddress", newVar_.addrBuf, sizeof(newVar_.addrBuf));
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Address (Hex)");
                         try {
                                 newVar_.addr = std::stoull(newVar_.addrBuf, nullptr, 16);
                         } catch (...) {
                                 newVar_.addr = 0;
                         }
                 } else if (newVar_.port == PortType::UDP) {
-                        ImGui::InputText("Target IP", newVar_.udpIp, sizeof(newVar_.udpIp));
-                        ImGui::InputInt("Target Port", &newVar_.udpPort);
-                        ImGui::InputText("Offset/Addr", newVar_.addrBuf, sizeof(newVar_.addrBuf));
+                        ImGui::InputText("##newVarTargetIp", newVar_.udpIp, sizeof(newVar_.udpIp));
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Target IP");
+                        ImGui::InputInt("##newVarTargetPort", &newVar_.udpPort);
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Target Port");
+                        ImGui::InputText("##newVarOffsetAddr", newVar_.addrBuf, sizeof(newVar_.addrBuf));
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Offset/Addr");
                         try {
                                 newVar_.addr = std::stoull(newVar_.addrBuf, nullptr, 16);
                         } catch (...) {
                                 newVar_.addr = 0;
                         }
                 } else if (newVar_.port == PortType::SHM) {
-                        ImGui::InputText("SHM Name", newVar_.shmName, sizeof(newVar_.shmName));
-                        ImGui::InputText("Offset", newVar_.addrBuf, sizeof(newVar_.addrBuf));
+                        ImGui::InputText("##newVarShmName", newVar_.shmName, sizeof(newVar_.shmName));
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("SHM Name");
+                        ImGui::InputText("##newVarOffset", newVar_.addrBuf, sizeof(newVar_.addrBuf));
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Offset");
                         try {
                                 newVar_.addr = std::stoull(newVar_.addrBuf, nullptr, 16);
                         } catch (...) {

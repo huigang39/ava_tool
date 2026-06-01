@@ -1,0 +1,7 @@
+// Windows resource script: embeds the application icon into ava_tool.exe.
+//
+// The resource is named "GLFW_ICON" so GLFW uses it for the window / taskbar
+// icon automatically; being the only icon group, Windows also uses it as the
+// executable icon shown in Explorer. The .ico is generated from assets/icon.png
+// by tools/make_icon.ps1 (run `make icon`).
+GLFW_ICON ICON "icon.ico"

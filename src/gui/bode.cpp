@@ -68,8 +68,6 @@ Bode::draw_()
         };
 
         auto drawCombo = [&](const char *id, const char *labelText, char *buf, size_t bufSz) {
-                ImGui::TextDisabled("%s", labelText);
-                ImGui::SameLine();
                 int curIdx = -1;
                 for (int i = 0; i < (int)keys.size(); ++i)
                         if (std::strcmp(buf, keys[i].c_str()) == 0) {
@@ -78,7 +76,10 @@ Bode::draw_()
                         }
                 std::string previewStr = (curIdx >= 0) ? varName(keys[curIdx]) : "(none)";
                 ImGui::SetNextItemWidth(150);
-                if (ImGui::BeginCombo(id, previewStr.c_str())) {
+                bool comboOpen = ImGui::BeginCombo(id, previewStr.c_str());
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", labelText);
+                if (comboOpen) {
                         for (int i = 0; i < (int)keys.size(); ++i) {
                                 bool        sel  = (i == curIdx);
                                 std::string disp = varName(keys[i]);
@@ -105,34 +106,34 @@ Bode::draw_()
         if (bodeSweepRunning_)
                 ImGui::BeginDisabled();
 
-        ImGui::TextDisabled("F Start(Hz)");
-        ImGui::SameLine();
         ImGui::SetNextItemWidth(80);
         ImGui::InputFloat("##bFS", &bodeFStart_, 0, 0, "%.3g");
-        ImGui::SameLine();
-        ImGui::TextDisabled("F Stop(Hz)");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("F Start(Hz)");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(80);
         ImGui::InputFloat("##bFE", &bodeFStop_, 0, 0, "%.3g");
-        ImGui::SameLine();
-        ImGui::TextDisabled("Step(Hz)");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("F Stop(Hz)");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(70);
         ImGui::InputFloat("##bSTP", &bodeFStep_, 0, 0, "%.3g");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Step(Hz)");
         if (bodeFStep_ <= 0.0f)
                 bodeFStep_ = 1.0f;
         ImGui::SameLine();
-        ImGui::TextDisabled("Dwell(s)");
-        ImGui::SameLine();
         ImGui::SetNextItemWidth(60);
         ImGui::InputFloat("##bDw", &bodeDwellSec_, 0, 0, "%.2f");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Dwell(s)");
         if (bodeDwellSec_ < 0.05f)
                 bodeDwellSec_ = 0.05f;
         ImGui::SameLine();
-        ImGui::TextDisabled("Amp");
-        ImGui::SameLine();
         ImGui::SetNextItemWidth(70);
         ImGui::InputFloat("##bAmp", &bodeAmp_, 0, 0, "%.3g");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Amp");
         if (bodeAmp_ < 0.0f)
                 bodeAmp_ = 0.0f;
 
@@ -214,7 +215,9 @@ Bode::draw_()
                                         }
                                 }
                                 ImGui::SetNextItemWidth(100);
-                                ImGui::SliderFloat("Width", &style.lineWeight, 0.5f, 5.0f, "%.1f");
+                                ImGui::SliderFloat("##LineWidth", &style.lineWeight, 0.5f, 5.0f, "%.1f");
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("Width");
                                 ImGui::Checkbox("Markers", &style.showMarkers);
                                 ImPlot::EndLegendPopup();
                         }

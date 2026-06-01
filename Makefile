@@ -215,6 +215,16 @@ OUTPUT_BUILD_DIR := $(BUILD_DIR)/$(COMPILER)-$(PLATFORM)-$(ARCH)
 OUTPUT_BIN_DIR   := $(BIN_DIR)/$(PLATFORM_DIR)
 OUTPUT_EXE       := $(OUTPUT_BIN_DIR)/$(PROJECT_NAME)$(EXE_EXT)
 
+# Standalone auto-update helper (Windows/MSVC only).
+ifeq ($(COMPILER),msvc)
+    UPDATER_EXE := $(OUTPUT_BIN_DIR)/updater$(EXE_EXT)
+    # Embed the app icon when assets/icon.ico exists (generate it with `make icon`).
+    # Guarded by wildcard so the build still works before the icon is created.
+    ifneq ($(wildcard assets/icon.ico),)
+        APP_RES := $(OUTPUT_BUILD_DIR)/app.res
+    endif
+endif
+
 # ─── Source files ─────────────────────────────────────────────────────────────
 
 ifeq ($(PLATFORM),mac)
@@ -238,6 +248,8 @@ SRC_CXX := \
     $(DIR_CORE)/bin_parser.cpp \
     $(DIR_CORE)/jlink_port.cpp \
     $(DIR_CORE)/sampler.cpp \
+    $(DIR_CORE)/http_win.cpp \
+    $(DIR_CORE)/updater.cpp \
     $(filter %.cpp,$(SRC_NATIVE)) \
     $(DIR_THIRDPARTY)/imgui/imgui.cpp \
     $(DIR_THIRDPARTY)/imgui/imgui_demo.cpp \
@@ -278,20 +290,20 @@ $(OBJ_FIRST_PARTY): $(PROJECT_HEADERS)
 
 # ─── Targets ──────────────────────────────────────────────────────────────────
 
-.PHONY: all clean fmt info help msvc-win gcc-linux clang-mac
+.PHONY: all clean fmt info help msvc-win gcc-linux clang-mac package icon
 
 .DEFAULT_GOAL := all
 
-all: $(OUTPUT_EXE)
+all: $(OUTPUT_EXE) $(UPDATER_EXE)
 	@$(ECHO_NL)
 	@echo make all complete: $(OUTPUT_EXE)
 	@$(ECHO_NL)
 
-$(OUTPUT_EXE): $(OBJ_ALL) $(MODULE_LIB) | $(OUTPUT_BIN_DIR)
+$(OUTPUT_EXE): $(OBJ_ALL) $(MODULE_LIB) $(APP_RES) | $(OUTPUT_BIN_DIR)
 	@$(ECHO_NL)
 	@echo [LINK] $@
 ifeq ($(COMPILER),msvc)
-	$(LD) $(LDFLAGS) /OUT:"$@" $(OBJ_ALL) $(LDLIBS)
+	$(LD) $(LDFLAGS) /OUT:"$@" $(OBJ_ALL) $(APP_RES) $(LDLIBS)
 	@echo copying runtime DLLs...
 	@copy /Y "$(subst /,\,$(GLFW_DLL))" "$(subst /,\,$(OUTPUT_BIN_DIR))\$(notdir $(GLFW_DLL))" >nul
 	@copy /Y "$(subst /,\,$(JLINK_DLL))" "$(subst /,\,$(OUTPUT_BIN_DIR))\$(notdir $(JLINK_DLL))" >nul
@@ -304,6 +316,47 @@ ifeq ($(PLATFORM),mac)
 	     install_name_tool -change "$$JLINK_EMBEDDED" "@rpath/libjlinkarm.dylib" "$@"; \
 	 fi
 endif
+endif
+
+ifeq ($(COMPILER),msvc)
+# Compile the icon resource (.rc -> .res) for embedding into the exe.
+$(OUTPUT_BUILD_DIR)/app.res: assets/app.rc assets/icon.ico
+	@$(ECHO_NL)
+	@echo [RC] $<
+	$(call MKDIR,$(dir $@))
+	rc.exe /nologo /fo "$@" assets\app.rc
+
+# Generate assets/icon.ico from assets/icon.png (no external tools needed).
+icon:
+	@echo [ICON] generating assets/icon.ico from assets/icon.png
+	powershell -NoProfile -ExecutionPolicy Bypass -File tools\make_icon.ps1
+	@echo icon ready: assets/icon.ico  ^(rebuild with: make^)
+
+# updater.exe: tiny standalone helper that downloads + runs the new installer.
+# Shares http_win.o with the main app; winhttp/shell32/user32 are pulled in via
+# #pragma comment(lib) inside the sources.
+UPDATER_OBJ := $(OUTPUT_BUILD_DIR)/$(DIR_SRC)/updater_main.o $(OUTPUT_BUILD_DIR)/$(DIR_CORE)/http_win.o
+
+$(UPDATER_EXE): $(UPDATER_OBJ) | $(OUTPUT_BIN_DIR)
+	@$(ECHO_NL)
+	@echo [LINK] $@
+	$(LD) $(LDFLAGS) /OUT:"$@" $(UPDATER_OBJ) winhttp.lib shell32.lib user32.lib
+
+# Build the installer with Inno Setup (ISCC). When ISCC is the default, auto-detect
+# the compiler at its standard install path; override with: make package ISCC="C:\path\ISCC.exe"
+ISCC      ?= iscc
+ISCC_PF86 := C:\Program Files (x86)\Inno Setup 6\ISCC.exe
+ISCC_PF   := C:\Program Files\Inno Setup 6\ISCC.exe
+ifeq ($(ISCC),iscc)
+PACKAGE_RUN = if exist "$(ISCC_PF86)" ( "$(ISCC_PF86)" "installer\ava_tool.iss" ) else if exist "$(ISCC_PF)" ( "$(ISCC_PF)" "installer\ava_tool.iss" ) else ( where iscc >nul 2>nul && iscc "installer\ava_tool.iss" || ( echo. & echo ERROR: Inno Setup ISCC.exe not found. & echo   Install it from https://jrsoftware.org/isdl.php & echo   then re-run: make package    ^(or: make package ISCC=C:\path\to\ISCC.exe^) & exit 1 ) )
+else
+PACKAGE_RUN = "$(ISCC)" "installer\ava_tool.iss"
+endif
+package: all
+	@$(ECHO_NL)
+	@echo [PACKAGE] running Inno Setup...
+	@$(PACKAGE_RUN)
+	@echo package complete: see dist\ava_tool_setup_*.exe
 endif
 
 $(MODULE_LIB):

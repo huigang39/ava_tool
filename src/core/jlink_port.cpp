@@ -328,14 +328,15 @@ JLinkPort::drawUI()
                         }
                 }
         }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Device");
         ImGui::SameLine();
-        ImGui::Text("device");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(140.0f);
+        ImGui::SetNextItemWidth(180.0f);
         bool speedCommitted = false;
         {
                 std::lock_guard lk(mtx_);
-                ImGui::InputInt("kHz##jlink", &speedKHz_, 0, 0);
+                // Logarithmic slider: SWD speeds span a wide range (kHz .. tens of MHz).
+                ImGui::SliderInt("##jlinkSpeed", &speedKHz_, 5, 50000, "%d kHz", ImGuiSliderFlags_Logarithmic);
                 speedCommitted = ImGui::IsItemDeactivatedAfterEdit();
                 if (speedKHz_ < 1)
                         speedKHz_ = 1;
@@ -345,7 +346,7 @@ JLinkPort::drawUI()
                 JLINKARM_SetSpeed(static_cast<u32>(speedKHz_));
         }
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("J-Link SWD speed (kHz). Applies when you finish editing.");
+                ImGui::SetTooltip("J-Link SWD speed (kHz). Drag to set; applies when you release. Ctrl+click to type.");
 
         ImGui::SameLine();
         if (!isConnected_) {

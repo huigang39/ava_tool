@@ -84,8 +84,6 @@ MonitorScope::menu()
                         ImGui::SetTooltip("FFT Points (Resolution)");
 
                 ImGui::SameLine();
-                ImGui::TextDisabled("Peaks");
-                ImGui::SameLine();
                 ImGui::SetNextItemWidth(30);
                 char pkBuf[16];
                 snprintf(pkBuf, sizeof(pkBuf), "%d", fftPeakCount_);
@@ -100,7 +98,7 @@ MonitorScope::menu()
                                 fftPeakCount_ = 20;
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Enter number of peaks and press Enter to confirm");
+                        ImGui::SetTooltip("Peaks: enter number of peaks and press Enter to confirm");
 
                 ImGui::SameLine();
                 if (fftBars_) {
@@ -487,17 +485,18 @@ MonitorScope::drawTableRow(const std::string               &chName,
         // 2. Value (Interactive)
         ImGui::TableNextColumn();
         if (ch->isEnum()) {
-                const char *currentName = ch->findEnumName(static_cast<i64>(ch->getRVal()));
+                const f32   dispVal     = ch->getDispVal();
+                const char *currentName = ch->findEnumName(static_cast<i64>(dispVal));
                 char        previewBuf[128];
                 if (currentName)
-                        snprintf(previewBuf, sizeof(previewBuf), "%s (%lld)", currentName, static_cast<i64>(ch->getRVal()));
+                        snprintf(previewBuf, sizeof(previewBuf), "%s (%lld)", currentName, static_cast<i64>(dispVal));
                 else
-                        snprintf(previewBuf, sizeof(previewBuf), "Unknown (%f)", ch->getRVal());
+                        snprintf(previewBuf, sizeof(previewBuf), "Unknown (%f)", dispVal);
 
                 ImGui::SetNextItemWidth(-1);
                 if (ImGui::BeginCombo("##enum", previewBuf)) {
                         for (const auto &e : ch->getEnums()) {
-                                bool isSelected = (static_cast<i64>(ch->getRVal()) == e.value);
+                                bool isSelected = (static_cast<i64>(dispVal) == e.value);
                                 char label[128];
                                 snprintf(label, sizeof(label), "%s (%lld)", e.name.c_str(), e.value);
                                 if (ImGui::Selectable(label, isSelected)) {
@@ -512,7 +511,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
                 ImGui::SetNextItemWidth(-1);
 
                 if (isIntegerType(t)) {
-                        i32 v = static_cast<i32>(ch->getRVal());
+                        i32 v = static_cast<i32>(ch->getDispVal());
                         ImGui::InputInt("##val", &v, 0, 0);
                         if (ImGui::IsItemDeactivated() &&
                             (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
@@ -520,7 +519,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
                                 ch->markWValDirty();
                         }
                 } else {
-                        f32 v = ch->getRVal();
+                        f32 v = ch->getDispVal();
                         ImGui::InputFloat("##val", &v, 0, 0, "%.3f");
                         if (ImGui::IsItemDeactivated() &&
                             (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
@@ -578,40 +577,50 @@ MonitorScope::drawTableRow(const std::string               &chName,
 
                 const char *types[]     = {"Sine", "Square", "Triangle"};
                 i32         currentType = pending.type.load();
-                if (ImGui::Combo("Type", &currentType, types, IM_ARRAYSIZE(types))) {
+                if (ImGui::Combo("##WaveType", &currentType, types, IM_ARRAYSIZE(types))) {
                         pending.type.store(currentType);
                         pending.dirty.store(true);
                 }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Type");
 
                 ImGui::SetNextItemWidth(100);
                 f32 f = pending.freq.load();
-                if (ImGui::InputFloat("Freq (Hz)", &f, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
+                if (ImGui::InputFloat("##WaveFreq", &f, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
                     (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
                         pending.freq.store(f);
                         pending.dirty.store(true);
                 }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Freq (Hz)");
                 ImGui::SetNextItemWidth(100);
                 f32 a = pending.amp.load();
-                if (ImGui::InputFloat("Amp", &a, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
+                if (ImGui::InputFloat("##WaveAmp", &a, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
                     (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
                         pending.amp.store(a);
                         pending.dirty.store(true);
                 }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Amp");
                 ImGui::SetNextItemWidth(100);
                 f32 o = pending.offset.load();
-                if (ImGui::InputFloat("Offset", &o, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
+                if (ImGui::InputFloat("##WaveOffset", &o, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
                     (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
                         pending.offset.store(o);
                         pending.dirty.store(true);
                 }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Offset");
                 if (pending.type.load() != WAVE_TYPE_SINE) {
                         ImGui::SetNextItemWidth(100);
                         f32 d = pending.duty.load();
-                        if (ImGui::InputFloat("Duty", &d, 0.0f, 0.0f, "%.2f") && ImGui::IsItemDeactivated() &&
+                        if (ImGui::InputFloat("##WaveDuty", &d, 0.0f, 0.0f, "%.2f") && ImGui::IsItemDeactivated() &&
                             (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
                                 pending.duty.store(d);
                                 pending.dirty.store(true);
                         }
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Duty");
                 }
 
                 ImGui::Separator();
@@ -972,9 +981,11 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 ImGui::SetNextItemWidth(100);
                                 const char *styleNames[] = {"Line", "Stairs"};
                                 i32         currentStyle = ch->getPlotStyle();
-                                if (ImGui::Combo("Style", &currentStyle, styleNames, 2)) {
+                                if (ImGui::Combo("##PlotStyle", &currentStyle, styleNames, 2)) {
                                         ch->getPlotStyle() = currentStyle;
                                 }
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("Style");
                                 ImGui::Checkbox("Markers", &ch->showMarkers());
                                 if (ImGui::Button("Delete Channel"))
                                         ch->markPendingDelete();
@@ -1396,8 +1407,8 @@ Monitor::updateDisplay()
                                 h = 0.0f;
                         historySeconds_ = h;
                 }
-                ImGui::SameLine();
-                ImGui::TextDisabled("History(s)");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("History(s)");
                 // Sync to all channels every frame to ensure newly added channels inherit the setting immediately
                 for (auto &[_, scope] : scopes_)
                         for (auto &[__, ch] : scope->getChannels())
@@ -1412,8 +1423,8 @@ Monitor::updateDisplay()
                                 maxPts = 100;
                         maxDisplayPoints_ = static_cast<u32>(maxPts);
                 }
-                ImGui::SameLine();
-                ImGui::TextDisabled("Max Pts");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Max Pts");
 
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(80);
@@ -1427,8 +1438,6 @@ Monitor::updateDisplay()
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Target sample rate (Hz). HSS mode on J-Link Pro/Ultra+ can reach several "
                                           "kHz to tens of kHz; POLL mode is limited by USB latency (~1-2kHz).");
-                ImGui::SameLine();
-                ImGui::TextDisabled("MaxHz");
 
                 ImGui::SameLine();
                 if (actualHz_ > 0.1f) {
@@ -1439,7 +1448,7 @@ Monitor::updateDisplay()
 
                 // Right-aligned mode control group
                 f32 spacing    = ImGui::GetStyle().ItemSpacing.x;
-                f32 totalWidth = 70 + spacing + 90 + spacing + ImGui::CalcTextSize("MODE").x;
+                f32 totalWidth = 70 + spacing + 90;
 
                 ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - totalWidth);
 
@@ -1454,6 +1463,8 @@ Monitor::updateDisplay()
                               name_.c_str(),
                               samplingMode_ == SamplingMode::HSS ? "HSS" : "POLL");
                 }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Sampling Mode");
                 ImGui::SameLine();
 
                 // Single MODE combo — targets FFT axis when any scope is in FFT view,
@@ -1477,8 +1488,6 @@ Monitor::updateDisplay()
                 }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip(anyFft ? "Frequency Domain View Mode" : "Time Domain View Mode");
-                ImGui::SameLine();
-                ImGui::TextDisabled("MODE");
 
                 ImGui::Separator();
 

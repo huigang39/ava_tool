@@ -13,3 +13,6 @@
 
 /**/*.ini
 /**/*.log
+
+# Installer output
+/dist/

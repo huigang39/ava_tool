@@ -35,7 +35,10 @@ AssemblyViewer::draw(Gui *gui)
                         currentElfPath_ = elfPaths.front();
                 }
 
-                if (ImGui::BeginCombo("Select ELF", currentElfPath_.c_str())) {
+                bool elfComboOpen = ImGui::BeginCombo("##SelectElf", currentElfPath_.c_str());
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Select ELF");
+                if (elfComboOpen) {
                         for (const auto &path : elfPaths) {
                                 bool isSelected = (currentElfPath_ == path);
                                 if (ImGui::Selectable(path.c_str(), isSelected)) {
@@ -61,7 +64,9 @@ AssemblyViewer::draw(Gui *gui)
                 ImGui::Separator();
 
                 static ImGuiTextFilter filter;
-                filter.Draw("Filter (e.g., function name)");
+                filter.Draw("##AsmFilter");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Filter (e.g., function name)");
 
                 ImGui::Separator();
 

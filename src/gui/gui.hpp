@@ -11,6 +11,7 @@
 #include "GLFW/glfw3.h"
 #include "module.h"
 
+#include "core/updater.hpp"
 #include "gui/assembly_viewer.hpp"
 #include "gui/bode.hpp"
 #include "gui/monitor.hpp"
@@ -101,6 +102,14 @@ class Gui
 
         void importCsvAsync(const std::string &path, const std::string &monitorName);
         void processPendingCsvImports();
+
+        // Auto-update (GitHub Releases). Checked once at startup and on demand from
+        // the Help menu; the result drives an "update available" popup.
+        Updater updater_{};
+        bool    updateCheckStarted_  = false; // startup check kicked off
+        bool    updateManualCheck_   = false; // user-initiated → also report "up to date"
+        bool    updatePendingResult_ = false; // a check is in flight; show result when done
+        void    drawUpdateUI();
 
       public:
         Gui(const std::string &initialPath = "");

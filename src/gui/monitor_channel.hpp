@@ -50,12 +50,16 @@ class MonitorChannel
         static constexpr usize kMaxSamples = 4096;
 
       private:
-        std::string       name_{};
-        std::string       type_{};
-        usize             addr_{};
-        std::string       symbolName_{};
-        u32               numBytes_{4};
-        f32               rVal_{}, wVal_{};
+        std::string name_{};
+        std::string type_{};
+        usize       addr_{};
+        std::string symbolName_{};
+        u32         numBytes_{4};
+        f32         rVal_{}, wVal_{};
+        // GUI-facing latest value, refreshed only on publishSnapshot(). Because
+        // publishing is skipped while paused, this stays frozen so the TABLE view
+        // doesn't update during pause (rVal_ keeps moving as sampling continues).
+        f32               dispVal_{};
         std::string       device_{};
         std::string       shmRegionName_{};
         std::atomic<bool> wValDirty_{false};
@@ -121,6 +125,9 @@ class MonitorChannel
                         }
                         publishedEnd_ = sampleCount_;
                 }
+
+                // Mirror the live value for the GUI; frozen while paused (not called).
+                dispVal_ = rVal_;
         }
 
       public:
@@ -153,6 +160,7 @@ class MonitorChannel
         void setOrder(i64 o) { order_ = o; }
 
         f32  &getRVal() { return rVal_; }
+        f32   getDispVal() const { return dispVal_; } // GUI display value (frozen while paused)
         bool &show() { return show_; }
         void  setShow(bool s) { show_ = s; }
         bool &selected() { return selected_; }

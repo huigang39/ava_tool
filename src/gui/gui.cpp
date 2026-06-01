@@ -36,6 +36,7 @@
 #include "gui/gui.hpp"
 #include "gui/monitor.hpp"
 #include "gui/variable.hpp"
+#include "version.hpp"
 #include <cstdlib>
 #include <filesystem>
 #include <thread>
@@ -754,6 +755,20 @@ Gui::drawBar()
                         ImGui::EndMenu();
                 }
 
+                if (ImGui::BeginMenu("Help")) {
+                        ImGui::MenuItem("Version " AVA_VERSION, nullptr, false, false);
+                        ImGui::Separator();
+                        const bool checking = updater_.isChecking();
+                        if (ImGui::MenuItem("Check for Updates...", nullptr, false, !checking)) {
+                                updateManualCheck_   = true;
+                                updatePendingResult_ = true;
+                                updater_.checkAsync();
+                        }
+                        if (checking)
+                                ImGui::TextDisabled("  checking...");
+                        ImGui::EndMenu();
+                }
+
                 ImGui::Separator();
                 bool wasConnected = JLinkPort::instance().isConnected();
                 JLinkPort::instance().drawUI();
@@ -904,6 +919,14 @@ Gui::loop()
                 }
 
                 ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+
+                // Kick off a one-time update check shortly after launch.
+                if (!updateCheckStarted_) {
+                        updateCheckStarted_  = true;
+                        updatePendingResult_ = true;
+                        updater_.checkAsync();
+                }
+                drawUpdateUI();
 
                 if (showCalculator_)
                         drawCalculator();
@@ -1155,24 +1178,40 @@ Gui::drawCalculator()
 
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "--- Input Parameters ---");
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputText("Model", mp.modelName, sizeof(mp.modelName));
+        ImGui::InputText("##MotorModel", mp.modelName, sizeof(mp.modelName));
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Model");
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("Rs (Ohm)", &mp.Rs, 0.0f, 0.0f, "%.4f");
+        ImGui::InputFloat("##MotorRs", &mp.Rs, 0.0f, 0.0f, "%.4f");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Rs (Ohm)");
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("Ld (H)", &mp.Ld, 0.0f, 0.0f, "%.6f");
+        ImGui::InputFloat("##MotorLd", &mp.Ld, 0.0f, 0.0f, "%.6f");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Ld (H)");
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("Lq (H)", &mp.Lq, 0.0f, 0.0f, "%.6f");
+        ImGui::InputFloat("##MotorLq", &mp.Lq, 0.0f, 0.0f, "%.6f");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Lq (H)");
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputInt("Pole Pairs", &mp.polePairs, 0, 0);
+        ImGui::InputInt("##MotorPolePairs", &mp.polePairs, 0, 0);
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Pole Pairs");
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("Kt (Nm/A)", &mp.Kt, 0.0f, 0.0f, "%.6f");
+        ImGui::InputFloat("##MotorKt", &mp.Kt, 0.0f, 0.0f, "%.6f");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Kt (Nm/A)");
 
         ImGui::Separator();
         ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "--- Back-EMF Measurement ---");
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("Frequency (Hz)", &mp.backEmfFreq, 0.0f, 0.0f, "%.3f");
+        ImGui::InputFloat("##MotorBackEmfFreq", &mp.backEmfFreq, 0.0f, 0.0f, "%.3f");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Frequency (Hz)");
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("Vpp (Line-to-Line) (V)", &mp.backEmfVpp, 0.0f, 0.0f, "%.3f");
+        ImGui::InputFloat("##MotorBackEmfVpp", &mp.backEmfVpp, 0.0f, 0.0f, "%.3f");
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Vpp (Line-to-Line) (V)");
 
         if (mp.polePairs < 1)
                 mp.polePairs = 1;
@@ -1475,5 +1514,78 @@ Gui::processPendingCsvImports()
                 monitor->csvLoading_.store(false, std::memory_order_release);
 
                 LOG_I("CSV import: monitor '%s' ready: %zu channels, %zu points", name.c_str(), imp.channels.size(), totalPts);
+        }
+}
+
+/* --------------------------------------------------------------------------
+ * Auto-update UI
+ * -------------------------------------------------------------------------- */
+
+void
+Gui::drawUpdateUI()
+{
+        const Updater::Info info = updater_.get();
+
+        // When a check finishes, open the appropriate popup exactly once.
+        if (updatePendingResult_ && !updater_.isChecking() && info.checked) {
+                updatePendingResult_ = false;
+                if (info.available)
+                        ImGui::OpenPopup("Update Available");
+                else if (updateManualCheck_)
+                        ImGui::OpenPopup("Update Status");
+                updateManualCheck_ = false;
+        }
+
+        // --- Update available ---
+        if (ImGui::BeginPopupModal("Update Available", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("A new version of ava_tool is available.");
+                ImGui::Separator();
+                ImGui::Text("Current: %s", info.currentVersion.c_str());
+                ImGui::Text("Latest:  %s", info.latestVersion.c_str());
+                if (!info.notes.empty()) {
+                        ImGui::Spacing();
+                        ImGui::TextDisabled("Release notes:");
+                        ImGui::BeginChild("##notes", ImVec2(460, 160), true);
+                        ImGui::TextWrapped("%s", info.notes.c_str());
+                        ImGui::EndChild();
+                }
+                ImGui::Spacing();
+
+                const bool canAutoUpdate = !info.assetUrl.empty();
+                if (canAutoUpdate) {
+                        if (ImGui::Button("Update Now", ImVec2(120, 0))) {
+                                if (updater_.launchUpdater(info.assetUrl)) {
+                                        // updater.exe waits for us to exit, then installs + relaunches.
+                                        saveSession();
+                                        glfwSetWindowShouldClose(window_, GLFW_TRUE);
+                                        wantsToQuit_ = true;
+                                }
+                                ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::SameLine();
+                } else if (!info.releaseUrl.empty()) {
+                        if (ImGui::Button("Open Release Page", ImVec2(160, 0))) {
+#ifdef _WIN32
+                                ShellExecuteA(nullptr, "open", info.releaseUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#endif
+                                ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::SameLine();
+                }
+                if (ImGui::Button("Later", ImVec2(120, 0)))
+                        ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+        }
+
+        // --- Manual "check finished" status ---
+        if (ImGui::BeginPopupModal("Update Status", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                if (!info.error.empty())
+                        ImGui::Text("Update check failed: %s", info.error.c_str());
+                else
+                        ImGui::Text("You're up to date (version %s).", info.currentVersion.c_str());
+                ImGui::Spacing();
+                if (ImGui::Button("OK", ImVec2(120, 0)))
+                        ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
         }
 }
