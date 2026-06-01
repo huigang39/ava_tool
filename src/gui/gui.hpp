@@ -14,7 +14,6 @@
 #include "gui/assembly_viewer.hpp"
 #include "gui/bode.hpp"
 #include "gui/monitor.hpp"
-#include "gui/register_viewer.hpp"
 #include "gui/variable.hpp"
 
 class Gui
@@ -85,14 +84,17 @@ class Gui
 
         bool           showCalculator_{false};
         Bode           bode_{};
-        RegisterViewer regViewer_{};
         AssemblyViewer asmViewer_{};
 
+        struct CsvChannelImport {
+                std::string         scope;   // scope this channel belongs to
+                std::string         channel; // channel (column) name
+                std::vector<double> timestamps;
+                std::vector<float>  values;
+        };
         struct CsvImportPending {
-                std::string                     monitorName;
-                std::vector<std::string>        headers;
-                std::vector<double>             timestamps;
-                std::vector<std::vector<float>> columns;
+                std::string                   monitorName;
+                std::vector<CsvChannelImport> channels;
         };
         std::mutex                    mtxCsvPending_{};
         std::vector<CsvImportPending> csvPendingList_{};

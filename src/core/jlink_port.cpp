@@ -249,8 +249,8 @@ JLinkPort::hssStart(const std::vector<HssBlock> &blocks, const i32 periodUs)
         i32 effectivePeriodUs = periodUs;
         if (effectivePeriodUs > 100000)
                 effectivePeriodUs = 100000; // clamp to 10Hz minimum
-        if (effectivePeriodUs < 1000)
-                effectivePeriodUs = 1000; // clamp to 1kHz maximum
+        if (effectivePeriodUs < 20)
+                effectivePeriodUs = 20; // clamp to 50kHz maximum (matches UI cap; HW rejects if too fast)
 
         LOG_I("JLinkPort::hssStart(): starting with %zu blocks, period %d us", descs.size(), effectivePeriodUs);
         i32 res = JLINK_HSS_Start(descs.data(), static_cast<i32>(descs.size()), effectivePeriodUs, 1);
@@ -258,7 +258,7 @@ JLinkPort::hssStart(const std::vector<HssBlock> &blocks, const i32 periodUs)
                 char buf[160];
                 snprintf(buf,
                          sizeof(buf),
-                         "HSS Error: HW rejected period %dus (~%dHz). Try reducing sample rate (recommend <= 100Hz).",
+                         "HSS Error: HW rejected period %dus (~%dHz). Try reducing the sample rate (MaxHz).",
                          effectivePeriodUs,
                          1000000 / effectivePeriodUs);
                 lastErr_ = buf;

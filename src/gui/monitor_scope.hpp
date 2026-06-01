@@ -37,6 +37,7 @@ class MonitorScope
         DrawEnum               getDraw() const { return e_draw; }
         f32                   &getHeight() { return height_; }
         bool                  &getShowFft() { return showFft_; }
+        bool                  &getFftBars() { return fftBars_; }
         int                   &getFftPoints() { return fftPoints_; }
         int                   &getFftPeakCount() { return fftPeakCount_; }
         ChannelMapType        &getChannels() { return chs_; }
@@ -49,6 +50,7 @@ class MonitorScope
         DrawEnum              e_draw{};
         f32                   height_{200.0f};
         bool                  showFft_{false};
+        bool                  fftBars_{false}; // FFT render style: false = line, true = bar chart
         int                   fftPoints_{1024};
         int                   fftPeakCount_{5};
         fft_t                 fft_;
@@ -68,6 +70,10 @@ class MonitorScope
         // persisted across sessions via Gui save/load.
         bool                  hidden_{false};
         std::set<std::string> expandedGroups_{};
+        // Monotonic counter handing each new channel an insertion-order index so
+        // the table/plot can display channels in the order they were added (e.g.
+        // matching CSV column order) instead of hash order.
+        i64 nextChannelOrder_{0};
 
         bool pendingAxisReset_{false};
         struct Peak {

@@ -1,11 +1,13 @@
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <fstream>
 #include <functional>
 #include <sstream>
 
 #include "ImGuiNotify.hpp"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "platform/native_dlg.hpp"
 
 #include "app_log.hpp"
@@ -521,6 +523,16 @@ Variable::flattenDataTree(std::vector<SearchEntry> &pool, const std::string &par
         }
 }
 
+// Defined later in this file; forward-declared so drawSymbolLeaf can flatten a
+// dragged struct/array into per-member channels (same as the watch list does).
+static void flattenForStructPayload(const dwarf::Info                                                     &info,
+                                    const std::string                                                     &prefix,
+                                    u64                                                                    baseAddr,
+                                    u64                                                                    typeOff,
+                                    StructChannelPayload                                                  &sp,
+                                    const std::unordered_map<std::string, std::vector<VarEntry::EnumDef>> *memberOverrides,
+                                    int                                                                    maxDepth);
+
 void
 Variable::drawSymbolTree()
 {
@@ -587,21 +599,30 @@ Variable::drawSymbolLeaf(const std::string &displayName, const std::string &full
 
         // Drag support
         if (ImGui::BeginDragDropSource()) {
-                ChannelDropPayload p{};
-                snprintf(p.name, sizeof(p.name), "%s", fullPath.c_str());
-                p.addr = addr;
-                if (scalarKind) {
-                        snprintf(p.type, sizeof(p.type), "%s", scalarKind);
-                } else if (isStruct) {
-                        snprintf(p.type, sizeof(p.type), "STRUCT");
-                } else if (isArray) {
-                        snprintf(p.type, sizeof(p.type), "ARRAY");
+                if (!scalarKind && (isStruct || isArray)) {
+                        // Flatten the struct/array into per-member scalar channels so the
+                        // monitor plots each leaf, matching the watch-list behaviour.
+                        // Dropping a raw struct as a single CHANNEL produced one
+                        // un-plottable channel (the abnormal display the user hit).
+                        StructChannelPayload sp{};
+                        snprintf(sp.device, sizeof(sp.device), "JLINK");
+                        snprintf(sp.rootName, sizeof(sp.rootName), "%s", fullPath.c_str());
+                        sp.rootAddr    = addr;
+                        sp.rootTypeOff = typeOff;
+                        flattenForStructPayload(dwarfInfo_, fullPath, addr, typeOff, sp, nullptr, 8);
+                        ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
+                } else {
+                        ChannelDropPayload p{};
+                        snprintf(p.name, sizeof(p.name), "%s", fullPath.c_str());
+                        p.addr = addr;
+                        if (scalarKind)
+                                snprintf(p.type, sizeof(p.type), "%s", scalarKind);
+                        snprintf(p.device, sizeof(p.device), "JLINK");
+                        p.numBytes = (u8)typeSize(dwarfInfo_, typeOff);
+                        p.typeOff  = typeOff;
+                        fillEnumPayload(dwarfInfo_, typeOff, p);
+                        ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                 }
-                snprintf(p.device, sizeof(p.device), "JLINK");
-                p.numBytes = (u8)typeSize(dwarfInfo_, typeOff);
-                p.typeOff  = typeOff;
-                fillEnumPayload(dwarfInfo_, typeOff, p);
-                ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                 ImGui::Text("Dragging %s", fullPath.c_str());
                 ImGui::EndDragDropSource();
         }
@@ -871,20 +892,31 @@ Variable::drawSymbolBrowser()
                                 }
 
                                 if (ImGui::BeginDragDropSource()) {
-                                        ChannelDropPayload p{};
-                                        snprintf(p.name, sizeof(p.name), "%s", e.path.c_str());
-                                        p.addr = e.addr;
                                         if (isComplex) {
-                                                snprintf(p.type, sizeof(p.type), "STRUCT");
+                                                // Flatten struct/array into per-member channels so the
+                                                // monitor plots each leaf instead of one bad channel.
+                                                StructChannelPayload sp{};
+                                                snprintf(sp.device,
+                                                         sizeof(sp.device),
+                                                         e.defaultPort == PortType::JLINK ? "JLINK" : "SHM");
+                                                snprintf(sp.rootName, sizeof(sp.rootName), "%s", e.path.c_str());
+                                                sp.rootAddr    = e.addr;
+                                                sp.rootTypeOff = e.typeOff;
+                                                flattenForStructPayload(dwarfInfo_, e.path, e.addr, e.typeOff, sp, nullptr, 8);
+                                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
                                         } else {
+                                                ChannelDropPayload p{};
+                                                snprintf(p.name, sizeof(p.name), "%s", e.path.c_str());
+                                                p.addr = e.addr;
                                                 snprintf(p.type, sizeof(p.type), "%s", Parser::dataTypeToStr(e.type));
+                                                snprintf(p.device,
+                                                         sizeof(p.device),
+                                                         e.defaultPort == PortType::JLINK ? "JLINK" : "SHM");
+                                                p.numBytes = (u8)Parser::typeBytes(e.type);
+                                                p.typeOff  = e.typeOff;
+                                                fillEnumPayload(dwarfInfo_, e.typeOff, p);
+                                                ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                                         }
-                                        snprintf(
-                                            p.device, sizeof(p.device), e.defaultPort == PortType::JLINK ? "JLINK" : "SHM");
-                                        p.numBytes = (u8)Parser::typeBytes(e.type);
-                                        p.typeOff  = e.typeOff;
-                                        fillEnumPayload(dwarfInfo_, e.typeOff, p);
-                                        ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                                         ImGui::Text("Dragging %s", e.path.c_str());
                                         ImGui::EndDragDropSource();
                                 }
@@ -1127,6 +1159,36 @@ Variable::drawVariableList()
         }
 
         if (ImGui::BeginDragDropTarget()) {
+                // A struct/array dragged from the symbol browser arrives as a
+                // STRUCT_CHANNEL (flattened for the monitor); here we re-add it as a
+                // single expandable watch-list entry using the carried root metadata.
+                if (const ImGuiPayload *sPayload = ImGui::AcceptDragDropPayload("STRUCT_CHANNEL")) {
+                        if (sPayload->DataSize == sizeof(StructChannelPayload)) {
+                                auto *s = static_cast<const StructChannelPayload *>(sPayload->Data);
+                                if (s->rootName[0] != '\0') {
+                                        VarEntry v;
+                                        v.name     = s->rootName;
+                                        v.addr     = s->rootAddr;
+                                        v.typeOff  = s->rootTypeOff;
+                                        v.writable = true;
+                                        v.type     = DataType::U32; // placeholder; tree uses typeOff
+                                        if (strcmp(s->device, "SHM") == 0) {
+                                                v.port = PortType::SHM;
+                                                snprintf(v.shm.name,
+                                                         sizeof(v.shm.name),
+                                                         "%s",
+                                                         s->shmName[0] != '\0' ? s->shmName : s->rootName);
+                                        } else if (strcmp(s->device, "LOCAL") == 0 || strcmp(s->device, "MANUAL") == 0) {
+                                                v.port     = PortType::MANUAL;
+                                                v.writable = false;
+                                        } else {
+                                                v.port = PortType::JLINK;
+                                        }
+                                        vars_.push_back(v);
+                                }
+                        }
+                }
+
                 const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("SYMBOL_CHANNEL");
                 if (!payload)
                         payload = ImGui::AcceptDragDropPayload("CHANNEL");
@@ -1424,12 +1486,115 @@ populateShmMemberCache(const dwarf::Info                    &info,
 }
 
 void
+Variable::startPollThread()
+{
+        if (poll_)
+                return; // already running
+        poll_              = std::make_shared<PollState>();
+        poll_->intervalMs  = updateIntervalMs_;
+        auto        ps     = poll_; // worker holds its own ref — never touches `this`
+        std::string nameCp = name_;
+        pollThread_        = std::thread([ps, nameCp]() {
+                LOG_I("Variable[%s] poll thread started", nameCp.c_str());
+                try {
+                        while (ps->running.load()) {
+                                u32 interval = ps->intervalMs.load();
+                                if (interval < 5)
+                                        interval = 5;
+
+                                if (!JLinkPort::instance().isConnected()) {
+                                        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                                        continue;
+                                }
+
+                                // Snapshot the read list published by the GUI thread.
+                                std::vector<PollReq> reqs;
+                                {
+                                        std::lock_guard lk(ps->mtx);
+                                        reqs = ps->reqs;
+                                }
+
+                                std::unordered_map<u64, PollVal> out;
+                                out.reserve(reqs.size());
+                                for (const auto &r : reqs) {
+                                        if (!ps->running.load())
+                                                break;
+                                        PollVal pv{};
+                                        pv.sz = r.sz;
+                                        pv.ok = (r.sz > 0 && r.sz <= sizeof(pv.buf)) &&
+                                                JLinkPort::instance().readMem(static_cast<u32>(r.addr), r.sz, pv.buf);
+                                        out[r.addr] = pv;
+                                }
+
+                                {
+                                        std::lock_guard lk(ps->mtx);
+                                        ps->vals = std::move(out);
+                                }
+
+                                // Sleep in small slices so a stop request (e.g. the
+                                // Variable being destroyed during a session import) is
+                                // honored promptly instead of blocking the join for up
+                                // to a full refresh interval.
+                                for (u32 slept = 0; slept < interval && ps->running.load(); slept += 20)
+                                        std::this_thread::sleep_for(std::chrono::milliseconds(std::min(20u, interval - slept)));
+                        }
+                } catch (...) {
+                        // Never let an exception escape — that would call
+                        // std::terminate and take the whole app down.
+                        LOG_E("Variable[%s] poll thread caught exception", nameCp.c_str());
+                }
+                LOG_I("Variable[%s] poll thread stopped", nameCp.c_str());
+        });
+}
+
+void
+Variable::stopPollThread()
+{
+        if (poll_)
+                poll_->running.store(false);
+        if (pollThread_.joinable())
+                pollThread_.join();
+        poll_.reset();
+}
+
+void
 Variable::updateVariables()
 {
+        // Keep the worker's poll cadence in sync with the UI slider and make sure
+        // the background reader is running (lazy start on first display).
+        startPollThread();
+        poll_->intervalMs.store(updateIntervalMs_);
+
+        // Pause is display-only: the background poll thread keeps reading the target
+        // (sampling continues), but we freeze the displayed values by not refreshing
+        // valueStr while paused.
+        if (g_monitorPaused.load())
+                return;
+
         u64 now = get_mono_ts_ms();
         if (now - lastUpdateTs_ < updateIntervalMs_)
                 return;
         lastUpdateTs_ = now;
+
+        // Publish the current set of JLINK scalar reads for the worker thread, and
+        // take a snapshot of the latest values it has produced.
+        std::unordered_map<u64, PollVal> polledVals;
+        {
+                std::vector<PollReq> reqs;
+                reqs.reserve(vars_.size());
+                for (const auto &v : vars_) {
+                        if (v.port != PortType::JLINK || v.is_editing)
+                                continue;
+                        const dwarf::Type *t = resolveAlias(dwarfInfo_, v.typeOff);
+                        if (t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
+                                  t->kind == dwarf::TypeKind::ARRAY))
+                                continue; // complex types aren't scalar-read here
+                        reqs.push_back({v.addr, Parser::typeBytes(v.type)});
+                }
+                std::lock_guard lk(poll_->mtx);
+                poll_->reqs = std::move(reqs);
+                polledVals  = poll_->vals;
+        }
 
         for (auto &v : vars_) {
                 if (v.is_editing)
@@ -1465,10 +1630,16 @@ Variable::updateVariables()
                 int ret = -2; // -2: No update, -1: Error, 0: Success
                 u32 sz  = Parser::typeBytes(v.type);
                 if (v.port == PortType::JLINK && JLinkPort::instance().isConnected()) {
-                        if (JLinkPort::instance().readMem((u32)v.addr, sz, buf))
+                        // Value is read by the background poll thread; consume the
+                        // cached bytes so the render thread never blocks on USB I/O.
+                        auto it = polledVals.find(v.addr);
+                        if (it != polledVals.end() && it->second.ok) {
+                                std::memcpy(buf, it->second.buf, sizeof(buf));
                                 ret = 0;
-                        else
+                        } else if (it != polledVals.end()) {
                                 ret = -1;
+                        }
+                        // Not yet polled (it == end): leave ret = -2 (no update).
                 } else if (v.port == PortType::SHM) {
                         if (!v.shm.inited) {
                                 shm_cfg_t cfg = {v.shm.name, SHM_READWRITE, 4096};
@@ -1618,8 +1789,39 @@ Variable::updateDisplay()
         }
         updateVariables();
         ImGui::SetNextWindowSize(ImVec2(800, 600), ImGuiCond_FirstUseEver);
-        if (ImGui::Begin(name_.c_str(), &open_))
+        // "VisibleTitle###name_": the visible label tracks the user-editable title
+        // while the trailing id keeps the ImGui window id (and dock layout) stable.
+        const std::string winLabel = getTitle() + "###" + name_;
+        if (ImGui::Begin(winLabel.c_str(), &open_)) {
+                // Double-click the title bar (or dock tab) to rename this window.
+                ImGuiWindow *win = ImGui::GetCurrentWindow();
+                ImRect       tr  = win->DockIsActive ? win->DC.DockTabItemRect : win->TitleBarRect();
+                if (ImGui::IsMouseHoveringRect(tr.Min, tr.Max, false) && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        snprintf(renameBuf_, sizeof(renameBuf_), "%s", getTitle().c_str());
+                        ImGui::OpenPopup("Rename Variable");
+                }
+                if (ImGui::BeginPopup("Rename Variable")) {
+                        ImGui::TextDisabled("重命名");
+                        ImGui::SetNextItemWidth(220);
+                        if (ImGui::IsWindowAppearing())
+                                ImGui::SetKeyboardFocusHere();
+                        bool commit =
+                            ImGui::InputText("##renameVar",
+                                             renameBuf_,
+                                             sizeof(renameBuf_),
+                                             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+                        ImGui::SameLine();
+                        if (ImGui::Button("OK"))
+                                commit = true;
+                        if (commit) {
+                                if (renameBuf_[0] != '\0')
+                                        setTitle(renameBuf_);
+                                ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::EndPopup();
+                }
                 draw();
+        }
         ImGui::End();
 }
 

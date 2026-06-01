@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "implot.h"
 #include "implot_internal.h"
 
@@ -100,6 +101,19 @@ MonitorScope::menu()
                 }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Enter number of peaks and press Enter to confirm");
+
+                ImGui::SameLine();
+                if (fftBars_) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue (active)
+                        if (ImGui::Button("BAR"))
+                                fftBars_ = false;
+                        ImGui::PopStyleColor();
+                } else {
+                        if (ImGui::Button("LINE"))
+                                fftBars_ = true;
+                }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Toggle FFT render style: line / bar chart");
         } else {
                 if (ImGui::Button("TIME")) {
                         showFft_ = true;
@@ -111,20 +125,25 @@ MonitorScope::menu()
         {
                 bool anyVisible = false;
                 for (auto &[_, ch] : chs_)
-                        if (ch && ch->show_) { anyVisible = true; break; }
+                        if (ch && ch->show_) {
+                                anyVisible = true;
+                                break;
+                        }
 
                 if (anyVisible) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 0.5f));
                         if (ImGui::Button("Hide All")) {
                                 for (auto &[_, ch] : chs_)
-                                        if (ch) ch->show_ = false;
+                                        if (ch)
+                                                ch->show_ = false;
                         }
                         ImGui::PopStyleColor();
                 } else {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.7f, 0.3f, 0.6f));
                         if (ImGui::Button("Show All")) {
                                 for (auto &[_, ch] : chs_)
-                                        if (ch) ch->show_ = true;
+                                        if (ch)
+                                                ch->show_ = true;
                         }
                         ImGui::PopStyleColor();
                 }
@@ -211,27 +230,55 @@ MonitorScope::tableDraw()
         ImGui::TableSetupColumn("Wave", ImGuiTableColumnFlags_WidthFixed, 100.0f);
         ImGui::TableHeadersRow();
 
+        auto chOrder = [&](const std::string &k) -> i64 {
+                auto it = chs_.find(k);
+                return it != chs_.end() ? it->second->getOrder() : 0;
+        };
+
         std::vector<std::string> keys;
         for (auto &pair : chs_)
                 keys.push_back(pair.first);
-        std::sort(keys.begin(), keys.end());
+        // Order channels by insertion order (e.g. CSV column order) rather than
+        // alphabetically; fall back to name for a stable tiebreak.
+        std::sort(keys.begin(), keys.end(), [&](const std::string &a, const std::string &b) {
+                const i64 oa = chOrder(a), ob = chOrder(b);
+                return oa != ob ? oa < ob : a < b;
+        });
 
         // Build a prefix trie on '.' so struct members render as an expandable tree.
         struct TNode {
                 std::map<std::string, TNode> children;
-                std::string                  leafKey; // non-empty → this node is a channel
+                std::string                  leafKey;                                // non-empty → this node is a channel
+                i64                          order{std::numeric_limits<i64>::max()}; // min insertion order of leaves beneath
         };
         TNode root;
         for (const auto &k : keys) {
-                TNode      *cur = &root;
+                const i64 ord   = chOrder(k);
+                TNode    *cur   = &root;
+                cur->order      = std::min(cur->order, ord);
                 std::string rem = k;
                 size_t      pos;
                 while ((pos = rem.find('.')) != std::string::npos) {
-                        cur = &cur->children[rem.substr(0, pos)];
-                        rem = rem.substr(pos + 1);
+                        cur        = &cur->children[rem.substr(0, pos)];
+                        cur->order = std::min(cur->order, ord);
+                        rem        = rem.substr(pos + 1);
                 }
-                cur->children[rem].leafKey = k;
+                TNode &leaf  = cur->children[rem];
+                leaf.leafKey = k;
+                leaf.order   = std::min(leaf.order, ord);
         }
+
+        // Children of a trie node ordered by min insertion order (then label).
+        auto orderedChildren = [](TNode &n) {
+                std::vector<std::pair<const std::string *, TNode *>> v;
+                v.reserve(n.children.size());
+                for (auto &[lbl, child] : n.children)
+                        v.emplace_back(&lbl, &child);
+                std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) {
+                        return a.second->order != b.second->order ? a.second->order < b.second->order : *a.first < *b.first;
+                });
+                return v;
+        };
 
         // Collect all leaf channel keys under a trie node (recursive).
         std::function<void(TNode &, std::vector<std::string> &)> collectLeaves;
@@ -346,15 +393,15 @@ MonitorScope::tableDraw()
                         ImGui::TableNextColumn();
                         ImGui::TableNextColumn();
                         if (open) {
-                                for (auto &[childLabel, childNode] : node.children)
-                                        drawNode(childLabel, childNode, fullPath + "." + childLabel);
+                                for (auto &[childLabel, childNode] : orderedChildren(node))
+                                        drawNode(*childLabel, *childNode, fullPath + "." + *childLabel);
                                 ImGui::TreePop();
                         }
                 }
         };
 
-        for (auto &[childLabel, childNode] : root.children)
-                drawNode(childLabel, childNode, childLabel);
+        for (auto &[childLabel, childNode] : orderedChildren(root))
+                drawNode(*childLabel, *childNode, *childLabel);
 
         if (ImGui::IsWindowHovered() && ImGui::IsMouseClicked(0) && !ImGui::IsAnyItemHovered()) {
                 for (auto &pair : chs_)
@@ -659,7 +706,19 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 std::vector<std::pair<MonitorChannel *, ImPlotItem *>> syncItems;
                 syncItems.reserve(chs_.size());
 
-                for (auto &[chName, ch] : chs_) {
+                // Iterate channels in insertion order so the legend/plot follow the
+                // order channels were added (e.g. CSV column order), not hash order.
+                std::vector<ChannelMapType::value_type *> orderedChs;
+                orderedChs.reserve(chs_.size());
+                for (auto &pair : chs_)
+                        orderedChs.push_back(&pair);
+                std::sort(orderedChs.begin(), orderedChs.end(), [](const auto *a, const auto *b) {
+                        return a->second->getOrder() < b->second->getOrder();
+                });
+
+                for (auto *pairPtr : orderedChs) {
+                        auto &chName = pairPtr->first;
+                        auto &ch     = pairPtr->second;
                         // 1. Handle Visibility
                         // For existing items: directly set Show so "Hide All/Show All"
                         // takes effect immediately (bypasses ImPlotCond limitations).
@@ -733,8 +792,19 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                         fftMagBuf_[i] = (f64)fftMagF32_[i] * 2.0 / (f64)fftPoints_;
                                                 }
 
-                                                ImPlot::PlotLine(
-                                                    chName.c_str(), dxs_.data(), fftMagBuf_.data(), (int)dxs_.size());
+                                                if (fftBars_) {
+                                                        // Bar width = one frequency bin, slightly narrowed
+                                                        // so adjacent bars stay visually separated.
+                                                        ImPlot::SetNextFillStyle(ImVec4(col[0], col[1], col[2], col[3]));
+                                                        ImPlot::PlotBars(chName.c_str(),
+                                                                         dxs_.data(),
+                                                                         fftMagBuf_.data(),
+                                                                         (int)dxs_.size(),
+                                                                         (f64)df * 0.9);
+                                                } else {
+                                                        ImPlot::PlotLine(
+                                                            chName.c_str(), dxs_.data(), fftMagBuf_.data(), (int)dxs_.size());
+                                                }
                                                 plotted = true;
 
                                                 if (fftPeakCount_ > 0) {
@@ -1003,6 +1073,7 @@ MonitorScope::addChannel(const std::string &chName)
         globalColorIdx            = (globalColorIdx + 1) % ImPlot::GetColormapSize();
         memcpy(ch->getColor(), &c.x, sizeof(f32) * 4);
         ch->minKeepPoints_ = fftPoints_;
+        ch->setOrder(nextChannelOrder_++); // preserve insertion order for display
 
         chs_[chName] = std::move(ch);
         return 0;
@@ -1181,16 +1252,48 @@ void
 Monitor::updateDisplay()
 {
         bool open = true;
-        if (ImGui::Begin(name_.c_str(), &open)) {
+        // "VisibleTitle###name_": the visible label tracks the user-editable title
+        // while the trailing id keeps the ImGui window id (and dock layout) stable.
+        const std::string winLabel = getTitle() + "###" + name_;
+        if (ImGui::Begin(winLabel.c_str(), &open)) {
                 if (!open)
                         markPendingDelete();
+
+                // Double-click the title bar (or dock tab) to rename this dock.
+                {
+                        ImGuiWindow *win = ImGui::GetCurrentWindow();
+                        ImRect       tr  = win->DockIsActive ? win->DC.DockTabItemRect : win->TitleBarRect();
+                        if (ImGui::IsMouseHoveringRect(tr.Min, tr.Max, false) &&
+                            ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                                snprintf(renameBuf_, sizeof(renameBuf_), "%s", getTitle().c_str());
+                                ImGui::OpenPopup("Rename Dock");
+                        }
+                        if (ImGui::BeginPopup("Rename Dock")) {
+                                ImGui::TextDisabled("重命名");
+                                ImGui::SetNextItemWidth(220);
+                                if (ImGui::IsWindowAppearing())
+                                        ImGui::SetKeyboardFocusHere();
+                                bool commit =
+                                    ImGui::InputText("##renameDock",
+                                                     renameBuf_,
+                                                     sizeof(renameBuf_),
+                                                     ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+                                ImGui::SameLine();
+                                if (ImGui::Button("OK"))
+                                        commit = true;
+                                if (commit) {
+                                        if (renameBuf_[0] != '\0')
+                                                setTitle(renameBuf_);
+                                        ImGui::CloseCurrentPopup();
+                                }
+                                ImGui::EndPopup();
+                        }
+                }
 
                 if (csvLoading_.load(std::memory_order_acquire)) {
                         const char *frames[] = {"|", "/", "-", "\\"};
                         int         fi       = static_cast<int>(ImGui::GetTime() * 8.0) % 4;
-                        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
-                                           "%s  正在解析 CSV...",
-                                           frames[fi]);
+                        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s  正在解析 CSV...", frames[fi]);
                         ImGui::End();
                         return;
                 }
@@ -1219,7 +1322,7 @@ Monitor::updateDisplay()
                         char dfltBuf[128];
                         auto now = std::time(nullptr);
                         std::strftime(dfltBuf, sizeof(dfltBuf), "%Y%m%d_%H%M%S_", std::localtime(&now));
-                        std::string defaultName = std::string(dfltBuf) + name_ + ".csv";
+                        std::string defaultName = std::string(dfltBuf) + getTitle() + ".csv";
 
                         std::string fullpath = nativeDlgSave("Export CSV", {{"CSV Files", {"csv"}}}, defaultName);
                         if (fullpath.empty()) {
@@ -1230,17 +1333,21 @@ Monitor::updateDisplay()
 
                                 FILE *f = fopen(fullpath.c_str(), "w");
                                 if (f) {
+                                        // Each column pair is tagged "<scope>::<channel>::Time" /
+                                        // "<scope>::<channel>::Value" so the importer can restore the
+                                        // originating scope. "::" is used (instead of "_") because both
+                                        // scope and channel names may legitimately contain underscores.
                                         std::vector<std::pair<std::string, MonitorChannel *>> channels;
                                         for (auto &[scopeName, scope] : scopes_) {
                                                 for (auto &[chName, ch] : scope->getChannels()) {
-                                                        channels.push_back({scopeName + "_" + chName, ch.get()});
+                                                        channels.push_back({scopeName + "::" + chName, ch.get()});
                                                 }
                                         }
 
                                         // Write header
                                         for (size_t i = 0; i < channels.size(); ++i) {
                                                 fprintf(f,
-                                                        "%s_Time,%s_Value%s",
+                                                        "%s::Time,%s::Value%s",
                                                         channels[i].first.c_str(),
                                                         channels[i].first.c_str(),
                                                         (i == channels.size() - 1) ? "" : ",");
@@ -1318,7 +1425,8 @@ Monitor::updateDisplay()
                         JLinkPort::instance().reqRestart();
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("HSS sample rate (Hz). Most J-Link hardware supports up to ~200Hz reliably.");
+                        ImGui::SetTooltip("Target sample rate (Hz). HSS mode on J-Link Pro/Ultra+ can reach several "
+                                          "kHz to tens of kHz; POLL mode is limited by USB latency (~1-2kHz).");
                 ImGui::SameLine();
                 ImGui::TextDisabled("MaxHz");
 

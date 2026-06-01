@@ -232,7 +232,6 @@ SRC_CXX := \
     $(DIR_GUI)/variable.cpp \
     $(DIR_GUI)/bode.cpp \
     $(DIR_GUI)/assembly_viewer.cpp \
-    $(DIR_GUI)/register_viewer.cpp \
     $(DIR_CORE)/elf_parser.cpp \
     $(DIR_CORE)/dwarf_parser.cpp \
     $(DIR_CORE)/json_parser.cpp \
@@ -258,6 +257,24 @@ OBJ_CXX := $(patsubst %.cpp,$(OUTPUT_BUILD_DIR)/%.o,$(SRC_CXX))
 OBJ_C   := $(patsubst %.c,$(OUTPUT_BUILD_DIR)/%.o,$(SRC_C))
 OBJ_MM  := $(patsubst %.mm,$(OUTPUT_BUILD_DIR)/%.o,$(SRC_MM))
 OBJ_ALL := $(OBJ_CXX) $(OBJ_C) $(OBJ_MM)
+
+# ─── Header dependencies ────────────────────────────────────────────────────────
+# This build does no per-translation-unit dependency scanning. Without it, editing
+# a header leaves dependent objects stale — and if that header changes a class's
+# size/layout (e.g. adding a member), some TUs see the new layout while others keep
+# the old one, corrupting memory at runtime (a make_shared<T> in one TU under-
+# allocates for code in another TU). To prevent that, conservatively rebuild every
+# first-party object whenever ANY project header changes. Thirdparty objects don't
+# include these headers, so they are intentionally left out and never over-rebuild.
+PROJECT_HEADERS := $(wildcard \
+    $(DIR_SRC)/*.hpp        $(DIR_SRC)/*.h \
+    $(DIR_GUI)/*.hpp        $(DIR_GUI)/*.h \
+    $(DIR_CORE)/*.hpp       $(DIR_CORE)/*.h \
+    $(DIR_PLATFORM)/*.hpp   $(DIR_PLATFORM)/*.h \
+    $(DIR_MODULE)/*.h       $(DIR_MODULE)/inc/*.h)
+
+OBJ_FIRST_PARTY := $(filter $(OUTPUT_BUILD_DIR)/$(DIR_SRC)/%,$(OBJ_ALL))
+$(OBJ_FIRST_PARTY): $(PROJECT_HEADERS)
 
 # ─── Targets ──────────────────────────────────────────────────────────────────
 

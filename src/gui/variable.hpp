@@ -81,7 +81,9 @@ struct ElfLoadingTask {
 class Variable
 {
       private:
-        std::string name_{};
+        std::string name_{};  // Stable internal id: map key + ImGui window id (never changes)
+        std::string title_{}; // User-facing window title; falls back to name_ when empty
+        char        renameBuf_[64]{};
         std::string cfgPath_{}, binPath_{}, elfPath_{};
 
       public:
@@ -109,8 +111,41 @@ class Variable
 
         f32 watchListHeight_ = 300.0f;
 
-        u64                                  lastUpdateTs_{0};
-        u32                                  updateIntervalMs_{200};
+        u64 lastUpdateTs_{0};
+        u32 updateIntervalMs_{200};
+
+        // Background J-Link polling. Reading target memory is a blocking USB
+        // round-trip; doing it on the render thread (and contending with the
+        // sampler on the shared J-Link lock) made the watch-list refresh rate
+        // drag down the GUI frame rate. The worker thread performs the reads at
+        // `updateIntervalMs_`; the render thread only consumes cached bytes.
+        //
+        // The shared state lives in a separately heap-allocated PollState owned
+        // by a shared_ptr that the worker thread *also* holds. The worker never
+        // touches `this`, so even in the unlikely event the thread outlives the
+        // Variable (e.g. a stuck J-Link call delaying the join), it can only ever
+        // dereference the still-alive PollState — never freed Variable memory.
+        struct PollReq {
+                u64 addr;
+                u32 sz;
+        };
+        struct PollVal {
+                u8   buf[8];
+                u32  sz;
+                bool ok;
+        };
+        struct PollState {
+                std::mutex                       mtx;
+                std::vector<PollReq>             reqs; // GUI → worker (what to read)
+                std::unordered_map<u64, PollVal> vals; // worker → GUI (latest bytes)
+                std::atomic<bool>                running{true};
+                std::atomic<u32>                 intervalMs{200};
+        };
+        std::shared_ptr<PollState> poll_{};
+        std::thread                pollThread_{};
+        void                       startPollThread();
+        void                       stopPollThread();
+
         bool                                 isModified_{false};
         std::unordered_map<u64, std::string> memberValueCache_;
         char                                 searchBuf_[128]{};
@@ -192,6 +227,7 @@ class Variable
         ~Variable()
         {
                 LOG_I("Variable Window Destroyed: %s", name_.c_str());
+                stopPollThread();
                 if (currentLoadingTask_) {
                         currentLoadingTask_->aborted = true;
                 }
@@ -204,6 +240,12 @@ class Variable
         void updateDisplay();
 
         const std::string &getName() const { return name_; }
+        const std::string &getTitle() const { return title_.empty() ? name_ : title_; }
+        void               setTitle(const std::string &t)
+        {
+                title_      = t;
+                isModified_ = true;
+        }
         const std::string &getCfgPath() const { return cfgPath_; }
         const std::string &getBinPath() const { return binPath_; }
         const std::string &getElfPath() const { return elfPath_; }

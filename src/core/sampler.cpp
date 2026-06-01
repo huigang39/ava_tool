@@ -211,8 +211,18 @@ threadFunc(Gui *gui)
         u64 lastHssStart       = get_mono_ts_ms();
         f64 lastHssSessionTime = 0;
 
-        bool lastPaused      = false;
-        f64  nextHssTs       = -1.0;
+        // HSS health watchdog. The J-Link HSS hardware FIFO can wedge into a
+        // backlogged/overflowed state in which JLINK_HSS_Read either returns no
+        // frames or returns a full buffer on every call. In the latter case each
+        // read takes much longer and, since it holds the shared J-Link FairMutex,
+        // it starves GUI-thread J-Link reads (register/variable watch) and tanks
+        // the render frame rate — exactly the symptom a manual disconnect/connect
+        // cured by restarting the stream. We reproduce that recovery automatically:
+        // drain the FIFO fully each iteration (below) so a backlog can't persist,
+        // and force a clean HSS restart if no frames arrive for a sustained window.
+        u64 lastHssFrameMs    = get_mono_ts_ms();
+        u64 lastHssWatchdogMs = 0;
+
         f64  hssBaseWallTime = 0;
         u32  hssBaseHwTs     = 0;
         bool hssTimeSynced   = false;
@@ -265,18 +275,11 @@ threadFunc(Gui *gui)
                 }
                 const u64 iterStartUs = get_mono_ts_us();
                 iterCounter++;
+                // Pause is display-only: acquisition keeps running so data is still
+                // captured into each channel's store; only the publish-to-GUI step is
+                // skipped (see below). HSS therefore stays running across pause and
+                // needs no stop/restart on resume.
                 bool isPaused = g_monitorPaused.load();
-                if (!isPaused && lastPaused) {
-                        LOG_I("Resuming from pause, restarting HSS");
-                        if (JLinkPort::instance().isHssRunning()) {
-                                JLinkPort::instance().hssStop();
-                        }
-                        carryLen     = 0;
-                        discardFirst = true;
-                        nextHssTs    = -1.0;
-                        lastBlocks.clear();
-                }
-                lastPaused = isPaused;
 
                 std::vector<WValTask> wvalTasks; // built fresh each iter from cached channels
 
@@ -422,8 +425,8 @@ threadFunc(Gui *gui)
                         for (auto &[m, tasks] : waveGroups) {
                                 const u64 waveNow        = get_mono_ts_us();
                                 i32       targetPeriodUs = 1000000 / m->maxSampleHz_;
-                                if (targetPeriodUs < 1000)
-                                        targetPeriodUs = 1000;
+                                if (targetPeriodUs < 20)
+                                        targetPeriodUs = 20; // honor up to 50kHz (matches UI cap)
 
                                 auto tickIt = lastMonitorWaveTicks.find(m);
                                 if (tickIt == lastMonitorWaveTicks.end()) {
@@ -567,7 +570,7 @@ threadFunc(Gui *gui)
                                 JLinkPort::instance().hasRestartReq());
                 lastConnected             = isConnected;
 
-                bool desiredRunning = !blocks.empty() && !isPaused && isConnected;
+                bool desiredRunning = !blocks.empty() && isConnected; // keep sampling even when paused
                 if (desiredRunning && !JLinkPort::instance().isHssRunning()) {
                         changed = true;
                 }
@@ -617,13 +620,19 @@ threadFunc(Gui *gui)
                         hssTimeSynced  = false;
                 }
 
-                auto processHss = [&]() {
-                        if (isPaused || !JLinkPort::instance().isHssRunning() || lastChans.empty())
-                                return;
+                // Returns true if the host read buffer came back full, i.e. the
+                // device FIFO likely still holds more frames and processHss should
+                // be invoked again this iteration to fully drain it.
+                auto processHss = [&]() -> bool {
+                        if (!JLinkPort::instance().isHssRunning() || lastChans.empty())
+                                return false;
 
+                        const u32 reqBytes     = static_cast<u32>(kBufCap - carryLen);
                         const u64 hssReadStart = get_mono_ts_us();
-                        i32       total = JLinkPort::instance().hssRead(buf + carryLen, static_cast<u32>(kBufCap - carryLen));
-                        const u64 hssReadDur = get_mono_ts_us() - hssReadStart;
+                        i32       total        = JLinkPort::instance().hssRead(buf + carryLen, reqBytes);
+                        const u64 hssReadDur   = get_mono_ts_us() - hssReadStart;
+                        // A full buffer means more frames are queued on the device.
+                        const bool bufferFull = (total > 0 && static_cast<u32>(total) >= reqBytes);
                         loopDiag.hssReads++;
                         loopDiag.sumHssUs += hssReadDur;
                         if (hssReadDur > loopDiag.maxHssUs)
@@ -642,7 +651,7 @@ threadFunc(Gui *gui)
 
                         const i32 frameSize = JLinkPort::instance().hssFrameSize();
                         if (frameSize <= 0)
-                                return;
+                                return false;
 
                         i32 frames = total / frameSize;
                         if (frames > 0) {
@@ -660,10 +669,12 @@ threadFunc(Gui *gui)
                                         carryLen             = total - consumed;
                                         if (carryLen > 0 && consumed > 0)
                                                 std::memmove(buf, buf + consumed, carryLen);
-                                        return; // skip this batch entirely
+                                        lastHssFrameMs = get_mono_ts_ms(); // stream is alive
+                                        return bufferFull;                 // skip this batch entirely
                                 }
 
-                                hzFrameAccum += static_cast<u64>(frames);
+                                lastHssFrameMs  = get_mono_ts_ms(); // stream is alive
+                                hzFrameAccum   += static_cast<u64>(frames);
                                 static std::vector<std::vector<f32>> pVals;
                                 static std::vector<std::vector<f64>> pTs;
                                 pVals.resize(lastChans.size());
@@ -729,6 +740,7 @@ threadFunc(Gui *gui)
                                 if (carryLen > 0 && consumed > 0)
                                         std::memmove(buf, buf + consumed, carryLen);
                         }
+                        return bufferFull;
                 };
 
                 // Execute POLL tasks.
@@ -757,7 +769,7 @@ threadFunc(Gui *gui)
                                 ++it;
                         }
                 }
-                if (!isPaused && !pollTasks.empty()) {
+                if (!pollTasks.empty()) {
                         static std::vector<std::pair<std::shared_ptr<Monitor>, std::vector<TempCh>>> monitorPollGroups;
                         for (auto &pair : monitorPollGroups)
                                 pair.second.clear();
@@ -780,8 +792,8 @@ threadFunc(Gui *gui)
                         for (auto &[m, tasks] : monitorPollGroups) {
                                 auto nowPoll        = get_mono_ts_us();
                                 i32  targetPeriodUs = 1000000 / m->maxSampleHz_;
-                                if (targetPeriodUs < 1000)
-                                        targetPeriodUs = 1000;
+                                if (targetPeriodUs < 20)
+                                        targetPeriodUs = 20; // best-effort up to 50kHz; real rate limited by USB latency
 
                                 if (lastMonitorPollTicks.find(m) == lastMonitorPollTicks.end()) {
                                         lastMonitorPollTicks[m] = nowPoll;
@@ -819,7 +831,34 @@ threadFunc(Gui *gui)
                         }
                 }
 
-                processHss();
+                // Drain the device FIFO this iteration. processHss() returns true
+                // while the host buffer keeps coming back full, meaning the device
+                // still has queued frames. Looping here prevents a backlog from
+                // persisting across frames (each call still takes the J-Link lock
+                // independently, so GUI-thread reads interleave between drains). The
+                // cap bounds worst-case iteration time.
+                static constexpr int kMaxHssDrains = 8;
+                for (int d = 0; d < kMaxHssDrains && processHss(); ++d) {
+                }
+
+                // HSS watchdog: if the stream is supposed to be running but no
+                // frames have arrived for a sustained window, the FIFO has wedged.
+                // Force a clean restart (same recovery a manual reconnect performs),
+                // rate-limited so a genuinely silent target can't thrash the link.
+                if (desiredRunning && JLinkPort::instance().isHssRunning()) {
+                        const u64 nowMs = get_mono_ts_ms();
+                        if (nowMs - lastHssFrameMs > 2000 && nowMs - lastHssWatchdogMs > 5000) {
+                                LOG_W("[HSS-WATCHDOG] no frames for %llums while streaming — forcing HSS restart",
+                                      nowMs - lastHssFrameMs);
+                                JLinkPort::instance().reqRestart();
+                                lastHssWatchdogMs = nowMs;
+                                lastHssFrameMs    = nowMs; // avoid immediate re-trigger before restart settles
+                        }
+                } else {
+                        // Not streaming (paused/disconnected/no channels): keep the
+                        // frame clock fresh so the watchdog doesn't fire on resume.
+                        lastHssFrameMs = get_mono_ts_ms();
+                }
 
                 // Publish snapshots — try_lock only. If GUI is holding the
                 // lock (rendering), skip this iteration; publishSnapshot is
@@ -831,8 +870,11 @@ threadFunc(Gui *gui)
                                 for (const auto &monitor : gui->getMonitors() | std::views::values) {
                                         monitor->updateHz();
                                         for (auto &scope : monitor->getScopes() | std::views::values) {
-                                                for (auto &[_, ch] : scope->getChannels())
-                                                        ch->publishSnapshot();
+                                                // While paused, keep capturing but don't push new
+                                                // samples to the GUI view (freezes the plot/table).
+                                                if (!isPaused)
+                                                        for (auto &[_, ch] : scope->getChannels())
+                                                                ch->publishSnapshot();
                                                 scope->purgeDeleted();
                                         }
                                         monitor->purgeDeletedScopes();

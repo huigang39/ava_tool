@@ -33,11 +33,15 @@ class Monitor
         using ScopeMapType = std::unordered_map<std::string, std::shared_ptr<MonitorScope>>;
 
       private:
-        std::string      name_{};
+        std::string      name_{};  // Stable internal id: map key + ImGui window id (never changes)
+        std::string      title_{}; // User-facing dock title; falls back to name_ when empty
         std::vector<f32> timestamps_{};
         bool             paused_{false};
         ScopeMapType     scopes_{};
         bool             isModified_{false};
+
+        // Inline rename of the dock title (double-click the title bar / tab).
+        char renameBuf_[64]{};
 
       public:
         enum class SamplingMode { HSS, POLL };
@@ -135,7 +139,13 @@ class Monitor
         void markPendingDelete() { pendingDelete_.store(true, std::memory_order_release); }
         bool isPendingDelete() const { return pendingDelete_.load(std::memory_order_acquire); }
 
-        std::string     getName() { return name_; }
+        std::string        getName() { return name_; }
+        const std::string &getTitle() const { return title_.empty() ? name_ : title_; }
+        void               setTitle(const std::string &t)
+        {
+                title_      = t;
+                isModified_ = true;
+        }
         int             addScope(const std::string &scopeName);
         ScopeMapType   &getScopes() { return scopes_; }
         MonitorChannel *findChannel(const std::string &scopeName, const std::string &chName);

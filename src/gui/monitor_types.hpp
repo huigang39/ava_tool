@@ -40,9 +40,15 @@ struct StructChannelPayload {
                 u8                            numEnums;
                 ChannelDropPayload::EnumEntry enums[kMaxEnums];
         };
-        int   count;
-        char  device[8];
-        char  shmName[64];
+        int  count;
+        char device[8];
+        char shmName[64];
+        // Root struct/array metadata, so a drop target (e.g. the variable watch
+        // list) can add the whole struct as a single expandable entry instead of
+        // the flattened scalar leaves the monitor consumes.
+        char  rootName[128];
+        u64   rootAddr;
+        u64   rootTypeOff;
         Entry entries[kMaxEntries];
 };
 

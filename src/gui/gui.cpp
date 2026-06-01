@@ -199,6 +199,7 @@ Gui::saveSession(const std::string &path)
         for (const auto &m : monitors_ | std::views::values) {
                 cJSON *mObj = cJSON_CreateObject();
                 cJSON_AddStringToObject(mObj, "name", m->getName().c_str());
+                cJSON_AddStringToObject(mObj, "title", m->getTitle().c_str());
                 cJSON_AddStringToObject(mObj, "samplingMode", m->samplingMode_ == Monitor::SamplingMode::HSS ? "HSS" : "POLL");
                 cJSON_AddNumberToObject(mObj, "maxSampleHz", m->maxSampleHz_);
                 cJSON_AddNumberToObject(mObj, "historySeconds", static_cast<f64>(m->historySeconds_));
@@ -211,6 +212,7 @@ Gui::saveSession(const std::string &path)
                         cJSON_AddStringToObject(sObj, "draw", s->getDraw() == MonitorScope::DrawEnum::PLOT ? "PLOT" : "TABLE");
                         cJSON_AddNumberToObject(sObj, "height", static_cast<f64>(s->getHeight()));
                         cJSON_AddBoolToObject(sObj, "showFft", s->getShowFft());
+                        cJSON_AddBoolToObject(sObj, "fftBars", s->getFftBars());
                         cJSON_AddNumberToObject(sObj, "fftPoints", static_cast<f64>(s->getFftPoints()));
                         cJSON_AddNumberToObject(sObj, "fftPeakCount", static_cast<f64>(s->getFftPeakCount()));
 
@@ -222,7 +224,15 @@ Gui::saveSession(const std::string &path)
                         }
 
                         cJSON *chsArr = cJSON_CreateArray();
-                        for (auto &ch : s->getChannels() | std::views::values) {
+                        // Persist channels in insertion order so the order survives a
+                        // save/load round-trip (the map itself is unordered).
+                        std::vector<MonitorChannel *> orderedChs;
+                        for (auto &ch : s->getChannels() | std::views::values)
+                                orderedChs.push_back(ch.get());
+                        std::sort(orderedChs.begin(), orderedChs.end(), [](const MonitorChannel *a, const MonitorChannel *b) {
+                                return a->getOrder() < b->getOrder();
+                        });
+                        for (auto *ch : orderedChs) {
                                 cJSON *chObj = cJSON_CreateObject();
                                 cJSON_AddStringToObject(chObj, "name", ch->getName().c_str());
                                 cJSON_AddStringToObject(chObj, "type", ch->getType().c_str());
@@ -265,13 +275,27 @@ Gui::saveSession(const std::string &path)
         }
         cJSON_AddItemToObject(root, "monitors", monitorsArr);
 
+        // Store file paths relative to the .ava file so the session stays portable
+        // when the project folder is moved. Cross-drive paths fall back to absolute.
+        const std::filesystem::path baseDir = std::filesystem::path(targetPath).parent_path();
+        auto                        toRel   = [&](const std::string &p) -> std::string {
+                if (p.empty() || baseDir.empty())
+                        return p;
+                std::error_code ec;
+                auto            rel = std::filesystem::relative(p, baseDir, ec);
+                if (ec || rel.empty())
+                        return p;
+                return rel.generic_string();
+        };
+
         cJSON *VariableArr = cJSON_CreateArray();
         for (const auto &p : vars_ | std::views::values) {
                 cJSON *pObj = cJSON_CreateObject();
                 cJSON_AddStringToObject(pObj, "name", p->getName().c_str());
-                cJSON_AddStringToObject(pObj, "cfgPath", p->getCfgPath().c_str());
-                cJSON_AddStringToObject(pObj, "binPath", p->getBinPath().c_str());
-                cJSON_AddStringToObject(pObj, "elfPath", p->getElfPath().c_str());
+                cJSON_AddStringToObject(pObj, "title", p->getTitle().c_str());
+                cJSON_AddStringToObject(pObj, "cfgPath", toRel(p->getCfgPath()).c_str());
+                cJSON_AddStringToObject(pObj, "binPath", toRel(p->getBinPath()).c_str());
+                cJSON_AddStringToObject(pObj, "elfPath", toRel(p->getElfPath()).c_str());
                 p->save(pObj);
                 p->clearModified();
                 cJSON_AddItemToArray(VariableArr, pObj);
@@ -299,7 +323,7 @@ Gui::saveSession(const std::string &path)
         cJSON_AddStringToObject(root, "imguiLayout", ImGui::SaveIniSettingsToMemory());
 
         u64           pStart = get_mono_ts_ms();
-        char         *out    = cJSON_PrintUnformatted(root);
+        char         *out    = cJSON_Print(root); // formatted/pretty-printed for human readability
         u64           pEnd   = get_mono_ts_ms();
         std::ofstream ofs(targetPath);
         if (ofs && out) {
@@ -381,6 +405,12 @@ Gui::loadSession(const std::string &path)
                         monitors_[mName]  = std::make_shared<Monitor>(mName);
                         Monitor *monitor  = monitors_[mName].get();
 
+                        if (const cJSON *titleItem = cJSON_GetObjectItem(mItem, "title");
+                            cJSON_IsString(titleItem) && titleItem->valuestring[0] != '\0') {
+                                monitor->setTitle(titleItem->valuestring);
+                                monitor->clearModified(); // loading is not a user edit
+                        }
+
                         if (const cJSON *hSec = cJSON_GetObjectItem(mItem, "historySeconds"); cJSON_IsNumber(hSec))
                                 monitor->historySeconds_ = static_cast<f32>(hSec->valuedouble);
 
@@ -420,6 +450,9 @@ Gui::loadSession(const std::string &path)
 
                                 if (const cJSON *fftShowItem = cJSON_GetObjectItem(sItem, "showFft"); cJSON_IsBool(fftShowItem))
                                         scope->getShowFft() = cJSON_IsTrue(fftShowItem);
+
+                                if (const cJSON *fftBarsItem = cJSON_GetObjectItem(sItem, "fftBars"); cJSON_IsBool(fftBarsItem))
+                                        scope->getFftBars() = cJSON_IsTrue(fftBarsItem);
 
                                 if (const cJSON *fftPtsItem = cJSON_GetObjectItem(sItem, "fftPoints");
                                     cJSON_IsNumber(fftPtsItem)) {
@@ -524,6 +557,18 @@ Gui::loadSession(const std::string &path)
                 }
         }
 
+        // Resolve file paths that were stored relative to the .ava file back to
+        // absolute paths. Already-absolute paths (old sessions) are used as-is.
+        const std::filesystem::path baseDir = std::filesystem::path(targetPath).parent_path();
+        auto                        toAbs   = [&](const std::string &p) -> std::string {
+                if (p.empty() || baseDir.empty())
+                        return p;
+                std::filesystem::path fp(p);
+                if (fp.is_absolute())
+                        return p;
+                return (baseDir / fp).lexically_normal().string();
+        };
+
         u64 varStart = get_mono_ts_ms();
         if (const cJSON *VarArr = cJSON_GetObjectItem(root, "Variables"); cJSON_IsArray(VarArr)) {
                 for (const cJSON *pItem = VarArr->child; pItem; pItem = pItem->next) {
@@ -534,12 +579,18 @@ Gui::loadSession(const std::string &path)
                         vars_[pName]      = std::make_shared<Variable>(pName);
                         Variable *v       = vars_[pName].get();
 
+                        if (const cJSON *titleItem = cJSON_GetObjectItem(pItem, "title");
+                            cJSON_IsString(titleItem) && titleItem->valuestring[0] != '\0') {
+                                v->setTitle(titleItem->valuestring);
+                                v->clearModified(); // loading is not a user edit
+                        }
+
                         const cJSON      *cfgItem = cJSON_GetObjectItem(pItem, "cfgPath");
                         const cJSON      *binItem = cJSON_GetObjectItem(pItem, "binPath");
                         const cJSON      *elfItem = cJSON_GetObjectItem(pItem, "elfPath");
-                        const std::string cfg     = cJSON_IsString(cfgItem) ? cfgItem->valuestring : "";
-                        const std::string bin     = cJSON_IsString(binItem) ? binItem->valuestring : "";
-                        const std::string elf     = cJSON_IsString(elfItem) ? elfItem->valuestring : "";
+                        const std::string cfg     = cJSON_IsString(cfgItem) ? toAbs(cfgItem->valuestring) : "";
+                        const std::string bin     = cJSON_IsString(binItem) ? toAbs(binItem->valuestring) : "";
+                        const std::string elf     = cJSON_IsString(elfItem) ? toAbs(elfItem->valuestring) : "";
 
                         if (!cfg.empty())
                                 v->loadCfg(cfg);
@@ -643,7 +694,6 @@ Gui::drawBar()
                         ImGui::MenuItem("Bode Plot", nullptr, &bode_.show_);
                         ImGui::Separator();
                         ImGui::MenuItem("Assembly Viewer", nullptr, &asmViewer_.show_);
-                        ImGui::MenuItem("Registers", nullptr, &regViewer_.show_);
                         ImGui::EndMenu();
                 }
 
@@ -887,7 +937,6 @@ Gui::loop()
 
                 bode_.updateDisplay();
                 asmViewer_.draw(this);
-                regViewer_.draw();
 
                 processPendingCsvImports();
 
@@ -900,14 +949,14 @@ Gui::loop()
                                 std::string monName;
                                 {
                                         std::lock_guard lk(mtxMonitors_);
-                                        monName   = stem;
-                                        int idx   = 1;
+                                        monName = stem;
+                                        int idx = 1;
                                         while (monitors_.count(monName))
                                                 monName = stem + "_" + std::to_string(idx++);
-                                        auto mon                  = std::make_shared<Monitor>(monName);
+                                        auto mon = std::make_shared<Monitor>(monName);
                                         mon->csvLoading_.store(true, std::memory_order_release);
-                                        monitors_[monName]        = mon;
-                                        isModified_               = true;
+                                        monitors_[monName] = mon;
+                                        isModified_        = true;
                                 }
                                 importCsvAsync(file, monName);
                         }
@@ -1167,6 +1216,21 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
                         return;
                 }
 
+                // Split a CSV line into trimmed fields (empty fields preserved).
+                auto splitCsv = [](const std::string &s) {
+                        std::vector<std::string> out;
+                        std::istringstream       ss(s);
+                        std::string              tok;
+                        while (std::getline(ss, tok, ',')) {
+                                while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' '))
+                                        tok.pop_back();
+                                while (!tok.empty() && tok.front() == ' ')
+                                        tok.erase(tok.begin());
+                                out.push_back(tok);
+                        }
+                        return out;
+                };
+
                 // --- Parse header row ---
                 std::string line;
                 if (!std::getline(f, line)) {
@@ -1174,99 +1238,160 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
                         return;
                 }
 
-                // Split header into column names
-                std::vector<std::string> headers;
-                {
-                        std::istringstream ss(line);
-                        std::string        tok;
-                        while (std::getline(ss, tok, ',')) {
-                                // Strip CR and surrounding whitespace
-                                while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' '))
-                                        tok.pop_back();
-                                while (!tok.empty() && tok.front() == ' ')
-                                        tok.erase(tok.begin());
-                                headers.push_back(tok);
-                        }
-                }
-
+                std::vector<std::string> headers = splitCsv(line);
                 if (headers.empty()) {
                         LOG_E("CSV import: no columns in %s", path.c_str());
                         return;
                 }
 
-                // Decide whether first column is a timestamp.
-                // Treat it as time if its header contains "time", "t", "ts", "timestamp", "index" (case-insensitive).
-                bool firstIsTime = false;
-                {
-                        std::string h0 = headers[0];
-                        for (auto &c : h0)
-                                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                        firstIsTime =
-                            (h0 == "t" || h0 == "time" || h0 == "ts" || h0 == "timestamp" || h0 == "index" || h0 == "x");
+                // Recognise this tool's own export format: every column is a
+                // "<scope>::<channel>::Time" / "<scope>::<channel>::Value" pair.
+                // scope/channel may contain '_' but never "::", so the split is
+                // unambiguous (channel takes everything after the first "::").
+                auto parseNative =
+                    [](const std::string &h, std::string &scope, std::string &channel, std::string &kind) -> bool {
+                        auto pK = h.rfind("::");
+                        if (pK == std::string::npos)
+                                return false;
+                        kind = h.substr(pK + 2);
+                        if (kind != "Time" && kind != "Value")
+                                return false;
+                        const std::string rest = h.substr(0, pK);
+                        auto              pS   = rest.find("::");
+                        if (pS == std::string::npos)
+                                return false;
+                        scope   = rest.substr(0, pS);
+                        channel = rest.substr(pS + 2);
+                        return !scope.empty() && !channel.empty();
+                };
+
+                bool isNative = true;
+                for (const auto &h : headers) {
+                        std::string s, c, k;
+                        if (!parseNative(h, s, c, k)) {
+                                isNative = false;
+                                break;
+                        }
                 }
 
-                const int timeCol   = firstIsTime ? 0 : -1;
-                const int dataStart = firstIsTime ? 1 : 0;
+                std::vector<CsvChannelImport> outChannels;
 
-                std::vector<std::string> dataHeaders;
-                for (int i = dataStart; i < static_cast<int>(headers.size()); ++i)
-                        dataHeaders.push_back(headers[i]);
-
-                const int nCols = static_cast<int>(dataHeaders.size());
-                if (nCols == 0) {
-                        LOG_E("CSV import: no data columns in %s", path.c_str());
-                        return;
-                }
-
-                std::vector<double>             timestamps;
-                std::vector<std::vector<float>> columns(nCols);
-
-                // --- Parse data rows ---
-                double rowIdx = 0.0;
-                while (std::getline(f, line)) {
-                        if (line.empty() || line[0] == '#')
-                                continue;
-
-                        std::vector<double> rowVals;
-                        rowVals.reserve(headers.size());
-                        {
-                                std::istringstream ss(line);
-                                std::string        tok;
-                                while (std::getline(ss, tok, ',')) {
-                                        while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' '))
-                                                tok.pop_back();
-                                        while (!tok.empty() && tok.front() == ' ')
-                                                tok.erase(tok.begin());
-                                        double v       = 0.0;
-                                        auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), v);
-                                        rowVals.push_back((ec == std::errc{}) ? v : 0.0);
-                                }
+                if (isNative) {
+                        // Map each column to its channel slot; preserve first-seen order.
+                        std::vector<std::string> keys; // "<scope>\x1f<channel>"
+                        std::vector<int>         timeCol, valCol;
+                        auto                     slotFor = [&](const std::string &scope, const std::string &channel) {
+                                const std::string key = scope + '\x1f' + channel;
+                                for (size_t i = 0; i < keys.size(); ++i)
+                                        if (keys[i] == key)
+                                                return static_cast<int>(i);
+                                keys.push_back(key);
+                                timeCol.push_back(-1);
+                                valCol.push_back(-1);
+                                CsvChannelImport ci;
+                                ci.scope   = scope;
+                                ci.channel = channel;
+                                outChannels.push_back(std::move(ci));
+                                return static_cast<int>(keys.size() - 1);
+                        };
+                        for (int i = 0; i < static_cast<int>(headers.size()); ++i) {
+                                std::string s, c, k;
+                                parseNative(headers[i], s, c, k);
+                                const int slot                         = slotFor(s, c);
+                                (k == "Time" ? timeCol : valCol)[slot] = i;
                         }
 
-                        // Pad / trim to expected column count
-                        rowVals.resize(headers.size(), 0.0);
+                        // Each channel carries its own Time/Value columns; a row whose
+                        // Time+Value cells are both empty means that channel has no sample
+                        // there (channels may differ in length), so it is simply skipped.
+                        while (std::getline(f, line)) {
+                                if (line.empty() || line[0] == '#')
+                                        continue;
+                                std::vector<std::string> toks = splitCsv(line);
+                                toks.resize(headers.size());
 
-                        const double ts = (timeCol >= 0) ? rowVals[timeCol] : rowIdx;
-                        timestamps.push_back(ts);
+                                for (size_t ch = 0; ch < outChannels.size(); ++ch) {
+                                        const int tc = timeCol[ch], vc = valCol[ch];
+                                        if (tc < 0 || vc < 0)
+                                                continue;
+                                        const std::string &tt = toks[tc];
+                                        const std::string &vt = toks[vc];
+                                        if (tt.empty() && vt.empty())
+                                                continue;
+                                        double tv = 0.0, vv = 0.0;
+                                        std::from_chars(tt.data(), tt.data() + tt.size(), tv);
+                                        std::from_chars(vt.data(), vt.data() + vt.size(), vv);
+                                        outChannels[ch].timestamps.push_back(tv);
+                                        outChannels[ch].values.push_back(static_cast<float>(vv));
+                                }
+                        }
+                } else {
+                        // Generic CSV: optional leading time column + data columns,
+                        // all dropped into a single scope.
+                        bool firstIsTime = false;
+                        {
+                                std::string h0 = headers[0];
+                                for (auto &c : h0)
+                                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                firstIsTime = (h0 == "t" || h0 == "time" || h0 == "ts" || h0 == "timestamp" || h0 == "index" ||
+                                               h0 == "x");
+                        }
 
-                        for (int c = 0; c < nCols; ++c)
-                                columns[c].push_back(static_cast<float>(rowVals[dataStart + c]));
+                        const int timeCol   = firstIsTime ? 0 : -1;
+                        const int dataStart = firstIsTime ? 1 : 0;
 
-                        rowIdx += 1.0;
+                        std::vector<std::string> dataHeaders(headers.begin() + dataStart, headers.end());
+                        const int                nCols = static_cast<int>(dataHeaders.size());
+                        if (nCols == 0) {
+                                LOG_E("CSV import: no data columns in %s", path.c_str());
+                                return;
+                        }
+
+                        std::vector<double>             timestamps;
+                        std::vector<std::vector<float>> columns(nCols);
+
+                        double rowIdx = 0.0;
+                        while (std::getline(f, line)) {
+                                if (line.empty() || line[0] == '#')
+                                        continue;
+                                std::vector<std::string> toks = splitCsv(line);
+                                toks.resize(headers.size());
+
+                                std::vector<double> rowVals(headers.size(), 0.0);
+                                for (size_t i = 0; i < toks.size(); ++i)
+                                        std::from_chars(toks[i].data(), toks[i].data() + toks[i].size(), rowVals[i]);
+
+                                timestamps.push_back((timeCol >= 0) ? rowVals[timeCol] : rowIdx);
+                                for (int c = 0; c < nCols; ++c)
+                                        columns[c].push_back(static_cast<float>(rowVals[dataStart + c]));
+                                rowIdx += 1.0;
+                        }
+
+                        if (timestamps.empty()) {
+                                LOG_E("CSV import: no data rows in %s", path.c_str());
+                                return;
+                        }
+
+                        for (int c = 0; c < nCols; ++c) {
+                                CsvChannelImport ci;
+                                ci.scope      = "scope_0";
+                                ci.channel    = dataHeaders[c];
+                                ci.timestamps = timestamps;
+                                ci.values     = std::move(columns[c]);
+                                outChannels.push_back(std::move(ci));
+                        }
                 }
 
-                if (timestamps.empty()) {
-                        LOG_E("CSV import: no data rows in %s", path.c_str());
+                if (outChannels.empty()) {
+                        LOG_E("CSV import: no data in %s", path.c_str());
                         return;
                 }
 
-                LOG_I("CSV import done: %s  rows=%zu  cols=%d", path.c_str(), timestamps.size(), nCols);
+                LOG_I("CSV import done: %s  native=%d  channels=%zu", path.c_str(), isNative ? 1 : 0, outChannels.size());
 
                 CsvImportPending result;
                 result.monitorName = monitorName;
-                result.headers     = std::move(dataHeaders);
-                result.timestamps  = std::move(timestamps);
-                result.columns     = std::move(columns);
+                result.channels    = std::move(outChannels);
 
                 {
                         std::lock_guard lk(mtxCsvPending_);
@@ -1290,52 +1415,65 @@ Gui::processPendingCsvImports()
         std::lock_guard lk(mtxMonitors_);
         for (auto &imp : pending) {
                 // Find the monitor that was created immediately on file drop
-                auto   it      = monitors_.find(imp.monitorName);
+                auto     it      = monitors_.find(imp.monitorName);
                 Monitor *monitor = (it != monitors_.end()) ? it->second.get() : nullptr;
                 if (!monitor) {
                         // Fallback: create it now (shouldn't normally happen)
-                        auto m             = std::make_shared<Monitor>(imp.monitorName);
+                        auto m                     = std::make_shared<Monitor>(imp.monitorName);
                         monitors_[imp.monitorName] = m;
-                        monitor            = m.get();
+                        monitor                    = m.get();
                 }
                 const std::string &name = imp.monitorName;
 
-                const std::string scopeName = "scope_0";
-                monitor->addScope(scopeName);
-                MonitorScope *scope = monitor->getScopes()[scopeName].get();
-                if (!scope)
-                        continue;
+                bool   haveSpan = false;
+                double spanMin = 0.0, spanMax = 0.0;
+                usize  totalPts = 0;
 
-                const usize nPts = imp.timestamps.size();
+                for (auto &cd : imp.channels) {
+                        // Restore the originating scope (no-op if already present).
+                        monitor->addScope(cd.scope);
+                        MonitorScope *scope = monitor->getScopes()[cd.scope].get();
+                        if (!scope)
+                                continue;
 
-                for (int c = 0; c < static_cast<int>(imp.headers.size()); ++c) {
-                        const std::string &chName = imp.headers[c];
-                        scope->addChannel(chName);
-                        MonitorChannel *ch = scope->findChannel(chName);
+                        scope->addChannel(cd.channel);
+                        MonitorChannel *ch = scope->findChannel(cd.channel);
                         if (!ch)
                                 continue;
 
                         ch->historySeconds_   = 0.0f; // static data — no time-based pruning
                         ch->maxDisplayPoints_ = 5000;
 
-                        ch->pushBatch(imp.columns[c].data(), imp.timestamps.data(), nPts);
+                        const usize nPts = cd.values.size();
+                        ch->pushBatch(cd.values.data(), cd.timestamps.data(), nPts);
                         ch->publishSnapshot();
+                        totalPts += nPts;
+
+                        if (!cd.timestamps.empty()) {
+                                const double lo = cd.timestamps.front();
+                                const double hi = cd.timestamps.back();
+                                if (!haveSpan) {
+                                        spanMin  = lo;
+                                        spanMax  = hi;
+                                        haveSpan = true;
+                                } else {
+                                        spanMin = std::min(spanMin, lo);
+                                        spanMax = std::max(spanMax, hi);
+                                }
+                        }
                 }
 
-                // Set x-axis range to cover the full data span
-                if (nPts > 0) {
-                        monitor->linkXMin_      = imp.timestamps.front();
-                        monitor->linkXMax_      = imp.timestamps.back();
-                        monitor->dataStartTime_ = imp.timestamps.front();
-                        monitor->lastNow_       = imp.timestamps.back();
+                // Set x-axis range to cover the full data span across all scopes
+                if (haveSpan) {
+                        monitor->linkXMin_      = spanMin;
+                        monitor->linkXMax_      = spanMax;
+                        monitor->dataStartTime_ = spanMin;
+                        monitor->lastNow_       = spanMax;
                 }
 
                 // Clear loading flag — monitor will show data on the next frame
                 monitor->csvLoading_.store(false, std::memory_order_release);
 
-                LOG_I("CSV import: monitor '%s' ready: %d channels, %zu points",
-                      name.c_str(),
-                      static_cast<int>(imp.headers.size()),
-                      nPts);
+                LOG_I("CSV import: monitor '%s' ready: %zu channels, %zu points", name.c_str(), imp.channels.size(), totalPts);
         }
 }

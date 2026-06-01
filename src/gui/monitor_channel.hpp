@@ -81,6 +81,7 @@ class MonitorChannel
         int  plotStyle_{0}; // 0 = Line, 1 = Stairs
         bool showMarkers_{false};
         bool show_{true};
+        i64  order_{0}; // Display/insertion order within the scope (lower = earlier)
 
         shm_t shm_{};
 
@@ -147,6 +148,9 @@ class MonitorChannel
         std::string &getShmRegionName() { return shmRegionName_; }
         void         setShmRegionName(const std::string &n) { shmRegionName_ = n; }
         shm_t       &getShm() { return shm_; }
+
+        i64  getOrder() const { return order_; }
+        void setOrder(i64 o) { order_ = o; }
 
         f32  &getRVal() { return rVal_; }
         bool &show() { return show_; }
