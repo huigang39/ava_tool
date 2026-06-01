@@ -106,6 +106,30 @@ MonitorScope::menu()
                 }
         }
 
+        // Hide All / Show All channels
+        ImGui::SameLine();
+        {
+                bool anyVisible = false;
+                for (auto &[_, ch] : chs_)
+                        if (ch && ch->show_) { anyVisible = true; break; }
+
+                if (anyVisible) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 0.5f));
+                        if (ImGui::Button("Hide All")) {
+                                for (auto &[_, ch] : chs_)
+                                        if (ch) ch->show_ = false;
+                        }
+                        ImGui::PopStyleColor();
+                } else {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.7f, 0.3f, 0.6f));
+                        if (ImGui::Button("Show All")) {
+                                for (auto &[_, ch] : chs_)
+                                        if (ch) ch->show_ = true;
+                        }
+                        ImGui::PopStyleColor();
+                }
+        }
+
         // Right-aligned buttons: Delete Scope, Hide Scope, and Pause/Resume
         float delBtnWidth  = ImGui::CalcTextSize("Delete Scope").x + ImGui::GetStyle().FramePadding.x * 2.0f;
         float hideBtnWidth = std::max(ImGui::CalcTextSize("Hide Scope").x, ImGui::CalcTextSize("Show Scope").x) +
@@ -628,8 +652,24 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
 
                 channelPeaks_.clear();
                 channelStats_.clear();
+
+                // Collect (channel, item) pairs here, inside the BeginPlot context
+                // where ImGui ID stack is correct. Used after EndPlot to sync
+                // legend-click state back to ch->show_ via raw pointer (no ID lookup).
+                std::vector<std::pair<MonitorChannel *, ImPlotItem *>> syncItems;
+                syncItems.reserve(chs_.size());
+
                 for (auto &[chName, ch] : chs_) {
                         // 1. Handle Visibility
+                        // For existing items: directly set Show so "Hide All/Show All"
+                        // takes effect immediately (bypasses ImPlotCond limitations).
+                        // For brand-new items: HideNextItem(Once) sets the initial state.
+                        if (auto *gp = ImPlot::GetCurrentContext(); gp && gp->CurrentPlot) {
+                                if (ImPlotItem *item = gp->CurrentPlot->Items.GetItem(chName.c_str())) {
+                                        item->Show = ch->show_;
+                                        syncItems.emplace_back(ch.get(), item);
+                                }
+                        }
                         ImPlot::HideNextItem(!ch->show_, ImPlotCond_Once);
 
                         // 2. Handle Style & Color
@@ -872,6 +912,14 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                         }
                 }
                 ImPlot::EndPlot();
+
+                // Sync legend-click state back to ch->show_.
+                // EndPlot() is where ImPlot processes legend clicks (toggles item->Show).
+                // We use the raw pointers saved before EndPlot to avoid re-doing
+                // the ID lookup (which would use the wrong ImGui context after EndPlot).
+                for (auto &[ch, item] : syncItems)
+                        ch->show_ = item->Show;
+
                 if (pushedPadding) {
                         ImPlot::PopStyleVar();
                 }
@@ -1136,6 +1184,16 @@ Monitor::updateDisplay()
         if (ImGui::Begin(name_.c_str(), &open)) {
                 if (!open)
                         markPendingDelete();
+
+                if (csvLoading_.load(std::memory_order_acquire)) {
+                        const char *frames[] = {"|", "/", "-", "\\"};
+                        int         fi       = static_cast<int>(ImGui::GetTime() * 8.0) % 4;
+                        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
+                                           "%s  正在解析 CSV...",
+                                           frames[fi]);
+                        ImGui::End();
+                        return;
+                }
 
                 if (ImGui::Button("Add Scope")) {
                         char nameBuf[32];

@@ -63,6 +63,7 @@ class Monitor
         bool              hssAutoPeriod_{true};
         int               maxSampleHz_{100};
         std::atomic<bool> pendingDelete_{false};
+        std::atomic<bool> csvLoading_{false};
 
         f32                           actualHz_{0.0f};
         u64                           pointAccum_{0};

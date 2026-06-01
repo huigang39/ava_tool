@@ -15,6 +15,8 @@
 #endif
 
 #include "timeops.h"
+#include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -887,9 +889,27 @@ Gui::loop()
                 asmViewer_.draw(this);
                 regViewer_.draw();
 
+                processPendingCsvImports();
+
                 for (const auto &file : sDroppedFiles_) {
                         if (file.ends_with(".ava")) {
                                 loadSession(file);
+                        } else if (file.ends_with(".csv") || file.ends_with(".CSV")) {
+                                // Create the monitor immediately (shows loading spinner)
+                                std::string stem = std::filesystem::path(file).stem().string();
+                                std::string monName;
+                                {
+                                        std::lock_guard lk(mtxMonitors_);
+                                        monName   = stem;
+                                        int idx   = 1;
+                                        while (monitors_.count(monName))
+                                                monName = stem + "_" + std::to_string(idx++);
+                                        auto mon                  = std::make_shared<Monitor>(monName);
+                                        mon->csvLoading_.store(true, std::memory_order_release);
+                                        monitors_[monName]        = mon;
+                                        isModified_               = true;
+                                }
+                                importCsvAsync(file, monName);
                         }
                 }
                 sDroppedFiles_.clear();
@@ -1129,4 +1149,193 @@ Gui::drawCalculator()
         ImGui::Text("Calculated Kt (Ref): %.6f Nm/A", static_cast<f64>(kt));
 
         ImGui::End();
+}
+
+/* --------------------------------------------------------------------------
+ * CSV drag-and-drop import
+ * -------------------------------------------------------------------------- */
+
+void
+Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
+{
+        std::thread([this, path, monitorName]() {
+                LOG_I("CSV import started: %s", path.c_str());
+
+                std::ifstream f(path);
+                if (!f.is_open()) {
+                        LOG_E("CSV import: cannot open %s", path.c_str());
+                        return;
+                }
+
+                // --- Parse header row ---
+                std::string line;
+                if (!std::getline(f, line)) {
+                        LOG_E("CSV import: empty file %s", path.c_str());
+                        return;
+                }
+
+                // Split header into column names
+                std::vector<std::string> headers;
+                {
+                        std::istringstream ss(line);
+                        std::string        tok;
+                        while (std::getline(ss, tok, ',')) {
+                                // Strip CR and surrounding whitespace
+                                while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' '))
+                                        tok.pop_back();
+                                while (!tok.empty() && tok.front() == ' ')
+                                        tok.erase(tok.begin());
+                                headers.push_back(tok);
+                        }
+                }
+
+                if (headers.empty()) {
+                        LOG_E("CSV import: no columns in %s", path.c_str());
+                        return;
+                }
+
+                // Decide whether first column is a timestamp.
+                // Treat it as time if its header contains "time", "t", "ts", "timestamp", "index" (case-insensitive).
+                bool firstIsTime = false;
+                {
+                        std::string h0 = headers[0];
+                        for (auto &c : h0)
+                                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                        firstIsTime =
+                            (h0 == "t" || h0 == "time" || h0 == "ts" || h0 == "timestamp" || h0 == "index" || h0 == "x");
+                }
+
+                const int timeCol   = firstIsTime ? 0 : -1;
+                const int dataStart = firstIsTime ? 1 : 0;
+
+                std::vector<std::string> dataHeaders;
+                for (int i = dataStart; i < static_cast<int>(headers.size()); ++i)
+                        dataHeaders.push_back(headers[i]);
+
+                const int nCols = static_cast<int>(dataHeaders.size());
+                if (nCols == 0) {
+                        LOG_E("CSV import: no data columns in %s", path.c_str());
+                        return;
+                }
+
+                std::vector<double>             timestamps;
+                std::vector<std::vector<float>> columns(nCols);
+
+                // --- Parse data rows ---
+                double rowIdx = 0.0;
+                while (std::getline(f, line)) {
+                        if (line.empty() || line[0] == '#')
+                                continue;
+
+                        std::vector<double> rowVals;
+                        rowVals.reserve(headers.size());
+                        {
+                                std::istringstream ss(line);
+                                std::string        tok;
+                                while (std::getline(ss, tok, ',')) {
+                                        while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' '))
+                                                tok.pop_back();
+                                        while (!tok.empty() && tok.front() == ' ')
+                                                tok.erase(tok.begin());
+                                        double v       = 0.0;
+                                        auto [ptr, ec] = std::from_chars(tok.data(), tok.data() + tok.size(), v);
+                                        rowVals.push_back((ec == std::errc{}) ? v : 0.0);
+                                }
+                        }
+
+                        // Pad / trim to expected column count
+                        rowVals.resize(headers.size(), 0.0);
+
+                        const double ts = (timeCol >= 0) ? rowVals[timeCol] : rowIdx;
+                        timestamps.push_back(ts);
+
+                        for (int c = 0; c < nCols; ++c)
+                                columns[c].push_back(static_cast<float>(rowVals[dataStart + c]));
+
+                        rowIdx += 1.0;
+                }
+
+                if (timestamps.empty()) {
+                        LOG_E("CSV import: no data rows in %s", path.c_str());
+                        return;
+                }
+
+                LOG_I("CSV import done: %s  rows=%zu  cols=%d", path.c_str(), timestamps.size(), nCols);
+
+                CsvImportPending result;
+                result.monitorName = monitorName;
+                result.headers     = std::move(dataHeaders);
+                result.timestamps  = std::move(timestamps);
+                result.columns     = std::move(columns);
+
+                {
+                        std::lock_guard lk(mtxCsvPending_);
+                        csvPendingList_.push_back(std::move(result));
+                }
+        }).detach();
+}
+
+void
+Gui::processPendingCsvImports()
+{
+        std::vector<CsvImportPending> pending;
+        {
+                std::lock_guard lk(mtxCsvPending_);
+                if (csvPendingList_.empty())
+                        return;
+                pending = std::move(csvPendingList_);
+                csvPendingList_.clear();
+        }
+
+        std::lock_guard lk(mtxMonitors_);
+        for (auto &imp : pending) {
+                // Find the monitor that was created immediately on file drop
+                auto   it      = monitors_.find(imp.monitorName);
+                Monitor *monitor = (it != monitors_.end()) ? it->second.get() : nullptr;
+                if (!monitor) {
+                        // Fallback: create it now (shouldn't normally happen)
+                        auto m             = std::make_shared<Monitor>(imp.monitorName);
+                        monitors_[imp.monitorName] = m;
+                        monitor            = m.get();
+                }
+                const std::string &name = imp.monitorName;
+
+                const std::string scopeName = "scope_0";
+                monitor->addScope(scopeName);
+                MonitorScope *scope = monitor->getScopes()[scopeName].get();
+                if (!scope)
+                        continue;
+
+                const usize nPts = imp.timestamps.size();
+
+                for (int c = 0; c < static_cast<int>(imp.headers.size()); ++c) {
+                        const std::string &chName = imp.headers[c];
+                        scope->addChannel(chName);
+                        MonitorChannel *ch = scope->findChannel(chName);
+                        if (!ch)
+                                continue;
+
+                        ch->historySeconds_   = 0.0f; // static data — no time-based pruning
+                        ch->maxDisplayPoints_ = 5000;
+
+                        ch->pushBatch(imp.columns[c].data(), imp.timestamps.data(), nPts);
+                        ch->publishSnapshot();
+                }
+
+                // Set x-axis range to cover the full data span
+                if (nPts > 0) {
+                        monitor->linkXMin_      = imp.timestamps.front();
+                        monitor->linkXMax_      = imp.timestamps.back();
+                        monitor->dataStartTime_ = imp.timestamps.front();
+                        monitor->lastNow_       = imp.timestamps.back();
+                }
+
+                // Clear loading flag — monitor will show data on the next frame
+                monitor->csvLoading_.store(false, std::memory_order_release);
+
+                LOG_I("CSV import: monitor '%s' ready: %d channels, %zu points",
+                      name.c_str(),
+                      static_cast<int>(imp.headers.size()),
+                      nPts);
+        }
 }

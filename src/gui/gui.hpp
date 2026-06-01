@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -86,6 +87,18 @@ class Gui
         Bode           bode_{};
         RegisterViewer regViewer_{};
         AssemblyViewer asmViewer_{};
+
+        struct CsvImportPending {
+                std::string                     monitorName;
+                std::vector<std::string>        headers;
+                std::vector<double>             timestamps;
+                std::vector<std::vector<float>> columns;
+        };
+        std::mutex                    mtxCsvPending_{};
+        std::vector<CsvImportPending> csvPendingList_{};
+
+        void importCsvAsync(const std::string &path, const std::string &monitorName);
+        void processPendingCsvImports();
 
       public:
         Gui(const std::string &initialPath = "");
