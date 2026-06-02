@@ -1,8 +1,8 @@
 /**
  * @file  updater.hpp
  * @brief In-app update checker. Queries the latest GitHub release, compares it
- *        against AVA_VERSION, and (on the user's request) launches the standalone
- *        updater.exe which downloads + installs the new version and relaunches.
+ *        against AVA_VERSION, and (on the user's request) downloads the installer
+ *        in the background and prompts the user to restart to install.
  */
 #ifndef UPDATER_HPP
 #define UPDATER_HPP
@@ -25,6 +25,8 @@ class Updater
                 std::string error;      // non-empty on failure
         };
 
+        enum class DownloadState { Idle, Downloading, Done, Failed };
+
         // Start a background check. No-op if one is already running. Safe to call
         // once at startup and again from a "Check for Updates" menu item.
         void checkAsync();
@@ -34,9 +36,33 @@ class Updater
 
         bool isChecking() const { return running_.load(std::memory_order_acquire); }
 
-        // Launch updater.exe (sitting next to this exe) to download `assetUrl`,
-        // wait for this process to exit, install, and relaunch. Returns true if the
-        // helper was started — the caller should then close the app.
+        // --------------- Background download ---------------
+
+        // Start downloading `assetUrl` to a temp file in the background.
+        // No-op if a download is already in progress.
+        void downloadAsync(const std::string &assetUrl);
+
+        DownloadState getDownloadState() const { return dlState_.load(std::memory_order_acquire); }
+
+        // Returns 0..100. Only meaningful when state == Downloading.
+        int getDownloadProgress() const { return dlProgress_.load(std::memory_order_acquire); }
+
+        // Path to the downloaded installer (valid when state == Done).
+        std::string getDownloadedPath() const;
+
+        // Human-readable error (valid when state == Failed).
+        std::string getDownloadError() const;
+
+        // Reset download state back to Idle (e.g. after user dismisses error).
+        void resetDownload();
+
+        // --------------- Install ---------------
+
+        // Launch the already-downloaded installer at `setupPath` with silent flags.
+        // Returns true if successfully started — caller should then close the app.
+        bool launchInstaller(const std::string &setupPath);
+
+        // (Legacy) Launch updater.exe to download + install. Kept for fallback.
         bool launchUpdater(const std::string &assetUrl);
 
         // Compare dotted version strings ("1.2.0"). >0 if a>b, 0 if equal, <0 if a<b.
@@ -47,6 +73,13 @@ class Updater
         mutable std::mutex mtx_;
         Info               info_;
         std::atomic<bool>  running_{false};
+
+        // Download state
+        std::atomic<DownloadState> dlState_{DownloadState::Idle};
+        std::atomic<int>           dlProgress_{0};
+        mutable std::mutex         dlMtx_;
+        std::string                dlPath_;  // path to downloaded file
+        std::string                dlError_; // error message
 };
 
 #endif // !UPDATER_HPP

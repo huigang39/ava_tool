@@ -222,6 +222,29 @@ Gui::addRecent(const std::string &path)
         saveRecentList();
 }
 
+bool
+Gui::shouldAutoCheckUpdate()
+{
+        // Skip the startup check if we already checked within the last 6 hours.
+        // GitHub's unauthenticated API allows only 60 requests/hour per IP, so an
+        // app that checks on every launch can trip a 403 across repeated launches.
+        std::ifstream f(getAppDir() + "/update_check.txt");
+        long long     last = 0;
+        if (f >> last) {
+                const long long now = static_cast<long long>(std::time(nullptr));
+                if (now - last < 6 * 3600)
+                        return false;
+        }
+        return true;
+}
+
+void
+Gui::recordUpdateCheck()
+{
+        std::ofstream f(getAppDir() + "/update_check.txt", std::ios::trunc);
+        f << static_cast<long long>(std::time(nullptr));
+}
+
 void
 Gui::saveSession(const std::string &path)
 {
@@ -436,9 +459,9 @@ Gui::loadSession(const std::string &path)
 
         if (const cJSON *jlink = cJSON_GetObjectItem(root, "jlink")) {
                 if (const cJSON *dev = cJSON_GetObjectItem(jlink, "device"); cJSON_IsString(dev))
-                        JLinkPort::instance().deviceName() = dev->valuestring;
+                        JLinkPort::instance().setDeviceName(dev->valuestring);
                 if (const cJSON *spd = cJSON_GetObjectItem(jlink, "speedKHz"); cJSON_IsNumber(spd))
-                        JLinkPort::instance().speed() = spd->valueint;
+                        JLinkPort::instance().setSpeed(spd->valueint);
                 if (const cJSON *p = cJSON_GetObjectItem(jlink, "hssPeriodUs"); cJSON_IsNumber(p))
                         JLinkPort::instance().hssPeriodUs() = p->valueint;
         }
@@ -839,6 +862,7 @@ Gui::drawBar()
                         if (ImGui::MenuItem("Check for Updates...", nullptr, false, !checking)) {
                                 updateManualCheck_   = true;
                                 updatePendingResult_ = true;
+                                recordUpdateCheck();
                                 updater_.checkAsync();
                         }
                         if (checking)
@@ -885,20 +909,41 @@ Gui::drawBar()
                 char fpsBuf[32];
                 snprintf(fpsBuf, sizeof(fpsBuf), "%.0f FPS", ImGui::GetIO().Framerate);
 
+                // Download progress indicator (shown between normal content and pts/fps)
+                char       dlBuf[48] = {0};
+                f32        dlWidth   = 0.0f;
+                const auto dlState   = updater_.getDownloadState();
+                if (dlState == Updater::DownloadState::Downloading) {
+                        const int pct = updater_.getDownloadProgress();
+                        snprintf(dlBuf, sizeof(dlBuf), "Updating: %d%%", pct);
+                        dlWidth = ImGui::CalcTextSize(dlBuf).x;
+                }
+
                 const f32 ptsWidthFixed = ImGui::CalcTextSize("999.99 M pts").x;
                 const f32 fpsWidthFixed = ImGui::CalcTextSize("9999 FPS").x;
                 const f32 spacing       = ImGui::GetStyle().ItemSpacing.x;
 
-                const f32 totalWidth = fpsWidthFixed + ptsWidthFixed + spacing;
+                const f32 totalWidth = fpsWidthFixed + ptsWidthFixed + spacing + (dlWidth > 0 ? dlWidth + spacing : 0);
                 const f32 startX     = ImGui::GetWindowWidth() - totalWidth - spacing * 2;
 
+                // Download progress (Cyan, pulsing)
+                if (dlWidth > 0) {
+                        ImGui::SetCursorPosX(startX);
+                        const float t     = (float)ImGui::GetTime();
+                        const float alpha = 0.6f + 0.4f * sinf(t * 3.0f);
+                        ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, alpha), "%s", dlBuf);
+                        ImGui::SameLine();
+                }
+
+                const f32 ptsStartX = startX + (dlWidth > 0 ? dlWidth + spacing : 0);
+
                 // PTS (Green, Right-aligned in its block)
-                ImGui::SetCursorPosX(startX + ptsWidthFixed - ImGui::CalcTextSize(ptsBuf).x);
+                ImGui::SetCursorPosX(ptsStartX + ptsWidthFixed - ImGui::CalcTextSize(ptsBuf).x);
                 ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "%s", ptsBuf);
 
                 // FPS (Red, Right-aligned in its block)
                 ImGui::SameLine();
-                ImGui::SetCursorPosX(startX + ptsWidthFixed + spacing + fpsWidthFixed - ImGui::CalcTextSize(fpsBuf).x);
+                ImGui::SetCursorPosX(ptsStartX + ptsWidthFixed + spacing + fpsWidthFixed - ImGui::CalcTextSize(fpsBuf).x);
                 ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s", fpsBuf);
 
                 ImGui::EndMainMenuBar();
@@ -957,13 +1002,8 @@ Gui::loop()
                         }
 
                         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L, false)) {
-                                bool wasConnected = JLinkPort::instance().isConnected();
-                                JLinkPort::instance().close();
-                                if (JLinkPort::instance().open() && JLinkPort::instance().connect()) {
-                                        LOG_I("J-Link connected via Ctrl+L");
-                                        if (!wasConnected)
-                                                Monitor::clearAll();
-                                }
+                                JLinkPort::instance().connectAsync(); // off the GUI thread
+                                LOG_I("J-Link connect requested via Ctrl+L");
                         }
 
                         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
@@ -972,8 +1012,8 @@ Gui::loop()
                         }
 
                         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-                                JLinkPort::instance().close();
-                                LOG_I("J-Link disconnected via Ctrl+C");
+                                JLinkPort::instance().disconnectAsync();
+                                LOG_I("J-Link disconnect requested via Ctrl+C");
                         }
                 }
 
@@ -997,11 +1037,15 @@ Gui::loop()
 
                 ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
 
-                // Kick off a one-time update check shortly after launch.
+                // Kick off a one-time update check shortly after launch (throttled to
+                // once every 6h so repeated launches don't trip GitHub's rate limit).
                 if (!updateCheckStarted_) {
-                        updateCheckStarted_  = true;
-                        updatePendingResult_ = true;
-                        updater_.checkAsync();
+                        updateCheckStarted_ = true;
+                        if (shouldAutoCheckUpdate()) {
+                                updatePendingResult_ = true;
+                                recordUpdateCheck();
+                                updater_.checkAsync();
+                        }
                 }
                 drawUpdateUI();
 
@@ -1626,6 +1670,16 @@ Gui::drawUpdateUI()
                 updateManualCheck_ = false;
         }
 
+        // --- Detect background download completion ---
+        const auto dlState = updater_.getDownloadState();
+        if (dlState == Updater::DownloadState::Done && !showDownloadDonePopup_) {
+                showDownloadDonePopup_ = true;
+                ImGui::OpenPopup("Update Ready");
+        } else if (dlState == Updater::DownloadState::Failed && !showDownloadDonePopup_) {
+                showDownloadDonePopup_ = true;
+                ImGui::OpenPopup("Download Failed");
+        }
+
         // --- Update available ---
         if (ImGui::BeginPopupModal("Update Available", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
                 ImGui::Text("A new version of ava_tool is available.");
@@ -1643,13 +1697,10 @@ Gui::drawUpdateUI()
 
                 const bool canAutoUpdate = !info.assetUrl.empty();
                 if (canAutoUpdate) {
-                        if (ImGui::Button("Update Now", ImVec2(120, 0))) {
-                                if (updater_.launchUpdater(info.assetUrl)) {
-                                        // updater.exe waits for us to exit, then installs + relaunches.
-                                        saveSession();
-                                        glfwSetWindowShouldClose(window_, GLFW_TRUE);
-                                        wantsToQuit_ = true;
-                                }
+                        if (ImGui::Button("Upgrade Now", ImVec2(130, 0))) {
+                                // Start background download — don't exit the app
+                                updater_.downloadAsync(info.assetUrl);
+                                showDownloadDonePopup_ = false; // reset so we detect completion
                                 ImGui::CloseCurrentPopup();
                         }
                         ImGui::SameLine();
@@ -1664,6 +1715,46 @@ Gui::drawUpdateUI()
                 }
                 if (ImGui::Button("Later", ImVec2(120, 0)))
                         ImGui::CloseCurrentPopup();
+                ImGui::EndPopup();
+        }
+
+        // --- Update downloaded & ready to install ---
+        if (ImGui::BeginPopupModal("Update Ready", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("Update has been downloaded successfully.");
+                ImGui::Text("Restart the application to install the update?");
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::Spacing();
+                if (ImGui::Button("Restart Now", ImVec2(130, 0))) {
+                        const std::string setupPath = updater_.getDownloadedPath();
+                        if (updater_.launchInstaller(setupPath)) {
+                                saveSession();
+                                glfwSetWindowShouldClose(window_, GLFW_TRUE);
+                                wantsToQuit_ = true;
+                        }
+                        ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Later", ImVec2(120, 0))) {
+                        ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+        }
+
+        // --- Download failed ---
+        if (ImGui::BeginPopupModal("Download Failed", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                const std::string dlErr = updater_.getDownloadError();
+                ImGui::Text("Failed to download the update.");
+                if (!dlErr.empty()) {
+                        ImGui::Spacing();
+                        ImGui::TextWrapped("Error: %s", dlErr.c_str());
+                }
+                ImGui::Spacing();
+                if (ImGui::Button("OK", ImVec2(120, 0))) {
+                        updater_.resetDownload();
+                        showDownloadDonePopup_ = false;
+                        ImGui::CloseCurrentPopup();
+                }
                 ImGui::EndPopup();
         }
 

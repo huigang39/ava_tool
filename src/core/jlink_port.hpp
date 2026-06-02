@@ -78,6 +78,13 @@ class JLinkPort
         void close();
         bool connect(); // uses deviceName_ + speed_
         bool resetTarget();
+
+        // Async wrappers: run the blocking USB operation on a detached worker so
+        // the GUI thread never stalls. isBusy() reflects an in-flight operation.
+        void connectAsync();
+        void disconnectAsync();
+        void resetAsync();
+        bool isBusy() const { return busy_.load(std::memory_order_acquire); }
         bool readMem(u32 addr, u32 numBytes, void *dst);
         bool writeMem(u32 addr, u32 numBytes, const void *src);
 
@@ -100,22 +107,37 @@ class JLinkPort
         void addPoints(u64 n) { totalPoints_.fetch_add(n, std::memory_order_relaxed); }
         void resetPoints() { totalPoints_.store(0, std::memory_order_relaxed); }
 
-        std::string &deviceName() { return deviceName_; }
-        int         &speed() { return speedKHz_; }
-        int         &hssPeriodUs() { return hssPeriodUs_; }
-        std::string  lastError() const;
+        // Config getters/setters use a lightweight mutex (cfgMtx_) separate from the
+        // J-Link I/O FairMutex. The GUI reads these every frame; using the I/O lock
+        // would stall the render thread behind slow J-Link reads (low SWD speed).
+        std::string deviceName() const
+        {
+                std::lock_guard lk(cfgMtx_);
+                return deviceName_;
+        }
+        void setDeviceName(const std::string &n)
+        {
+                std::lock_guard lk(cfgMtx_);
+                deviceName_ = n;
+        }
+        int         speed() const { return speedKHz_.load(std::memory_order_relaxed); }
+        void        setSpeed(int s) { speedKHz_.store(s, std::memory_order_relaxed); }
+        int        &hssPeriodUs() { return hssPeriodUs_; }
+        std::string lastError() const;
 
         void drawUI();
 
       private:
         JLinkPort() = default;
 
-        mutable FairMutex mtx_{};
-        bool              isOpen_{false};
-        bool              isConnected_{false};
-        std::string       deviceName_{"STM32H745II"};
-        int               speedKHz_{4000};
-        std::string       lastErr_{};
+        mutable FairMutex  mtx_{};       // serialises J-Link SDK I/O (held during slow reads)
+        mutable std::mutex cfgMtx_{};    // guards deviceName_ only (never held during I/O)
+        std::atomic<bool>  busy_{false}; // an async connect/disconnect/reset is in flight
+        bool               isOpen_{false};
+        bool               isConnected_{false};
+        std::string        deviceName_{"STM32H745II"};
+        std::atomic<int>   speedKHz_{4000};
+        std::string        lastErr_{};
 
         bool              hssRunning_{false};
         int               hssPeriodUs_{1000};

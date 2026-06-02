@@ -112,10 +112,15 @@ class Gui
         // Auto-update (GitHub Releases). Checked once at startup and on demand from
         // the Help menu; the result drives an "update available" popup.
         Updater updater_{};
-        bool    updateCheckStarted_  = false; // startup check kicked off
-        bool    updateManualCheck_   = false; // user-initiated → also report "up to date"
-        bool    updatePendingResult_ = false; // a check is in flight; show result when done
+        bool    updateCheckStarted_    = false; // startup check kicked off
+        bool    updateManualCheck_     = false; // user-initiated → also report "up to date"
+        bool    updatePendingResult_   = false; // a check is in flight; show result when done
+        bool    showDownloadDonePopup_ = false; // download finished; show restart prompt
         void    drawUpdateUI();
+        // Throttle auto-checks (persisted to <appdir>/update_check.txt) so we don't
+        // hit GitHub's 60-req/hour unauthenticated rate limit across many launches.
+        bool shouldAutoCheckUpdate();
+        void recordUpdateCheck();
 
       public:
         Gui(const std::string &initialPath = "");

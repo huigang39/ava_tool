@@ -110,8 +110,15 @@ JLinkPort::connect()
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
         };
 
+        std::string dev;
+        {
+                std::lock_guard cfg(cfgMtx_);
+                dev = deviceName_;
+        }
+        const int spdKHz = speedKHz_.load(std::memory_order_relaxed);
+
         char cmd[160];
-        snprintf(cmd, sizeof(cmd), "Device = %s", deviceName_.c_str());
+        snprintf(cmd, sizeof(cmd), "Device = %s", dev.c_str());
         char ack[256] = {0};
         if (JLINKARM_ExecCommand(cmd, ack, sizeof(ack)) < 0) {
                 lastErr_ = std::string("ExecCommand(Device): ") + ack;
@@ -119,7 +126,7 @@ JLinkPort::connect()
                 resetSdk();
                 return false;
         }
-        LOG_I("JLinkPort::connect(): Device set to %s", deviceName_.c_str());
+        LOG_I("JLinkPort::connect(): Device set to %s", dev.c_str());
 
         if (JLINKARM_TIF_Select(JLINKARM_TIF_SWD) < 0) {
                 lastErr_ = "TIF_Select(SWD) failed";
@@ -127,8 +134,8 @@ JLinkPort::connect()
                 resetSdk();
                 return false;
         }
-        JLINKARM_SetSpeed(static_cast<u32>(speedKHz_));
-        LOG_I("JLinkPort::connect(): TIF SWD selected, speed %d KHz", speedKHz_);
+        JLINKARM_SetSpeed(static_cast<u32>(spdKHz));
+        LOG_I("JLinkPort::connect(): TIF SWD selected, speed %d KHz", spdKHz);
 
         if (JLINKARM_Connect() < 0) {
                 lastErr_ = "Connect failed (Check power/cable or replug J-Link)";
@@ -162,6 +169,45 @@ JLinkPort::resetTarget()
         JLINKARM_Go();
 
         return true;
+}
+
+void
+JLinkPort::connectAsync()
+{
+        bool expected = false;
+        if (!busy_.compare_exchange_strong(expected, true))
+                return; // already busy
+        std::thread([this]() {
+                if (!isOpen_)
+                        open();
+                if (isOpen_)
+                        connect();
+                busy_.store(false, std::memory_order_release);
+        }).detach();
+}
+
+void
+JLinkPort::disconnectAsync()
+{
+        bool expected = false;
+        if (!busy_.compare_exchange_strong(expected, true))
+                return;
+        std::thread([this]() {
+                close();
+                busy_.store(false, std::memory_order_release);
+        }).detach();
+}
+
+void
+JLinkPort::resetAsync()
+{
+        bool expected = false;
+        if (!busy_.compare_exchange_strong(expected, true))
+                return;
+        std::thread([this]() {
+                resetTarget();
+                busy_.store(false, std::memory_order_release);
+        }).detach();
 }
 
 bool
@@ -306,11 +352,11 @@ JLinkPort::lastError() const
 void
 JLinkPort::drawUI()
 {
-        char nameBuf[64];
-        {
-                std::lock_guard lk(mtx_);
-                snprintf(nameBuf, sizeof(nameBuf), "%s", deviceName_.c_str());
-        }
+        // Read config via the lightweight cfgMtx_ getters — never the J-Link I/O
+        // FairMutex — so the render thread doesn't stall behind slow J-Link reads.
+        char        nameBuf[64];
+        std::string dev = deviceName();
+        snprintf(nameBuf, sizeof(nameBuf), "%s", dev.c_str());
 
         char btnLabel[128];
         snprintf(btnLabel, sizeof(btnLabel), "%s##jlink_port_btn", nameBuf[0] != '\0' ? nameBuf : "Select Device");
@@ -322,55 +368,52 @@ JLinkPort::drawUI()
                 if (devIdx >= 0) {
                         JLINKARM_DEVICE_INFO dinfo;
                         dinfo.SizeOfStruct = sizeof(dinfo);
-                        if (JLINKARM_DEVICE_GetInfo(devIdx, &dinfo) >= 0) {
-                                std::lock_guard lk(mtx_);
-                                deviceName_ = dinfo.sName;
-                        }
+                        if (JLINKARM_DEVICE_GetInfo(devIdx, &dinfo) >= 0)
+                                setDeviceName(dinfo.sName);
                 }
         }
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Device");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(180.0f);
-        bool speedCommitted = false;
-        {
-                std::lock_guard lk(mtx_);
-                // Logarithmic slider: SWD speeds span a wide range (kHz .. tens of MHz).
-                ImGui::SliderInt("##jlinkSpeed", &speedKHz_, 5, 50000, "%d kHz", ImGuiSliderFlags_Logarithmic);
-                speedCommitted = ImGui::IsItemDeactivatedAfterEdit();
-                if (speedKHz_ < 1)
-                        speedKHz_ = 1;
-        }
+        // Logarithmic slider: SWD speeds span a wide range (kHz .. tens of MHz).
+        int spd = speedKHz_.load(std::memory_order_relaxed);
+        ImGui::SliderInt("##jlinkSpeed", &spd, 5, 50000, "%d kHz", ImGuiSliderFlags_Logarithmic);
+        const bool speedCommitted = ImGui::IsItemDeactivatedAfterEdit();
+        if (spd < 1)
+                spd = 1;
+        speedKHz_.store(spd, std::memory_order_relaxed);
         if (speedCommitted && isOpen_) {
+                // One-off J-Link call on slider release (rare) — OK under the I/O lock.
                 std::lock_guard lk(mtx_);
-                JLINKARM_SetSpeed(static_cast<u32>(speedKHz_));
+                JLINKARM_SetSpeed(static_cast<u32>(spd));
         }
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("J-Link SWD speed (kHz). Drag to set; applies when you release. Ctrl+click to type.");
 
         ImGui::SameLine();
-        if (!isConnected_) {
+        const bool busy = busy_.load(std::memory_order_acquire);
+        if (busy) {
+                // An async connect/disconnect/reset is running — show a spinner-ish
+                // label instead of a button so the GUI never blocks on USB I/O.
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 0.6f));
+                ImGui::Button(isConnected_ ? "Working..." : "Connecting...");
+                ImGui::PopStyleColor();
+        } else if (!isConnected_) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // Red
-                if (ImGui::SmallButton("CONNECT")) {
-                        if (!isOpen_)
-                                open();
-                        if (connect()) {
-                                // Handled by Gui::drawBar connection detection
-                        }
-                }
+                if (ImGui::SmallButton("CONNECT"))
+                        connectAsync();
                 ImGui::PopStyleColor();
         } else {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f)); // Green
-                if (ImGui::SmallButton("DISCONNECT")) {
-                        close();
-                }
+                if (ImGui::SmallButton("DISCONNECT"))
+                        disconnectAsync();
                 ImGui::PopStyleColor();
 
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.6f, 0.2f, 1.0f)); // Orange
-                if (ImGui::SmallButton("RESET MCU")) {
-                        resetTarget();
-                }
+                if (ImGui::SmallButton("RESET MCU"))
+                        resetAsync();
                 ImGui::PopStyleColor();
         }
 

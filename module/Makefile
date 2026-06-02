@@ -2,6 +2,13 @@ ifeq ($(OS),Windows_NT)
 SHELL := cmd.exe
 ifndef VCVARS_DONE
 
+# Targets that don't need the MSVC compiler/linker. When every requested goal is
+# one of these, skip the (slow) vcvars init below.
+_NO_MSVC_GOALS := clean fmt list info help
+_NEED_MSVC     := $(if $(MAKECMDGOALS),$(filter-out $(_NO_MSVC_GOALS),$(MAKECMDGOALS)),static)
+
+ifneq ($(_NEED_MSVC),)
+
 _CL_OK := $(shell where cl.exe 2>NUL)
 
 ifeq ($(_CL_OK),)
@@ -25,6 +32,7 @@ $(_GOALS): _msvc_env
 .DEFAULT_GOAL := static
 
 endif # _CL_OK
+endif # _NEED_MSVC
 endif # VCVARS_DONE
 endif # Windows_NT (MSVC init)
 

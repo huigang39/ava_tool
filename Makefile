@@ -2,6 +2,13 @@ ifeq ($(OS),Windows_NT)
 SHELL := cmd.exe
 ifndef VCVARS_DONE
 
+# Targets that only need Python / file ops — not the MSVC compiler/linker.
+# When every requested goal is one of these, skip the (slow) vcvars init below.
+_NO_MSVC_GOALS := icon sign clean fmt info help package
+_NEED_MSVC     := $(if $(MAKECMDGOALS),$(filter-out $(_NO_MSVC_GOALS),$(MAKECMDGOALS)),all)
+
+ifneq ($(_NEED_MSVC),)
+
 _CL_OK := $(shell where cl.exe 2>NUL)
 
 ifeq ($(_CL_OK),)
@@ -25,6 +32,7 @@ $(_GOALS): _msvc_env
 .DEFAULT_GOAL := all
 
 endif # _CL_OK
+endif # _NEED_MSVC
 endif # VCVARS_DONE
 endif # Windows_NT (MSVC init)
 
@@ -329,7 +337,7 @@ $(OUTPUT_BUILD_DIR)/app.res: assets/app.rc assets/icon.ico
 # Generate assets/icon.ico from assets/icon.png (no external tools needed).
 icon:
 	@echo [ICON] generating assets/icon.ico from assets/icon.png
-	powershell -NoProfile -ExecutionPolicy Bypass -File tools\make_icon.ps1
+	python tools\make_icon.py
 	@echo icon ready: assets/icon.ico  ^(rebuild with: make^)
 
 # updater.exe: tiny standalone helper that downloads + runs the new installer.
@@ -360,18 +368,18 @@ export AVA_SIGN_PFX
 export AVA_SIGN_PASS
 export AVA_SIGN_SHA1
 export AVA_SIGN_TS
-SIGN_PS = powershell -NoProfile -ExecutionPolicy Bypass -File tools\sign.ps1 -Files
+SIGN_CMD = python tools\sign.py
 
 # Sign the app binaries in place (run after a build).
 sign:
-	@$(SIGN_PS) bin\win\ava_tool.exe,bin\win\updater.exe
+	@$(SIGN_CMD) bin\win\ava_tool.exe bin\win\updater.exe
 
 package: all
 	@$(ECHO_NL)
 	@echo [PACKAGE] running Inno Setup...
-	@$(SIGN_PS) bin\win\ava_tool.exe,bin\win\updater.exe
+	@$(SIGN_CMD) bin\win\ava_tool.exe bin\win\updater.exe
 	@$(PACKAGE_RUN)
-	@$(SIGN_PS) dist\ava_tool_setup_*.exe
+	@$(SIGN_CMD) dist\ava_tool_setup_*.exe
 	@echo package complete: see dist\ava_tool_setup_*.exe
 endif
 

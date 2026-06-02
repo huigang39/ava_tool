@@ -124,7 +124,7 @@ AssemblyViewer::disassemble(const std::string &elfPath)
                 if (!pipe) {
                         result = "Failed to run arm-none-eabi-objdump. Ensure it is in your PATH.";
                 } else {
-                        while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+                        while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe.get()) != nullptr) {
                                 result += buffer.data();
                         }
                 }

@@ -77,6 +77,8 @@ Updater::checkAsync()
                         // failure — report it gently rather than as an error.
                         if (err.find("404") != std::string::npos)
                                 result.error = "No published release found yet (or the repository is private).";
+                        else if (err.find("403") != std::string::npos || err.find("429") != std::string::npos)
+                                result.error = "GitHub rate limit reached (60 checks/hour per IP). Please try again later.";
                         else
                                 result.error = std::string("Update check failed: ") + (err.empty() ? "unknown error" : err);
                         LOG_W("Update check: %s", result.error.c_str());
@@ -179,6 +181,118 @@ Updater::launchUpdater(const std::string &assetUrl)
         return true;
 #else
         (void)assetUrl;
+        return false;
+#endif
+}
+
+void
+Updater::downloadAsync(const std::string &assetUrl)
+{
+        // Don't start if already downloading
+        DownloadState expected = DownloadState::Idle;
+        if (!dlState_.compare_exchange_strong(expected, DownloadState::Downloading)) {
+                // Also allow re-download after a failure
+                expected = DownloadState::Failed;
+                if (!dlState_.compare_exchange_strong(expected, DownloadState::Downloading))
+                        return;
+        }
+
+        dlProgress_.store(0, std::memory_order_release);
+        {
+                std::lock_guard lk(dlMtx_);
+                dlPath_.clear();
+                dlError_.clear();
+        }
+
+        std::string url = assetUrl; // copy for the thread
+
+        std::thread([this, url]() {
+#ifdef _WIN32
+                char tmpDir[MAX_PATH] = {0};
+                GetTempPathA(MAX_PATH, tmpDir);
+                const std::string setupPath = std::string(tmpDir) + "ava_tool_setup.exe";
+#else
+                const std::string setupPath = "/tmp/ava_tool_setup";
+#endif
+
+                LOG_I("Background download started: %s -> %s", url.c_str(), setupPath.c_str());
+
+                std::string err;
+                bool        ok = http::download(
+                    url,
+                    setupPath,
+                    [this](uint64_t received, uint64_t total) {
+                            if (total > 0) {
+                                    int pct = static_cast<int>((received * 100) / total);
+                                    if (pct > 100)
+                                            pct = 100;
+                                    dlProgress_.store(pct, std::memory_order_release);
+                            }
+                    },
+                    &err);
+
+                {
+                        std::lock_guard lk(dlMtx_);
+                        if (ok) {
+                                dlPath_ = setupPath;
+                                LOG_I("Background download completed: %s", setupPath.c_str());
+                        } else {
+                                dlError_ = err.empty() ? "download failed" : err;
+                                LOG_E("Background download failed: %s", dlError_.c_str());
+                        }
+                }
+                dlState_.store(ok ? DownloadState::Done : DownloadState::Failed, std::memory_order_release);
+        }).detach();
+}
+
+std::string
+Updater::getDownloadedPath() const
+{
+        std::lock_guard lk(dlMtx_);
+        return dlPath_;
+}
+
+std::string
+Updater::getDownloadError() const
+{
+        std::lock_guard lk(dlMtx_);
+        return dlError_;
+}
+
+void
+Updater::resetDownload()
+{
+        dlState_.store(DownloadState::Idle, std::memory_order_release);
+        dlProgress_.store(0, std::memory_order_release);
+        std::lock_guard lk(dlMtx_);
+        dlPath_.clear();
+        dlError_.clear();
+}
+
+bool
+Updater::launchInstaller(const std::string &setupPath)
+{
+#ifdef _WIN32
+        if (setupPath.empty())
+                return false;
+
+        SHELLEXECUTEINFOA sei{};
+        sei.cbSize       = sizeof(sei);
+        sei.fMask        = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpVerb       = "open";
+        sei.lpFile       = setupPath.c_str();
+        sei.lpParameters = "/SILENT /SUPPRESSMSGBOXES /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS";
+        sei.nShow        = SW_SHOWNORMAL;
+        if (!ShellExecuteExA(&sei)) {
+                LOG_E("Failed to launch installer: %s (err=%lu)", setupPath.c_str(), GetLastError());
+                return false;
+        }
+        if (sei.hProcess)
+                CloseHandle(sei.hProcess);
+        LOG_I("Launched installer: %s", setupPath.c_str());
+        return true;
+#else
+        (void)setupPath;
         return false;
 #endif
 }
