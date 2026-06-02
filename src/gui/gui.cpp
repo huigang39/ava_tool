@@ -393,11 +393,13 @@ Gui::saveSession(const std::string &path)
         cJSON_AddItemToObject(root, "motorProfiles", motorsArr);
         cJSON_AddNumberToObject(root, "currentMotorProfile", currentMotorProfile_);
         cJSON_AddStringToObject(root, "imguiLayout", ImGui::SaveIniSettingsToMemory());
+        seqEditor_.saveSession(root);
 
-        u64           pStart = get_mono_ts_ms();
-        char         *out    = cJSON_Print(root); // formatted/pretty-printed for human readability
-        u64           pEnd   = get_mono_ts_ms();
-        std::ofstream ofs(targetPath);
+        u64                   pStart = get_mono_ts_ms();
+        char                 *out    = cJSON_Print(root); // formatted/pretty-printed for human readability
+        u64                   pEnd   = get_mono_ts_ms();
+        std::filesystem::path p(reinterpret_cast<const char8_t *>(targetPath.c_str()));
+        std::ofstream         ofs(p);
         if (ofs && out) {
                 ofs << out;
                 currentSessionPath_ = targetPath;
@@ -430,10 +432,11 @@ Gui::saveSessionAs()
 void
 Gui::loadSession(const std::string &path)
 {
-        u64             start = get_mono_ts_ms();
-        std::lock_guard lk(mtxMonitors_);
-        std::string     targetPath = path.empty() ? currentSessionPath_ : path;
-        std::ifstream   ifs(targetPath);
+        u64                   start = get_mono_ts_ms();
+        std::lock_guard       lk(mtxMonitors_);
+        std::string           targetPath = path.empty() ? currentSessionPath_ : path;
+        std::filesystem::path p(reinterpret_cast<const char8_t *>(targetPath.c_str()));
+        std::ifstream         ifs(p);
         if (!ifs.is_open())
                 return;
 
@@ -708,6 +711,11 @@ Gui::loadSession(const std::string &path)
                 ImGui::LoadIniSettingsFromMemory(layout->valuestring);
         }
 
+        seqEditor_.loadSession(root);
+
+        for (auto &pair : monitors_)
+                pair.second->clearModified();
+
         cJSON_Delete(root);
 
         u64 end = get_mono_ts_ms();
@@ -795,6 +803,11 @@ Gui::drawBar()
                         ImGui::MenuItem("Bode Plot", nullptr, &bode_.show_);
                         ImGui::Separator();
                         ImGui::MenuItem("Assembly Viewer", nullptr, &asmViewer_.show_);
+                        ImGui::Separator();
+                        bool seqOpen = seqEditor_.isOpen();
+                        if (ImGui::MenuItem("Sequence Editor", nullptr, &seqOpen)) {
+                                seqEditor_.setOpen(seqOpen);
+                        }
                         ImGui::EndMenu();
                 }
 
@@ -976,6 +989,11 @@ Gui::loop()
                                         }
                                 }
                         }
+                        if (!anyModified) {
+                                if (seqEditor_.isModified()) {
+                                        anyModified = true;
+                                }
+                        }
                         if (anyModified || isFirstSave_) {
                                 glfwSetWindowShouldClose(window_, GLFW_FALSE);
                                 showQuitModal_ = true;
@@ -1081,6 +1099,7 @@ Gui::loop()
 
                 bode_.updateDisplay();
                 asmViewer_.draw(this);
+                seqEditor_.draw();
 
                 processPendingCsvImports();
 

@@ -26,11 +26,6 @@ std::mutex             Monitor::sMtxInstances_;
 class MonitorChannel;
 class MonitorScope;
 
-struct ChannelMovePayload {
-        MonitorScope *srcScope;
-        char          chName[128];
-};
-
 /* -------------------------------------------------------------------------- */
 
 void
@@ -38,14 +33,14 @@ MonitorScope::menu()
 {
         // Scope Toolbar
         // Scope Toolbar
-        if (ImGui::Button(e_draw == DrawEnum::PLOT ? "Plot" : "Table")) {
+        if (ImGui::Button(e_draw == DrawEnum::PLOT ? "Plot view" : "Table view")) {
                 e_draw = (e_draw == DrawEnum::PLOT) ? DrawEnum::TABLE : DrawEnum::PLOT;
         }
 
         ImGui::SameLine();
         if (showFft_) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue
-                if (ImGui::Button("Freq")) {
+                if (ImGui::Button("Freq domain")) {
                         showFft_ = false;
                 }
                 ImGui::PopStyleColor();
@@ -113,7 +108,7 @@ MonitorScope::menu()
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Toggle FFT render style: line / bar chart");
         } else {
-                if (ImGui::Button("Time")) {
+                if (ImGui::Button("Time domain")) {
                         showFft_ = true;
                 }
         }
@@ -121,12 +116,10 @@ MonitorScope::menu()
         // Toggle the right-side data panel (Stats in time view / Peaks in freq view).
         ImGui::SameLine();
         if (showSidePanel_) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue (active)
-                if (ImGui::Button("Table"))
+                if (ImGui::Button("Hide table"))
                         showSidePanel_ = false;
-                ImGui::PopStyleColor();
         } else {
-                if (ImGui::Button("Table"))
+                if (ImGui::Button("Show table"))
                         showSidePanel_ = true;
         }
         if (ImGui::IsItemHovered())
@@ -143,21 +136,17 @@ MonitorScope::menu()
                         }
 
                 if (anyVisible) {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 0.5f));
                         if (ImGui::Button("Hide line")) {
                                 for (auto &[_, ch] : chs_)
                                         if (ch)
                                                 ch->show_ = false;
                         }
-                        ImGui::PopStyleColor();
                 } else {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.7f, 0.3f, 0.6f));
                         if (ImGui::Button("Show line")) {
                                 for (auto &[_, ch] : chs_)
                                         if (ch)
                                                 ch->show_ = true;
                         }
-                        ImGui::PopStyleColor();
                 }
         }
 
@@ -231,16 +220,21 @@ MonitorScope::tableMenu()
 void
 MonitorScope::tableDraw()
 {
-        if (!ImGui::BeginTable("MonitorTable", 6, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable))
+        if (!ImGui::BeginTable("MonitorTable",
+                               6,
+                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+                                   ImGuiTableFlags_Sortable))
                 return;
 
-        ImGui::TableSetupColumn("Name");
-        ImGui::TableSetupColumn("Value");
-        ImGui::TableSetupColumn("Type");
-        ImGui::TableSetupColumn("Address");
-        ImGui::TableSetupColumn("Port");
-        ImGui::TableSetupColumn("Wave", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Port", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Wave", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 100.0f);
         ImGui::TableHeadersRow();
+
+        ImGuiTableSortSpecs *sortSpecs = ImGui::TableGetSortSpecs();
 
         auto chOrder = [&](const std::string &k) -> i64 {
                 auto it = chs_.find(k);
@@ -280,15 +274,62 @@ MonitorScope::tableDraw()
                 leaf.order   = std::min(leaf.order, ord);
         }
 
-        // Children of a trie node ordered by min insertion order (then label).
-        auto orderedChildren = [](TNode &n) {
+        // Children of a trie node ordered by min insertion order (then label), or by column sort specs.
+        auto orderedChildren = [&](TNode &n) {
                 std::vector<std::pair<const std::string *, TNode *>> v;
                 v.reserve(n.children.size());
                 for (auto &[lbl, child] : n.children)
                         v.emplace_back(&lbl, &child);
-                std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) {
-                        return a.second->order != b.second->order ? a.second->order < b.second->order : *a.first < *b.first;
-                });
+
+                if (sortSpecs && sortSpecs->SpecsCount > 0) {
+                        const auto *spec = &sortSpecs->Specs[0];
+                        std::sort(v.begin(), v.end(), [&](const auto &a, const auto &b) -> bool {
+                                bool isLeafA = !a.second->leafKey.empty();
+                                bool isLeafB = !b.second->leafKey.empty();
+                                if (isLeafA != isLeafB)
+                                        return isLeafB; // Groups before leaves
+
+                                int cmp = 0;
+                                if (isLeafA && isLeafB) {
+                                        auto &chA = chs_[a.second->leafKey];
+                                        auto &chB = chs_[b.second->leafKey];
+                                        switch (spec->ColumnIndex) {
+                                                case 0: // Name
+                                                        cmp = a.second->leafKey.compare(b.second->leafKey);
+                                                        break;
+                                                case 1: // Value
+                                                        cmp = (chA->getDispVal() < chB->getDispVal())
+                                                                  ? -1
+                                                                  : (chA->getDispVal() > chB->getDispVal() ? 1 : 0);
+                                                        break;
+                                                case 2: // Type
+                                                        cmp = chA->getType().compare(chB->getType());
+                                                        break;
+                                                case 3: // Address
+                                                        cmp = (chA->getAddr() < chB->getAddr())
+                                                                  ? -1
+                                                                  : (chA->getAddr() > chB->getAddr() ? 1 : 0);
+                                                        break;
+                                                case 4: // Port
+                                                        cmp = chA->getDevice().compare(chB->getDevice());
+                                                        break;
+                                        }
+                                } else {
+                                        cmp = a.first->compare(*b.first);
+                                }
+
+                                if (cmp == 0) {
+                                        cmp = a.second->order < b.second->order ? -1
+                                                                                : (a.second->order > b.second->order ? 1 : 0);
+                                }
+                                return spec->SortDirection == ImGuiSortDirection_Ascending ? (cmp < 0) : (cmp > 0);
+                        });
+                } else {
+                        std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) {
+                                return a.second->order != b.second->order ? a.second->order < b.second->order
+                                                                          : *a.first < *b.first;
+                        });
+                }
                 return v;
         };
 
@@ -1148,6 +1189,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                 ImGui::TableSetupColumn("Freq (Hz)");
                                                 ImGui::TableSetupColumn("Mag");
                                                 ImGui::TableHeadersRow();
+
                                                 for (const auto &p : peaks) {
                                                         ImGui::TableNextRow();
                                                         ImGui::TableSetColumnIndex(0);
@@ -1268,6 +1310,8 @@ MonitorScope::dropTarget()
                                                 ch->setDevice(chPayload->device);
                                                 if (chPayload->shmName[0] != '\0')
                                                         ch->setShmRegionName(chPayload->shmName);
+                                                ch->setBitOffset(chPayload->bitOffset);
+                                                ch->setBitSize(chPayload->bitSize);
                                                 if (chPayload->numEnums > 0) {
                                                         std::vector<MonitorChannel::EnumEntry> ents;
                                                         for (int i = 0; i < chPayload->numEnums; ++i)
@@ -1298,6 +1342,8 @@ MonitorScope::dropTarget()
                                                         ch->setDevice(sp->device);
                                                         if (sp->shmName[0] != '\0')
                                                                 ch->setShmRegionName(sp->shmName);
+                                                        ch->setBitOffset(e.bitOffset);
+                                                        ch->setBitSize(e.bitSize);
                                                         if (e.numEnums > 0) {
                                                                 std::vector<MonitorChannel::EnumEntry> ents;
                                                                 for (int k = 0; k < e.numEnums; ++k)

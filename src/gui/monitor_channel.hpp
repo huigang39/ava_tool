@@ -62,6 +62,8 @@ class MonitorChannel
         f32               dispVal_{};
         std::string       device_{};
         std::string       shmRegionName_{};
+        u32               bitOffset_{0};
+        u32               bitSize_{0};
         std::atomic<bool> wValDirty_{false};
         std::atomic<bool> pendingDelete_{false};
         bool              addrUnknown_{false}; // symbol missing from the (reloaded) ELF
@@ -160,6 +162,11 @@ class MonitorChannel
         std::string &getShmRegionName() { return shmRegionName_; }
         void         setShmRegionName(const std::string &n) { shmRegionName_ = n; }
         shm_t       &getShm() { return shm_; }
+
+        u32  getBitOffset() const { return bitOffset_; }
+        void setBitOffset(u32 o) { bitOffset_ = o; }
+        u32  getBitSize() const { return bitSize_; }
+        void setBitSize(u32 s) { bitSize_ = s; }
 
         i64  getOrder() const { return order_; }
         void setOrder(i64 o) { order_ = o; }

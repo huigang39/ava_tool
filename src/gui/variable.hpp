@@ -29,7 +29,12 @@ struct VarEntry {
         std::string name;
         DataType    type;
         PortType    port;
-        u64         addr;     // address or offset
+        u64         addr; // address or offset
+        bool        isStruct{false};
+        u32         bitOffset{0};
+        u32         bitSize{0};
+
+        std::string typeStr;  // Full type description (e.g. "struct my_struct")
         std::string valueStr; // Current value as string for display
         bool        writable;
         bool        is_editing = false;
@@ -147,16 +152,18 @@ class Variable
         void                       startPollThread();
         void                       stopPollThread();
 
-        bool                                 isModified_{false};
-        std::unordered_map<u64, std::string> memberValueCache_;
-        char                                 searchBuf_[128]{};
-        std::vector<SearchEntry>             searchResults_;
-        i32                                  lastSelectedIndex_{-1};
-        i32                                  enumEditIdx_{-1};
-        bool                                 pendingDeleteFromSubVar_{false};
-        i32                                  enumSubEditParentIdx_{-1};
-        std::string                          enumSubEditMemberPath_;
-        u64                                  enumSubEditMemberTypeOff_{0};
+        bool                                         isModified_{false};
+        std::unordered_map<std::string, std::string> memberValueCache_;
+        std::unordered_map<u64, PollVal>             syncReadCache_;
+
+        char                     searchBuf_[128]{};
+        std::vector<SearchEntry> searchResults_;
+        i32                      lastSelectedIndex_{-1};
+        i32                      enumEditIdx_{-1};
+        bool                     pendingDeleteFromSubVar_{false};
+        i32                      enumSubEditParentIdx_{-1};
+        std::string              enumSubEditMemberPath_;
+        u64                      enumSubEditMemberTypeOff_{0};
 
         void rebuildSearchPool();
         void flattenDwarfType(std::vector<SearchEntry> &pool,
@@ -201,7 +208,13 @@ class Variable
 
         void drawSymbolBrowser();
         void drawSymbolTree();
-        void drawSymbolLeaf(const std::string &displayName, const std::string &fullPath, u64 addr, u64 typeOff, i32 depth);
+        void drawSymbolLeaf(const std::string &displayName,
+                            const std::string &fullPath,
+                            u64                addr,
+                            u64                typeOff,
+                            i32                depth,
+                            u32                bitOffset = 0,
+                            u32                bitSize   = 0);
         void drawDataTreeLeaf(DataTree &node, const int indentLevel = 0);
 
         void drawVariableList();

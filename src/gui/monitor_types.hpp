@@ -25,6 +25,8 @@ struct ChannelDropPayload {
         u8        numBytes;    // 1/2/4/8 - derived from type
         u8        numEnums;    // 0 = not an enum
         u64       typeOff;     // DWARF type offset
+        u32       bitOffset;
+        u32       bitSize;
         EnumEntry enums[kMaxEnums];
 };
 
@@ -38,6 +40,8 @@ struct StructChannelPayload {
                 u64                           addr;
                 char                          type[8]; // same codes as ChannelDropPayload::type
                 u8                            numEnums;
+                u32                           bitOffset;
+                u32                           bitSize;
                 ChannelDropPayload::EnumEntry enums[kMaxEnums];
         };
         int  count;

@@ -235,6 +235,8 @@ threadFunc(Gui *gui)
                 u32                             addr;
                 u32                             nb;
                 std::string                     type;
+                u32                             bitOffset;
+                u32                             bitSize;
         };
         struct WValTask {
                 std::shared_ptr<MonitorChannel> ch;
@@ -247,6 +249,8 @@ threadFunc(Gui *gui)
                 std::shared_ptr<Monitor>        monitor;
                 u32                             nb;
                 std::string                     type;
+                u32                             bitOffset;
+                u32                             bitSize;
         };
         struct WaveTask {
                 std::shared_ptr<MonitorChannel> ch;
@@ -332,21 +336,30 @@ threadFunc(Gui *gui)
                                                         if (nb == 0)
                                                                 nb = typeBytes(ch->getType());
                                                         if (dev == "SHM" && ch->getShm().lo.spsc != nullptr) {
-                                                                shmTasks.push_back({ch, monitor, nb, ch->getType()});
+                                                                shmTasks.push_back({ch,
+                                                                                    monitor,
+                                                                                    nb,
+                                                                                    ch->getType(),
+                                                                                    ch->getBitOffset(),
+                                                                                    ch->getBitSize()});
                                                         } else if (dev == "JLINK" && ch->getAddr() != 0) {
                                                                 if (monitor->samplingMode_ == Monitor::SamplingMode::HSS) {
                                                                         tempChs.push_back({ch,
                                                                                            monitor,
                                                                                            static_cast<u32>(ch->getAddr()),
                                                                                            nb,
-                                                                                           ch->getType()});
+                                                                                           ch->getType(),
+                                                                                           ch->getBitOffset(),
+                                                                                           ch->getBitSize()});
                                                                         hasHss = true;
                                                                 } else {
                                                                         pollTasks.push_back({ch,
                                                                                              monitor,
                                                                                              static_cast<u32>(ch->getAddr()),
                                                                                              nb,
-                                                                                             ch->getType()});
+                                                                                             ch->getType(),
+                                                                                             ch->getBitOffset(),
+                                                                                             ch->getBitSize()});
                                                                 }
                                                                 if (ch->waveEnable_)
                                                                         waveTasks.push_back(
@@ -385,7 +398,7 @@ threadFunc(Gui *gui)
                                 continue;
                         u8 raw[8];
                         while (shm_read(&st.ch->getShm(), raw, st.nb) == st.nb) {
-                                st.ch->setRVal(decodeAs(raw, st.type), sessionTimeSec());
+                                st.ch->setRVal(decodeAs(raw, st.type, st.bitOffset, st.bitSize), sessionTimeSec());
                                 st.monitor->addPoints(1);
                                 hzFrameAccum++;
                                 loopDiag.shmSamples++;
@@ -549,11 +562,15 @@ threadFunc(Gui *gui)
                 static std::vector<std::shared_ptr<Monitor>>        chMonitors;
                 static std::vector<std::string>                     lastTypes_current;
                 static std::vector<u32>                             offsets;
+                static std::vector<u32>                             bitOffsets;
+                static std::vector<u32>                             bitSizes;
                 blocks.clear();
                 chans.clear();
                 chMonitors.clear();
                 lastTypes_current.clear();
                 offsets.clear();
+                bitOffsets.clear();
+                bitSizes.clear();
                 u32 curOff = 0;
                 for (auto &tc : tempChs) {
                         blocks.push_back({tc.addr, tc.nb});
@@ -561,6 +578,8 @@ threadFunc(Gui *gui)
                         chMonitors.push_back(tc.monitor);
                         lastTypes_current.push_back(tc.type);
                         offsets.push_back(curOff);
+                        bitOffsets.push_back(tc.bitOffset);
+                        bitSizes.push_back(tc.bitSize);
                         curOff += tc.nb;
                 }
                 i32 periodUs = 1000000 / maxHssHz;
@@ -716,7 +735,7 @@ threadFunc(Gui *gui)
                                                 u8  raw[8]  = {0};
                                                 u32 varSize = typeBytes(lastTypes[i]);
                                                 std::memcpy(raw, pData + lastOffsets[i], varSize);
-                                                pVals[i].push_back(decodeAs(raw, lastTypes[i]));
+                                                pVals[i].push_back(decodeAs(raw, lastTypes[i], bitOffsets[i], bitSizes[i]));
                                                 pTs[i].push_back(ts);
                                         }
                                 }
@@ -826,7 +845,9 @@ threadFunc(Gui *gui)
                                                         }
                                                         u8 rbuf[8] = {0};
                                                         if (JLinkPort::instance().readMem(pt.addr, pt.nb, rbuf)) {
-                                                                pt.ch->setRVal(decodeAs(rbuf, pt.type), sessionTimeSec());
+                                                                pt.ch->setRVal(
+                                                                    decodeAs(rbuf, pt.type, pt.bitOffset, pt.bitSize),
+                                                                    sessionTimeSec());
                                                                 loopDiag.pollSamples++;
                                                         }
                                                 }

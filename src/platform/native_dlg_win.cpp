@@ -3,6 +3,7 @@
 // windows.h must precede commdlg.h (commdlg.h → prsht.h needs CALLBACK/HWND from windows.h)
 #include <windows.h>
 #include <commdlg.h>
+#include <shlobj.h>
 // clang-format on
 #include <string>
 #include <vector>
@@ -97,4 +98,31 @@ nativeDlgSave(const std::string                  &title,
                 ofn.lpstrInitialDir = wDir.c_str();
 
         return GetSaveFileNameW(&ofn) ? toUtf8(buf) : "";
+}
+
+std::string
+nativeDlgPickDir(const std::string &title)
+{
+        BROWSEINFOW  bi     = {0};
+        std::wstring wTitle = toWide(title);
+        bi.lpszTitle        = wTitle.c_str();
+        bi.ulFlags          = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+
+        HRESULT hr     = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        bool    coInit = (hr == S_OK || hr == S_FALSE);
+
+        PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+        std::string      ret  = "";
+        if (pidl != 0) {
+                wchar_t path[MAX_PATH];
+                if (SHGetPathFromIDListW(pidl, path)) {
+                        ret = toUtf8(path);
+                }
+                CoTaskMemFree(pidl);
+        }
+
+        if (coInit) {
+                CoUninitialize();
+        }
+        return ret;
 }

@@ -27,6 +27,11 @@
 
 extern std::atomic<bool> g_monitorPaused;
 
+struct ChannelMovePayload {
+        MonitorScope *srcScope;
+        char          chName[128];
+};
+
 class Monitor
 {
       public:

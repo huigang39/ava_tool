@@ -16,3 +16,6 @@ std::string nativeDlgSave(const std::string                  &title,
                           const std::vector<NativeDlgFilter> &filters,
                           const std::string                  &defaultName = "",
                           const std::string                  &defaultDir  = ".");
+
+// Blocking pick-directory dialog. Returns chosen path, or "" if cancelled.
+std::string nativeDlgPickDir(const std::string &title);

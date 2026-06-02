@@ -16,6 +16,7 @@
 #include "gui/bode.hpp"
 #include "gui/monitor.hpp"
 #include "gui/variable.hpp"
+#include "sequence_editor.hpp"
 
 class Gui
 {
@@ -92,6 +93,7 @@ class Gui
         bool           showCalculator_{false};
         Bode           bode_{};
         AssemblyViewer asmViewer_{};
+        SequenceEditor seqEditor_{};
 
         struct CsvChannelImport {
                 std::string         scope;   // scope this channel belongs to

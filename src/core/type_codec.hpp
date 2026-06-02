@@ -29,32 +29,60 @@ typeBytes(const std::string &t)
 
 // Decode raw bytes into an f32 value according to the type string.
 inline f32
-decodeAs(const u8 *raw, const std::string &type)
+decodeAs(const u8 *raw, const std::string &type, u32 bitOffset = 0, u32 bitSize = 0)
 {
         if (type == "U8") {
                 u8 v;
                 std::memcpy(&v, raw, 1);
+                if (bitSize > 0)
+                        v = (v >> bitOffset) & ((1 << bitSize) - 1);
                 return static_cast<f32>(v);
         }
         if (type == "I8") {
-                i8 v;
+                u8 v;
                 std::memcpy(&v, raw, 1);
-                return static_cast<f32>(v);
+                if (bitSize > 0) {
+                        v = (v >> bitOffset) & ((1 << bitSize) - 1);
+                        if (v & (1 << (bitSize - 1)))
+                                v |= static_cast<u8>(~((1 << bitSize) - 1));
+                        return static_cast<f32>(static_cast<i8>(v));
+                }
+                i8 sv;
+                std::memcpy(&sv, raw, 1);
+                return static_cast<f32>(sv);
         }
         if (type == "U16") {
                 u16 v;
                 std::memcpy(&v, raw, 2);
+                if (bitSize > 0)
+                        v = (v >> bitOffset) & ((1 << bitSize) - 1);
                 return static_cast<f32>(v);
         }
         if (type == "I16") {
-                i16 v;
+                u16 v;
                 std::memcpy(&v, raw, 2);
-                return static_cast<f32>(v);
+                if (bitSize > 0) {
+                        v = (v >> bitOffset) & ((1 << bitSize) - 1);
+                        if (v & (1 << (bitSize - 1)))
+                                v |= static_cast<u16>(~((1 << bitSize) - 1));
+                        return static_cast<f32>(static_cast<i16>(v));
+                }
+                i16 sv;
+                std::memcpy(&sv, raw, 2);
+                return static_cast<f32>(sv);
         }
         if (type == "I32") {
-                i32 v;
+                u32 v;
                 std::memcpy(&v, raw, 4);
-                return static_cast<f32>(v);
+                if (bitSize > 0) {
+                        v = (v >> bitOffset) & ((1ULL << bitSize) - 1);
+                        if (v & (1ULL << (bitSize - 1)))
+                                v |= static_cast<u32>(~((1ULL << bitSize) - 1));
+                        return static_cast<f32>(static_cast<i32>(v));
+                }
+                i32 sv;
+                std::memcpy(&sv, raw, 4);
+                return static_cast<f32>(sv);
         }
         if (type == "F32") {
                 f32 f;
@@ -64,12 +92,22 @@ decodeAs(const u8 *raw, const std::string &type)
         if (type == "U64") {
                 u64 v;
                 std::memcpy(&v, raw, 8);
+                if (bitSize > 0)
+                        v = (v >> bitOffset) & ((1ULL << bitSize) - 1);
                 return static_cast<f32>(v);
         }
         if (type == "I64") {
-                i64 v;
+                u64 v;
                 std::memcpy(&v, raw, 8);
-                return static_cast<f32>(v);
+                if (bitSize > 0) {
+                        v = (v >> bitOffset) & ((1ULL << bitSize) - 1);
+                        if (v & (1ULL << (bitSize - 1)))
+                                v |= ~((1ULL << bitSize) - 1);
+                        return static_cast<f32>(static_cast<i64>(v));
+                }
+                i64 sv;
+                std::memcpy(&sv, raw, 8);
+                return static_cast<f32>(sv);
         }
         if (type == "F64") {
                 f64 d;
@@ -79,6 +117,8 @@ decodeAs(const u8 *raw, const std::string &type)
         // Default / U32
         u32 v;
         std::memcpy(&v, raw, 4);
+        if (bitSize > 0)
+                v = (v >> bitOffset) & ((1ULL << bitSize) - 1);
         return static_cast<f32>(v);
 }
 

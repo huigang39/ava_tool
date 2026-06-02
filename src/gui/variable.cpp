@@ -23,44 +23,97 @@
 
 // Helper to decode raw bytes to string based on DataType
 static std::string
-decodeValue(const u8 *raw, DataType type)
+decodeValue(const u8 *raw, DataType type, u32 bitOffset = 0, u32 bitSize = 0)
 {
         if (!raw)
                 return "...";
         char buf[64];
         switch (type) {
-                case DataType::U8:
-                        snprintf(buf, sizeof(buf), "%u", *raw);
+                case DataType::U8: {
+                        u8 v = *raw;
+                        if (bitSize > 0)
+                                v = (v >> bitOffset) & ((1 << bitSize) - 1);
+                        snprintf(buf, sizeof(buf), "%u", v);
                         break;
-                case DataType::I8:
-                        snprintf(buf, sizeof(buf), "%d", *(i8 *)raw);
+                }
+                case DataType::I8: {
+                        u8 v = *raw;
+                        if (bitSize > 0) {
+                                v = (v >> bitOffset) & ((1 << bitSize) - 1);
+                                if (v & (1 << (bitSize - 1)))
+                                        v |= static_cast<u8>(~((1 << bitSize) - 1));
+                                snprintf(buf, sizeof(buf), "%d", static_cast<i8>(v));
+                        } else {
+                                snprintf(buf, sizeof(buf), "%d", *(i8 *)raw);
+                        }
                         break;
-                case DataType::U16:
-                        snprintf(buf, sizeof(buf), "%u", *(u16 *)raw);
+                }
+                case DataType::U16: {
+                        u16 v = *(u16 *)raw;
+                        if (bitSize > 0)
+                                v = (v >> bitOffset) & ((1 << bitSize) - 1);
+                        snprintf(buf, sizeof(buf), "%u", v);
                         break;
-                case DataType::I16:
-                        snprintf(buf, sizeof(buf), "%d", *(i16 *)raw);
+                }
+                case DataType::I16: {
+                        u16 v = *(u16 *)raw;
+                        if (bitSize > 0) {
+                                v = (v >> bitOffset) & ((1 << bitSize) - 1);
+                                if (v & (1 << (bitSize - 1)))
+                                        v |= static_cast<u16>(~((1 << bitSize) - 1));
+                                snprintf(buf, sizeof(buf), "%d", static_cast<i16>(v));
+                        } else {
+                                snprintf(buf, sizeof(buf), "%d", *(i16 *)raw);
+                        }
                         break;
-                case DataType::U32:
-                        snprintf(buf, sizeof(buf), "%u", *(u32 *)raw);
+                }
+                case DataType::U32: {
+                        u32 v = *(u32 *)raw;
+                        if (bitSize > 0)
+                                v = (v >> bitOffset) & ((1ULL << bitSize) - 1);
+                        snprintf(buf, sizeof(buf), "%u", v);
                         break;
-                case DataType::I32:
-                        snprintf(buf, sizeof(buf), "%d", *(i32 *)raw);
+                }
+                case DataType::I32: {
+                        u32 v = *(u32 *)raw;
+                        if (bitSize > 0) {
+                                v = (v >> bitOffset) & ((1ULL << bitSize) - 1);
+                                if (v & (1ULL << (bitSize - 1)))
+                                        v |= static_cast<u32>(~((1ULL << bitSize) - 1));
+                                snprintf(buf, sizeof(buf), "%d", static_cast<i32>(v));
+                        } else {
+                                snprintf(buf, sizeof(buf), "%d", *(i32 *)raw);
+                        }
                         break;
+                }
                 case DataType::F32:
                         snprintf(buf, sizeof(buf), "%.4f", *(f32 *)raw);
                         break;
-                case DataType::U64:
-                        snprintf(buf, sizeof(buf), "%llu", *(u64 *)raw);
+                case DataType::U64: {
+                        u64 v = *(u64 *)raw;
+                        if (bitSize > 0)
+                                v = (v >> bitOffset) & ((1ULL << bitSize) - 1);
+                        snprintf(buf, sizeof(buf), "%llu", v);
                         break;
-                case DataType::I64:
-                        snprintf(buf, sizeof(buf), "%lld", *(i64 *)raw);
+                }
+                case DataType::I64: {
+                        u64 v = *(u64 *)raw;
+                        if (bitSize > 0) {
+                                v = (v >> bitOffset) & ((1ULL << bitSize) - 1);
+                                if (v & (1ULL << (bitSize - 1)))
+                                        v |= ~((1ULL << bitSize) - 1);
+                                snprintf(buf, sizeof(buf), "%lld", static_cast<i64>(v));
+                        } else {
+                                snprintf(buf, sizeof(buf), "%lld", *(i64 *)raw);
+                        }
                         break;
+                }
                 case DataType::F64:
                         snprintf(buf, sizeof(buf), "%.6f", *(f64 *)raw);
                         break;
                 default:
-                        return "???";
+                        snprintf(buf, sizeof(buf), "Unknown");
+                        break;
         }
         return buf;
 }
@@ -541,16 +594,55 @@ Variable::drawSymbolTree()
                 if (ImGui::BeginTable("SymbolTreeTable",
                                       4,
                                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
-                                          ImGuiTableFlags_ScrollY,
+                                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable,
                                       ImVec2(0, 0))) {
-                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
                         ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
                         ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 60.0f);
                         ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
                         ImGui::TableHeadersRow();
 
-                        for (const auto &v : dwarfInfo_.variables) {
-                                drawSymbolLeaf(v.name, v.name, v.addr, v.type, 0);
+                        std::vector<const dwarf::Variable *> vars;
+                        vars.reserve(dwarfInfo_.variables.size());
+                        for (const auto &v : dwarfInfo_.variables)
+                                vars.push_back(&v);
+
+                        if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
+                                if (sorts_specs->SpecsCount > 0) {
+                                        const auto *spec = &sorts_specs->Specs[0];
+                                        std::sort(vars.begin(),
+                                                  vars.end(),
+                                                  [&](const dwarf::Variable *a, const dwarf::Variable *b) -> bool {
+                                                          int cmp = 0;
+                                                          switch (spec->ColumnIndex) {
+                                                                  case 0: // Name
+                                                                          cmp = a->name.compare(b->name);
+                                                                          break;
+                                                                  case 1: // Address
+                                                                          cmp = (a->addr < b->addr)
+                                                                                    ? -1
+                                                                                    : (a->addr > b->addr ? 1 : 0);
+                                                                          break;
+                                                                  case 2: // Size
+                                                                          cmp = ((int)typeSize(dwarfInfo_, a->type) -
+                                                                                 (int)typeSize(dwarfInfo_, b->type));
+                                                                          break;
+                                                                  case 3: // Type
+                                                                          cmp = prettyType(dwarfInfo_, a->type)
+                                                                                    .compare(prettyType(dwarfInfo_, b->type));
+                                                                          break;
+                                                          }
+                                                          if (cmp == 0)
+                                                                  cmp = a->name.compare(b->name);
+                                                          return spec->SortDirection == ImGuiSortDirection_Ascending
+                                                                     ? (cmp < 0)
+                                                                     : (cmp > 0);
+                                                  });
+                                }
+                        }
+
+                        for (const auto *v : vars) {
+                                drawSymbolLeaf(v->name, v->name, v->addr, v->type, 0);
                         }
                         ImGui::EndTable();
                 }
@@ -558,14 +650,43 @@ Variable::drawSymbolTree()
                 if (ImGui::BeginTable("BinTreeTable",
                                       3,
                                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
-                                          ImGuiTableFlags_ScrollY,
+                                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable,
                                       ImVec2(0, 0))) {
-                        ImGui::TableSetupColumn("Name");
-                        ImGui::TableSetupColumn("Type");
-                        ImGui::TableSetupColumn("Value");
+                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
                         ImGui::TableHeadersRow();
+
+                        std::vector<DataTree *> nodes;
+                        nodes.reserve(dataTree_.children.size());
                         for (auto &n : dataTree_.children)
-                                drawDataTreeLeaf(n);
+                                nodes.push_back(&n);
+
+                        if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
+                                if (sorts_specs->SpecsCount > 0) {
+                                        const auto *spec = &sorts_specs->Specs[0];
+                                        std::sort(
+                                            nodes.begin(), nodes.end(), [&](const DataTree *a, const DataTree *b) -> bool {
+                                                    int cmp = 0;
+                                                    switch (spec->ColumnIndex) {
+                                                            case 0:
+                                                                    cmp = a->name.compare(b->name);
+                                                                    break;
+                                                            case 1:
+                                                                    cmp = std::string(Parser::dataTypeToStr(a->type))
+                                                                              .compare(Parser::dataTypeToStr(b->type));
+                                                                    break;
+                                                    }
+                                                    if (cmp == 0)
+                                                            cmp = a->name.compare(b->name);
+                                                    return spec->SortDirection == ImGuiSortDirection_Ascending ? (cmp < 0)
+                                                                                                               : (cmp > 0);
+                                            });
+                                }
+                        }
+
+                        for (auto *n : nodes)
+                                drawDataTreeLeaf(*n);
                         ImGui::EndTable();
                 }
         } else {
@@ -574,7 +695,8 @@ Variable::drawSymbolTree()
 }
 
 void
-Variable::drawSymbolLeaf(const std::string &displayName, const std::string &fullPath, u64 addr, u64 typeOff, i32 depth)
+Variable::drawSymbolLeaf(
+    const std::string &displayName, const std::string &fullPath, u64 addr, u64 typeOff, i32 depth, u32 bitOffset, u32 bitSize)
 {
         // Note: mtxElf_ is already held by drawSymbolTree()
         if (depth > 16)
@@ -618,8 +740,10 @@ Variable::drawSymbolLeaf(const std::string &displayName, const std::string &full
                         if (scalarKind)
                                 snprintf(p.type, sizeof(p.type), "%s", scalarKind);
                         snprintf(p.device, sizeof(p.device), "JLINK");
-                        p.numBytes = (u8)typeSize(dwarfInfo_, typeOff);
-                        p.typeOff  = typeOff;
+                        p.numBytes  = (u8)typeSize(dwarfInfo_, typeOff);
+                        p.typeOff   = typeOff;
+                        p.bitOffset = bitOffset;
+                        p.bitSize   = bitSize;
                         fillEnumPayload(dwarfInfo_, typeOff, p);
                         ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                 }
@@ -630,12 +754,14 @@ Variable::drawSymbolLeaf(const std::string &displayName, const std::string &full
         if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
                 if (scalarKind) {
                         VarEntry v;
-                        v.name     = fullPath;
-                        v.type     = Parser::strToDataType(scalarKind);
-                        v.port     = PortType::JLINK;
-                        v.addr     = addr;
-                        v.writable = true;
-                        v.typeOff  = typeOff;
+                        v.name      = fullPath;
+                        v.type      = Parser::strToDataType(scalarKind);
+                        v.port      = PortType::JLINK;
+                        v.addr      = addr;
+                        v.writable  = true;
+                        v.typeOff   = typeOff;
+                        v.bitOffset = bitOffset;
+                        v.bitSize   = bitSize;
                         vars_.push_back(v);
                         ImGui::InsertNotification({ImGuiToastType::Success, 2000, "Added %s to watch list", fullPath.c_str()});
                 } else if (isStruct || isArray) {
@@ -657,7 +783,9 @@ Variable::drawSymbolLeaf(const std::string &displayName, const std::string &full
                                                fullPath + "." + (m.name.empty() ? "<anon>" : m.name),
                                                addr + m.offset,
                                                m.type,
-                                               depth + 1);
+                                               depth + 1,
+                                               m.bitOffset,
+                                               m.bitSize);
                         }
                 } else if (isArray) {
                         u64 elemSize  = typeSize(dwarfInfo_, t->inner);
@@ -861,14 +989,48 @@ Variable::drawSymbolBrowser()
         if (searchBuf_[0] == '\0') {
                 drawSymbolTree();
         } else {
-                constexpr ImGuiTableFlags flags =
-                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
+                constexpr ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+                                                  ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
                 if (ImGui::BeginTable("SymbolSearchTable", 4, flags, ImVec2(0, 0))) {
-                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
                         ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
                         ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 60.0f);
                         ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
                         ImGui::TableHeadersRow();
+
+                        if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
+                                if (sorts_specs->SpecsCount > 0 && sorts_specs->SpecsDirty) {
+                                        const auto *spec = &sorts_specs->Specs[0];
+                                        std::sort(searchResults_.begin(),
+                                                  searchResults_.end(),
+                                                  [&](const SearchEntry &a, const SearchEntry &b) -> bool {
+                                                          int cmp = 0;
+                                                          switch (spec->ColumnIndex) {
+                                                                  case 0:
+                                                                          cmp = a.path.compare(b.path);
+                                                                          break;
+                                                                  case 1:
+                                                                          cmp = (a.addr < b.addr) ? -1
+                                                                                                  : (a.addr > b.addr ? 1 : 0);
+                                                                          break;
+                                                                  case 2:
+                                                                          cmp = ((int)typeSize(dwarfInfo_, a.typeOff) -
+                                                                                 (int)typeSize(dwarfInfo_, b.typeOff));
+                                                                          break;
+                                                                  case 3:
+                                                                          cmp = prettyType(dwarfInfo_, a.typeOff)
+                                                                                    .compare(prettyType(dwarfInfo_, b.typeOff));
+                                                                          break;
+                                                          }
+                                                          if (cmp == 0)
+                                                                  cmp = a.path.compare(b.path);
+                                                          return spec->SortDirection == ImGuiSortDirection_Ascending
+                                                                     ? (cmp < 0)
+                                                                     : (cmp > 0);
+                                                  });
+                                        sorts_specs->SpecsDirty = false;
+                                }
+                        }
 
                         for (int i = 0; i < (int)searchResults_.size(); ++i) {
                                 const auto &e = searchResults_[i];
@@ -932,10 +1094,12 @@ Variable::drawSymbolBrowser()
                                         if (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION) {
                                                 for (const auto &m : t->members)
                                                         drawSymbolLeaf(m.name.empty() ? "<anon>" : m.name,
-                                                                       e.path + "." + (m.name.empty() ? "<anon>" : m.name),
+                                                                       e.path + "." + m.name,
                                                                        e.addr + m.offset,
                                                                        m.type,
-                                                                       1);
+                                                                       1,
+                                                                       m.bitOffset,
+                                                                       m.bitSize);
                                         } else if (t->kind == dwarf::TypeKind::ARRAY) {
                                                 u64 elemSize  = typeSize(dwarfInfo_, t->inner);
                                                 u64 dim       = t->dims.empty() ? 0 : t->dims.front();
@@ -976,15 +1140,43 @@ Variable::drawVariableList()
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Refresh(ms)");
 
-        constexpr ImGuiTableFlags flags =
-            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
+        constexpr ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+                                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
         if (ImGui::BeginTable("VarMonitorTable", 5, flags, ImVec2(0, 0))) {
-                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 60.0f);
                 ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn("Port", ImGuiTableColumnFlags_WidthFixed, 80.0f);
                 ImGui::TableHeadersRow();
+
+                if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
+                        if (sorts_specs->SpecsCount > 0 && sorts_specs->SpecsDirty) {
+                                const auto *spec = &sorts_specs->Specs[0];
+                                std::sort(vars_.begin(), vars_.end(), [&](const VarEntry &a, const VarEntry &b) -> bool {
+                                        int cmp = 0;
+                                        switch (spec->ColumnIndex) {
+                                                case 0:
+                                                        cmp = a.name.compare(b.name);
+                                                        break;
+                                                case 2:
+                                                        cmp = prettyType(dwarfInfo_, a.typeOff)
+                                                                  .compare(prettyType(dwarfInfo_, b.typeOff));
+                                                        break;
+                                                case 3:
+                                                        cmp = (a.addr < b.addr) ? -1 : (a.addr > b.addr ? 1 : 0);
+                                                        break;
+                                                case 4:
+                                                        cmp = (int)a.port - (int)b.port;
+                                                        break;
+                                        }
+                                        if (cmp == 0)
+                                                cmp = a.name.compare(b.name);
+                                        return spec->SortDirection == ImGuiSortDirection_Ascending ? (cmp < 0) : (cmp > 0);
+                                });
+                                sorts_specs->SpecsDirty = false;
+                        }
+                }
 
                 for (int i = 0; i < (int)vars_.size(); ++i) {
                         auto      &v          = vars_[i];
@@ -1200,10 +1392,12 @@ Variable::drawVariableList()
                 if (payload) {
                         auto    *p = static_cast<ChannelDropPayload *>(payload->Data);
                         VarEntry v;
-                        v.name     = p->name;
-                        v.addr     = p->addr;
-                        v.writable = true;
-                        v.typeOff  = p->typeOff;
+                        v.name      = p->name;
+                        v.addr      = p->addr;
+                        v.writable  = true;
+                        v.typeOff   = p->typeOff;
+                        v.bitOffset = p->bitOffset;
+                        v.bitSize   = p->bitSize;
 
                         if (strcmp(p->device, "SHM") == 0) {
                                 v.port = PortType::SHM;
@@ -1461,12 +1655,13 @@ Variable::drawSubEnumEditPopup()
 }
 
 static void
-populateShmMemberCache(const dwarf::Info                    &info,
-                       u64                                   baseAddr,
-                       u64                                   typeOff,
-                       const u8                             *blob,
-                       usize                                 blobSize,
-                       std::unordered_map<u64, std::string> &cache)
+populateShmMemberCache(const dwarf::Info                            &info,
+                       const std::string                            &prefix,
+                       u64                                           baseAddr,
+                       u64                                           typeOff,
+                       const u8                                     *blob,
+                       usize                                         blobSize,
+                       std::unordered_map<std::string, std::string> &cache)
 {
         const dwarf::Type *t = resolveAlias(info, typeOff);
         if (!t)
@@ -1475,14 +1670,17 @@ populateShmMemberCache(const dwarf::Info                    &info,
                 for (const auto &m : t->members) {
                         if (m.offset >= blobSize)
                                 continue;
+                        std::string memberPath = prefix + "." + (m.name.empty() ? "<anon>" : m.name);
                         u64         memberAddr = baseAddr + m.offset;
                         const char *sType      = scalarPayloadType(info, m.type);
                         if (sType) {
                                 u32 sz = Parser::typeBytes(Parser::strToDataType(sType));
                                 if (m.offset + sz <= blobSize)
-                                        cache[memberAddr] = decodeValue(blob + m.offset, Parser::strToDataType(sType));
+                                        cache[memberPath] =
+                                            decodeValue(blob + m.offset, Parser::strToDataType(sType), m.bitOffset, m.bitSize);
                         } else {
-                                populateShmMemberCache(info, memberAddr, m.type, blob + m.offset, blobSize - m.offset, cache);
+                                populateShmMemberCache(
+                                    info, memberPath, memberAddr, m.type, blob + m.offset, blobSize - m.offset, cache);
                         }
                 }
         } else if (t->kind == dwarf::TypeKind::ARRAY) {
@@ -1495,13 +1693,15 @@ populateShmMemberCache(const dwarf::Info                    &info,
                         u64 offset = i * elemSize;
                         if (offset >= blobSize)
                                 break;
-                        u64 memberAddr = baseAddr + offset;
+                        std::string memberPath = prefix + "[" + std::to_string(i) + "]";
+                        u64         memberAddr = baseAddr + offset;
                         if (sType) {
                                 u32 sz = Parser::typeBytes(Parser::strToDataType(sType));
                                 if (offset + sz <= blobSize)
-                                        cache[memberAddr] = decodeValue(blob + offset, Parser::strToDataType(sType));
+                                        cache[memberPath] = decodeValue(blob + offset, Parser::strToDataType(sType), 0, 0);
                         } else {
-                                populateShmMemberCache(info, memberAddr, t->inner, blob + offset, blobSize - offset, cache);
+                                populateShmMemberCache(
+                                    info, memberPath, memberAddr, t->inner, blob + offset, blobSize - offset, cache);
                         }
                 }
         }
@@ -1603,7 +1803,6 @@ Variable::updateVariables()
         std::unordered_map<u64, PollVal> polledVals;
         {
                 std::vector<PollReq> reqs;
-                reqs.reserve(vars_.size());
                 for (const auto &v : vars_) {
                         if (v.port != PortType::JLINK || v.is_editing)
                                 continue;
@@ -1611,6 +1810,7 @@ Variable::updateVariables()
                         if (t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
                                   t->kind == dwarf::TypeKind::ARRAY))
                                 continue; // complex types aren't scalar-read here
+
                         reqs.push_back({v.addr, Parser::typeBytes(v.type)});
                 }
                 std::lock_guard lk(poll_->mtx);
@@ -1640,8 +1840,13 @@ Variable::updateVariables()
                                         if (sz > 0 && sz <= 4096) {
                                                 std::vector<u8> blob(sz);
                                                 if (shm_read(&v.shm.handle, blob.data(), sz) == sz)
-                                                        populateShmMemberCache(
-                                                            dwarfInfo_, v.addr, v.typeOff, blob.data(), sz, memberValueCache_);
+                                                        populateShmMemberCache(dwarfInfo_,
+                                                                               v.name,
+                                                                               v.addr,
+                                                                               v.typeOff,
+                                                                               blob.data(),
+                                                                               sz,
+                                                                               memberValueCache_);
                                         }
                                 }
                         }
@@ -1685,7 +1890,7 @@ Variable::updateVariables()
                         if (isEnum) {
                                 i64 ival = 0;
                                 std::memcpy(&ival, buf, std::min((size_t)sz, sizeof(ival)));
-                                v.valueStr = decodeValue(buf, v.type);
+                                v.valueStr = decodeValue(buf, v.type, v.bitOffset, v.bitSize);
                                 // User-defined defs take priority over DWARF
                                 bool found = false;
                                 for (const auto &e : v.enumDefs)
@@ -1701,7 +1906,7 @@ Variable::updateVariables()
                                                         break;
                                                 }
                         } else {
-                                v.valueStr = decodeValue(buf, v.type);
+                                v.valueStr = decodeValue(buf, v.type, v.bitOffset, v.bitSize);
                         }
                 } else if (ret == -1)
                         v.valueStr = "ERR";
@@ -1750,6 +1955,7 @@ Variable::writeVariable(const VarEntry &v, const std::string &newVal)
 void
 Variable::draw()
 {
+        syncReadCache_.clear();
         f32 availY       = ImGui::GetContentRegionAvail().y;
         f32 splitterSize = 8.0f;
         f32 topHeight    = watchListHeight_;
@@ -2012,55 +2218,76 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
 
         const char *devLabel = (port == PortType::SHM) ? "SHM" : (port == PortType::UDP) ? "UDP" : "JLINK";
 
-        auto drawValueCell = [&](u64 memberAddr, const char *sType, u64 memberTypeOff, const std::string &mPath) {
-                auto               it             = memberValueCache_.find(memberAddr);
-                const dwarf::Type *et             = resolveAlias(dwarfInfo_, memberTypeOff);
-                const bool         isEnum         = et && et->kind == dwarf::TypeKind::ENUM;
-                auto               decodeWithEnum = [&](const u8 *buf, u32 sz) -> std::string {
-                        if (!isEnum)
-                                return decodeValue(buf, Parser::strToDataType(sType));
-                        // User-defined overrides for this member take priority
-                        if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
-                                const auto &medMap = vars_[parentVarIdx].memberEnumDefs;
-                                auto        medIt  = medMap.find(mPath);
-                                if (medIt != medMap.end() && !medIt->second.empty()) {
-                                        i64 ival = 0;
-                                        std::memcpy(&ival, buf, std::min((size_t)sz, sizeof(ival)));
-                                        for (const auto &e : medIt->second)
-                                                if (e.value == ival)
-                                                        return e.name;
-                                }
-                        }
-                        i64 ival = 0;
-                        std::memcpy(&ival, buf, std::min((size_t)sz, sizeof(ival)));
-                        for (const auto &e : et->enums)
-                                if (e.value == ival)
-                                        return e.name;
-                        return decodeValue(buf, Parser::strToDataType(sType));
-                };
-                if (port == PortType::JLINK) {
-                        u8   buf[8]{};
-                        u32  sz         = Parser::typeBytes(Parser::strToDataType(sType));
-                        u64  now        = get_mono_ts_ms();
-                        bool shouldRead = (now - lastUpdateTs_ < 20);
-                        if (shouldRead && JLinkPort::instance().isConnected() &&
-                            JLinkPort::instance().readMem((u32)memberAddr, sz, buf)) {
-                                std::string val               = decodeWithEnum(buf, sz);
-                                memberValueCache_[memberAddr] = val;
-                                ImGui::TextUnformatted(val.c_str());
-                        } else if (it != memberValueCache_.end()) {
-                                ImGui::TextUnformatted(it->second.c_str());
-                        } else {
-                                ImGui::TextUnformatted("...");
-                        }
-                } else {
-                        // SHM/UDP: cache is populated by updateVariables �?just display
-                        if (it != memberValueCache_.end())
-                                ImGui::TextUnformatted(it->second.c_str());
-                        else
-                                ImGui::TextUnformatted("...");
-                }
-        };
+        auto drawValueCell =
+            [&](u64 memberAddr, const char *sType, u64 memberTypeOff, const std::string &mPath, u32 bitOffset, u32 bitSize) {
+                    auto               it             = memberValueCache_.find(mPath);
+                    const dwarf::Type *et             = resolveAlias(dwarfInfo_, memberTypeOff);
+                    const bool         isEnum         = et && et->kind == dwarf::TypeKind::ENUM;
+                    auto               decodeWithEnum = [&](const u8 *buf, u32 sz) -> std::string {
+                            if (!isEnum)
+                                    return decodeValue(buf, Parser::strToDataType(sType), bitOffset, bitSize);
+                            // User-defined overrides for this member take priority
+                            if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
+                                    const auto &medMap = vars_[parentVarIdx].memberEnumDefs;
+                                    auto        medIt  = medMap.find(mPath);
+                                    if (medIt != medMap.end() && !medIt->second.empty()) {
+                                            i64 ival = 0;
+                                            std::memcpy(&ival, buf, std::min((size_t)sz, sizeof(ival)));
+                                            for (const auto &e : medIt->second)
+                                                    if (e.value == ival)
+                                                            return e.name;
+                                    }
+                            }
+                            i64 ival = 0;
+                            std::memcpy(&ival, buf, std::min((size_t)sz, sizeof(ival)));
+                            for (const auto &e : et->enums)
+                                    if (e.value == ival)
+                                            return e.name;
+                            return decodeValue(buf, Parser::strToDataType(sType), bitOffset, bitSize);
+                    };
+                    if (port == PortType::JLINK) {
+                            u8  buf[8]{};
+                            u32 sz = Parser::typeBytes(Parser::strToDataType(sType));
+
+                            auto itSync = syncReadCache_.find(memberAddr);
+                            if (itSync != syncReadCache_.end()) {
+                                    if (itSync->second.ok) {
+                                            std::string val          = decodeWithEnum(itSync->second.buf, sz);
+                                            memberValueCache_[mPath] = val;
+                                            return val;
+                                    }
+                                    return std::string("ERR");
+                            }
+
+                            u64  now        = get_mono_ts_ms();
+                            bool shouldRead = (now - lastUpdateTs_ < 20);
+                            if (shouldRead && JLinkPort::instance().isConnected()) {
+                                    bool    ok = JLinkPort::instance().readMem((u32)memberAddr, sz, buf);
+                                    PollVal pv{};
+                                    pv.sz = sz;
+                                    pv.ok = ok;
+                                    if (ok)
+                                            std::memcpy(pv.buf, buf, sz);
+                                    syncReadCache_[memberAddr] = pv;
+
+                                    if (ok) {
+                                            std::string val          = decodeWithEnum(buf, sz);
+                                            memberValueCache_[mPath] = val;
+                                            return val;
+                                    }
+                                    return std::string("ERR");
+                            } else if (it != memberValueCache_.end()) {
+                                    return it->second;
+                            } else {
+                                    return std::string("...");
+                            }
+                    } else {
+                            // SHM/UDP: cache is populated by updateVariables
+                            if (it != memberValueCache_.end())
+                                    return it->second;
+                            return std::string("...");
+                    }
+            };
 
         const std::set<std::string> *hidden =
             (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) ? &vars_[parentVarIdx].hiddenMembers : nullptr;
@@ -2147,9 +2374,11 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                         ImGui::EndDragDropSource();
                                 }
                                 ImGui::TableSetColumnIndex(1);
-                                if (sType)
-                                        drawValueCell(memberAddr, sType, m.type, memberPath);
-                                else
+                                if (sType) {
+                                        std::string valStr =
+                                            drawValueCell(memberAddr, sType, m.type, memberPath, m.bitOffset, m.bitSize);
+                                        ImGui::TextUnformatted(valStr.c_str());
+                                } else
                                         ImGui::TextUnformatted("...");
                                 ImGui::TableSetColumnIndex(2);
                                 if (isMemberEnum)
@@ -2253,9 +2482,10 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                         ImGui::EndDragDropSource();
                                 }
                                 ImGui::TableSetColumnIndex(1);
-                                if (sType)
-                                        drawValueCell(memberAddr, sType, t->inner, memberPath);
-                                else
+                                if (sType) {
+                                        std::string valStr = drawValueCell(memberAddr, sType, t->inner, memberPath, 0, 0);
+                                        ImGui::TextUnformatted(valStr.c_str());
+                                } else
                                         ImGui::TextUnformatted("...");
                                 ImGui::TableSetColumnIndex(2);
                                 if (isElemEnum)
