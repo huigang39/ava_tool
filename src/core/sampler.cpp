@@ -223,8 +223,9 @@ threadFunc(Gui *gui)
         u64 lastHssFrameMs    = get_mono_ts_ms();
         u64 lastHssWatchdogMs = 0;
 
-        f64  hssBaseWallTime = 0;
-        u32  hssBaseHwTs     = 0;
+        f64  hssBaseWallTime = 0; // session time captured at HSS (re)sync
+        u32  hssLastHwTs     = 0; // previous raw 32-bit µs counter (for wrap detection)
+        u64  hssAccumUs      = 0; // elapsed µs since sync, accumulated across 2^32 wraps
         bool hssTimeSynced   = false;
 
         // Internal task structs
@@ -692,19 +693,23 @@ threadFunc(Gui *gui)
                                         std::memcpy(&hwTs, pFrame, 4);
 
                                         if (!hssTimeSynced) {
-                                                hssBaseHwTs     = hwTs;
+                                                hssLastHwTs     = hwTs;
+                                                hssAccumUs      = 0;
                                                 hssBaseWallTime = sessionTimeSec();
                                                 hssTimeSynced   = true;
                                         }
 
-                                        u32 diff = 0;
-                                        if (hwTs >= hssBaseHwTs) {
-                                                diff = hwTs - hssBaseHwTs;
-                                        } else {
-                                                diff = (0xFFFFFFFF - hssBaseHwTs) + hwTs + 1;
-                                        }
+                                        // The J-Link HSS hardware timestamp is a 32-bit microsecond counter
+                                        // that wraps every 2^32 µs (~71.6 min). Accumulate the wrap-safe
+                                        // per-frame delta into a 64-bit total so the timeline stays correct
+                                        // over arbitrarily long runs. (The previous single-wrap diff was a
+                                        // u32, so after ~71 min it overflowed — pinning the time axis to a
+                                        // ~4295 s window and breaking history pruning → runaway memory.)
+                                        const u32 deltaUs = hwTs - hssLastHwTs; // modular u32 sub handles wrap
+                                        hssLastHwTs       = hwTs;
+                                        hssAccumUs       += deltaUs;
 
-                                        const f64 ts = hssBaseWallTime + (static_cast<f64>(diff) * 1e-6);
+                                        const f64 ts = hssBaseWallTime + (static_cast<f64>(hssAccumUs) * 1e-6);
 
                                         const u8 *pData = pFrame + JLinkPort::kHssHeaderBytes;
                                         for (usize i = 0; i < lastChans.size(); ++i) {

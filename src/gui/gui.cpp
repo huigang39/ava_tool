@@ -1580,7 +1580,7 @@ Gui::drawUpdateUI()
         // --- Manual "check finished" status ---
         if (ImGui::BeginPopupModal("Update Status", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
                 if (!info.error.empty())
-                        ImGui::Text("Update check failed: %s", info.error.c_str());
+                        ImGui::TextWrapped("%s", info.error.c_str());
                 else
                         ImGui::Text("You're up to date (version %s).", info.currentVersion.c_str());
                 ImGui::Spacing();

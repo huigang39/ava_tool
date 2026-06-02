@@ -72,8 +72,14 @@ Updater::checkAsync()
                 std::string body, err;
                 if (!http::get(apiUrl, body, &err)) {
                         result.checked = true;
-                        result.error   = err.empty() ? "update check failed" : err;
-                        LOG_W("Update check failed: %s", result.error.c_str());
+                        // 404 = no published release yet, or the repo is private and the
+                        // unauthenticated API can't see it. That's a normal state, not a
+                        // failure — report it gently rather than as an error.
+                        if (err.find("404") != std::string::npos)
+                                result.error = "No published release found yet (or the repository is private).";
+                        else
+                                result.error = std::string("Update check failed: ") + (err.empty() ? "unknown error" : err);
+                        LOG_W("Update check: %s", result.error.c_str());
                 } else if (cJSON *root = cJSON_Parse(body.c_str())) {
                         if (const cJSON *tag = cJSON_GetObjectItem(root, "tag_name"); cJSON_IsString(tag))
                                 result.latestVersion = tag->valuestring;
