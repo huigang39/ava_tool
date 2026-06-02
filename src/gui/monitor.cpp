@@ -38,14 +38,14 @@ MonitorScope::menu()
 {
         // Scope Toolbar
         // Scope Toolbar
-        if (ImGui::Button(e_draw == DrawEnum::PLOT ? "PLOT" : "TABLE")) {
+        if (ImGui::Button(e_draw == DrawEnum::PLOT ? "Plot" : "Table")) {
                 e_draw = (e_draw == DrawEnum::PLOT) ? DrawEnum::TABLE : DrawEnum::PLOT;
         }
 
         ImGui::SameLine();
         if (showFft_) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue
-                if (ImGui::Button("FREQ")) {
+                if (ImGui::Button("Freq")) {
                         showFft_ = false;
                 }
                 ImGui::PopStyleColor();
@@ -103,17 +103,17 @@ MonitorScope::menu()
                 ImGui::SameLine();
                 if (fftBars_) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue (active)
-                        if (ImGui::Button("BAR"))
+                        if (ImGui::Button("Bar"))
                                 fftBars_ = false;
                         ImGui::PopStyleColor();
                 } else {
-                        if (ImGui::Button("LINE"))
+                        if (ImGui::Button("Line"))
                                 fftBars_ = true;
                 }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Toggle FFT render style: line / bar chart");
         } else {
-                if (ImGui::Button("TIME")) {
+                if (ImGui::Button("Time")) {
                         showFft_ = true;
                 }
         }
@@ -132,7 +132,7 @@ MonitorScope::menu()
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Show/hide the side data panel (Stats / Peaks)");
 
-        // Hide All / Show All channels
+        // Hide/show all plot lines in this scope.
         ImGui::SameLine();
         {
                 bool anyVisible = false;
@@ -144,7 +144,7 @@ MonitorScope::menu()
 
                 if (anyVisible) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 0.5f));
-                        if (ImGui::Button("Hide All")) {
+                        if (ImGui::Button("Hide line")) {
                                 for (auto &[_, ch] : chs_)
                                         if (ch)
                                                 ch->show_ = false;
@@ -152,7 +152,7 @@ MonitorScope::menu()
                         ImGui::PopStyleColor();
                 } else {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.7f, 0.3f, 0.6f));
-                        if (ImGui::Button("Show All")) {
+                        if (ImGui::Button("Show line")) {
                                 for (auto &[_, ch] : chs_)
                                         if (ch)
                                                 ch->show_ = true;
@@ -166,7 +166,7 @@ MonitorScope::menu()
         float hideBtnWidth = std::max(ImGui::CalcTextSize("Hide Scope").x, ImGui::CalcTextSize("Show Scope").x) +
                              ImGui::GetStyle().FramePadding.x * 2.0f;
         float pauseBtnWidth =
-            std::max(ImGui::CalcTextSize("PAUSE").x, ImGui::CalcTextSize("RESUME").x) + ImGui::GetStyle().FramePadding.x * 2.0f;
+            std::max(ImGui::CalcTextSize("Pause").x, ImGui::CalcTextSize("Resume").x) + ImGui::GetStyle().FramePadding.x * 2.0f;
         float spacing         = ImGui::GetStyle().ItemSpacing.x;
         float totalRightWidth = delBtnWidth + spacing + hideBtnWidth + spacing + pauseBtnWidth;
         float availWidth      = ImGui::GetContentRegionAvail().x;
@@ -201,12 +201,12 @@ MonitorScope::menu()
         ImGui::SameLine();
         if (paused_) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.8f, 0.2f, 0.6f)); // Yellow/Orange
-                if (ImGui::Button("RESUME"))
+                if (ImGui::Button("Resume"))
                         paused_ = false;
                 ImGui::PopStyleColor();
         } else {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 0.6f)); // Green
-                if (ImGui::Button("PAUSE"))
+                if (ImGui::Button("Pause"))
                         paused_ = true;
                 ImGui::PopStyleColor();
         }
@@ -654,6 +654,170 @@ MonitorScope::plotMenu()
 {
 }
 
+// Runs on the dedicated FFT worker thread. Copies the visible window for each
+// shown channel (briefly holding monitorMtx), transforms off-lock, and publishes
+// freqs/mags/peaks for the GUI to draw. Keeps fft_exec off the render thread.
+void
+MonitorScope::fftWorkerStep(std::mutex &monitorMtx)
+{
+        if (!showFft_) {
+                // Drop any stale results so old spectra don't linger after switching to TIME.
+                std::lock_guard lk(fftPubMtx_);
+                if (!fftPublished_.empty())
+                        fftPublished_.clear();
+                return;
+        }
+
+        const f64 xmin = fftWinMin_.load(std::memory_order_relaxed);
+        const f64 xmax = fftWinMax_.load(std::memory_order_relaxed);
+        if (fftPoints_ <= 0)
+                return;
+
+        const u64 nowMs       = get_mono_ts_ms();
+        const u64 minPeriodMs = (fftPoints_ >= 1048576)  ? 500
+                                : (fftPoints_ >= 524288) ? 250
+                                : (fftPoints_ >= 131072) ? 100
+                                : (fftPoints_ >= 32768)  ? 33
+                                                         : 16;
+        const u64 lastRunMs   = fftLastRunMs_.load(std::memory_order_relaxed);
+        if (lastRunMs != 0 && nowMs - lastRunMs < minPeriodMs)
+                return;
+        fftLastRunMs_.store(nowMs, std::memory_order_relaxed);
+
+        // 1. Gather visible samples per shown channel (short lock on the monitor mtx).
+        struct Job {
+                std::string      name;
+                std::vector<f32> samples; // already mean-detrended
+                f32              fs;
+        };
+        std::vector<Job> jobs;
+        {
+                std::unique_lock lk(monitorMtx, std::try_to_lock);
+                if (!lk.owns_lock())
+                        return;
+                const int fftN = fftPoints_;
+                for (auto &[name, ch] : chs_) {
+                        if (!ch || !ch->show_)
+                                continue;
+                        const auto &rd           = ch->read_;
+                        const usize startIdx     = rd.rawLowerBound(xmin);
+                        const usize endIdx       = rd.rawUpperBound(xmax);
+                        const usize visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
+                        if (visibleCount == 0)
+                                continue;
+
+                        const usize copyCount  = std::min(visibleCount, static_cast<usize>(fftN));
+                        const usize readOffset = (visibleCount > copyCount) ? (visibleCount - copyCount) : 0;
+
+                        Job j;
+                        j.name = name;
+                        j.samples.resize(copyCount);
+                        f64 sum = 0;
+                        for (usize i = 0; i < copyCount; ++i) {
+                                f32 v         = rd.rawVal(startIdx + readOffset + i);
+                                j.samples[i]  = v;
+                                sum          += v;
+                        }
+                        const f32 mean = static_cast<f32>(sum / static_cast<f64>(copyCount));
+                        for (auto &v : j.samples)
+                                v -= mean;
+
+                        f32 fs = (parent_) ? (f32)parent_->getHz() : 1000.0f;
+                        if (copyCount > 1) {
+                                f64 totalTime =
+                                    rd.rawTs(startIdx + readOffset + copyCount - 1) - rd.rawTs(startIdx + readOffset);
+                                if (totalTime > 1e-9)
+                                        fs = static_cast<f32>((f64)(copyCount - 1) / totalTime);
+                        }
+                        if (fs < 0.1f)
+                                fs = 0.1f;
+                        if (fs > 10000000.0f)
+                                fs = 10000000.0f;
+                        j.fs = fs;
+                        jobs.push_back(std::move(j));
+                }
+        }
+
+        if (jobs.empty()) {
+                std::lock_guard lk(fftPubMtx_);
+                fftPublished_.clear();
+                return;
+        }
+
+        // 2. Transform off-lock. fft_ + its buffers are guarded by fftObjMtx_ so a
+        //    concurrent reinitFft() can't pull the buffers out from under us.
+        std::map<std::string, FftResult> out;
+        {
+                std::lock_guard lk(fftObjMtx_);
+                const int       N    = fftPoints_; // re-read under the same lock as reinitFft
+                const int       half = N / 2 + 1;
+                if (N <= 0 || (int)fftMagF32_.size() < half || (int)fftLoBuf_.size() < N)
+                        return;
+
+                for (auto &j : jobs) {
+                        std::fill(fftLoBuf_.begin(), fftLoBuf_.end(), 0.0f);
+                        const usize cc = std::min(j.samples.size(), static_cast<usize>(N));
+                        for (usize i = 0; i < cc; ++i)
+                                fftLoBuf_[i] = j.samples[i];
+
+                        fft_.cfg.fs       = j.fs;
+                        fft_.lo.need_exec = 1;
+                        fft_exec(&fft_);
+
+                        const f32 df = j.fs / (f32)N;
+                        FftResult r;
+                        auto      magAt = [&](int i) { return (f64)fftMagF32_[i] * 2.0 / (f64)N; };
+
+                        if (fftPeakCount_ > 0) {
+                                for (int i = 2; i < half - 2; ++i)
+                                        if (magAt(i) > magAt(i - 1) && magAt(i) > magAt(i + 1))
+                                                r.peaks.push_back({(f64)i * (f64)df, magAt(i)});
+                                std::sort(
+                                    r.peaks.begin(), r.peaks.end(), [](const Peak &a, const Peak &b) { return a.mag > b.mag; });
+                                if ((int)r.peaks.size() > fftPeakCount_)
+                                        r.peaks.resize(fftPeakCount_);
+                        }
+
+                        constexpr int kMaxFftPlotBins = 8192;
+                        if (half <= kMaxFftPlotBins) {
+                                r.df = df;
+                                r.freqs.resize(half);
+                                r.mags.resize(half);
+                                for (int i = 0; i < half; ++i) {
+                                        r.freqs[i] = (f64)i * (f64)df;
+                                        r.mags[i]  = magAt(i);
+                                }
+                        } else {
+                                r.df = (f64)df * (f64)half / (f64)kMaxFftPlotBins;
+                                r.freqs.reserve(kMaxFftPlotBins);
+                                r.mags.reserve(kMaxFftPlotBins);
+                                for (int b = 0; b < kMaxFftPlotBins; ++b) {
+                                        const int b0 = (int)((i64)b * half / kMaxFftPlotBins);
+                                        const int b1 = std::max(b0 + 1, (int)(((i64)b + 1) * half / kMaxFftPlotBins));
+                                        int       mi = b0;
+                                        f64       mm = magAt(b0);
+                                        for (int i = b0 + 1; i < b1 && i < half; ++i) {
+                                                const f64 m = magAt(i);
+                                                if (m > mm) {
+                                                        mm = m;
+                                                        mi = i;
+                                                }
+                                        }
+                                        r.freqs.push_back((f64)mi * (f64)df);
+                                        r.mags.push_back(mm);
+                                }
+                        }
+                        out[j.name] = std::move(r);
+                }
+        }
+
+        // 3. Publish.
+        {
+                std::lock_guard lk(fftPubMtx_);
+                fftPublished_ = std::move(out);
+        }
+}
+
 void
 MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode)
 {
@@ -748,7 +912,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                         auto &chName = pairPtr->first;
                         auto &ch     = pairPtr->second;
                         // 1. Handle Visibility
-                        // For existing items: directly set Show so "Hide All/Show All"
+                        // For existing items: directly set Show so hide/show line
                         // takes effect immediately (bypasses ImPlotCond limitations).
                         // For brand-new items: HideNextItem(Once) sets the initial state.
                         if (auto *gp = ImPlot::GetCurrentContext(); gp && gp->CurrentPlot) {
@@ -769,87 +933,32 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                         bool        plotted = false;
                         const auto &rd      = ch->read_;
                         if (showFft_) {
-                                if (ch->show_ && fftPoints_ > 0) {
-                                        // FFT reads from the raw ring under mtxMonitors_.
-                                        const double xmin = (linkXMin) ? *linkXMin : 0.0;
-                                        const double xmax = (linkXMax) ? *linkXMax : 1.0;
+                                // Publish the current time window for the FFT worker thread, then draw
+                                // the latest transform it produced — no fft_exec on the render thread.
+                                const f64 xmin = (linkXMin) ? *linkXMin : 0.0;
+                                const f64 xmax = (linkXMax) ? *linkXMax : 1.0;
+                                fftWinMin_.store(xmin, std::memory_order_relaxed);
+                                fftWinMax_.store(xmax, std::memory_order_relaxed);
 
-                                        const usize startIdx     = rd.rawLowerBound(xmin);
-                                        const usize endIdx       = rd.rawUpperBound(xmax);
-                                        const usize visibleCount = (endIdx > startIdx) ? (endIdx - startIdx) : 0;
-
-                                        if (visibleCount > 0) {
-                                                std::fill(fftLoBuf_.begin(), fftLoBuf_.end(), 0.0f);
-
-                                                const usize copyCount = std::min(visibleCount, static_cast<usize>(fftPoints_));
-                                                const usize readOffset =
-                                                    (visibleCount > copyCount) ? (visibleCount - copyCount) : 0;
-
-                                                f32 mean = 0;
-                                                for (usize i = 0; i < copyCount; ++i) {
-                                                        f32 v         = rd.rawVal(startIdx + readOffset + i);
-                                                        fftLoBuf_[i]  = v;
-                                                        mean         += v;
-                                                }
-                                                mean /= (f32)copyCount;
-                                                for (usize i = 0; i < copyCount; ++i) {
-                                                        fftLoBuf_[i] -= mean;
-                                                }
-
-                                                f32 fs = (parent_) ? (f32)parent_->getHz() : 1000.0f;
-                                                if (copyCount > 1) {
-                                                        f64 totalTime = rd.rawTs(startIdx + readOffset + copyCount - 1) -
-                                                                        rd.rawTs(startIdx + readOffset);
-                                                        if (totalTime > 1e-9f) {
-                                                                fs = static_cast<f32>((f64)(copyCount - 1) / totalTime);
-                                                        }
-                                                }
-                                                if (fs < 0.1f)
-                                                        fs = 0.1f;
-                                                if (fs > 10000000.0f)
-                                                        fs = 10000000.0f;
-                                                fft_.cfg.fs = fs;
-
-                                                fft_.lo.need_exec = 1;
-                                                fft_exec(&fft_);
-
-                                                f32 df = fs / (f32)fftPoints_;
-                                                dxs_.resize(fftPoints_ / 2 + 1);
-                                                for (i32 i = 0; i < (i32)dxs_.size(); ++i) {
-                                                        dxs_[i]       = (f64)i * (f64)df;
-                                                        fftMagBuf_[i] = (f64)fftMagF32_[i] * 2.0 / (f64)fftPoints_;
-                                                }
-
+                                if (ch->show_) {
+                                        std::lock_guard lk(fftPubMtx_);
+                                        auto            it = fftPublished_.find(chName);
+                                        if (it != fftPublished_.end() && !it->second.freqs.empty()) {
+                                                const FftResult &r = it->second;
                                                 if (fftBars_) {
-                                                        // Bar width = one frequency bin, slightly narrowed
-                                                        // so adjacent bars stay visually separated.
                                                         ImPlot::SetNextFillStyle(ImVec4(col[0], col[1], col[2], col[3]));
                                                         ImPlot::PlotBars(chName.c_str(),
-                                                                         dxs_.data(),
-                                                                         fftMagBuf_.data(),
-                                                                         (int)dxs_.size(),
-                                                                         (f64)df * 0.9);
+                                                                         r.freqs.data(),
+                                                                         r.mags.data(),
+                                                                         (int)r.freqs.size(),
+                                                                         r.df * 0.9);
                                                 } else {
                                                         ImPlot::PlotLine(
-                                                            chName.c_str(), dxs_.data(), fftMagBuf_.data(), (int)dxs_.size());
+                                                            chName.c_str(), r.freqs.data(), r.mags.data(), (int)r.freqs.size());
                                                 }
                                                 plotted = true;
-
-                                                if (fftPeakCount_ > 0) {
-                                                        std::vector<Peak> peaks;
-                                                        for (int i = 2; i < (int)fftMagBuf_.size() - 2; ++i) {
-                                                                if (fftMagBuf_[i] > fftMagBuf_[i - 1] &&
-                                                                    fftMagBuf_[i] > fftMagBuf_[i + 1]) {
-                                                                        peaks.push_back({dxs_[i], fftMagBuf_[i]});
-                                                                }
-                                                        }
-                                                        std::sort(peaks.begin(), peaks.end(), [](const Peak &a, const Peak &b) {
-                                                                return a.mag > b.mag;
-                                                        });
-                                                        if ((int)peaks.size() > fftPeakCount_)
-                                                                peaks.resize(fftPeakCount_);
-                                                        channelPeaks_[chName] = std::move(peaks);
-                                                }
+                                                if (fftPeakCount_ > 0 && !r.peaks.empty())
+                                                        channelPeaks_[chName] = r.peaks;
                                         }
                                 }
                         } else {
@@ -1223,6 +1332,9 @@ MonitorScope::dropTarget()
 void
 MonitorScope::reinitFft(i32 newPoints)
 {
+        // Guard against the FFT worker thread using fft_ / its buffers mid-transform.
+        std::lock_guard lk(fftObjMtx_);
+
         fftPoints_ = newPoints;
         fft_destroy(&fft_);
 

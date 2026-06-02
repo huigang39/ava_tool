@@ -245,6 +245,7 @@ main(int argc, char **argv)
         auto        gui            = std::make_unique<Gui>(initialSession);
 
         std::thread t1(threadFunc, gui.get());
+        std::thread tFft(fftThreadFunc, gui.get());
 
         // ---- Core isolation: evict GUI + flusher from sampler core ----
         // Wait for the sampler thread to bind (typically < 1ms).
@@ -290,6 +291,8 @@ main(int argc, char **argv)
         g_appRunning.store(false);
         if (t1.joinable())
                 t1.join();
+        if (tFft.joinable())
+                tFft.join();
         LOG_I("Sampler thread stopped.");
 
         JLinkPort::instance().close();

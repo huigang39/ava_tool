@@ -15,6 +15,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -94,6 +95,22 @@ class MonitorScope
         };
         std::map<std::string, Stats> channelStats_;
 
+        // FFT results published by the background FFT worker thread (fftWorkerStep)
+        // and consumed by the GUI thread in plotDraw — so the expensive transform
+        // no longer runs on the render thread and stops dragging down FPS.
+        struct FftResult {
+                std::vector<f64>  freqs;
+                std::vector<f64>  mags;
+                std::vector<Peak> peaks;
+                f64               df{0};
+        };
+        std::map<std::string, FftResult> fftPublished_;   // chName -> latest result
+        std::mutex                       fftPubMtx_;      // guards fftPublished_ (worker write / GUI read)
+        std::mutex                       fftObjMtx_;      // guards fft_ + fft buffers (worker exec / reinit)
+        std::atomic<f64>                 fftWinMin_{0.0}; // current time window the GUI wants transformed
+        std::atomic<f64>                 fftWinMax_{1.0};
+        std::atomic<u64>                 fftLastRunMs_{0};
+
         void tableDraw();
         void tableMenu();
 
@@ -128,8 +145,11 @@ class MonitorScope
         }
         ~MonitorScope() { fft_destroy(&fft_); }
 
-        void            menu();
-        void            draw(f64 *linkXMin, f64 *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode);
+        void menu();
+        void draw(f64 *linkXMin, f64 *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode);
+        // Run one FFT pass for this scope: copy the visible window under monitorMtx,
+        // transform off-lock, and publish the result. Called by the FFT worker thread.
+        void            fftWorkerStep(std::mutex &monitorMtx);
         void            dropTarget();
         int             addChannel(const std::string &chName);
         int             setValue(const std::string &chName, f32 val);

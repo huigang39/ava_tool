@@ -1065,3 +1065,32 @@ threadFunc(Gui *gui)
                         delay_us(1000);
         }
 }
+
+// Background FFT worker. Each pass: snapshot the FFT-enabled scopes (holding
+// shared_ptrs so they stay alive), then run each scope's transform off the GUI
+// thread. Capped at ~60 Hz — recomputing faster than the display refreshes is
+// wasted work, and the GUI always draws the most recent published spectrum.
+void
+fftThreadFunc(Gui *gui)
+{
+        LOG_I("FFT worker thread started.");
+        while (g_appRunning.load()) {
+                // Hold both the scope AND its owning monitor alive (scope->parent_ is a
+                // raw Monitor*; keeping the monitor shared_ptr prevents it dangling if
+                // the monitor is removed between enumeration and processing).
+                std::vector<std::pair<std::shared_ptr<Monitor>, std::shared_ptr<MonitorScope>>> work;
+                {
+                        std::lock_guard lk(gui->getMonitorMtx());
+                        for (const auto &monitor : gui->getMonitors() | std::views::values)
+                                for (auto &scope : monitor->getScopes() | std::views::values)
+                                        if (scope && !scope->isPendingDelete() && scope->getShowFft())
+                                                work.emplace_back(monitor, scope);
+                }
+
+                for (auto &[monitor, scope] : work)
+                        scope->fftWorkerStep(gui->getMonitorMtx());
+
+                delay_us(16000); // ~60 Hz
+        }
+        LOG_I("FFT worker thread stopped.");
+}

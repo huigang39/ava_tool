@@ -16,6 +16,11 @@ class Gui;
 // Entry point for the sampler thread. Runs until g_appRunning is set to false.
 void threadFunc(Gui *gui);
 
+// Entry point for the FFT worker thread. Computes scope spectra off the render
+// thread so heavy fft_exec calls don't drag down the GUI frame rate. Runs until
+// g_appRunning is set to false.
+void fftThreadFunc(Gui *gui);
+
 // CPU core the sampler thread should bind to. -1 = auto (highest available).
 // Written by GUI, read by sampler thread on the next iteration after
 // g_samplerCpuRebind is set.
