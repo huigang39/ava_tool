@@ -705,9 +705,9 @@ threadFunc(Gui *gui)
                                         // over arbitrarily long runs. (The previous single-wrap diff was a
                                         // u32, so after ~71 min it overflowed — pinning the time axis to a
                                         // ~4295 s window and breaking history pruning → runaway memory.)
-                                        const u32 deltaUs = hwTs - hssLastHwTs; // modular u32 sub handles wrap
-                                        hssLastHwTs       = hwTs;
-                                        hssAccumUs       += deltaUs;
+                                        const u32 deltaUs  = hwTs - hssLastHwTs; // modular u32 sub handles wrap
+                                        hssLastHwTs        = hwTs;
+                                        hssAccumUs        += deltaUs;
 
                                         const f64 ts = hssBaseWallTime + (static_cast<f64>(hssAccumUs) * 1e-6);
 

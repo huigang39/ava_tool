@@ -38,6 +38,7 @@ class MonitorScope
         f32                   &getHeight() { return height_; }
         bool                  &getShowFft() { return showFft_; }
         bool                  &getFftBars() { return fftBars_; }
+        bool                  &getShowSidePanel() { return showSidePanel_; }
         int                   &getFftPoints() { return fftPoints_; }
         int                   &getFftPeakCount() { return fftPeakCount_; }
         ChannelMapType        &getChannels() { return chs_; }
@@ -50,7 +51,8 @@ class MonitorScope
         DrawEnum              e_draw{};
         f32                   height_{200.0f};
         bool                  showFft_{false};
-        bool                  fftBars_{false}; // FFT render style: false = line, true = bar chart
+        bool                  fftBars_{false};      // FFT render style: false = line, true = bar chart
+        bool                  showSidePanel_{true}; // show the right-side Stats/Peaks table in plot view
         int                   fftPoints_{1024};
         int                   fftPeakCount_{5};
         fft_t                 fft_;

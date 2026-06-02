@@ -118,6 +118,20 @@ MonitorScope::menu()
                 }
         }
 
+        // Toggle the right-side data panel (Stats in time view / Peaks in freq view).
+        ImGui::SameLine();
+        if (showSidePanel_) {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue (active)
+                if (ImGui::Button("Table"))
+                        showSidePanel_ = false;
+                ImGui::PopStyleColor();
+        } else {
+                if (ImGui::Button("Table"))
+                        showSidePanel_ = true;
+        }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Show/hide the side data panel (Stats / Peaks)");
+
         // Hide All / Show All channels
         ImGui::SameLine();
         {
@@ -535,7 +549,10 @@ MonitorScope::drawTableRow(const std::string               &chName,
 
         // 4. Address
         ImGui::TableNextColumn();
-        ImGui::Text("0x%zX", ch->getAddr());
+        if (ch->isAddrUnknown())
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "UNKNOWN");
+        else
+                ImGui::Text("0x%zX", ch->getAddr());
 
         // 5. Port
         ImGui::TableNextColumn();
@@ -648,11 +665,13 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 ImPlot::SetNextAxesToFit();
         }
 
-        if (!ImGui::BeginTable("##plotLayoutTable", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        const int layoutCols = showSidePanel_ ? 2 : 1;
+        if (!ImGui::BeginTable("##plotLayoutTable", layoutCols, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
                 return;
         }
         ImGui::TableSetupColumn("Plot", ImGuiTableColumnFlags_WidthStretch, 0.75f);
-        ImGui::TableSetupColumn(showFft_ ? "Peaks" : "Stats", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+        if (showSidePanel_)
+                ImGui::TableSetupColumn(showFft_ ? "Peaks" : "Stats", ImGuiTableColumnFlags_WidthFixed, 180.0f);
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
 
@@ -1006,68 +1025,70 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 }
         }
 
-        ImGui::TableSetColumnIndex(1);
-        if (showFft_) {
-                if (!channelPeaks_.empty()) {
-                        for (auto &[chName, peaks] : channelPeaks_) {
-                                if (peaks.empty())
-                                        continue;
-                                ImGui::Text("Peaks: %s", chName.c_str());
-                                if (ImGui::BeginTable(("##peaksTable_" + chName).c_str(),
-                                                      2,
-                                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-                                        ImGui::TableSetupColumn("Freq (Hz)");
-                                        ImGui::TableSetupColumn("Mag");
-                                        ImGui::TableHeadersRow();
-                                        for (const auto &p : peaks) {
-                                                ImGui::TableNextRow();
-                                                ImGui::TableSetColumnIndex(0);
-                                                ImGui::Text("%.1f", p.freq);
-                                                ImGui::TableSetColumnIndex(1);
-                                                ImGui::Text("%.3f", p.mag);
+        if (showSidePanel_) {
+                ImGui::TableSetColumnIndex(1);
+                if (showFft_) {
+                        if (!channelPeaks_.empty()) {
+                                for (auto &[chName, peaks] : channelPeaks_) {
+                                        if (peaks.empty())
+                                                continue;
+                                        ImGui::Text("Peaks: %s", chName.c_str());
+                                        if (ImGui::BeginTable(("##peaksTable_" + chName).c_str(),
+                                                              2,
+                                                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                                                ImGui::TableSetupColumn("Freq (Hz)");
+                                                ImGui::TableSetupColumn("Mag");
+                                                ImGui::TableHeadersRow();
+                                                for (const auto &p : peaks) {
+                                                        ImGui::TableNextRow();
+                                                        ImGui::TableSetColumnIndex(0);
+                                                        ImGui::Text("%.1f", p.freq);
+                                                        ImGui::TableSetColumnIndex(1);
+                                                        ImGui::Text("%.3f", p.mag);
+                                                }
+                                                ImGui::EndTable();
                                         }
-                                        ImGui::EndTable();
+                                        ImGui::Spacing();
                                 }
-                                ImGui::Spacing();
+                        } else {
+                                ImGui::Text("No peaks detected");
                         }
                 } else {
-                        ImGui::Text("No peaks detected");
-                }
-        } else {
-                if (!channelStats_.empty()) {
-                        for (auto &[chName, s] : channelStats_) {
-                                ImGui::Text("%s", chName.c_str());
-                                if (ImGui::BeginTable(("##statsTable_" + chName).c_str(),
-                                                      2,
-                                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-                                        ImGui::TableSetupColumn("Metric");
-                                        ImGui::TableSetupColumn("Value");
-                                        ImGui::TableHeadersRow();
-                                        auto row = [](const char *k, const char *fmt, f64 v) {
+                        if (!channelStats_.empty()) {
+                                for (auto &[chName, s] : channelStats_) {
+                                        ImGui::Text("%s", chName.c_str());
+                                        if (ImGui::BeginTable(("##statsTable_" + chName).c_str(),
+                                                              2,
+                                                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
+                                                ImGui::TableSetupColumn("Metric");
+                                                ImGui::TableSetupColumn("Value");
+                                                ImGui::TableHeadersRow();
+                                                auto row = [](const char *k, const char *fmt, f64 v) {
+                                                        ImGui::TableNextRow();
+                                                        ImGui::TableSetColumnIndex(0);
+                                                        ImGui::TextUnformatted(k);
+                                                        ImGui::TableSetColumnIndex(1);
+                                                        ImGui::Text(fmt, v);
+                                                };
+                                                row("Min", "%.4f", s.min);
+                                                row("Max", "%.4f", s.max);
+                                                row("Pk-Pk", "%.4f", s.pkpk);
+                                                row("Mean", "%.4f", s.mean);
+                                                row("RMS", "%.4f", s.rms);
                                                 ImGui::TableNextRow();
                                                 ImGui::TableSetColumnIndex(0);
-                                                ImGui::TextUnformatted(k);
+                                                ImGui::TextUnformatted("N");
                                                 ImGui::TableSetColumnIndex(1);
-                                                ImGui::Text(fmt, v);
-                                        };
-                                        row("Min", "%.4f", s.min);
-                                        row("Max", "%.4f", s.max);
-                                        row("Pk-Pk", "%.4f", s.pkpk);
-                                        row("Mean", "%.4f", s.mean);
-                                        row("RMS", "%.4f", s.rms);
-                                        ImGui::TableNextRow();
-                                        ImGui::TableSetColumnIndex(0);
-                                        ImGui::TextUnformatted("N");
-                                        ImGui::TableSetColumnIndex(1);
-                                        ImGui::Text("%zu", s.count);
-                                        ImGui::EndTable();
+                                                ImGui::Text("%zu", s.count);
+                                                ImGui::EndTable();
+                                        }
+                                        ImGui::Spacing();
                                 }
-                                ImGui::Spacing();
+                        } else {
+                                ImGui::Text("No data in window");
                         }
-                } else {
-                        ImGui::Text("No data in window");
                 }
-        }
+        } // showSidePanel_
         ImGui::EndTable();
 }
 

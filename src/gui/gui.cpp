@@ -60,6 +60,8 @@ Gui::Gui(const std::string &initialPath)
 {
         LOG_I("Gui(%s)", initialPath.c_str());
 
+        loadRecentList();
+
         glfwSetErrorCallback(glfwErrCb);
         if (!glfwInit()) {
                 LOG_E("Failed to init GLFW");
@@ -176,6 +178,51 @@ Gui::getAppDir()
 }
 
 void
+Gui::loadRecentList()
+{
+        recentSessions_.clear();
+        std::ifstream f(getAppDir() + "/recent.txt");
+        std::string   line;
+        while (std::getline(f, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+                        line.pop_back();
+                if (!line.empty())
+                        recentSessions_.push_back(line);
+        }
+}
+
+void
+Gui::saveRecentList()
+{
+        std::ofstream f(getAppDir() + "/recent.txt", std::ios::trunc);
+        for (const auto &p : recentSessions_)
+                f << p << "\n";
+}
+
+void
+Gui::addRecent(const std::string &path)
+{
+        if (path.empty())
+                return;
+        std::error_code ec;
+        std::string     abs = std::filesystem::absolute(path, ec).string();
+        if (ec)
+                abs = path;
+
+        // Move to front, de-duplicated, capped at 10 entries.
+        for (auto it = recentSessions_.begin(); it != recentSessions_.end();) {
+                if (*it == abs)
+                        it = recentSessions_.erase(it);
+                else
+                        ++it;
+        }
+        recentSessions_.insert(recentSessions_.begin(), abs);
+        if (recentSessions_.size() > 10)
+                recentSessions_.resize(10);
+        saveRecentList();
+}
+
+void
 Gui::saveSession(const std::string &path)
 {
         if (path.empty() && isFirstSave_) {
@@ -214,6 +261,7 @@ Gui::saveSession(const std::string &path)
                         cJSON_AddNumberToObject(sObj, "height", static_cast<f64>(s->getHeight()));
                         cJSON_AddBoolToObject(sObj, "showFft", s->getShowFft());
                         cJSON_AddBoolToObject(sObj, "fftBars", s->getFftBars());
+                        cJSON_AddBoolToObject(sObj, "showSidePanel", s->getShowSidePanel());
                         cJSON_AddNumberToObject(sObj, "fftPoints", static_cast<f64>(s->getFftPoints()));
                         cJSON_AddNumberToObject(sObj, "fftPeakCount", static_cast<f64>(s->getFftPeakCount()));
 
@@ -332,6 +380,7 @@ Gui::saveSession(const std::string &path)
                 currentSessionPath_ = targetPath;
                 isModified_         = false;
                 isFirstSave_        = false;
+                addRecent(targetPath);
         }
         size_t outLen = out ? strlen(out) : 0;
         cJSON_free(out);
@@ -367,6 +416,7 @@ Gui::loadSession(const std::string &path)
 
         isFirstSave_        = false;
         currentSessionPath_ = targetPath;
+        addRecent(targetPath);
 
         std::stringstream ss;
         ss << ifs.rdbuf();
@@ -454,6 +504,10 @@ Gui::loadSession(const std::string &path)
 
                                 if (const cJSON *fftBarsItem = cJSON_GetObjectItem(sItem, "fftBars"); cJSON_IsBool(fftBarsItem))
                                         scope->getFftBars() = cJSON_IsTrue(fftBarsItem);
+
+                                if (const cJSON *sidePanelItem = cJSON_GetObjectItem(sItem, "showSidePanel");
+                                    cJSON_IsBool(sidePanelItem))
+                                        scope->getShowSidePanel() = cJSON_IsTrue(sidePanelItem);
 
                                 if (const cJSON *fftPtsItem = cJSON_GetObjectItem(sItem, "fftPoints");
                                     cJSON_IsNumber(fftPtsItem)) {
@@ -645,6 +699,9 @@ void
 Gui::drawBar()
 {
         if (ImGui::BeginMainMenuBar()) {
+                // A recent session chosen from the submenu is loaded after the menu is
+                // built (loadSession mutates recentSessions_, so we can't load mid-iteration).
+                std::string sessionToOpen;
                 if (ImGui::BeginMenu("File")) {
                         if (ImGui::MenuItem("New Session")) {
                                 monitors_.clear();
@@ -657,6 +714,24 @@ Gui::drawBar()
                                 std::string p = nativeDlgOpen("Open Session", {{"Session Files", {"ava", "json"}}});
                                 if (!p.empty())
                                         loadSession(p);
+                        }
+                        if (ImGui::BeginMenu("Recent Sessions", !recentSessions_.empty())) {
+                                for (size_t i = 0; i < recentSessions_.size(); ++i) {
+                                        const std::string &p      = recentSessions_[i];
+                                        const bool         exists = std::filesystem::exists(p);
+                                        std::string        label =
+                                            std::filesystem::path(p).filename().string() + "##recent" + std::to_string(i);
+                                        if (ImGui::MenuItem(label.c_str(), nullptr, false, exists))
+                                                sessionToOpen = p;
+                                        if (ImGui::IsItemHovered())
+                                                ImGui::SetTooltip("%s%s", p.c_str(), exists ? "" : "  (missing)");
+                                }
+                                ImGui::Separator();
+                                if (ImGui::MenuItem("Clear Recent")) {
+                                        recentSessions_.clear();
+                                        saveRecentList();
+                                }
+                                ImGui::EndMenu();
                         }
                         if (ImGui::MenuItem("Save Session", "Ctrl+S")) {
                                 saveSession();
@@ -672,6 +747,8 @@ Gui::drawBar()
                         }
                         ImGui::EndMenu();
                 }
+                if (!sessionToOpen.empty())
+                        loadSession(sessionToOpen);
 
                 if (ImGui::BeginMenu("Window")) {
                         if (ImGui::MenuItem("Add Monitor")) {
@@ -1083,23 +1160,34 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
 {
         if (!reloadedVar)
                 return;
-        const auto     &searchPool = reloadedVar->searchPool_;
         std::lock_guard lk(mtxMonitors_);
-        i32             count     = 0;
-        i32             enumCount = 0;
+
+        // Build a symbol map from EVERY loaded ELF (not just the reloaded one) so a
+        // symbol provided by another open ELF isn't falsely flagged as missing.
+        std::unordered_map<std::string, std::pair<u64, u64>> symMap; // name -> {addr, typeOff}
+        for (auto &vp : vars_)
+                for (const auto &se : vp.second->searchPool_)
+                        symMap.try_emplace(se.path, se.addr, se.typeOff);
+
+        i32 count     = 0;
+        i32 unknown   = 0;
+        i32 enumCount = 0;
         for (auto &pair : monitors_) {
                 for (auto &spair : pair.second->getScopes()) {
                         for (auto &cpair : spair.second->getChannels()) {
                                 MonitorChannel *ch = cpair.second.get();
                                 if (ch->getSymbolName().empty())
-                                        continue;
+                                        continue; // manual / CSV channel — no symbol to resolve
 
-                                for (const auto &se : searchPool) {
-                                        if (se.path == ch->getSymbolName()) {
-                                                ch->setAddr(se.addr);
-                                                count++;
-                                                break;
-                                        }
+                                auto it = symMap.find(ch->getSymbolName());
+                                if (it != symMap.end()) {
+                                        ch->setAddr(it->second.first);
+                                        ch->setAddrUnknown(false);
+                                        count++;
+                                } else {
+                                        // Symbol no longer exists in any loaded ELF → mark unknown.
+                                        ch->setAddrUnknown(true);
+                                        unknown++;
                                 }
                                 // Refresh enum entries from the reloaded ELF +
                                 // any user overrides on the owning VarEntry.
@@ -1114,19 +1202,21 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
                         if (v.port != PortType::JLINK)
                                 continue;
 
-                        for (const auto &se : searchPool) {
-                                if (se.path == v.name) {
-                                        v.addr    = se.addr;
-                                        v.typeOff = se.typeOff;
-                                        count++;
-                                        break;
-                                }
+                        auto it = symMap.find(v.name);
+                        if (it != symMap.end()) {
+                                v.addr        = it->second.first;
+                                v.typeOff     = it->second.second;
+                                v.addrUnknown = false;
+                                count++;
+                        } else {
+                                v.addrUnknown = true;
+                                unknown++;
                         }
                 }
         }
 
-        if (count > 0 || enumCount > 0) {
-                LOG_I("Synced %d symbol addresses, refreshed %d channel enums with new ELF", count, enumCount);
+        if (count > 0 || unknown > 0 || enumCount > 0) {
+                LOG_I("ELF sync: %d resolved, %d unknown, %d enums refreshed", count, unknown, enumCount);
                 JLinkPort::instance().reqRestart(); // Force sampler thread to rebuild HSS list
         }
 }

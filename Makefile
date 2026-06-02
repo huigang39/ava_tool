@@ -290,7 +290,7 @@ $(OBJ_FIRST_PARTY): $(PROJECT_HEADERS)
 
 # ─── Targets ──────────────────────────────────────────────────────────────────
 
-.PHONY: all clean fmt info help msvc-win gcc-linux clang-mac package icon
+.PHONY: all clean fmt info help msvc-win gcc-linux clang-mac package icon sign
 
 .DEFAULT_GOAL := all
 
@@ -352,10 +352,26 @@ PACKAGE_RUN = if exist "$(ISCC_PF86)" ( "$(ISCC_PF86)" "installer\ava_tool.iss" 
 else
 PACKAGE_RUN = "$(ISCC)" "installer\ava_tool.iss"
 endif
+# Optional Authenticode signing to remove the "Unknown Publisher" warning.
+# Provide a certificate and signing is applied automatically (no-op without one):
+#   make package AVA_SIGN_PFX="C:\cert.pfx" AVA_SIGN_PASS=secret     (OV .pfx)
+#   make package AVA_SIGN_SHA1=<thumbprint>                          (store / EV token)
+export AVA_SIGN_PFX
+export AVA_SIGN_PASS
+export AVA_SIGN_SHA1
+export AVA_SIGN_TS
+SIGN_PS = powershell -NoProfile -ExecutionPolicy Bypass -File tools\sign.ps1 -Files
+
+# Sign the app binaries in place (run after a build).
+sign:
+	@$(SIGN_PS) bin\win\ava_tool.exe,bin\win\updater.exe
+
 package: all
 	@$(ECHO_NL)
 	@echo [PACKAGE] running Inno Setup...
+	@$(SIGN_PS) bin\win\ava_tool.exe,bin\win\updater.exe
 	@$(PACKAGE_RUN)
+	@$(SIGN_PS) dist\ava_tool_setup_*.exe
 	@echo package complete: see dist\ava_tool_setup_*.exe
 endif
 

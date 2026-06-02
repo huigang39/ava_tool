@@ -1138,6 +1138,8 @@ Variable::drawVariableList()
                                 ImGui::Text("%s:%d", v.udp.ip, v.udp.port);
                         } else if (v.port == PortType::SHM) {
                                 ImGui::TextUnformatted(v.shm.name);
+                        } else if (v.addrUnknown) {
+                                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "UNKNOWN");
                         } else {
                                 ImGui::Text("0x%08llX", (unsigned long long)v.addr);
                         }

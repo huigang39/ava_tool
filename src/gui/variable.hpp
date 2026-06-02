@@ -46,8 +46,9 @@ struct VarEntry {
                 bool  inited = false;
         } shm{};
 
-        u64  typeOff  = 0; // For DWARF nested display
-        bool selected = false;
+        u64  typeOff     = 0; // For DWARF nested display
+        bool selected    = false;
+        bool addrUnknown = false; // symbol missing from the (reloaded) ELF → show "UNKNOWN"
 
         // User-editable enum label definitions (overrides DWARF when non-empty)
         struct EnumDef {

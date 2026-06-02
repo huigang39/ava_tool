@@ -64,6 +64,7 @@ class MonitorChannel
         std::string       shmRegionName_{};
         std::atomic<bool> wValDirty_{false};
         std::atomic<bool> pendingDelete_{false};
+        bool              addrUnknown_{false}; // symbol missing from the (reloaded) ELF
 
         // Primary data store — written ONLY by sampler thread (no lock needed).
         MmapVector<f32> rVals_{};
@@ -150,6 +151,10 @@ class MonitorChannel
         usize       &getAddr() { return addr_; }
         std::string &getSymbolName() { return symbolName_; }
         void         setAddr(const usize addr) { addr_ = addr; }
+        // Set when a reloaded ELF no longer defines this channel's symbol — the
+        // address is then shown as "UNKNOWN" instead of a stale value.
+        bool         isAddrUnknown() const { return addrUnknown_; }
+        void         setAddrUnknown(bool u) { addrUnknown_ = u; }
         std::string &getDevice() { return device_; }
         void         setDevice(const std::string &device) { device_ = device; }
         std::string &getShmRegionName() { return shmRegionName_; }

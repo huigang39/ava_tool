@@ -67,8 +67,14 @@ class Gui
         void loadSession(const std::string &path = "");
         void saveSession(const std::string &path = "");
         bool saveSessionAs(); // returns false if user cancelled the dialog
-        void drawCalculator();
-        void syncSymbolAddresses(Variable *reloadedVar);
+
+        // Recent sessions (File menu). Persisted to <appdir>/recent.txt.
+        std::vector<std::string> recentSessions_;
+        void                     loadRecentList();
+        void                     saveRecentList();
+        void                     addRecent(const std::string &path);
+        void                     drawCalculator();
+        void                     syncSymbolAddresses(Variable *reloadedVar);
 
         struct MotorProfile {
                 char  modelName[64] = "Motor_A";
