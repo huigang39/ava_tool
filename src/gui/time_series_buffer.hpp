@@ -15,6 +15,7 @@
 
 #include "module.h"
 
+#include "delta_ts_buffer.hpp"
 #include "mmap_vector.hpp"
 #include <algorithm>
 #include <limits>
@@ -84,6 +85,17 @@ class TimeSeriesBuffer
                         rawVals_.pop_front();
                 }
                 firstAbsIdx_ += n;
+
+                // Also drop LOD samples that are now older than the oldest remaining
+                // raw sample. Without this the LOD pyramid grows without bound even
+                // though the raw window is pruned — the single largest source of the
+                // mmap cache ballooning over long runs.
+                const f64 cutoff = rawTs_.empty() ? std::numeric_limits<f64>::infinity() : rawTs_.front();
+                for (int k = 0; k < kMaxLevels; ++k) {
+                        auto &data = levels_[k].data;
+                        while (!data.empty() && data.front().t < cutoff)
+                                data.pop_front();
+                }
         }
 
         // Advance the raw front past samples with ts < cutoff. minKeep keeps
@@ -104,16 +116,8 @@ class TimeSeriesBuffer
         }
 
         // -- Binary search --------------------------------------------------
-        usize rawLowerBound(f64 t) const
-        {
-                auto it = std::lower_bound(rawTs_.begin(), rawTs_.end(), t);
-                return static_cast<usize>(std::distance(rawTs_.begin(), it));
-        }
-        usize rawUpperBound(f64 t) const
-        {
-                auto it = std::upper_bound(rawTs_.begin(), rawTs_.end(), t);
-                return static_cast<usize>(std::distance(rawTs_.begin(), it));
-        }
+        usize rawLowerBound(f64 t) const { return rawTs_.lowerBound(t); }
+        usize rawUpperBound(f64 t) const { return rawTs_.upperBound(t); }
 
         usize lodLowerBound(int level, f64 t) const
         {
@@ -200,7 +204,7 @@ class TimeSeriesBuffer
                 return (hi > lo) ? (hi - lo) : 0;
         }
 
-        MmapVector<f64> rawTs_;
+        DeltaTsBuffer   rawTs_; // block-anchored f32-delta timestamps (compact)
         MmapVector<f32> rawVals_;
         Level           levels_[kMaxLevels];
         u64             firstAbsIdx_{0};

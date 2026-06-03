@@ -32,10 +32,12 @@
 
 #include "app_log.hpp"
 #include "core/jlink_port.hpp"
+#include "core/mmap_vector.hpp"
 #include "core/sampler.hpp"
 #include "gui/gui.hpp"
 #include "gui/monitor.hpp"
 #include "gui/variable.hpp"
+#include "platform/native_dlg.hpp"
 #include "version.hpp"
 #include <cstdlib>
 #include <filesystem>
@@ -60,6 +62,7 @@ Gui::Gui(const std::string &initialPath)
 {
         LOG_I("Gui(%s)", initialPath.c_str());
 
+        loadCacheDirSetting(); // apply the saved mmap cache dir before any buffers are created
         loadRecentList();
 
         glfwSetErrorCallback(glfwErrCb);
@@ -220,6 +223,28 @@ Gui::addRecent(const std::string &path)
         if (recentSessions_.size() > 10)
                 recentSessions_.resize(10);
         saveRecentList();
+}
+
+void
+Gui::loadCacheDirSetting()
+{
+        std::ifstream f(getAppDir() + "/cache_dir.txt");
+        std::string   line;
+        if (std::getline(f, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+                        line.pop_back();
+                if (!line.empty() && std::filesystem::exists(line))
+                        mmapVectorSetCacheDir(line);
+        }
+}
+
+void
+Gui::setCacheDir(const std::string &dir)
+{
+        mmapVectorSetCacheDir(dir);
+        std::ofstream f(getAppDir() + "/cache_dir.txt", std::ios::trunc);
+        f << dir;
+        LOG_I("Cache directory set to: %s", dir.empty() ? "(system temp)" : dir.c_str());
 }
 
 bool
@@ -863,6 +888,23 @@ Gui::drawBar()
                                                 applyCoreChange(i);
                                         }
                                 }
+                                ImGui::EndMenu();
+                        }
+
+                        if (ImGui::BeginMenu("Disk Cache Folder")) {
+                                const std::string cur = mmapVectorCacheDir();
+                                ImGui::TextDisabled("Current:");
+                                ImGui::TextWrapped("%s", cur.empty() ? "(system temp)" : cur.c_str());
+                                ImGui::Separator();
+                                if (ImGui::MenuItem("Change...")) {
+                                        std::string d = nativeDlgPickDir("Select disk-cache folder");
+                                        if (!d.empty())
+                                                setCacheDir(d);
+                                }
+                                if (ImGui::MenuItem("Reset to system temp", nullptr, false, !cur.empty()))
+                                        setCacheDir("");
+                                ImGui::Separator();
+                                ImGui::TextDisabled("Applies to newly created buffers.\nRestart to move all cache here.");
                                 ImGui::EndMenu();
                         }
                         ImGui::EndMenu();

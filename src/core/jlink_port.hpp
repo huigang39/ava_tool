@@ -139,6 +139,9 @@ class JLinkPort
         std::atomic<int>   speedKHz_{4000};
         std::string        lastErr_{};
 
+        static constexpr int kMaxReadFails = 10;
+        std::atomic<int>     readFailCount_{0};
+
         bool              hssRunning_{false};
         int               hssPeriodUs_{1000};
         int               hssFrameSize_{0};

@@ -4,7 +4,9 @@ ifndef VCVARS_DONE
 
 # Targets that only need Python / file ops — not the MSVC compiler/linker.
 # When every requested goal is one of these, skip the (slow) vcvars init below.
-_NO_MSVC_GOALS := icon sign clean fmt info help package
+# NOTE: `package` is NOT here — it depends on `all`, so it must initialize MSVC
+# (otherwise a build after `make clean` can't find cl.exe).
+_NO_MSVC_GOALS := icon sign clean fmt info help
 _NEED_MSVC     := $(if $(MAKECMDGOALS),$(filter-out $(_NO_MSVC_GOALS),$(MAKECMDGOALS)),all)
 
 ifneq ($(_NEED_MSVC),)

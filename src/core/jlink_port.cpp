@@ -144,12 +144,21 @@ JLinkPort::connect()
                 return false;
         }
 
-        // Ensure the MCU keeps running and doesn't get stuck in halted state upon connection
+        // Ensure the MCU keeps running and doesn't get stuck in halted state upon connection.
+        // After a power cycle, Go() alone may not recover — do a full reset.
         if (JLINKARM_IsHalted()) {
-                LOG_I("JLinkPort::connect(): Target was halted, resuming...");
+                LOG_I("JLinkPort::connect(): Target is halted — performing reset + go to recover...");
+                JLINKARM_SetResetType(0);
+                JLINKARM_Reset();
                 JLINKARM_Go();
+                // Give the MCU time to boot after reset
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (JLINKARM_IsHalted()) {
+                        LOG_W("JLinkPort::connect(): Target still halted after reset — proceeding anyway");
+                }
         }
 
+        readFailCount_.store(0, std::memory_order_relaxed);
         isConnected_ = true;
         LOG_I("JLinkPort::connect() SUCCEEDED");
         return true;
@@ -178,6 +187,11 @@ JLinkPort::connectAsync()
         if (!busy_.compare_exchange_strong(expected, true))
                 return; // already busy
         std::thread([this]() {
+                // Always do a full close+open+connect cycle.
+                // This handles the case where the MCU lost power and the
+                // old SDK state is stale ("cpu is halt" on reconnect).
+                if (isConnected_ || isOpen_)
+                        close();
                 if (!isOpen_)
                         open();
                 if (isOpen_)
@@ -216,7 +230,18 @@ JLinkPort::readMem(const u32 addr, const u32 numBytes, void *dst)
         std::lock_guard lk(mtx_);
         if (!isOpen_ || !isConnected_)
                 return false;
-        return JLINKARM_ReadMemEx(addr, numBytes, dst, 0) >= 0;
+        bool ok = JLINKARM_ReadMemEx(addr, numBytes, dst, 0) >= 0;
+        if (!ok) {
+                int fc = readFailCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (fc >= kMaxReadFails) {
+                        LOG_E("JLinkPort::readMem() %d consecutive failures — auto-disconnecting", fc);
+                        isConnected_ = false;
+                        isOpen_      = false;
+                }
+        } else {
+                readFailCount_.store(0, std::memory_order_relaxed);
+        }
+        return ok;
 }
 
 bool

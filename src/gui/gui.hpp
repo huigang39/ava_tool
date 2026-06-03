@@ -74,8 +74,12 @@ class Gui
         void                     loadRecentList();
         void                     saveRecentList();
         void                     addRecent(const std::string &path);
-        void                     drawCalculator();
-        void                     syncSymbolAddresses(Variable *reloadedVar);
+
+        // mmap disk-cache directory (Settings). Persisted to <appdir>/cache_dir.txt.
+        void loadCacheDirSetting(); // reads + applies the saved cache dir (call early)
+        void setCacheDir(const std::string &dir);
+        void drawCalculator();
+        void syncSymbolAddresses(Variable *reloadedVar);
 
         struct MotorProfile {
                 char  modelName[64] = "Motor_A";

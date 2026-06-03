@@ -70,7 +70,7 @@ class MonitorChannel
 
         // Primary data store — written ONLY by sampler thread (no lock needed).
         MmapVector<f32> rVals_{};
-        MmapVector<f64> rTs_{};
+        DeltaTsBuffer   rTs_{}; // block-anchored f32-delta timestamps (compact, ~half the bytes)
 
         std::vector<EnumEntry> enums_{};
 

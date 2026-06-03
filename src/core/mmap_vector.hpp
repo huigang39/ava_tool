@@ -28,6 +28,52 @@ mmapVectorNextId()
         return counter.fetch_add(1);
 }
 
+// User-configurable base directory for the disk cache. Empty => system temp.
+// Set once at startup (before heavy sampling) via mmapVectorSetCacheDir().
+inline std::string &
+mmapVectorCacheDirRaw()
+{
+        static std::string dir; // empty => system temp
+        return dir;
+}
+inline void
+mmapVectorSetCacheDir(const std::string &d)
+{
+        mmapVectorCacheDirRaw() = d;
+}
+inline std::string
+mmapVectorCacheDir()
+{
+        return mmapVectorCacheDirRaw();
+}
+
+// Resolve (and create) the directory that holds the ".tmp" cache files.
+inline std::string
+mmapVectorCacheRoot()
+{
+        std::string base = mmapVectorCacheDirRaw();
+#ifdef _WIN32
+        if (base.empty()) {
+                char tempPath[MAX_PATH];
+                GetTempPathA(MAX_PATH, tempPath);
+                base = tempPath;
+        }
+        if (!base.empty() && base.back() != '\\' && base.back() != '/')
+                base += "\\";
+        std::string dir = base + "ava_tool_mmap_cache";
+        CreateDirectoryA(dir.c_str(), NULL);
+        return dir;
+#else
+        if (base.empty())
+                base = "/tmp";
+        if (!base.empty() && base.back() != '/')
+                base += "/";
+        std::string dir = base + "ava_tool_mmap_cache";
+        mkdir(dir.c_str(), 0777);
+        return dir;
+#endif
+}
+
 // Clean up stale mmap files from previous runs (e.g. after a crash).
 // Called once on first MmapVector construction.
 inline void
@@ -38,9 +84,7 @@ mmapVectorCleanupStale()
                 return;
         done = true;
 #ifdef _WIN32
-        char tempPath[MAX_PATH];
-        GetTempPathA(MAX_PATH, tempPath);
-        std::string      dirPath = std::string(tempPath) + "ava_tool_mmap_cache";
+        std::string      dirPath = mmapVectorCacheRoot();
         std::string      pattern = dirPath + "\\ava_tool_mmap_*.tmp";
         WIN32_FIND_DATAA fd;
         HANDLE           hFind = FindFirstFileA(pattern.c_str(), &fd);
@@ -71,25 +115,14 @@ template <typename T> class MmapVector
 
         static std::string generateTempPath()
         {
+                // Built from std::string (not a fixed buffer) so a long, user-chosen
+                // cache directory can't truncate the path.
+                const std::string dir = mmapVectorCacheRoot();
 #ifdef _WIN32
-                char tempPath[MAX_PATH];
-                GetTempPathA(MAX_PATH, tempPath);
-                std::string dirPath = std::string(tempPath) + "ava_tool_mmap_cache";
-                CreateDirectoryA(dirPath.c_str(), NULL);
-                char buf[MAX_PATH];
-                snprintf(buf,
-                         sizeof(buf),
-                         "%s\\ava_tool_mmap_%lu_%llu.tmp",
-                         dirPath.c_str(),
-                         GetCurrentProcessId(),
-                         mmapVectorNextId());
-                return std::string(buf);
+                return dir + "\\ava_tool_mmap_" + std::to_string(GetCurrentProcessId()) + "_" +
+                       std::to_string(mmapVectorNextId()) + ".tmp";
 #else
-                const char *dirPath = "/tmp/ava_tool_mmap_cache";
-                mkdir(dirPath, 0777);
-                char buf[256];
-                snprintf(buf, sizeof(buf), "%s/ava_tool_mmap_%d_%llu.tmp", dirPath, getpid(), mmapVectorNextId());
-                return std::string(buf);
+                return dir + "/ava_tool_mmap_" + std::to_string(getpid()) + "_" + std::to_string(mmapVectorNextId()) + ".tmp";
 #endif
         }
 
