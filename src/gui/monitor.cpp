@@ -19,6 +19,7 @@
 
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
+#include "gui/ui_theme.hpp"
 #include "platform/native_dlg.hpp"
 
 std::atomic<bool> g_monitorPaused{false};
@@ -68,11 +69,10 @@ MonitorScope::menu()
 
         ImGui::SameLine();
         if (showFft_) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue
-                if (ImGui::Button(tr("Freq domain", "频域"))) {
+                // Active-state toggle (currently showing frequency domain) → info blue.
+                if (ui::Button(tr("Freq domain", "频域"), ui::BtnStyle::Primary)) {
                         showFft_ = false;
                 }
-                ImGui::PopStyleColor();
 
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(100);
@@ -128,10 +128,9 @@ MonitorScope::menu()
 
                 ImGui::SameLine();
                 if (fftBars_) {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue (active)
-                        if (ImGui::Button(tr("Bar", "柱状")))
+                        // Active-state toggle (bar chart selected) → info blue.
+                        if (ui::Button(tr("Bar", "柱状"), ui::BtnStyle::Primary))
                                 fftBars_ = false;
-                        ImGui::PopStyleColor();
                 } else {
                         if (ImGui::Button(tr("Line", "折线")))
                                 fftBars_ = true;
@@ -183,7 +182,8 @@ MonitorScope::menu()
                 }
         }
 
-        // Right-aligned buttons: Delete Scope, Hide Scope, and Pause/Resume
+        // Right-aligned buttons: reorder (up/down), Delete Scope, Hide Scope, Pause/Resume
+        float arrowW       = ImGui::GetFrameHeight(); // ArrowButton is square
         float delBtnWidth  = ImGui::CalcTextSize(tr("Delete Scope", "删除示波器")).x + ImGui::GetStyle().FramePadding.x * 2.0f;
         float hideBtnWidth = std::max(ImGui::CalcTextSize(tr("Hide Scope", "隐藏示波器")).x,
                                       ImGui::CalcTextSize(tr("Show Scope", "显示示波器")).x) +
@@ -191,9 +191,10 @@ MonitorScope::menu()
         float pauseBtnWidth =
             std::max(ImGui::CalcTextSize(tr("Pause", "暂停")).x, ImGui::CalcTextSize(tr("Resume", "继续")).x) +
             ImGui::GetStyle().FramePadding.x * 2.0f;
-        float spacing         = ImGui::GetStyle().ItemSpacing.x;
-        float totalRightWidth = delBtnWidth + spacing + hideBtnWidth + spacing + pauseBtnWidth;
-        float availWidth      = ImGui::GetContentRegionAvail().x;
+        float spacing = ImGui::GetStyle().ItemSpacing.x;
+        float totalRightWidth =
+            arrowW + spacing + arrowW + spacing + delBtnWidth + spacing + hideBtnWidth + spacing + pauseBtnWidth;
+        float availWidth = ImGui::GetContentRegionAvail().x;
 
         if (availWidth > totalRightWidth) {
                 ImGui::SameLine(ImGui::GetCursorPosX() + availWidth - totalRightWidth);
@@ -201,38 +202,41 @@ MonitorScope::menu()
                 ImGui::SameLine();
         }
 
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.1f, 0.1f, 0.6f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 0.8f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
-        if (ImGui::Button(tr("Delete Scope", "删除示波器"))) {
+        // Reorder this scope within the monitor (consumed by Monitor::updateDisplay).
+        if (ImGui::ArrowButton("##scopeUp", ImGuiDir_Up))
+                requestMove(-1);
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tr("Move scope up", "上移示波器"));
+        ImGui::SameLine();
+        if (ImGui::ArrowButton("##scopeDown", ImGuiDir_Down))
+                requestMove(+1);
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tr("Move scope down", "下移示波器"));
+        ImGui::SameLine();
+
+        // Delete = destructive → red.
+        if (ui::Button(tr("Delete Scope", "删除示波器"), ui::BtnStyle::Danger)) {
                 markPendingDelete();
         }
-        ImGui::PopStyleColor(3);
 
+        // Show/Hide = de-emphasised visibility toggle → muted grey.
         ImGui::SameLine();
         if (hidden_) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.4f, 0.4f, 0.4f, 0.8f));
-                if (ImGui::Button(tr("Show Scope", "显示示波器")))
+                if (ui::Button(tr("Show Scope", "显示示波器"), ui::BtnStyle::Muted))
                         hidden_ = false;
-                ImGui::PopStyleColor();
         } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 0.6f));
-                if (ImGui::Button(tr("Hide Scope", "隐藏示波器")))
+                if (ui::Button(tr("Hide Scope", "隐藏示波器"), ui::BtnStyle::Muted))
                         hidden_ = true;
-                ImGui::PopStyleColor();
         }
 
+        // Resume = go (green); Pause = caution (amber).
         ImGui::SameLine();
         if (paused_) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.8f, 0.2f, 0.6f)); // Yellow/Orange
-                if (ImGui::Button(tr("Resume", "继续")))
+                if (ui::Button(tr("Resume", "继续"), ui::BtnStyle::Success))
                         paused_ = false;
-                ImGui::PopStyleColor();
         } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 0.6f)); // Green
-                if (ImGui::Button(tr("Pause", "暂停")))
+                if (ui::Button(tr("Pause", "暂停"), ui::BtnStyle::Warning))
                         paused_ = true;
-                ImGui::PopStyleColor();
         }
 
         ImGui::Separator();
@@ -650,15 +654,12 @@ MonitorScope::drawTableRow(const std::string               &chName,
         f32 cfgW    = (availX - spacing) * 0.35f;
 
         if (ch->waveEnable_) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
-                if (ImGui::Button("ON", ImVec2(btnW, 0)))
+                // Wave generator active → green; inactive → muted grey.
+                if (ui::Button("ON", ui::BtnStyle::Success, ImVec2(btnW, 0)))
                         ch->waveEnable_ = false;
-                ImGui::PopStyleColor();
         } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-                if (ImGui::Button("OFF", ImVec2(btnW, 0)))
+                if (ui::Button("OFF", ui::BtnStyle::Muted, ImVec2(btnW, 0)))
                         ch->waveEnable_ = true;
-                ImGui::PopStyleColor();
         }
         ImGui::SameLine();
         if (ImGui::Button("..", ImVec2(cfgW, 0)))
@@ -1196,7 +1197,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 if (ImGui::IsItemHovered())
                                         ImGui::SetTooltip("%s", tr("Style", "样式"));
                                 ImGui::Checkbox(tr("Markers", "标记点"), &ch->showMarkers());
-                                if (ImGui::Button(tr("Delete Channel", "删除通道")))
+                                if (ui::Button(tr("Delete Channel", "删除通道"), ui::BtnStyle::Danger))
                                         ch->markPendingDelete();
                                 ImPlot::EndLegendPopup();
                         }
@@ -1459,7 +1460,8 @@ Monitor::addScope(const std::string &scopeName)
 {
         if (scopes_.find(scopeName) != scopes_.end())
                 return -1;
-        auto scope         = std::make_shared<MonitorScope>(scopeName);
+        auto scope = std::make_shared<MonitorScope>(scopeName);
+        scope->setOrder(allocScopeOrder()); // default display order = insertion order
         scopes_[scopeName] = scope;
         needsLayout_       = true;
         for (auto &pair : scopes_)
@@ -1529,6 +1531,23 @@ Monitor::updateDisplay()
                         return;
                 }
 
+                // ---- Flow layout for the toolbar ----------------------------------------
+                // ImGui's SameLine() never wraps, so a row of widgets overflows past the
+                // window edge (and gets clipped / disappears) on a narrow window. tbFlow()
+                // is called before each item with that item's width: it keeps the item on
+                // the current row when it fits, otherwise lets it fall onto a new row.
+                ImGuiStyle &tbStyle  = ImGui::GetStyle();
+                const float tbRightX = ImGui::GetWindowPos().x + ImGui::GetWindowContentRegionMax().x;
+                auto        tbBtnW   = [&](const char *label) {
+                        return ImGui::CalcTextSize(label, nullptr, true).x + tbStyle.FramePadding.x * 2.0f;
+                };
+                auto tbFlow = [&](float nextW) {
+                        // GetItemRectMax() is the right edge of the previously submitted item.
+                        if (ImGui::GetItemRectMax().x + tbStyle.ItemSpacing.x + nextW < tbRightX)
+                                ImGui::SameLine();
+                        // else: fall through to the default cursor advance, i.e. a new row.
+                };
+
                 if (ImGui::Button(tr("Add Scope", "添加示波器"))) {
                         char nameBuf[32];
                         snprintf(nameBuf, sizeof(nameBuf), "scope_%zu", scopes_.size());
@@ -1536,39 +1555,27 @@ Monitor::updateDisplay()
                 }
 
                 // Master pause for every scope's acquisition in this monitor.
-                ImGui::SameLine();
-                const bool monSampPaused = isSamplingPaused();
-                if (monSampPaused) {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.8f, 0.2f, 0.6f)); // Yellow
-                        if (ImGui::Button(tr("Resume All Scopes", "恢复全部采样")))
-                                setSamplingPaused(false);
-                        ImGui::PopStyleColor();
-                } else {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.8f, 0.6f)); // Blue
-                        if (ImGui::Button(tr("Pause All Scopes", "暂停全部采样")))
-                                setSamplingPaused(true);
-                        ImGui::PopStyleColor();
-                }
+                const bool  monSampPaused = isSamplingPaused();
+                const char *pauseAllLabel =
+                    monSampPaused ? tr("Resume All Scopes", "恢复全部采样") : tr("Pause All Scopes", "暂停全部采样");
+                tbFlow(tbBtnW(pauseAllLabel));
+                // Resume = go (green); Pause = caution (amber).
+                if (ui::Button(pauseAllLabel, monSampPaused ? ui::BtnStyle::Success : ui::BtnStyle::Warning))
+                        setSamplingPaused(!monSampPaused);
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s",
                                           tr("Pause/resume acquisition for all scopes in this monitor",
                                              "暂停/恢复此监视器内所有示波器的采样"));
 
-                ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.5f, 0.0f, 0.6f)); // Orange
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.6f, 0.1f, 0.8f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.7f, 0.2f, 1.0f));
-                if (ImGui::Button(tr("Clear Data", "清空数据"))) {
+                tbFlow(tbBtnW(tr("Clear Data", "清空数据")));
+                // Clear Data = caution / reversible-by-resampling → amber.
+                if (ui::Button(tr("Clear Data", "清空数据"), ui::BtnStyle::Warning)) {
                         requestClearData();
                         JLinkPort::instance().reqRestart();
                         LOG_I("Monitor[%s] clear data requested from UI", name_.c_str());
                 }
-                ImGui::PopStyleColor(3);
 
-                ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f)); // Green
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 0.3f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
+                tbFlow(tbBtnW(tr("Export CSV", "导出 CSV")));
 
                 // Cheap per-frame estimate of the resulting CSV size, shown as a tooltip so the
                 // user knows what they're about to write before picking a path.
@@ -1590,7 +1597,8 @@ Monitor::updateDisplay()
 
                 const bool exporting = csvExport_->running.load(std::memory_order_acquire);
                 ImGui::BeginDisabled(exporting);
-                const bool exportClicked = ImGui::Button(tr("Export CSV", "导出 CSV"));
+                // Export = constructive action → green.
+                const bool exportClicked = ui::Button(tr("Export CSV", "导出 CSV"), ui::BtnStyle::Success);
                 ImGui::EndDisabled();
                 if (ImGui::IsItemHovered() && !exporting) {
                         if (estChans == 0)
@@ -1693,30 +1701,30 @@ Monitor::updateDisplay()
                                 }).detach();
                         }
                 }
-                ImGui::PopStyleColor(3);
 
                 if (exporting) {
-                        ImGui::SameLine();
                         const u64   done     = csvExport_->rows.load(std::memory_order_acquire);
                         const u64   total    = csvExport_->total.load(std::memory_order_acquire);
                         const char *frames[] = {"|", "/", "-", "\\"};
                         const int   fi       = static_cast<int>(ImGui::GetTime() * 8.0) % 4;
                         const float pct      = total ? (100.0f * static_cast<float>(done) / static_cast<float>(total)) : 0.0f;
-                        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
-                                           tr("%s  Exporting CSV in background... %.0f%%", "%s  正在后台导出 CSV... %.0f%%"),
-                                           frames[fi],
-                                           pct);
+                        char        prog[96];
+                        snprintf(prog,
+                                 sizeof(prog),
+                                 tr("%s  Exporting CSV in background... %.0f%%", "%s  正在后台导出 CSV... %.0f%%"),
+                                 frames[fi],
+                                 pct);
+                        tbFlow(ImGui::CalcTextSize(prog).x);
+                        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s", prog);
                 }
 
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(100);
+                // Logarithmic sliders (same style as the J-Link speed control): drag to
+                // set, Ctrl+click to type. Units are baked into the format string.
+                tbFlow(120);
+                ImGui::SetNextItemWidth(120);
                 f32 h = historySeconds_;
-                if (ImGui::InputFloat("##History", &h, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
-                    (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
-                        if (h < 0.0f)
-                                h = 0.0f;
+                if (ImGui::SliderFloat("##History", &h, 0.1f, 3600.0f, "%.1f s", ImGuiSliderFlags_Logarithmic))
                         historySeconds_ = h;
-                }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("History(s)", "历史时长(秒)"));
                 // Sync to all channels every frame to ensure newly added channels inherit the setting immediately
@@ -1724,27 +1732,21 @@ Monitor::updateDisplay()
                         for (auto &[__, ch] : scope->getChannels())
                                 ch->historySeconds_ = historySeconds_;
 
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(100);
+                tbFlow(120);
+                ImGui::SetNextItemWidth(120);
                 i32 maxPts = static_cast<i32>(maxDisplayPoints_);
-                if (ImGui::InputInt("##MaxPts", &maxPts, 0, 0) && ImGui::IsItemDeactivated() &&
-                    (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
-                        if (maxPts < 100)
-                                maxPts = 100;
+                if (ImGui::SliderInt("##MaxPts", &maxPts, 100, 100000, "%d pts", ImGuiSliderFlags_Logarithmic))
                         maxDisplayPoints_ = static_cast<u32>(maxPts);
-                }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("Max Pts", "最大显示点数"));
 
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(80);
-                if (ImGui::InputInt("##MaxHz", &maxSampleHz_, 0, 0)) {
-                        if (maxSampleHz_ < 1)
-                                maxSampleHz_ = 1;
-                        if (maxSampleHz_ > 50000)
-                                maxSampleHz_ = 50000;
+                tbFlow(120);
+                ImGui::SetNextItemWidth(120);
+                ImGui::SliderInt("##MaxHz", &maxSampleHz_, 1, 50000, "%d Hz", ImGuiSliderFlags_Logarithmic);
+                // Restart HSS only on release (matches the J-Link slider) so dragging
+                // doesn't spam restarts every frame.
+                if (ImGui::IsItemDeactivatedAfterEdit())
                         JLinkPort::instance().reqRestart();
-                }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s",
                                           tr("Target sample rate (Hz). HSS mode on J-Link Pro/Ultra+ can reach several "
@@ -1752,18 +1754,25 @@ Monitor::updateDisplay()
                                              "目标采样率 (Hz)。J-Link Pro/Ultra+ 的 HSS 模式可达数 kHz 至数十 kHz；"
                                              "POLL 模式受 USB 延迟限制（约 1-2kHz）。"));
 
-                ImGui::SameLine();
+                tbFlow(ImGui::CalcTextSize(actualHz_ > 0.1f ? "0000 Hz" : "-- Hz").x);
                 if (actualHz_ > 0.1f) {
                         ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "%.0f Hz", actualHz_);
                 } else {
                         ImGui::TextDisabled("-- Hz");
                 }
 
-                // Right-aligned mode control group
+                // Mode control group (Sampling Mode + View Mode). Right-align it when there's
+                // room on the current row, otherwise wrap it to a new line so it never overlaps
+                // the left-side buttons when the window is narrow.
                 f32 spacing    = ImGui::GetStyle().ItemSpacing.x;
                 f32 totalWidth = 70 + spacing + 90;
+                f32 targetX    = ImGui::GetWindowContentRegionMax().x - totalWidth;
 
-                ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - totalWidth);
+                ImGui::SameLine();
+                if (ImGui::GetCursorPosX() < targetX)
+                        ImGui::SameLine(targetX); // enough room — right-align on the same row
+                else
+                        ImGui::NewLine(); // not enough room — wrap the group to a new row
 
                 const char *sampModes[] = {"HSS", "POLL"};
                 i32         curSamp     = (samplingMode_ == SamplingMode::HSS) ? 0 : 1;
@@ -1809,7 +1818,10 @@ Monitor::updateDisplay()
                 std::vector<std::string> keys;
                 for (auto &pair : scopes_)
                         keys.push_back(pair.first);
-                std::sort(keys.begin(), keys.end());
+                // Draw scopes in user-defined display order (reorderable via the toolbar).
+                std::sort(keys.begin(), keys.end(), [&](const std::string &a, const std::string &b) {
+                        return scopes_[a]->getOrder() < scopes_[b]->getOrder();
+                });
 
                 ImVec2 avail = ImGui::GetContentRegionAvail();
 
@@ -1929,6 +1941,24 @@ Monitor::updateDisplay()
                                 }
                         }
                         ImGui::PopID();
+                }
+
+                // Apply a pending reorder request: swap this scope's display order with
+                // its neighbour in the current order. `keys` is sorted by order above, so
+                // index i is the on-screen position. One move per frame.
+                for (size_t i = 0; i < keys.size(); ++i) {
+                        const int dir = scopes_[keys[i]]->consumeMoveRequest();
+                        if (dir == 0)
+                                continue;
+                        const int j = static_cast<int>(i) + dir;
+                        if (j >= 0 && j < static_cast<int>(keys.size())) {
+                                const i64 oi = scopes_[keys[i]]->getOrder();
+                                const i64 oj = scopes_[keys[j]]->getOrder();
+                                scopes_[keys[i]]->setOrder(oj);
+                                scopes_[keys[j]]->setOrder(oi);
+                                setModified();
+                        }
+                        break;
                 }
 
                 bool anyDeleted = false;

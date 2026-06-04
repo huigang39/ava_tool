@@ -2,6 +2,7 @@
 #include "ImGuiNotify.hpp"
 #include "cJSON.h"
 #include "gui/i18n.hpp"
+#include "gui/ui_theme.hpp"
 #include "imgui.h"
 #include "monitor.hpp"
 #include "platform/native_dlg.hpp"
@@ -173,27 +174,19 @@ SequenceEditor::draw()
                 }
         }
 
-        // Toolbar
+        // Toolbar — Play = go (green), Stop = halt (red).
         if (state_ == State::IDLE) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.2f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.8f, 0.3f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.1f, 0.6f, 0.1f, 1.0f));
-                if (ImGui::Button(tr("Play", "播放"), ImVec2(80, 0))) {
+                if (ui::Button(tr("Play", "播放"), ui::BtnStyle::Success, ImVec2(80, 0))) {
                         if (!steps_.empty()) {
                                 state_          = State::RUNNING;
                                 currentStepIdx_ = 0;
                                 stepStartTime_  = get_mono_ts_ms();
                         }
                 }
-                ImGui::PopStyleColor(3);
         } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
-                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.1f, 0.1f, 1.0f));
-                if (ImGui::Button(tr("Stop", "停止"), ImVec2(80, 0))) {
+                if (ui::Button(tr("Stop", "停止"), ui::BtnStyle::Danger, ImVec2(80, 0))) {
                         state_ = State::IDLE;
                 }
-                ImGui::PopStyleColor(3);
         }
         ImGui::SameLine();
         if (ImGui::Button(tr("Import", "导入"))) {
@@ -247,7 +240,7 @@ SequenceEditor::draw()
                 isModified_   = true;
         }
         ImGui::SameLine();
-        if (ImGui::Button(tr("Clear All", "全部清空"))) {
+        if (ui::Button(tr("Clear All", "全部清空"), ui::BtnStyle::Warning)) {
                 steps_.clear();
                 selectedStep_ = -1;
                 isModified_   = true;
@@ -378,7 +371,7 @@ SequenceEditor::draw()
                                 ImGui::PopItemWidth();
 
                                 ImGui::SameLine();
-                                if (ImGui::Button(tr("Remove Step", "删除步骤"))) {
+                                if (ui::Button(tr("Remove Step", "删除步骤"), ui::BtnStyle::Danger)) {
                                         steps_.erase(steps_.begin() + selectedStep_);
                                         isModified_ = true;
                                         if (selectedStep_ >= (int)steps_.size()) {
@@ -467,7 +460,9 @@ SequenceEditor::draw()
                                                         }
 
                                                         ImGui::TableNextColumn();
-                                                        if (ImGui::Button(tr("Remove", "移除"), ImVec2(-FLT_MIN, 0))) {
+                                                        if (ui::Button(tr("Remove", "移除"),
+                                                                       ui::BtnStyle::Danger,
+                                                                       ImVec2(-FLT_MIN, 0))) {
                                                                 step.actions.erase(step.actions.begin() + i);
                                                                 isModified_ = true;
                                                                 i--;

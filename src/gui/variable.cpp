@@ -15,6 +15,7 @@
 #include "gui/gui.hpp"
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
+#include "gui/ui_theme.hpp"
 #include "gui/variable.hpp"
 
 // Port headers
@@ -1134,7 +1135,7 @@ Variable::drawVariableList()
         if (ImGui::Button(tr("Add Variable", "添加变量")))
                 state_ = WindowState::AddVariable;
         ImGui::SameLine();
-        if (ImGui::Button(tr("Clear All", "全部清空"))) {
+        if (ui::Button(tr("Clear All", "全部清空"), ui::BtnStyle::Warning)) {
                 vars_.clear();
                 isModified_ = true;
         }
@@ -1577,7 +1578,7 @@ Variable::drawEnumEditPopup()
                                 if (ImGui::InputInt("##val", &ival, 0, 0))
                                         v.enumDefs[j].value = ival;
                                 ImGui::TableSetColumnIndex(2);
-                                if (ImGui::SmallButton("x"))
+                                if (ui::SmallButton("x", ui::BtnStyle::Danger))
                                         deleteIdx = j;
                                 ImGui::PopID();
                         }
@@ -1653,7 +1654,7 @@ Variable::drawSubEnumEditPopup()
                                 if (ImGui::InputInt("##val", &ival, 0, 0))
                                         defs[j].value = ival;
                                 ImGui::TableSetColumnIndex(2);
-                                if (ImGui::SmallButton("x"))
+                                if (ui::SmallButton("x", ui::BtnStyle::Danger))
                                         deleteIdx = j;
                                 ImGui::PopID();
                         }
@@ -1979,31 +1980,43 @@ void
 Variable::draw()
 {
         syncReadCache_.clear();
-        f32 availY       = ImGui::GetContentRegionAvail().y;
-        f32 splitterSize = 8.0f;
-        f32 topHeight    = watchListHeight_;
-        f32 bottomHeight = availY - topHeight - splitterSize;
-        if (bottomHeight < 100.0f) {
-                bottomHeight = 100.0f;
-                topHeight    = availY - bottomHeight - splitterSize;
-        }
 
-        if (ImGui::BeginChild("TopSection", ImVec2(0, topHeight), false)) {
+        // The Symbol Browser pane only appears once a symbol/data source has been
+        // imported (ELF/AXF via drag-drop or "Load File", or a bin/json data tree),
+        // or while an ELF is still loading. Until then the watch list fills the window.
+        const bool showSymbolBrowser = isElfLoading_.load(std::memory_order_acquire) || !elfPath_.empty() ||
+                                       !binPath_.empty() || !cfgPath_.empty() || !dataTree_.children.empty();
+
+        if (showSymbolBrowser) {
+                f32 availY       = ImGui::GetContentRegionAvail().y;
+                f32 splitterSize = 8.0f;
+                f32 topHeight    = watchListHeight_;
+                f32 bottomHeight = availY - topHeight - splitterSize;
+                if (bottomHeight < 100.0f) {
+                        bottomHeight = 100.0f;
+                        topHeight    = availY - bottomHeight - splitterSize;
+                }
+
+                if (ImGui::BeginChild("TopSection", ImVec2(0, topHeight), false)) {
+                        drawVariableList();
+                }
+                ImGui::EndChild();
+
+                ImGui::Button("##Splitter", ImVec2(-1, splitterSize));
+                if (ImGui::IsItemActive()) {
+                        watchListHeight_ += ImGui::GetIO().MouseDelta.y;
+                }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+
+                if (ImGui::BeginChild("BottomSection", ImVec2(0, 0), false)) {
+                        drawSymbolBrowser();
+                }
+                ImGui::EndChild();
+        } else {
+                // No symbol source yet — the watch list uses the full window.
                 drawVariableList();
         }
-        ImGui::EndChild();
-
-        ImGui::Button("##Splitter", ImVec2(-1, splitterSize));
-        if (ImGui::IsItemActive()) {
-                watchListHeight_ += ImGui::GetIO().MouseDelta.y;
-        }
-        if (ImGui::IsItemHovered())
-                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-
-        if (ImGui::BeginChild("BottomSection", ImVec2(0, 0), false)) {
-                drawSymbolBrowser();
-        }
-        ImGui::EndChild();
 
         drawAddVariableDialog();
         drawEnumEditPopup();

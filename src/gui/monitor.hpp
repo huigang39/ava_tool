@@ -73,6 +73,7 @@ class Monitor
         bool              needsLayout_{true};
         float             lastAvailY_{0.0f};
         std::atomic<bool> pendingClearData_{false};
+        i64               nextScopeOrder_{0}; // monotonic scope display-order allocator
 
       public:
         f64               linkXMin_{0.0}, linkXMax_{1.0};
@@ -175,6 +176,15 @@ class Monitor
         int             addScope(const std::string &scopeName);
         ScopeMapType   &getScopes() { return scopes_; }
         MonitorChannel *findChannel(const std::string &scopeName, const std::string &chName);
+
+        // Scope display-order allocation. Each new scope gets the next index so the
+        // default order is insertion order; the user can then reorder via the toolbar.
+        i64  allocScopeOrder() { return nextScopeOrder_++; }
+        void noteScopeOrder(i64 o)
+        {
+                if (o >= nextScopeOrder_)
+                        nextScopeOrder_ = o + 1;
+        }
 
         void purgeDeletedScopes()
         {

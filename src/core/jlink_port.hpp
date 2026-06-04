@@ -135,7 +135,7 @@ class JLinkPort
         std::atomic<bool>  busy_{false}; // an async connect/disconnect/reset is in flight
         bool               isOpen_{false};
         bool               isConnected_{false};
-        std::string        deviceName_{"STM32H745II"};
+        std::string        deviceName_{""};
         std::atomic<int>   speedKHz_{4000};
         std::string        lastErr_{};
 

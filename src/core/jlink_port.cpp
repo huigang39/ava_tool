@@ -12,6 +12,7 @@
 #include "app_log.hpp"
 #include "core/jlink_port.hpp"
 #include "gui/i18n.hpp"
+#include "gui/ui_theme.hpp"
 
 JLinkPort &
 JLinkPort::instance()
@@ -425,25 +426,20 @@ JLinkPort::drawUI()
         if (busy) {
                 // An async connect/disconnect/reset is running — show a spinner-ish
                 // label instead of a button so the GUI never blocks on USB I/O.
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 0.6f));
-                ImGui::Button(isConnected_ ? tr("Working...", "处理中...") : tr("Connecting...", "连接中..."));
-                ImGui::PopStyleColor();
+                ui::Button(isConnected_ ? tr("Working...", "处理中...") : tr("Connecting...", "连接中..."),
+                           ui::BtnStyle::Muted);
         } else if (!isConnected_) {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // Red
-                if (ImGui::SmallButton(tr("CONNECT", "连接")))
+                // Connect = constructive action → green.
+                if (ui::SmallButton(tr("CONNECT", "连接"), ui::BtnStyle::Success))
                         connectAsync();
-                ImGui::PopStyleColor();
         } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f)); // Green
-                if (ImGui::SmallButton(tr("DISCONNECT", "断开")))
+                // Disconnect = teardown → red; Reset = caution → amber.
+                if (ui::SmallButton(tr("DISCONNECT", "断开"), ui::BtnStyle::Danger))
                         disconnectAsync();
-                ImGui::PopStyleColor();
 
                 ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.6f, 0.2f, 1.0f)); // Orange
-                if (ImGui::SmallButton(tr("RESET MCU", "复位 MCU")))
+                if (ui::SmallButton(tr("RESET MCU", "复位 MCU"), ui::BtnStyle::Warning))
                         resetAsync();
-                ImGui::PopStyleColor();
         }
 
         if (!lastErr_.empty()) {

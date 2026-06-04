@@ -37,6 +37,7 @@
 #include "gui/gui.hpp"
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
+#include "gui/ui_theme.hpp"
 #include "gui/variable.hpp"
 #include "platform/native_dlg.hpp"
 #include "version.hpp"
@@ -333,9 +334,18 @@ Gui::saveSession(const std::string &path)
                 cJSON_AddNumberToObject(mObj, "maxDisplayPoints", static_cast<f64>(m->maxDisplayPoints_));
 
                 cJSON *scopesArr = cJSON_CreateArray();
-                for (auto &s : m->getScopes() | std::views::values) {
+                // Persist scopes in their user-defined display order so it survives a
+                // save/load round-trip (the map itself is unordered).
+                std::vector<MonitorScope *> orderedScopes;
+                for (auto &s : m->getScopes() | std::views::values)
+                        orderedScopes.push_back(s.get());
+                std::sort(orderedScopes.begin(), orderedScopes.end(), [](const MonitorScope *a, const MonitorScope *b) {
+                        return a->getOrder() < b->getOrder();
+                });
+                for (auto *s : orderedScopes) {
                         cJSON *sObj = cJSON_CreateObject();
                         cJSON_AddStringToObject(sObj, "name", s->getName().c_str());
+                        cJSON_AddNumberToObject(sObj, "order", static_cast<f64>(s->getOrder()));
                         cJSON_AddStringToObject(sObj, "draw", s->getDraw() == MonitorScope::DrawEnum::PLOT ? "PLOT" : "TABLE");
                         cJSON_AddNumberToObject(sObj, "height", static_cast<f64>(s->getHeight()));
                         cJSON_AddBoolToObject(sObj, "showFft", s->getShowFft());
@@ -571,6 +581,14 @@ Gui::loadSession(const std::string &path)
                                 if (monitor->addScope(sName) != 0)
                                         continue;
                                 MonitorScope *scope = monitor->getScopes()[sName].get();
+
+                                // Restore the saved display order (older sessions without it
+                                // keep the default insertion order from addScope).
+                                if (const cJSON *orderItem = cJSON_GetObjectItem(sItem, "order"); cJSON_IsNumber(orderItem)) {
+                                        const i64 ord = static_cast<i64>(orderItem->valuedouble);
+                                        scope->setOrder(ord);
+                                        monitor->noteScopeOrder(ord);
+                                }
 
                                 if (const cJSON *drawItem = cJSON_GetObjectItem(sItem, "draw"); cJSON_IsString(drawItem)) {
                                         if (std::string(drawItem->valuestring) == "TABLE")
@@ -975,32 +993,25 @@ Gui::drawBar()
                 if (!wasConnected && JLinkPort::instance().isConnected()) {
                         Monitor::clearAll();
                 }
+                // Resume = go (green); Pause = caution (amber).
                 const bool paused = g_monitorPaused.load();
                 if (paused) {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // Red (State: Paused)
-                        if (ImGui::SmallButton(tr("RESUME", "继续")))
+                        if (ui::SmallButton(tr("RESUME", "继续"), ui::BtnStyle::Success))
                                 g_monitorPaused.store(false);
-                        ImGui::PopStyleColor();
                 } else {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f)); // Green (State: Running)
-                        if (ImGui::SmallButton(tr("PAUSE", "暂停")))
+                        if (ui::SmallButton(tr("PAUSE", "暂停"), ui::BtnStyle::Warning))
                                 g_monitorPaused.store(true);
-                        ImGui::PopStyleColor();
                 }
 
                 // Pause all J-Link acquisition (separate from the display-only pause above).
                 ImGui::SameLine();
                 const bool jlinkPaused = g_jlinkSamplingPaused.load();
                 if (jlinkPaused) {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // Red
-                        if (ImGui::SmallButton(tr("RESUME JLINK", "恢复 JLink 采样")))
+                        if (ui::SmallButton(tr("RESUME JLINK", "恢复 JLink 采样"), ui::BtnStyle::Success))
                                 g_jlinkSamplingPaused.store(false);
-                        ImGui::PopStyleColor();
                 } else {
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f)); // Green
-                        if (ImGui::SmallButton(tr("PAUSE JLINK", "暂停 JLink 采样")))
+                        if (ui::SmallButton(tr("PAUSE JLINK", "暂停 JLink 采样"), ui::BtnStyle::Warning))
                                 g_jlinkSamplingPaused.store(true);
-                        ImGui::PopStyleColor();
                 }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s",
@@ -1244,7 +1255,8 @@ Gui::loop()
                                             tr("The app will save the current session and relaunch elevated.",
                                                "程序将保存当前会话并以管理员身份重启。"));
                                 ImGui::Separator();
-                                if (ImGui::Button(tr("Relaunch as Admin", "以管理员身份重启"), ImVec2(160, 0))) {
+                                if (ui::Button(
+                                        tr("Relaunch as Admin", "以管理员身份重启"), ui::BtnStyle::Warning, ImVec2(160, 0))) {
                                         const int newCore = pendingElevationCore_;
                                         saveSession();
                                         LOG_I("UAC elevation: relaunching as admin (core=%d)", newCore);
@@ -1285,7 +1297,7 @@ Gui::loop()
                                 tr("Quit?###Quit", "退出？###Quit"), NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
                                 ImGui::Text("%s", tr("Save changes to session before quitting?", "退出前保存会话更改吗？"));
                                 ImGui::Separator();
-                                if (ImGui::Button(tr("Save", "保存"), ImVec2(120, 0))) {
+                                if (ui::Button(tr("Save", "保存"), ui::BtnStyle::Success, ImVec2(120, 0))) {
                                         bool saved;
                                         if (isFirstSave_) {
                                                 saved = saveSessionAs();
@@ -1301,7 +1313,7 @@ Gui::loop()
                                 }
                                 ImGui::SetItemDefaultFocus();
                                 ImGui::SameLine();
-                                if (ImGui::Button(tr("Don't Save", "不保存"), ImVec2(120, 0))) {
+                                if (ui::Button(tr("Don't Save", "不保存"), ui::BtnStyle::Danger, ImVec2(120, 0))) {
                                         wantsToQuit_   = true;
                                         showQuitModal_ = false;
                                         ImGui::CloseCurrentPopup();
@@ -1433,7 +1445,7 @@ Gui::drawCalculator()
                 currentMotorProfile_ = static_cast<i32>(motorProfiles_.size()) - 1;
         }
         ImGui::SameLine();
-        if (ImGui::Button(tr("Del", "删除")) && motorProfiles_.size() > 1) {
+        if (ui::Button(tr("Del", "删除"), ui::BtnStyle::Danger) && motorProfiles_.size() > 1) {
                 motorProfiles_.erase(motorProfiles_.begin() + currentMotorProfile_);
                 if (currentMotorProfile_ > 0)
                         currentMotorProfile_--;
@@ -1831,7 +1843,7 @@ Gui::drawUpdateUI()
 
                 const bool canAutoUpdate = !info.assetUrl.empty();
                 if (canAutoUpdate) {
-                        if (ImGui::Button(tr("Upgrade Now", "立即升级"), ImVec2(130, 0))) {
+                        if (ui::Button(tr("Upgrade Now", "立即升级"), ui::BtnStyle::Success, ImVec2(130, 0))) {
                                 // Start background download — don't exit the app
                                 updater_.downloadAsync(info.assetUrl);
                                 showDownloadDonePopup_ = false; // reset so we detect completion
@@ -1860,7 +1872,7 @@ Gui::drawUpdateUI()
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
-                if (ImGui::Button(tr("Restart Now", "立即重启"), ImVec2(130, 0))) {
+                if (ui::Button(tr("Restart Now", "立即重启"), ui::BtnStyle::Warning, ImVec2(130, 0))) {
                         const std::string setupPath = updater_.getDownloadedPath();
                         if (updater_.launchInstaller(setupPath)) {
                                 saveSession();

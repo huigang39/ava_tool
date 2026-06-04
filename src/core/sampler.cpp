@@ -68,8 +68,8 @@ setupRealtimeThread(int coreId)
 #ifdef _WIN32
         // ---- 1. Elevate process priority class ----
         HANDLE hProc = GetCurrentProcess();
-        SetPriorityClass(hProc, HIGH_PRIORITY_CLASS);
-        LOG_I("Sampler: process class set to HIGH");
+        SetPriorityClass(hProc, ABOVE_NORMAL_PRIORITY_CLASS);
+        LOG_I("Sampler: process class set to ABOVE_NORMAL");
 
         // ---- 2. Thread priority to HIGHEST ----
         HANDLE hThread = GetCurrentThread();
@@ -1094,11 +1094,27 @@ threadFunc(Gui *gui)
                         }
                 }
 
-                // Busy-loop when there's work that needs tight timing (wave/HSS/POLL).
-                // The thread is pinned to a dedicated core at TIME_CRITICAL priority,
-                // so the spin only burns that one core.
-                if (waveTasks.empty() && !JLinkPort::instance().isHssRunning() && pollTasks.empty())
-                        delay_us(1000);
+                // Adaptive sleep: yield CPU to other processes to avoid starving them.
+                // The sampler runs at elevated priority on a dedicated core; without
+                // yielding, it can monopolise the core and cause other apps to stutter.
+                if (waveTasks.empty() && !JLinkPort::instance().isHssRunning() && pollTasks.empty()) {
+                        // No real-time work — sleep via the OS scheduler (1ms granularity).
+#ifdef _WIN32
+                        Sleep(1);
+#else
+                        usleep(1000);
+#endif
+                } else {
+                        // Active sampling — yield the remainder of our time slice so
+                        // other threads/processes get a chance to run.  The J-Link USB
+                        // I/O already blocks for 200-500µs per call, so this costs
+                        // essentially nothing in terms of throughput.
+#ifdef _WIN32
+                        SwitchToThread();
+#else
+                        sched_yield();
+#endif
+                }
         }
 }
 

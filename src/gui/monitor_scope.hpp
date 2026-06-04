@@ -77,6 +77,9 @@ class MonitorScope
         // the table/plot can display channels in the order they were added (e.g.
         // matching CSV column order) instead of hash order.
         i64 nextChannelOrder_{0};
+        // Display order of this scope within its Monitor (user-reorderable).
+        i64 order_{0};
+        int moveDir_{0}; // pending reorder request (-1 up, +1 down), consumed by Monitor
 
         bool pendingAxisReset_{false};
         struct Peak {
@@ -165,6 +168,21 @@ class MonitorScope
 
         bool isHidden() const { return hidden_; }
         void setHidden(bool h) { hidden_ = h; }
+
+        // Display order within the parent Monitor (lower = earlier). Scopes are drawn
+        // sorted by this value so the user can reorder them.
+        i64  getOrder() const { return order_; }
+        void setOrder(i64 o) { order_ = o; }
+
+        // Reorder request set by the scope's own toolbar (up/down buttons) and consumed
+        // by Monitor::updateDisplay after the draw loop. -1 = up, +1 = down, 0 = none.
+        void requestMove(int dir) { moveDir_ = dir; }
+        int  consumeMoveRequest()
+        {
+                int d    = moveDir_;
+                moveDir_ = 0;
+                return d;
+        }
 
         // Purge channels marked for deletion (called by sampler at safe point).
         void purgeDeleted()

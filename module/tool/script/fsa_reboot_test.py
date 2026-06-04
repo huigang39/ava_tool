@@ -2,7 +2,7 @@ import fi_fsa_v3
 import time
 
 fsa = fi_fsa_v3.FSA()
-fsa.Init("192.168.137.55")
+fsa.Init("192.168.137.75")
 
 
 def main():

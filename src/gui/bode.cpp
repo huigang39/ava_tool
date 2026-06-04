@@ -14,6 +14,7 @@
 #include "gui/bode.hpp"
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
+#include "gui/ui_theme.hpp"
 
 void
 Bode::generateBodeFreqs_()
@@ -382,10 +383,10 @@ Bode::draw_()
                 if (bodeOfflineThreshPct_ > 100.0f)
                         bodeOfflineThreshPct_ = 100.0f;
                 ImGui::SameLine();
-                if (ImGui::Button(tr("Compute##bodeCmp", "计算##bodeCmp")))
+                if (ui::Button(tr("Compute##bodeCmp", "计算##bodeCmp"), ui::BtnStyle::Success))
                         computeFromData_();
                 ImGui::SameLine();
-                if (ImGui::Button(tr("Clear##bodeClD", "清除##bodeClD"))) {
+                if (ui::Button(tr("Clear##bodeClD", "清除##bodeClD"), ui::BtnStyle::Warning)) {
                         bodeData_.clear();
                         bodeFreqsV_.clear();
                         bodeMagsV_.clear();
@@ -447,7 +448,7 @@ Bode::draw_()
         // ---------- Control buttons ----------
         ImGui::SameLine();
         if (!bodeSweepRunning_) {
-                if (ImGui::Button(tr("Start##bodeSt", "开始##bodeSt"))) {
+                if (ui::Button(tr("Start##bodeSt", "开始##bodeSt"), ui::BtnStyle::Success)) {
                         generateBodeFreqs_();
                         if (!bodeFreqList_.empty()) {
                                 bodeData_.clear();
@@ -467,8 +468,7 @@ Bode::draw_()
                         }
                 }
         } else {
-                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 0.8f));
-                if (ImGui::Button(tr("Stop##bodeSt", "停止##bodeSt"))) {
+                if (ui::Button(tr("Stop##bodeSt", "停止##bodeSt"), ui::BtnStyle::Danger)) {
                         bodeSweepRunning_    = false;
                         MonitorChannel *wrCh = findChannelByKey_(bodeWriteKey_);
                         if (wrCh) {
@@ -477,7 +477,6 @@ Bode::draw_()
                                 wrCh->markWValDirty();
                         }
                 }
-                ImGui::PopStyleColor();
                 ImGui::SameLine();
                 const int   total = static_cast<int>(bodeFreqList_.size());
                 const float pct   = (total > 0) ? static_cast<float>(bodeSweepFreqIdx_) / total : 0.0f;
@@ -489,7 +488,7 @@ Bode::draw_()
         }
 
         ImGui::SameLine();
-        if (ImGui::Button(tr("Clear##bodeCl", "清除##bodeCl"))) {
+        if (ui::Button(tr("Clear##bodeCl", "清除##bodeCl"), ui::BtnStyle::Warning)) {
                 bodeData_.clear();
                 bodeFreqsV_.clear();
                 bodeMagsV_.clear();
