@@ -12,6 +12,7 @@
 
 #include "fft.h"
 #include "gui/bode.hpp"
+#include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
 
 void
@@ -261,7 +262,7 @@ Bode::draw_()
                                 curIdx = i;
                                 break;
                         }
-                std::string previewStr = (curIdx >= 0) ? varName(keys[curIdx]) : "(none)";
+                std::string previewStr = (curIdx >= 0) ? varName(keys[curIdx]) : tr("(none)", "（无）");
                 ImGui::SetNextItemWidth(150);
                 bool comboOpen = ImGui::BeginCombo(id, previewStr.c_str());
                 if (ImGui::IsItemHovered())
@@ -292,12 +293,12 @@ Bode::draw_()
                         if (ImPlot::BeginLegendPopup(label)) {
                                 f32 colArr[4];
                                 memcpy(colArr, style.color, sizeof(colArr));
-                                if (ImGui::ColorEdit4("Color", colArr, ImGuiColorEditFlags_NoInputs)) {
+                                if (ImGui::ColorEdit4(tr("Color", "颜色"), colArr, ImGuiColorEditFlags_NoInputs)) {
                                         style.useAutoColor = false;
                                         memcpy(style.color, colArr, sizeof(colArr));
                                 }
                                 ImGui::SameLine();
-                                if (ImGui::Checkbox("Auto", &style.useAutoColor)) {
+                                if (ImGui::Checkbox(tr("Auto", "自动"), &style.useAutoColor)) {
                                         if (style.useAutoColor) {
                                                 static i32 bodeShuffleIdx = 0;
                                                 bodeShuffleIdx            = (bodeShuffleIdx + 1) % ImPlot::GetColormapSize();
@@ -308,8 +309,8 @@ Bode::draw_()
                                 ImGui::SetNextItemWidth(100);
                                 ImGui::SliderFloat("##LineWidth", &style.lineWeight, 0.5f, 5.0f, "%.1f");
                                 if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip("Width");
-                                ImGui::Checkbox("Markers", &style.showMarkers);
+                                        ImGui::SetTooltip("%s", tr("Width", "线宽"));
+                                ImGui::Checkbox(tr("Markers", "标记点"), &style.showMarkers);
                                 ImPlot::EndLegendPopup();
                         }
                 };
@@ -352,35 +353,39 @@ Bode::draw_()
         // ---------- Mode selection ----------
         if (bodeSweepRunning_)
                 ImGui::BeginDisabled();
-        const char *modeNames[] = {"Sweep", "From Data"};
+        const char *modeNames[] = {tr("Sweep", "扫频"), tr("From Data", "来自数据")};
         int         modeIdx     = static_cast<int>(bodeMode_);
         ImGui::SetNextItemWidth(100);
         if (ImGui::Combo("##bodeMode", &modeIdx, modeNames, IM_ARRAYSIZE(modeNames)))
                 bodeMode_ = static_cast<Mode>(modeIdx);
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Sweep: drive a live swept-sine\nFrom Data: offline FFT of the displayed data");
+                ImGui::SetTooltip("%s",
+                                  tr("Sweep: drive a live swept-sine\nFrom Data: offline FFT of the displayed data",
+                                     "扫频：驱动实时扫频正弦信号\n来自数据：对已显示数据做离线 FFT"));
         if (bodeSweepRunning_)
                 ImGui::EndDisabled();
         ImGui::SameLine();
 
         if (bodeMode_ == Mode::FromData) {
-                drawCombo("##bodeIn", "Input", bodeInputKey_, sizeof(bodeInputKey_));
+                drawCombo("##bodeIn", tr("Input", "输入"), bodeInputKey_, sizeof(bodeInputKey_));
                 ImGui::SameLine();
-                drawCombo("##bodeOut", "Output", bodeOutputKey_, sizeof(bodeOutputKey_));
+                drawCombo("##bodeOut", tr("Output", "输出"), bodeOutputKey_, sizeof(bodeOutputKey_));
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(70);
                 ImGui::InputFloat("##bodeThr", &bodeOfflineThreshPct_, 0, 0, "%.2f");
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Thresh%%: keep only FFT bins where |Input| >= peak * this%%");
+                        ImGui::SetTooltip("%s",
+                                          tr("Thresh%: keep only FFT bins where |Input| >= peak * this%",
+                                             "阈值%：仅保留 |输入| >= 峰值 * 此百分比 的 FFT 频点"));
                 if (bodeOfflineThreshPct_ < 0.0f)
                         bodeOfflineThreshPct_ = 0.0f;
                 if (bodeOfflineThreshPct_ > 100.0f)
                         bodeOfflineThreshPct_ = 100.0f;
                 ImGui::SameLine();
-                if (ImGui::Button("Compute##bodeCmp"))
+                if (ImGui::Button(tr("Compute##bodeCmp", "计算##bodeCmp")))
                         computeFromData_();
                 ImGui::SameLine();
-                if (ImGui::Button("Clear##bodeClD")) {
+                if (ImGui::Button(tr("Clear##bodeClD", "清除##bodeClD"))) {
                         bodeData_.clear();
                         bodeFreqsV_.clear();
                         bodeMagsV_.clear();
@@ -395,11 +400,11 @@ Bode::draw_()
                 return;
         }
 
-        drawCombo("##bodeWr", "Write", bodeWriteKey_, sizeof(bodeWriteKey_));
+        drawCombo("##bodeWr", tr("Write", "写入"), bodeWriteKey_, sizeof(bodeWriteKey_));
         ImGui::SameLine();
-        drawCombo("##bodeIn", "Input", bodeInputKey_, sizeof(bodeInputKey_));
+        drawCombo("##bodeIn", tr("Input", "输入"), bodeInputKey_, sizeof(bodeInputKey_));
         ImGui::SameLine();
-        drawCombo("##bodeOut", "Output", bodeOutputKey_, sizeof(bodeOutputKey_));
+        drawCombo("##bodeOut", tr("Output", "输出"), bodeOutputKey_, sizeof(bodeOutputKey_));
 
         // ---------- Sweep parameters ----------
         if (bodeSweepRunning_)
@@ -408,31 +413,31 @@ Bode::draw_()
         ImGui::SetNextItemWidth(80);
         ImGui::InputFloat("##bFS", &bodeFStart_, 0, 0, "%.3g");
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("F Start(Hz)");
+                ImGui::SetTooltip("%s", tr("F Start(Hz)", "起始频率(Hz)"));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(80);
         ImGui::InputFloat("##bFE", &bodeFStop_, 0, 0, "%.3g");
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("F Stop(Hz)");
+                ImGui::SetTooltip("%s", tr("F Stop(Hz)", "终止频率(Hz)"));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(70);
         ImGui::InputFloat("##bSTP", &bodeFStep_, 0, 0, "%.3g");
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Step(Hz)");
+                ImGui::SetTooltip("%s", tr("Step(Hz)", "步进(Hz)"));
         if (bodeFStep_ <= 0.0f)
                 bodeFStep_ = 1.0f;
         ImGui::SameLine();
         ImGui::SetNextItemWidth(60);
         ImGui::InputFloat("##bDw", &bodeDwellSec_, 0, 0, "%.2f");
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Dwell(s)");
+                ImGui::SetTooltip("%s", tr("Dwell(s)", "驻留(秒)"));
         if (bodeDwellSec_ < 0.05f)
                 bodeDwellSec_ = 0.05f;
         ImGui::SameLine();
         ImGui::SetNextItemWidth(70);
         ImGui::InputFloat("##bAmp", &bodeAmp_, 0, 0, "%.3g");
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Amp");
+                ImGui::SetTooltip("%s", tr("Amp", "幅值"));
         if (bodeAmp_ < 0.0f)
                 bodeAmp_ = 0.0f;
 
@@ -442,7 +447,7 @@ Bode::draw_()
         // ---------- Control buttons ----------
         ImGui::SameLine();
         if (!bodeSweepRunning_) {
-                if (ImGui::Button("Start##bodeSt")) {
+                if (ImGui::Button(tr("Start##bodeSt", "开始##bodeSt"))) {
                         generateBodeFreqs_();
                         if (!bodeFreqList_.empty()) {
                                 bodeData_.clear();
@@ -463,7 +468,7 @@ Bode::draw_()
                 }
         } else {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 0.8f));
-                if (ImGui::Button("Stop##bodeSt")) {
+                if (ImGui::Button(tr("Stop##bodeSt", "停止##bodeSt"))) {
                         bodeSweepRunning_    = false;
                         MonitorChannel *wrCh = findChannelByKey_(bodeWriteKey_);
                         if (wrCh) {
@@ -484,7 +489,7 @@ Bode::draw_()
         }
 
         ImGui::SameLine();
-        if (ImGui::Button("Clear##bodeCl")) {
+        if (ImGui::Button(tr("Clear##bodeCl", "清除##bodeCl"))) {
                 bodeData_.clear();
                 bodeFreqsV_.clear();
                 bodeMagsV_.clear();
@@ -564,7 +569,7 @@ Bode::updateDisplay()
                 return;
 
         ImGui::SetNextWindowSize(ImVec2(700.0f, 520.0f), ImGuiCond_FirstUseEver);
-        if (ImGui::Begin("Bode Plot", &show_))
+        if (ImGui::Begin(tr("Bode Plot###BodePlot", "伯德图###BodePlot"), &show_))
                 draw_();
         ImGui::End();
 

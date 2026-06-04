@@ -39,6 +39,7 @@
 
 extern std::atomic<bool> g_appRunning;
 extern std::atomic<bool> g_monitorPaused;
+extern std::atomic<bool> g_jlinkSamplingPaused;
 
 std::atomic<int>  g_samplerCpuCore{-1}; // -1 = auto (highest available)
 std::atomic<bool> g_samplerCpuRebind{false};
@@ -284,7 +285,8 @@ threadFunc(Gui *gui)
                 // captured into each channel's store; only the publish-to-GUI step is
                 // skipped (see below). HSS therefore stays running across pause and
                 // needs no stop/restart on resume.
-                bool isPaused = g_monitorPaused.load();
+                bool isPaused        = g_monitorPaused.load();
+                bool jlinkSampPaused = g_jlinkSamplingPaused.load();
 
                 std::vector<WValTask> wvalTasks; // built fresh each iter from cached channels
 
@@ -324,6 +326,11 @@ threadFunc(Gui *gui)
                                                 hssTimeSynced = false;
                                         }
 
+                                        // Monitor-level master pause: skip acquisition for all of
+                                        // this monitor's scopes at once.
+                                        if (monitor->isSamplingPaused())
+                                                continue;
+
                                         bool hasHss = false;
                                         for (auto &scope : monitor->getScopes() | std::views::values) {
                                                 if (scope->isPendingDelete() || scope->isPaused())
@@ -343,23 +350,31 @@ threadFunc(Gui *gui)
                                                                                     ch->getBitOffset(),
                                                                                     ch->getBitSize()});
                                                         } else if (dev == "JLINK" && ch->getAddr() != 0) {
-                                                                if (monitor->samplingMode_ == Monitor::SamplingMode::HSS) {
-                                                                        tempChs.push_back({ch,
-                                                                                           monitor,
-                                                                                           static_cast<u32>(ch->getAddr()),
-                                                                                           nb,
-                                                                                           ch->getType(),
-                                                                                           ch->getBitOffset(),
-                                                                                           ch->getBitSize()});
-                                                                        hasHss = true;
-                                                                } else {
-                                                                        pollTasks.push_back({ch,
-                                                                                             monitor,
-                                                                                             static_cast<u32>(ch->getAddr()),
-                                                                                             nb,
-                                                                                             ch->getType(),
-                                                                                             ch->getBitOffset(),
-                                                                                             ch->getBitSize()});
+                                                                // Global "pause all J-Link sampling": drop read tasks so
+                                                                // HSS auto-stops (blocks become empty). Wave output below
+                                                                // is unaffected — this pauses acquisition only.
+                                                                if (!jlinkSampPaused) {
+                                                                        if (monitor->samplingMode_ ==
+                                                                            Monitor::SamplingMode::HSS) {
+                                                                                tempChs.push_back(
+                                                                                    {ch,
+                                                                                     monitor,
+                                                                                     static_cast<u32>(ch->getAddr()),
+                                                                                     nb,
+                                                                                     ch->getType(),
+                                                                                     ch->getBitOffset(),
+                                                                                     ch->getBitSize()});
+                                                                                hasHss = true;
+                                                                        } else {
+                                                                                pollTasks.push_back(
+                                                                                    {ch,
+                                                                                     monitor,
+                                                                                     static_cast<u32>(ch->getAddr()),
+                                                                                     nb,
+                                                                                     ch->getType(),
+                                                                                     ch->getBitOffset(),
+                                                                                     ch->getBitSize()});
+                                                                        }
                                                                 }
                                                                 if (ch->waveEnable_)
                                                                         waveTasks.push_back(

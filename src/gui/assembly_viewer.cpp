@@ -1,5 +1,6 @@
 #include "gui/assembly_viewer.hpp"
 #include "gui/gui.hpp"
+#include "gui/i18n.hpp"
 #include "imgui.h"
 
 #include <algorithm>
@@ -14,7 +15,7 @@ AssemblyViewer::draw(Gui *gui)
         if (!show_)
                 return;
 
-        if (ImGui::Begin("Assembly Viewer", &show_)) {
+        if (ImGui::Begin(tr("Assembly Viewer###AsmViewer", "汇编查看器###AsmViewer"), &show_)) {
                 // Find all ELF paths
                 std::vector<std::string> elfPaths;
                 for (const auto &[name, var] : gui->getVars()) {
@@ -25,7 +26,9 @@ AssemblyViewer::draw(Gui *gui)
                 }
 
                 if (elfPaths.empty()) {
-                        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "No ELF/AXF files loaded in Variables.");
+                        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                                           "%s",
+                                           tr("No ELF/AXF files loaded in Variables.", "变量窗口中未加载 ELF/AXF 文件。"));
                         ImGui::End();
                         return;
                 }
@@ -37,7 +40,7 @@ AssemblyViewer::draw(Gui *gui)
 
                 bool elfComboOpen = ImGui::BeginCombo("##SelectElf", currentElfPath_.c_str());
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Select ELF");
+                        ImGui::SetTooltip("%s", tr("Select ELF", "选择 ELF"));
                 if (elfComboOpen) {
                         for (const auto &path : elfPaths) {
                                 bool isSelected = (currentElfPath_ == path);
@@ -52,13 +55,16 @@ AssemblyViewer::draw(Gui *gui)
                 }
 
                 ImGui::SameLine();
-                if (ImGui::Button("Disassemble")) {
+                if (ImGui::Button(tr("Disassemble", "反汇编"))) {
                         disassemble(currentElfPath_);
                 }
 
                 if (isLoading_) {
                         ImGui::SameLine();
-                        ImGui::TextColored(ImVec4(1.0f, 1.0f, 0.4f, 1.0f), "Disassembling... (this may take a moment)");
+                        ImGui::TextColored(
+                            ImVec4(1.0f, 1.0f, 0.4f, 1.0f),
+                            "%s",
+                            tr("Disassembling... (this may take a moment)", "正在反汇编...（可能需要一些时间）"));
                 }
 
                 ImGui::Separator();
@@ -66,7 +72,7 @@ AssemblyViewer::draw(Gui *gui)
                 static ImGuiTextFilter filter;
                 filter.Draw("##AsmFilter");
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Filter (e.g., function name)");
+                        ImGui::SetTooltip("%s", tr("Filter (e.g., function name)", "过滤（例如函数名）"));
 
                 ImGui::Separator();
 

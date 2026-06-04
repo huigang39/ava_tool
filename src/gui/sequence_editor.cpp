@@ -1,6 +1,7 @@
 #include "sequence_editor.hpp"
 #include "ImGuiNotify.hpp"
 #include "cJSON.h"
+#include "gui/i18n.hpp"
 #include "imgui.h"
 #include "monitor.hpp"
 #include "platform/native_dlg.hpp"
@@ -142,7 +143,7 @@ SequenceEditor::draw()
         }
 
         ImGui::SetNextWindowSize(ImVec2(600, 400), ImGuiCond_FirstUseEver);
-        if (!ImGui::Begin("Sequence Editor", &show_)) {
+        if (!ImGui::Begin(tr("Sequence Editor###SeqEditor", "序列编辑器###SeqEditor"), &show_)) {
                 if (state_ == State::RUNNING)
                         state_ = State::IDLE;
                 ImGui::End();
@@ -166,7 +167,8 @@ SequenceEditor::draw()
                                 }
                         } else {
                                 state_ = State::IDLE;
-                                ImGui::InsertNotification({ImGuiToastType::Success, 3000, "Sequence execution completed!"});
+                                ImGui::InsertNotification(
+                                    {ImGuiToastType::Success, 3000, tr("Sequence execution completed!", "序列执行完成！")});
                         }
                 }
         }
@@ -176,7 +178,7 @@ SequenceEditor::draw()
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.7f, 0.2f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.8f, 0.3f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.1f, 0.6f, 0.1f, 1.0f));
-                if (ImGui::Button("Play", ImVec2(80, 0))) {
+                if (ImGui::Button(tr("Play", "播放"), ImVec2(80, 0))) {
                         if (!steps_.empty()) {
                                 state_          = State::RUNNING;
                                 currentStepIdx_ = 0;
@@ -188,20 +190,20 @@ SequenceEditor::draw()
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.7f, 0.1f, 0.1f, 1.0f));
-                if (ImGui::Button("Stop", ImVec2(80, 0))) {
+                if (ImGui::Button(tr("Stop", "停止"), ImVec2(80, 0))) {
                         state_ = State::IDLE;
                 }
                 ImGui::PopStyleColor(3);
         }
         ImGui::SameLine();
-        if (ImGui::Button("Import")) {
+        if (ImGui::Button(tr("Import", "导入"))) {
                 std::string path = nativeDlgOpen("Import Sequence", {{"Sequence Files", {"seq"}}}, "");
                 if (!path.empty()) {
                         importFromFile(path);
                 }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Export")) {
+        if (ImGui::Button(tr("Export", "导出"))) {
                 std::string path = nativeDlgSave("Export Sequence", {{"Sequence Files", {"seq"}}}, "sequence.seq");
                 if (!path.empty()) {
                         if (path.find(".seq") == std::string::npos)
@@ -210,7 +212,7 @@ SequenceEditor::draw()
                 }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Folder")) {
+        if (ImGui::Button(tr("Folder", "文件夹"))) {
                 std::string path = nativeDlgPickDir("Choose Sequence Folder");
                 if (!path.empty()) {
                         seqFolder_ = path;
@@ -222,7 +224,7 @@ SequenceEditor::draw()
         if (ImGui::BeginCombo("##SeqFiles",
                               selectedSeqIdx_ >= 0 && selectedSeqIdx_ < (int)seqFiles_.size()
                                   ? seqFiles_[selectedSeqIdx_].c_str()
-                                  : "Select seq...")) {
+                                  : tr("Select seq...", "选择序列..."))) {
                 for (int i = 0; i < (int)seqFiles_.size(); i++) {
                         bool isSelected = (selectedSeqIdx_ == i);
                         if (ImGui::Selectable(seqFiles_[i].c_str(), isSelected)) {
@@ -239,13 +241,13 @@ SequenceEditor::draw()
 
         ImGui::Separator();
 
-        if (ImGui::Button("Add Step")) {
+        if (ImGui::Button(tr("Add Step", "添加步骤"))) {
                 steps_.push_back({"", 1000, {}}); // Default 1000ms delay, empty name
                 selectedStep_ = (int)steps_.size() - 1;
                 isModified_   = true;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Clear All")) {
+        if (ImGui::Button(tr("Clear All", "全部清空"))) {
                 steps_.clear();
                 selectedStep_ = -1;
                 isModified_   = true;
@@ -255,8 +257,8 @@ SequenceEditor::draw()
 
         static ImGuiTableFlags splitFlags = ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV;
         if (ImGui::BeginTable("SplitView", 2, splitFlags)) {
-                ImGui::TableSetupColumn("Left", ImGuiTableColumnFlags_WidthFixed, 200.0f);
-                ImGui::TableSetupColumn("Right", ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn("Left", ImGuiTableColumnFlags_WidthFixed, 200.0f); // layout-only, not shown
+                ImGui::TableSetupColumn("Right", ImGuiTableColumnFlags_WidthStretch);      // layout-only, not shown
                 ImGui::TableNextRow();
 
                 ImGui::TableSetColumnIndex(0);
@@ -266,7 +268,7 @@ SequenceEditor::draw()
                                 if (!steps_[i].name.empty()) {
                                         snprintf(label, sizeof(label), "%d: %s", i + 1, steps_[i].name.c_str());
                                 } else {
-                                        snprintf(label, sizeof(label), "Step %d", i + 1);
+                                        snprintf(label, sizeof(label), tr("Step %d", "步骤 %d"), i + 1);
                                 }
 
                                 bool isExecuting = (state_ == State::RUNNING && currentStepIdx_ == i);
@@ -366,17 +368,17 @@ SequenceEditor::draw()
                                 char nameBuf[128];
                                 strncpy(nameBuf, step.name.c_str(), sizeof(nameBuf));
                                 ImGui::PushItemWidth(200);
-                                if (ImGui::InputTextWithHint("##Name", "Step Name", nameBuf, sizeof(nameBuf))) {
+                                if (ImGui::InputTextWithHint("##Name", tr("Step Name", "步骤名称"), nameBuf, sizeof(nameBuf))) {
                                         step.name   = nameBuf;
                                         isModified_ = true;
                                 }
                                 if (ImGui::IsItemHovered()) {
-                                        ImGui::SetTooltip("Step Name");
+                                        ImGui::SetTooltip("%s", tr("Step Name", "步骤名称"));
                                 }
                                 ImGui::PopItemWidth();
 
                                 ImGui::SameLine();
-                                if (ImGui::Button("Remove Step")) {
+                                if (ImGui::Button(tr("Remove Step", "删除步骤"))) {
                                         steps_.erase(steps_.begin() + selectedStep_);
                                         isModified_ = true;
                                         if (selectedStep_ >= (int)steps_.size()) {
@@ -384,11 +386,11 @@ SequenceEditor::draw()
                                         }
                                 }
 
-                                ImGui::Text("Step %d Configuration", selectedStep_ + 1);
+                                ImGui::Text(tr("Step %d Configuration", "步骤 %d 配置"), selectedStep_ + 1);
                                 ImGui::Separator();
 
                                 int delay = step.delayMs;
-                                if (ImGui::InputInt("Delay (ms)", &delay, 10, 100)) {
+                                if (ImGui::InputInt(tr("Delay (ms)", "延时 (毫秒)"), &delay, 10, 100)) {
                                         if (delay < 0)
                                                 delay = 0;
                                         step.delayMs = delay;
@@ -396,7 +398,7 @@ SequenceEditor::draw()
                                 }
 
                                 ImGui::Spacing();
-                                ImGui::Text("Actions (Drag variables here):");
+                                ImGui::Text("%s", tr("Actions (Drag variables here):", "动作（将变量拖到此处）："));
 
                                 // Add drag target to the action list box
                                 if (ImGui::BeginChild("ActionList", ImVec2(0, 0), true)) {
@@ -404,9 +406,15 @@ SequenceEditor::draw()
                                                               3,
                                                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
                                                                   ImGuiTableFlags_Resizable)) {
-                                                ImGui::TableSetupColumn("Variable", ImGuiTableColumnFlags_WidthStretch, 0.4f);
-                                                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.4f);
-                                                ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                                                ImGui::TableSetupColumn(tr("Variable###col_seqvar", "变量###col_seqvar"),
+                                                                        ImGuiTableColumnFlags_WidthStretch,
+                                                                        0.4f);
+                                                ImGui::TableSetupColumn(tr("Value###col_seqval", "数值###col_seqval"),
+                                                                        ImGuiTableColumnFlags_WidthStretch,
+                                                                        0.4f);
+                                                ImGui::TableSetupColumn(tr("Action###col_seqact", "操作###col_seqact"),
+                                                                        ImGuiTableColumnFlags_WidthFixed,
+                                                                        60.0f);
                                                 ImGui::TableHeadersRow();
 
                                                 for (int i = 0; i < (int)step.actions.size(); ++i) {
@@ -459,7 +467,7 @@ SequenceEditor::draw()
                                                         }
 
                                                         ImGui::TableNextColumn();
-                                                        if (ImGui::Button("Remove", ImVec2(-FLT_MIN, 0))) {
+                                                        if (ImGui::Button(tr("Remove", "移除"), ImVec2(-FLT_MIN, 0))) {
                                                                 step.actions.erase(step.actions.begin() + i);
                                                                 isModified_ = true;
                                                                 i--;
@@ -471,7 +479,7 @@ SequenceEditor::draw()
                                 }
                                 ImGui::EndChild();
                         } else {
-                                ImGui::Text("No step selected.");
+                                ImGui::Text("%s", tr("No step selected.", "未选择步骤。"));
                         }
                 }
                 ImGui::EndChild();

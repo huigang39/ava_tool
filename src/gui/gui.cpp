@@ -35,6 +35,7 @@
 #include "core/mmap_vector.hpp"
 #include "core/sampler.hpp"
 #include "gui/gui.hpp"
+#include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
 #include "gui/variable.hpp"
 #include "platform/native_dlg.hpp"
@@ -112,11 +113,17 @@ Gui::Gui(const std::string &initialPath)
         const float uiScale = xScale_ / fbRatio;
 
         const float fontSize = std::round(18.0f * uiScale);
-        if (!io.Fonts->AddFontFromFileTTF(fontFile_.c_str(), fontSize)) {
+        // Build the atlas with both Latin and common Simplified-Chinese glyphs so the
+        // UI can switch languages at runtime without rebuilding the font.
+        if (!io.Fonts->AddFontFromFileTTF(
+                fontFile_.c_str(), fontSize, nullptr, io.Fonts->GetGlyphRangesChineseSimplifiedCommon())) {
                 ImFontConfig cfg;
                 cfg.SizePixels = fontSize;
                 io.Fonts->AddFontDefault(&cfg);
         }
+
+        // Restore the persisted UI language (defaults to English on first launch).
+        loadLangSetting();
 
         ImGui::StyleColorsDark();
         ImGui::GetStyle().ScaleAllSizes(uiScale);
@@ -245,6 +252,30 @@ Gui::setCacheDir(const std::string &dir)
         std::ofstream f(getAppDir() + "/cache_dir.txt", std::ios::trunc);
         f << dir;
         LOG_I("Cache directory set to: %s", dir.empty() ? "(system temp)" : dir.c_str());
+}
+
+void
+Gui::loadLangSetting()
+{
+        std::ifstream f(getAppDir() + "/lang.txt");
+        std::string   line;
+        if (std::getline(f, line)) {
+                while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
+                        line.pop_back();
+                if (line == "zh")
+                        g_lang = Lang::ZH;
+                else
+                        g_lang = Lang::EN;
+        }
+}
+
+void
+Gui::setLang(Lang lang)
+{
+        g_lang = lang;
+        std::ofstream f(getAppDir() + "/lang.txt", std::ios::trunc);
+        f << (lang == Lang::ZH ? "zh" : "en");
+        LOG_I("UI language set to: %s", lang == Lang::ZH ? "zh" : "en");
 }
 
 bool
@@ -758,20 +789,20 @@ Gui::drawBar()
                 // A recent session chosen from the submenu is loaded after the menu is
                 // built (loadSession mutates recentSessions_, so we can't load mid-iteration).
                 std::string sessionToOpen;
-                if (ImGui::BeginMenu("File")) {
-                        if (ImGui::MenuItem("New Session")) {
+                if (ImGui::BeginMenu(tr("File", "文件"))) {
+                        if (ImGui::MenuItem(tr("New Session", "新建会话"))) {
                                 monitors_.clear();
                                 vars_.clear();
                                 currentSessionPath_ = "session.ava";
                                 isModified_         = false;
                                 isFirstSave_        = true;
                         }
-                        if (ImGui::MenuItem("Open Session...")) {
+                        if (ImGui::MenuItem(tr("Open Session...", "打开会话..."))) {
                                 std::string p = nativeDlgOpen("Open Session", {{"Session Files", {"ava", "json"}}});
                                 if (!p.empty())
                                         loadSession(p);
                         }
-                        if (ImGui::BeginMenu("Recent Sessions", !recentSessions_.empty())) {
+                        if (ImGui::BeginMenu(tr("Recent Sessions", "最近会话"), !recentSessions_.empty())) {
                                 for (size_t i = 0; i < recentSessions_.size(); ++i) {
                                         const std::string &p      = recentSessions_[i];
                                         const bool         exists = std::filesystem::exists(p);
@@ -783,22 +814,22 @@ Gui::drawBar()
                                                 ImGui::SetTooltip("%s%s", p.c_str(), exists ? "" : "  (missing)");
                                 }
                                 ImGui::Separator();
-                                if (ImGui::MenuItem("Clear Recent")) {
+                                if (ImGui::MenuItem(tr("Clear Recent", "清空最近列表"))) {
                                         recentSessions_.clear();
                                         saveRecentList();
                                 }
                                 ImGui::EndMenu();
                         }
-                        if (ImGui::MenuItem("Save Session", "Ctrl+S")) {
+                        if (ImGui::MenuItem(tr("Save Session", "保存会话"), "Ctrl+S")) {
                                 saveSession();
                                 saveToastAlpha_ = 2.0f;
                                 LOG_I("Session saved via Menu");
                         }
-                        if (ImGui::MenuItem("Save Session As...")) {
+                        if (ImGui::MenuItem(tr("Save Session As...", "会话另存为..."))) {
                                 saveSessionAs();
                         }
                         ImGui::Separator();
-                        if (ImGui::MenuItem("Exit", "Alt+F4")) {
+                        if (ImGui::MenuItem(tr("Exit", "退出"), "Alt+F4")) {
                                 glfwSetWindowShouldClose(window_, GLFW_TRUE);
                         }
                         ImGui::EndMenu();
@@ -806,14 +837,14 @@ Gui::drawBar()
                 if (!sessionToOpen.empty())
                         loadSession(sessionToOpen);
 
-                if (ImGui::BeginMenu("Window")) {
-                        if (ImGui::MenuItem("Add Monitor")) {
+                if (ImGui::BeginMenu(tr("Window", "窗口"))) {
+                        if (ImGui::MenuItem(tr("Add Monitor", "添加监视器"))) {
                                 std::string monitorName = "Monitor_" + std::to_string(monitors_.size());
                                 monitors_[monitorName]  = std::make_shared<Monitor>(monitorName);
                                 isModified_             = true;
                                 LOG_I("Add Monitor: %s", monitorName.c_str());
                         }
-                        if (ImGui::MenuItem("Add Variable")) {
+                        if (ImGui::MenuItem(tr("Add Variable", "添加变量"))) {
                                 std::string varName = "Variable_" + std::to_string(vars_.size());
                                 vars_[varName]      = std::make_shared<Variable>(varName);
                                 isModified_         = true;
@@ -822,22 +853,22 @@ Gui::drawBar()
                         ImGui::EndMenu();
                 }
 
-                if (ImGui::BeginMenu("Tools")) {
-                        ImGui::MenuItem("Joint Calculator", nullptr, &showCalculator_);
+                if (ImGui::BeginMenu(tr("Tools", "工具"))) {
+                        ImGui::MenuItem(tr("Joint Calculator", "电机参数计算器"), nullptr, &showCalculator_);
                         ImGui::Separator();
-                        ImGui::MenuItem("Bode Plot", nullptr, &bode_.show_);
+                        ImGui::MenuItem(tr("Bode Plot", "伯德图"), nullptr, &bode_.show_);
                         ImGui::Separator();
-                        ImGui::MenuItem("Assembly Viewer", nullptr, &asmViewer_.show_);
+                        ImGui::MenuItem(tr("Assembly Viewer", "汇编查看器"), nullptr, &asmViewer_.show_);
                         ImGui::Separator();
                         bool seqOpen = seqEditor_.isOpen();
-                        if (ImGui::MenuItem("Sequence Editor", nullptr, &seqOpen)) {
+                        if (ImGui::MenuItem(tr("Sequence Editor", "序列编辑器"), nullptr, &seqOpen)) {
                                 seqEditor_.setOpen(seqOpen);
                         }
                         ImGui::EndMenu();
                 }
 
-                if (ImGui::BeginMenu("Settings")) {
-                        if (ImGui::BeginMenu("Sampler CPU Core")) {
+                if (ImGui::BeginMenu(tr("Settings", "设置"))) {
+                        if (ImGui::BeginMenu(tr("Sampler CPU Core", "采样器 CPU 核心"))) {
 #ifdef _WIN32
                                 // Show elevation status
                                 BOOL                     isAdmin    = FALSE;
@@ -858,7 +889,9 @@ Gui::drawBar()
                                         FreeSid(adminGroup);
                                 }
                                 if (!isAdmin) {
-                                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f), "Not Admin (priority capped)");
+                                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
+                                                           "%s",
+                                                           tr("Not Admin (priority capped)", "非管理员（优先级受限）"));
                                         ImGui::Separator();
                                 }
 #endif
@@ -877,7 +910,7 @@ Gui::drawBar()
                                         g_samplerCpuRebind.store(true);
                                 };
 
-                                if (ImGui::MenuItem("Auto (highest)", nullptr, cur < 0)) {
+                                if (ImGui::MenuItem(tr("Auto (highest)", "自动（最高）"), nullptr, cur < 0)) {
                                         applyCoreChange(-1);
                                 }
                                 ImGui::Separator();
@@ -891,37 +924,48 @@ Gui::drawBar()
                                 ImGui::EndMenu();
                         }
 
-                        if (ImGui::BeginMenu("Disk Cache Folder")) {
+                        if (ImGui::BeginMenu(tr("Disk Cache Folder", "磁盘缓存目录"))) {
                                 const std::string cur = mmapVectorCacheDir();
-                                ImGui::TextDisabled("Current:");
-                                ImGui::TextWrapped("%s", cur.empty() ? "(system temp)" : cur.c_str());
+                                ImGui::TextDisabled("%s", tr("Current:", "当前："));
+                                ImGui::TextWrapped("%s", cur.empty() ? tr("(system temp)", "（系统临时目录）") : cur.c_str());
                                 ImGui::Separator();
-                                if (ImGui::MenuItem("Change...")) {
+                                if (ImGui::MenuItem(tr("Change...", "更改..."))) {
                                         std::string d = nativeDlgPickDir("Select disk-cache folder");
                                         if (!d.empty())
                                                 setCacheDir(d);
                                 }
-                                if (ImGui::MenuItem("Reset to system temp", nullptr, false, !cur.empty()))
+                                if (ImGui::MenuItem(
+                                        tr("Reset to system temp", "重置为系统临时目录"), nullptr, false, !cur.empty()))
                                         setCacheDir("");
                                 ImGui::Separator();
-                                ImGui::TextDisabled("Applies to newly created buffers.\nRestart to move all cache here.");
+                                ImGui::TextDisabled("%s",
+                                                    tr("Applies to newly created buffers.\nRestart to move all cache here.",
+                                                       "应用于新创建的缓冲区。\n重启后所有缓存迁移至此。"));
+                                ImGui::EndMenu();
+                        }
+
+                        if (ImGui::BeginMenu(tr("Language", "语言"))) {
+                                if (ImGui::MenuItem("English", nullptr, g_lang == Lang::EN))
+                                        setLang(Lang::EN);
+                                if (ImGui::MenuItem("中文", nullptr, g_lang == Lang::ZH))
+                                        setLang(Lang::ZH);
                                 ImGui::EndMenu();
                         }
                         ImGui::EndMenu();
                 }
 
-                if (ImGui::BeginMenu("Help")) {
+                if (ImGui::BeginMenu(tr("Help", "帮助"))) {
                         ImGui::MenuItem("Version " AVA_VERSION, nullptr, false, false);
                         ImGui::Separator();
                         const bool checking = updater_.isChecking();
-                        if (ImGui::MenuItem("Check for Updates...", nullptr, false, !checking)) {
+                        if (ImGui::MenuItem(tr("Check for Updates...", "检查更新..."), nullptr, false, !checking)) {
                                 updateManualCheck_   = true;
                                 updatePendingResult_ = true;
                                 recordUpdateCheck();
                                 updater_.checkAsync();
                         }
                         if (checking)
-                                ImGui::TextDisabled("  checking...");
+                                ImGui::TextDisabled("%s", tr("  checking...", "  检查中..."));
                         ImGui::EndMenu();
                 }
 
@@ -934,15 +978,34 @@ Gui::drawBar()
                 const bool paused = g_monitorPaused.load();
                 if (paused) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // Red (State: Paused)
-                        if (ImGui::SmallButton("RESUME"))
+                        if (ImGui::SmallButton(tr("RESUME", "继续")))
                                 g_monitorPaused.store(false);
                         ImGui::PopStyleColor();
                 } else {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f)); // Green (State: Running)
-                        if (ImGui::SmallButton("PAUSE"))
+                        if (ImGui::SmallButton(tr("PAUSE", "暂停")))
                                 g_monitorPaused.store(true);
                         ImGui::PopStyleColor();
                 }
+
+                // Pause all J-Link acquisition (separate from the display-only pause above).
+                ImGui::SameLine();
+                const bool jlinkPaused = g_jlinkSamplingPaused.load();
+                if (jlinkPaused) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // Red
+                        if (ImGui::SmallButton(tr("RESUME JLINK", "恢复 JLink 采样")))
+                                g_jlinkSamplingPaused.store(false);
+                        ImGui::PopStyleColor();
+                } else {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f)); // Green
+                        if (ImGui::SmallButton(tr("PAUSE JLINK", "暂停 JLink 采样")))
+                                g_jlinkSamplingPaused.store(true);
+                        ImGui::PopStyleColor();
+                }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s",
+                                          tr("Pause/resume all J-Link sampling (acquisition stops; display pause is separate)",
+                                             "暂停/恢复所有 J-Link 采样（停止采集；与显示暂停相互独立）"));
 
                 // Total points currently in memory (across all channels)
                 u64 totalPts = 0;
@@ -970,7 +1033,7 @@ Gui::drawBar()
                 const auto dlState   = updater_.getDownloadState();
                 if (dlState == Updater::DownloadState::Downloading) {
                         const int pct = updater_.getDownloadProgress();
-                        snprintf(dlBuf, sizeof(dlBuf), "Updating: %d%%", pct);
+                        snprintf(dlBuf, sizeof(dlBuf), tr("Updating: %d%%", "更新中：%d%%"), pct);
                         dlWidth = ImGui::CalcTextSize(dlBuf).x;
                 }
 
@@ -1090,7 +1153,8 @@ Gui::loop()
                                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
                                              ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove)) {
                                 ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, std::min(1.0f, saveToastAlpha_)),
-                                                   "Session Saved Successfully!");
+                                                   "%s",
+                                                   tr("Session Saved Successfully!", "会话保存成功！"));
                         }
                         ImGui::End();
                 }
@@ -1169,12 +1233,18 @@ Gui::loop()
                 sDroppedFiles_.clear();
 #ifdef _WIN32
                 if (showElevationModal_) {
-                        ImGui::OpenPopup("Elevate?");
-                        if (ImGui::BeginPopupModal("Elevate?", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-                                ImGui::Text("Changing the sampler core requires administrator privileges.");
-                                ImGui::Text("The app will save the current session and relaunch elevated.");
+                        ImGui::OpenPopup("###Elevate");
+                        if (ImGui::BeginPopupModal(tr("Elevate?###Elevate", "需要管理员权限？###Elevate"),
+                                                   NULL,
+                                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+                                ImGui::Text("%s",
+                                            tr("Changing the sampler core requires administrator privileges.",
+                                               "更改采样器核心需要管理员权限。"));
+                                ImGui::Text("%s",
+                                            tr("The app will save the current session and relaunch elevated.",
+                                               "程序将保存当前会话并以管理员身份重启。"));
                                 ImGui::Separator();
-                                if (ImGui::Button("Relaunch as Admin", ImVec2(160, 0))) {
+                                if (ImGui::Button(tr("Relaunch as Admin", "以管理员身份重启"), ImVec2(160, 0))) {
                                         const int newCore = pendingElevationCore_;
                                         saveSession();
                                         LOG_I("UAC elevation: relaunching as admin (core=%d)", newCore);
@@ -1201,7 +1271,7 @@ Gui::loop()
                                 }
                                 ImGui::SetItemDefaultFocus();
                                 ImGui::SameLine();
-                                if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                                if (ImGui::Button(tr("Cancel", "取消"), ImVec2(120, 0))) {
                                         showElevationModal_ = false;
                                         ImGui::CloseCurrentPopup();
                                 }
@@ -1210,11 +1280,12 @@ Gui::loop()
                 }
 #endif
                 if (showQuitModal_) {
-                        ImGui::OpenPopup("Quit?");
-                        if (ImGui::BeginPopupModal("Quit?", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
-                                ImGui::Text("Save changes to session before quitting?");
+                        ImGui::OpenPopup("###Quit");
+                        if (ImGui::BeginPopupModal(
+                                tr("Quit?###Quit", "退出？###Quit"), NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+                                ImGui::Text("%s", tr("Save changes to session before quitting?", "退出前保存会话更改吗？"));
                                 ImGui::Separator();
-                                if (ImGui::Button("Save", ImVec2(120, 0))) {
+                                if (ImGui::Button(tr("Save", "保存"), ImVec2(120, 0))) {
                                         bool saved;
                                         if (isFirstSave_) {
                                                 saved = saveSessionAs();
@@ -1230,13 +1301,13 @@ Gui::loop()
                                 }
                                 ImGui::SetItemDefaultFocus();
                                 ImGui::SameLine();
-                                if (ImGui::Button("Don't Save", ImVec2(120, 0))) {
+                                if (ImGui::Button(tr("Don't Save", "不保存"), ImVec2(120, 0))) {
                                         wantsToQuit_   = true;
                                         showQuitModal_ = false;
                                         ImGui::CloseCurrentPopup();
                                 }
                                 ImGui::SameLine();
-                                if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                                if (ImGui::Button(tr("Cancel", "取消"), ImVec2(120, 0))) {
                                         showQuitModal_ = false;
                                         ImGui::CloseCurrentPopup();
                                 }
@@ -1329,7 +1400,7 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
 void
 Gui::drawCalculator()
 {
-        if (!ImGui::Begin("Motor Parameter Calculator", &showCalculator_)) {
+        if (!ImGui::Begin(tr("Motor Parameter Calculator###MotorCalc", "电机参数计算器###MotorCalc"), &showCalculator_)) {
                 ImGui::End();
                 return;
         }
@@ -1342,7 +1413,7 @@ Gui::drawCalculator()
                 currentMotorProfile_ = 0;
         }
 
-        ImGui::Text("Saved Profiles:");
+        ImGui::Text("%s", tr("Saved Profiles:", "已保存配置："));
         ImGui::SetNextItemWidth(200.0f);
         if (ImGui::BeginCombo("##motor_profiles", motorProfiles_[currentMotorProfile_].modelName)) {
                 for (i32 i = 0; i < static_cast<i32>(motorProfiles_.size()); ++i) {
@@ -1355,14 +1426,14 @@ Gui::drawCalculator()
                 ImGui::EndCombo();
         }
         ImGui::SameLine();
-        if (ImGui::Button("Add")) {
+        if (ImGui::Button(tr("Add", "添加"))) {
                 MotorProfile mp;
                 snprintf(mp.modelName, sizeof(mp.modelName), "Motor_%d", static_cast<i32>(motorProfiles_.size() + 1));
                 motorProfiles_.push_back(mp);
                 currentMotorProfile_ = static_cast<i32>(motorProfiles_.size()) - 1;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Del") && motorProfiles_.size() > 1) {
+        if (ImGui::Button(tr("Del", "删除")) && motorProfiles_.size() > 1) {
                 motorProfiles_.erase(motorProfiles_.begin() + currentMotorProfile_);
                 if (currentMotorProfile_ > 0)
                         currentMotorProfile_--;
@@ -1371,11 +1442,11 @@ Gui::drawCalculator()
         ImGui::Separator();
         MotorProfile &mp = motorProfiles_[currentMotorProfile_];
 
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "--- Input Parameters ---");
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Input Parameters ---", "--- 输入参数 ---"));
         ImGui::SetNextItemWidth(150.0f);
         ImGui::InputText("##MotorModel", mp.modelName, sizeof(mp.modelName));
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Model");
+                ImGui::SetTooltip("%s", tr("Model", "型号"));
         ImGui::SetNextItemWidth(150.0f);
         ImGui::InputFloat("##MotorRs", &mp.Rs, 0.0f, 0.0f, "%.4f");
         if (ImGui::IsItemHovered())
@@ -1391,22 +1462,22 @@ Gui::drawCalculator()
         ImGui::SetNextItemWidth(150.0f);
         ImGui::InputInt("##MotorPolePairs", &mp.polePairs, 0, 0);
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Pole Pairs");
+                ImGui::SetTooltip("%s", tr("Pole Pairs", "极对数"));
         ImGui::SetNextItemWidth(150.0f);
         ImGui::InputFloat("##MotorKt", &mp.Kt, 0.0f, 0.0f, "%.6f");
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Kt (Nm/A)");
 
         ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "--- Back-EMF Measurement ---");
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Back-EMF Measurement ---", "--- 反电动势测量 ---"));
         ImGui::SetNextItemWidth(150.0f);
         ImGui::InputFloat("##MotorBackEmfFreq", &mp.backEmfFreq, 0.0f, 0.0f, "%.3f");
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Frequency (Hz)");
+                ImGui::SetTooltip("%s", tr("Frequency (Hz)", "频率 (Hz)"));
         ImGui::SetNextItemWidth(150.0f);
         ImGui::InputFloat("##MotorBackEmfVpp", &mp.backEmfVpp, 0.0f, 0.0f, "%.3f");
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Vpp (Line-to-Line) (V)");
+                ImGui::SetTooltip("%s", tr("Vpp (Line-to-Line) (V)", "线电压峰峰值 Vpp (V)"));
 
         if (mp.polePairs < 1)
                 mp.polePairs = 1;
@@ -1426,10 +1497,10 @@ Gui::drawCalculator()
         f32 kv = (120.0f * mp.backEmfFreq) / (static_cast<f32>(mp.polePairs) * mp.backEmfVpp);
 
         ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "--- Calculated Results ---");
-        ImGui::Text("Flux Linkage (Psi_m): %.6f Wb", static_cast<f64>(psi_m));
-        ImGui::Text("KV value: %.2f RPM/V", static_cast<f64>(kv));
-        ImGui::Text("Calculated Kt (Ref): %.6f Nm/A", static_cast<f64>(kt));
+        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Calculated Results ---", "--- 计算结果 ---"));
+        ImGui::Text(tr("Flux Linkage (Psi_m): %.6f Wb", "磁链 (Psi_m): %.6f Wb"), static_cast<f64>(psi_m));
+        ImGui::Text(tr("KV value: %.2f RPM/V", "KV 值: %.2f RPM/V"), static_cast<f64>(kv));
+        ImGui::Text(tr("Calculated Kt (Ref): %.6f Nm/A", "计算 Kt (参考): %.6f Nm/A"), static_cast<f64>(kt));
 
         ImGui::End();
 }
@@ -1725,9 +1796,9 @@ Gui::drawUpdateUI()
         if (updatePendingResult_ && !updater_.isChecking() && info.checked) {
                 updatePendingResult_ = false;
                 if (info.available)
-                        ImGui::OpenPopup("Update Available");
+                        ImGui::OpenPopup("###UpdateAvailable");
                 else if (updateManualCheck_)
-                        ImGui::OpenPopup("Update Status");
+                        ImGui::OpenPopup("###UpdateStatus");
                 updateManualCheck_ = false;
         }
 
@@ -1735,21 +1806,23 @@ Gui::drawUpdateUI()
         const auto dlState = updater_.getDownloadState();
         if (dlState == Updater::DownloadState::Done && !showDownloadDonePopup_) {
                 showDownloadDonePopup_ = true;
-                ImGui::OpenPopup("Update Ready");
+                ImGui::OpenPopup("###UpdateReady");
         } else if (dlState == Updater::DownloadState::Failed && !showDownloadDonePopup_) {
                 showDownloadDonePopup_ = true;
-                ImGui::OpenPopup("Download Failed");
+                ImGui::OpenPopup("###DownloadFailed");
         }
 
         // --- Update available ---
-        if (ImGui::BeginPopupModal("Update Available", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::Text("A new version of ava_tool is available.");
+        if (ImGui::BeginPopupModal(tr("Update Available###UpdateAvailable", "有可用更新###UpdateAvailable"),
+                                   nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("%s", tr("A new version of ava_tool is available.", "ava_tool 有新版本可用。"));
                 ImGui::Separator();
-                ImGui::Text("Current: %s", info.currentVersion.c_str());
-                ImGui::Text("Latest:  %s", info.latestVersion.c_str());
+                ImGui::Text(tr("Current: %s", "当前版本: %s"), info.currentVersion.c_str());
+                ImGui::Text(tr("Latest:  %s", "最新版本: %s"), info.latestVersion.c_str());
                 if (!info.notes.empty()) {
                         ImGui::Spacing();
-                        ImGui::TextDisabled("Release notes:");
+                        ImGui::TextDisabled("%s", tr("Release notes:", "更新说明："));
                         ImGui::BeginChild("##notes", ImVec2(460, 160), true);
                         ImGui::TextWrapped("%s", info.notes.c_str());
                         ImGui::EndChild();
@@ -1758,7 +1831,7 @@ Gui::drawUpdateUI()
 
                 const bool canAutoUpdate = !info.assetUrl.empty();
                 if (canAutoUpdate) {
-                        if (ImGui::Button("Upgrade Now", ImVec2(130, 0))) {
+                        if (ImGui::Button(tr("Upgrade Now", "立即升级"), ImVec2(130, 0))) {
                                 // Start background download — don't exit the app
                                 updater_.downloadAsync(info.assetUrl);
                                 showDownloadDonePopup_ = false; // reset so we detect completion
@@ -1766,7 +1839,7 @@ Gui::drawUpdateUI()
                         }
                         ImGui::SameLine();
                 } else if (!info.releaseUrl.empty()) {
-                        if (ImGui::Button("Open Release Page", ImVec2(160, 0))) {
+                        if (ImGui::Button(tr("Open Release Page", "打开发布页面"), ImVec2(160, 0))) {
 #ifdef _WIN32
                                 ShellExecuteA(nullptr, "open", info.releaseUrl.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 #endif
@@ -1774,19 +1847,20 @@ Gui::drawUpdateUI()
                         }
                         ImGui::SameLine();
                 }
-                if (ImGui::Button("Later", ImVec2(120, 0)))
+                if (ImGui::Button(tr("Later", "稍后"), ImVec2(120, 0)))
                         ImGui::CloseCurrentPopup();
                 ImGui::EndPopup();
         }
 
         // --- Update downloaded & ready to install ---
-        if (ImGui::BeginPopupModal("Update Ready", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::Text("Update has been downloaded successfully.");
-                ImGui::Text("Restart the application to install the update?");
+        if (ImGui::BeginPopupModal(
+                tr("Update Ready###UpdateReady", "更新就绪###UpdateReady"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::Text("%s", tr("Update has been downloaded successfully.", "更新已下载完成。"));
+                ImGui::Text("%s", tr("Restart the application to install the update?", "重启程序以安装更新？"));
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
-                if (ImGui::Button("Restart Now", ImVec2(130, 0))) {
+                if (ImGui::Button(tr("Restart Now", "立即重启"), ImVec2(130, 0))) {
                         const std::string setupPath = updater_.getDownloadedPath();
                         if (updater_.launchInstaller(setupPath)) {
                                 saveSession();
@@ -1796,19 +1870,21 @@ Gui::drawUpdateUI()
                         ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Later", ImVec2(120, 0))) {
+                if (ImGui::Button(tr("Later", "稍后"), ImVec2(120, 0))) {
                         ImGui::CloseCurrentPopup();
                 }
                 ImGui::EndPopup();
         }
 
         // --- Download failed ---
-        if (ImGui::BeginPopupModal("Download Failed", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (ImGui::BeginPopupModal(tr("Download Failed###DownloadFailed", "下载失败###DownloadFailed"),
+                                   nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
                 const std::string dlErr = updater_.getDownloadError();
-                ImGui::Text("Failed to download the update.");
+                ImGui::Text("%s", tr("Failed to download the update.", "更新下载失败。"));
                 if (!dlErr.empty()) {
                         ImGui::Spacing();
-                        ImGui::TextWrapped("Error: %s", dlErr.c_str());
+                        ImGui::TextWrapped(tr("Error: %s", "错误: %s"), dlErr.c_str());
                 }
                 ImGui::Spacing();
                 if (ImGui::Button("OK", ImVec2(120, 0))) {
@@ -1820,11 +1896,13 @@ Gui::drawUpdateUI()
         }
 
         // --- Manual "check finished" status ---
-        if (ImGui::BeginPopupModal("Update Status", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        if (ImGui::BeginPopupModal(
+                tr("Update Status###UpdateStatus", "更新状态###UpdateStatus"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
                 if (!info.error.empty())
                         ImGui::TextWrapped("%s", info.error.c_str());
                 else
-                        ImGui::Text("You're up to date (version %s).", info.currentVersion.c_str());
+                        ImGui::Text(tr("You're up to date (version %s).", "已是最新版本（版本 %s）。"),
+                                    info.currentVersion.c_str());
                 ImGui::Spacing();
                 if (ImGui::Button("OK", ImVec2(120, 0)))
                         ImGui::CloseCurrentPopup();

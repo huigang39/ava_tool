@@ -13,6 +13,7 @@
 #include "app_log.hpp"
 #include "core/jlink_port.hpp"
 #include "gui/gui.hpp"
+#include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
 #include "gui/variable.hpp"
 
@@ -596,10 +597,13 @@ Variable::drawSymbolTree()
                                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable,
                                       ImVec2(0, 0))) {
-                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
-                        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-                        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
+                                                ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn(
+                            tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                        ImGui::TableSetupColumn(
+                            tr("Size###col_size", "大小###col_size"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
                         ImGui::TableHeadersRow();
 
                         std::vector<const dwarf::Variable *> vars;
@@ -652,9 +656,11 @@ Variable::drawSymbolTree()
                                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable,
                                       ImVec2(0, 0))) {
-                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
+                                                ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn(tr("Value###col_value", "数值###col_value"),
+                                                ImGuiTableColumnFlags_WidthStretch);
                         ImGui::TableHeadersRow();
 
                         std::vector<DataTree *> nodes;
@@ -690,7 +696,7 @@ Variable::drawSymbolTree()
                         ImGui::EndTable();
                 }
         } else {
-                ImGui::TextDisabled("Drop an ELF or BIN file to browse symbols.");
+                ImGui::TextDisabled("%s", tr("Drop an ELF or BIN file to browse symbols.", "拖入 ELF 或 BIN 文件以浏览符号。"));
         }
 }
 
@@ -747,7 +753,7 @@ Variable::drawSymbolLeaf(
                         fillEnumPayload(dwarfInfo_, typeOff, p);
                         ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                 }
-                ImGui::Text("Dragging %s", fullPath.c_str());
+                ImGui::Text(tr("Dragging %s", "拖拽 %s"), fullPath.c_str());
                 ImGui::EndDragDropSource();
         }
         // Double click to add
@@ -842,7 +848,7 @@ Variable::drawDataTreeLeaf(DataTree &node, const int indentLevel)
                         p.numBytes = (u8)Parser::typeBytes(node.type);
                         p.typeOff  = 0;
                         ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
-                        ImGui::Text("Dragging %s", node.name.c_str());
+                        ImGui::Text(tr("Dragging %s", "拖拽 %s"), node.name.c_str());
                         ImGui::EndDragDropSource();
                 }
         }
@@ -945,9 +951,9 @@ flattenForStructPayload(const dwarf::Info                                       
 void
 Variable::drawSymbolBrowser()
 {
-        ImGui::SeparatorText("Symbol Browser");
+        ImGui::SeparatorText(tr("Symbol Browser", "符号浏览器"));
         if (isElfLoading_) {
-                ImGui::Text("Loading symbols...");
+                ImGui::Text("%s", tr("Loading symbols...", "正在加载符号..."));
                 ImGui::SameLine();
                 static float ang  = 0.0f;
                 ang              += 0.1f;
@@ -992,10 +998,13 @@ Variable::drawSymbolBrowser()
                 constexpr ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
                 if (ImGui::BeginTable("SymbolSearchTable", 4, flags, ImVec2(0, 0))) {
-                        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 120.0f);
-                        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-                        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
+                                                ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn(
+                            tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                        ImGui::TableSetupColumn(
+                            tr("Size###col_size", "大小###col_size"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
                         ImGui::TableHeadersRow();
 
                         if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
@@ -1079,7 +1088,7 @@ Variable::drawSymbolBrowser()
                                                 fillEnumPayload(dwarfInfo_, e.typeOff, p);
                                                 ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                                         }
-                                        ImGui::Text("Dragging %s", e.path.c_str());
+                                        ImGui::Text(tr("Dragging %s", "拖拽 %s"), e.path.c_str());
                                         ImGui::EndDragDropSource();
                                 }
 
@@ -1122,15 +1131,15 @@ Variable::drawSymbolBrowser()
 void
 Variable::drawVariableList()
 {
-        if (ImGui::Button("Add Variable"))
+        if (ImGui::Button(tr("Add Variable", "添加变量")))
                 state_ = WindowState::AddVariable;
         ImGui::SameLine();
-        if (ImGui::Button("Clear All")) {
+        if (ImGui::Button(tr("Clear All", "全部清空"))) {
                 vars_.clear();
                 isModified_ = true;
         }
         ImGui::SameLine();
-        if (ImGui::Button("Load File..."))
+        if (ImGui::Button(tr("Load File...", "加载文件...")))
                 state_ = WindowState::LoadElf;
         ImGui::SameLine();
         ImGui::SetNextItemWidth(100);
@@ -1138,16 +1147,18 @@ Variable::drawVariableList()
                 isModified_ = true;
         }
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Refresh(ms)");
+                ImGui::SetTooltip("%s", tr("Refresh(ms)", "刷新间隔(毫秒)"));
 
         constexpr ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
         if (ImGui::BeginTable("VarMonitorTable", 5, flags, ImVec2(0, 0))) {
-                ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-                ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 150.0f);
-                ImGui::TableSetupColumn("Port", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
+                                        ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn(tr("Value###col_value", "数值###col_value"),
+                                        ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthFixed, 150.0f);
+                ImGui::TableSetupColumn(tr("Port###col_port", "端口###col_port"), ImGuiTableColumnFlags_WidthFixed, 80.0f);
                 ImGui::TableHeadersRow();
 
                 if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
@@ -1237,11 +1248,12 @@ Variable::drawVariableList()
                                                 var.selected = false;
                                         v.selected = true;
                                 }
-                                if (ImGui::MenuItem("Delete Selected")) {
+                                if (ImGui::MenuItem(tr("Delete Selected", "删除选中项"))) {
                                         pendingDelete = true;
                                 }
                                 const bool isEnumType = (t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty();
-                                if (!isComplex && isEnumType && ImGui::MenuItem("Edit Enum Definition...")) {
+                                if (!isComplex && isEnumType &&
+                                    ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
                                         pendingEnumEdit = true;
                                 }
                                 if (isComplex && !v.hiddenMembers.empty()) {
@@ -1306,7 +1318,7 @@ Variable::drawVariableList()
                                         fillEnumPayload(dwarfInfo_, v.typeOff, p, &v.enumDefs);
                                         ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                                 }
-                                ImGui::Text("Dragging %s", v.name.c_str());
+                                ImGui::Text(tr("Dragging %s", "拖拽 %s"), v.name.c_str());
                                 ImGui::EndDragDropSource();
                         }
 
@@ -1425,28 +1437,30 @@ Variable::drawAddVariableDialog()
 {
         if (state_ != WindowState::AddVariable)
                 return;
-        ImGui::OpenPopup("Add New Variable");
-        if (ImGui::BeginPopupModal("Add New Variable", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::OpenPopup("###AddNewVariable");
+        if (ImGui::BeginPopupModal(tr("Add New Variable###AddNewVariable", "添加新变量###AddNewVariable"),
+                                   nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
                 ImGui::InputText("##newVarName", newVar_.name, sizeof(newVar_.name));
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Name");
+                        ImGui::SetTooltip("%s", tr("Name", "名称"));
                 static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
                 static int         typeIdx = 2;
                 if (ImGui::Combo("##newVarType", &typeIdx, types, IM_ARRAYSIZE(types)))
                         newVar_.type = Parser::strToDataType(types[typeIdx]);
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Type");
+                        ImGui::SetTooltip("%s", tr("Type", "类型"));
                 static const char *ports[] = {"JLINK", "UDP", "SHM"};
                 static int         portIdx = 0;
                 if (ImGui::Combo("##newVarPort", &portIdx, ports, IM_ARRAYSIZE(ports)))
                         newVar_.port = (PortType)portIdx;
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Port");
+                        ImGui::SetTooltip("%s", tr("Port", "端口"));
 
                 if (newVar_.port == PortType::JLINK) {
                         ImGui::InputText("##newVarAddress", newVar_.addrBuf, sizeof(newVar_.addrBuf));
                         if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Address (Hex)");
+                                ImGui::SetTooltip("%s", tr("Address (Hex)", "地址（十六进制）"));
                         try {
                                 newVar_.addr = std::stoull(newVar_.addrBuf, nullptr, 16);
                         } catch (...) {
@@ -1455,13 +1469,13 @@ Variable::drawAddVariableDialog()
                 } else if (newVar_.port == PortType::UDP) {
                         ImGui::InputText("##newVarTargetIp", newVar_.udpIp, sizeof(newVar_.udpIp));
                         if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Target IP");
+                                ImGui::SetTooltip("%s", tr("Target IP", "目标 IP"));
                         ImGui::InputInt("##newVarTargetPort", &newVar_.udpPort);
                         if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Target Port");
+                                ImGui::SetTooltip("%s", tr("Target Port", "目标端口"));
                         ImGui::InputText("##newVarOffsetAddr", newVar_.addrBuf, sizeof(newVar_.addrBuf));
                         if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Offset/Addr");
+                                ImGui::SetTooltip("%s", tr("Offset/Addr", "偏移/地址"));
                         try {
                                 newVar_.addr = std::stoull(newVar_.addrBuf, nullptr, 16);
                         } catch (...) {
@@ -1470,10 +1484,10 @@ Variable::drawAddVariableDialog()
                 } else if (newVar_.port == PortType::SHM) {
                         ImGui::InputText("##newVarShmName", newVar_.shmName, sizeof(newVar_.shmName));
                         if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("SHM Name");
+                                ImGui::SetTooltip("%s", tr("SHM Name", "共享内存名称"));
                         ImGui::InputText("##newVarOffset", newVar_.addrBuf, sizeof(newVar_.addrBuf));
                         if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Offset");
+                                ImGui::SetTooltip("%s", tr("Offset", "偏移"));
                         try {
                                 newVar_.addr = std::stoull(newVar_.addrBuf, nullptr, 16);
                         } catch (...) {
@@ -1481,7 +1495,7 @@ Variable::drawAddVariableDialog()
                         }
                 }
 
-                ImGui::Checkbox("Writable", &newVar_.writable);
+                ImGui::Checkbox(tr("Writable", "可写"), &newVar_.writable);
                 if (ImGui::Button("OK", ImVec2(120, 0))) {
                         VarEntry v;
                         v.name     = newVar_.name;
@@ -1503,7 +1517,7 @@ Variable::drawAddVariableDialog()
                         ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
-                if (ImGui::Button("Cancel", ImVec2(120, 0))) {
+                if (ImGui::Button(tr("Cancel", "取消"), ImVec2(120, 0))) {
                         state_ = WindowState::None;
                         ImGui::CloseCurrentPopup();
                 }
@@ -1518,8 +1532,10 @@ Variable::drawEnumEditPopup()
                 enumEditIdx_ = -1;
                 return;
         }
-        ImGui::OpenPopup("Edit Enum Definition");
-        if (ImGui::BeginPopupModal("Edit Enum Definition", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::OpenPopup("###EditEnumDef");
+        if (ImGui::BeginPopupModal(tr("Edit Enum Definition###EditEnumDef", "编辑枚举定义###EditEnumDef"),
+                                   nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
                 VarEntry &v = vars_[enumEditIdx_];
 
                 // Pre-populate from DWARF on first open (when user hasn't set anything yet)
@@ -1532,14 +1548,16 @@ Variable::drawEnumEditPopup()
                         }
                 }
 
-                ImGui::Text("Variable: %s", v.name.c_str());
+                ImGui::Text(tr("Variable: %s", "变量: %s"), v.name.c_str());
                 ImGui::Separator();
 
                 constexpr ImGuiTableFlags tfl =
                     ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp;
                 if (ImGui::BeginTable("EnumDefTable", 3, tfl, ImVec2(400, 200))) {
-                        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                        ImGui::TableSetupColumn(tr("Label###col_label", "标签###col_label"),
+                                                ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn(
+                            tr("Value###col_enumval", "数值###col_enumval"), ImGuiTableColumnFlags_WidthFixed, 80.0f);
                         ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 24.0f);
                         ImGui::TableHeadersRow();
 
@@ -1568,13 +1586,13 @@ Variable::drawEnumEditPopup()
                         ImGui::EndTable();
                 }
 
-                if (ImGui::Button("+ Add"))
+                if (ImGui::Button(tr("+ Add", "+ 添加")))
                         v.enumDefs.push_back({"", 0});
                 ImGui::SameLine();
-                if (ImGui::Button("Clear All"))
+                if (ImGui::Button(tr("Clear All", "全部清空")))
                         v.enumDefs.clear();
                 ImGui::SameLine(0, 40);
-                if (ImGui::Button("Close", ImVec2(80, 0))) {
+                if (ImGui::Button(tr("Close", "关闭"), ImVec2(80, 0))) {
                         isModified_  = true;
                         enumEditIdx_ = -1;
                         ImGui::CloseCurrentPopup();
@@ -1590,8 +1608,11 @@ Variable::drawSubEnumEditPopup()
                 enumSubEditParentIdx_ = -1;
                 return;
         }
-        ImGui::OpenPopup("Edit Member Enum Definition");
-        if (ImGui::BeginPopupModal("Edit Member Enum Definition", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::OpenPopup("###EditMemberEnumDef");
+        if (ImGui::BeginPopupModal(
+                tr("Edit Member Enum Definition###EditMemberEnumDef", "编辑成员枚举定义###EditMemberEnumDef"),
+                nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize)) {
                 VarEntry &parent = vars_[enumSubEditParentIdx_];
                 auto     &defs   = parent.memberEnumDefs[enumSubEditMemberPath_];
 
@@ -1603,14 +1624,16 @@ Variable::drawSubEnumEditPopup()
                                         defs.push_back({e.name, e.value});
                 }
 
-                ImGui::Text("Member: %s", enumSubEditMemberPath_.c_str());
+                ImGui::Text(tr("Member: %s", "成员: %s"), enumSubEditMemberPath_.c_str());
                 ImGui::Separator();
 
                 constexpr ImGuiTableFlags tfl =
                     ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp;
                 if (ImGui::BeginTable("SubEnumDefTable", 3, tfl, ImVec2(400, 200))) {
-                        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                        ImGui::TableSetupColumn(tr("Label###col_label", "标签###col_label"),
+                                                ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableSetupColumn(
+                            tr("Value###col_enumval", "数值###col_enumval"), ImGuiTableColumnFlags_WidthFixed, 80.0f);
                         ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 24.0f);
                         ImGui::TableHeadersRow();
 
@@ -1639,13 +1662,13 @@ Variable::drawSubEnumEditPopup()
                         ImGui::EndTable();
                 }
 
-                if (ImGui::Button("+ Add"))
+                if (ImGui::Button(tr("+ Add", "+ 添加")))
                         defs.push_back({"", 0});
                 ImGui::SameLine();
-                if (ImGui::Button("Clear All"))
+                if (ImGui::Button(tr("Clear All", "全部清空")))
                         defs.clear();
                 ImGui::SameLine(0, 40);
-                if (ImGui::Button("Close", ImVec2(80, 0))) {
+                if (ImGui::Button(tr("Close", "关闭"), ImVec2(80, 0))) {
                         isModified_           = true;
                         enumSubEditParentIdx_ = -1;
                         ImGui::CloseCurrentPopup();
@@ -2022,14 +2045,15 @@ Variable::updateDisplay()
         const std::string winLabel = getTitle() + "###" + name_;
         if (ImGui::Begin(winLabel.c_str(), &open_)) {
                 // Double-click the title bar (or dock tab) to rename this window.
-                ImGuiWindow *win = ImGui::GetCurrentWindow();
-                ImRect       tr  = win->DockIsActive ? win->DC.DockTabItemRect : win->TitleBarRect();
-                if (ImGui::IsMouseHoveringRect(tr.Min, tr.Max, false) && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                ImGuiWindow *win       = ImGui::GetCurrentWindow();
+                ImRect       titleRect = win->DockIsActive ? win->DC.DockTabItemRect : win->TitleBarRect();
+                if (ImGui::IsMouseHoveringRect(titleRect.Min, titleRect.Max, false) &&
+                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                         snprintf(renameBuf_, sizeof(renameBuf_), "%s", getTitle().c_str());
                         ImGui::OpenPopup("Rename Variable");
                 }
                 if (ImGui::BeginPopup("Rename Variable")) {
-                        ImGui::TextDisabled("重命名");
+                        ImGui::TextDisabled("%s", tr("Rename", "重命名"));
                         ImGui::SetNextItemWidth(220);
                         if (ImGui::IsWindowAppearing())
                                 ImGui::SetKeyboardFocusHere();
@@ -2326,13 +2350,13 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                 const dwarf::Type *mt           = resolveAlias(dwarfInfo_, m.type);
                                 const bool         isMemberEnum = mt && mt->kind == dwarf::TypeKind::ENUM;
                                 if (ImGui::BeginPopupContextItem()) {
-                                        if (ImGui::MenuItem("Delete")) {
+                                        if (ImGui::MenuItem(tr("Delete", "删除"))) {
                                                 if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
                                                         vars_[parentVarIdx].hiddenMembers.insert(memberPath);
                                                         isModified_ = true;
                                                 }
                                         }
-                                        if (isMemberEnum && ImGui::MenuItem("Edit Enum Definition...")) {
+                                        if (isMemberEnum && ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
                                                 enumSubEditParentIdx_     = parentVarIdx;
                                                 enumSubEditMemberPath_    = memberPath;
                                                 enumSubEditMemberTypeOff_ = m.type;
@@ -2370,7 +2394,7 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                                 fillEnumPayload(dwarfInfo_, m.type, p, leafOvr);
                                                 ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                                         }
-                                        ImGui::Text("Dragging %s", memberPath.c_str());
+                                        ImGui::Text(tr("Dragging %s", "拖拽 %s"), memberPath.c_str());
                                         ImGui::EndDragDropSource();
                                 }
                                 ImGui::TableSetColumnIndex(1);
@@ -2433,13 +2457,13 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                 const dwarf::Type *et2        = resolveAlias(dwarfInfo_, t->inner);
                                 const bool         isElemEnum = et2 && et2->kind == dwarf::TypeKind::ENUM;
                                 if (ImGui::BeginPopupContextItem()) {
-                                        if (ImGui::MenuItem("Delete")) {
+                                        if (ImGui::MenuItem(tr("Delete", "删除"))) {
                                                 if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
                                                         vars_[parentVarIdx].hiddenMembers.insert(memberPath);
                                                         isModified_ = true;
                                                 }
                                         }
-                                        if (isElemEnum && ImGui::MenuItem("Edit Enum Definition...")) {
+                                        if (isElemEnum && ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
                                                 enumSubEditParentIdx_     = parentVarIdx;
                                                 enumSubEditMemberPath_    = memberPath;
                                                 enumSubEditMemberTypeOff_ = t->inner;
@@ -2478,7 +2502,7 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                                 fillEnumPayload(dwarfInfo_, t->inner, p, leafOvr);
                                                 ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                                         }
-                                        ImGui::Text("Dragging %s", memberPath.c_str());
+                                        ImGui::Text(tr("Dragging %s", "拖拽 %s"), memberPath.c_str());
                                         ImGui::EndDragDropSource();
                                 }
                                 ImGui::TableSetColumnIndex(1);

@@ -14,6 +14,7 @@
 #include "core/updater.hpp"
 #include "gui/assembly_viewer.hpp"
 #include "gui/bode.hpp"
+#include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
 #include "gui/variable.hpp"
 #include "sequence_editor.hpp"
@@ -78,6 +79,10 @@ class Gui
         // mmap disk-cache directory (Settings). Persisted to <appdir>/cache_dir.txt.
         void loadCacheDirSetting(); // reads + applies the saved cache dir (call early)
         void setCacheDir(const std::string &dir);
+
+        // UI language (Settings). Persisted to <appdir>/lang.txt.
+        void loadLangSetting();
+        void setLang(Lang lang);
         void drawCalculator();
         void syncSymbolAddresses(Variable *reloadedVar);
 

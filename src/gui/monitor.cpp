@@ -17,10 +17,12 @@
 #include "implot.h"
 #include "implot_internal.h"
 
+#include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
 #include "platform/native_dlg.hpp"
 
 std::atomic<bool> g_monitorPaused{false};
+std::atomic<bool> g_jlinkSamplingPaused{false};
 
 std::vector<Monitor *> Monitor::sInstances_;
 std::mutex             Monitor::sMtxInstances_;
@@ -60,14 +62,14 @@ MonitorScope::menu()
 {
         // Scope Toolbar
         // Scope Toolbar
-        if (ImGui::Button(e_draw == DrawEnum::PLOT ? "Plot view" : "Table view")) {
+        if (ImGui::Button(e_draw == DrawEnum::PLOT ? tr("Plot view", "图形视图") : tr("Table view", "表格视图"))) {
                 e_draw = (e_draw == DrawEnum::PLOT) ? DrawEnum::TABLE : DrawEnum::PLOT;
         }
 
         ImGui::SameLine();
         if (showFft_) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue
-                if (ImGui::Button("Freq domain")) {
+                if (ImGui::Button(tr("Freq domain", "频域"))) {
                         showFft_ = false;
                 }
                 ImGui::PopStyleColor();
@@ -103,7 +105,7 @@ MonitorScope::menu()
                         }
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("FFT Points (Resolution)");
+                        ImGui::SetTooltip("%s", tr("FFT Points (Resolution)", "FFT 点数（分辨率）"));
 
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(30);
@@ -120,22 +122,25 @@ MonitorScope::menu()
                                 fftPeakCount_ = 20;
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Peaks: enter number of peaks and press Enter to confirm");
+                        ImGui::SetTooltip(
+                            "%s",
+                            tr("Peaks: enter number of peaks and press Enter to confirm", "峰值：输入峰值数量并按回车确认"));
 
                 ImGui::SameLine();
                 if (fftBars_) {
                         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.6f, 1.0f, 1.0f)); // Blue (active)
-                        if (ImGui::Button("Bar"))
+                        if (ImGui::Button(tr("Bar", "柱状")))
                                 fftBars_ = false;
                         ImGui::PopStyleColor();
                 } else {
-                        if (ImGui::Button("Line"))
+                        if (ImGui::Button(tr("Line", "折线")))
                                 fftBars_ = true;
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Toggle FFT render style: line / bar chart");
+                        ImGui::SetTooltip("%s",
+                                          tr("Toggle FFT render style: line / bar chart", "切换 FFT 渲染样式：折线 / 柱状图"));
         } else {
-                if (ImGui::Button("Time domain")) {
+                if (ImGui::Button(tr("Time domain", "时域"))) {
                         showFft_ = true;
                 }
         }
@@ -143,14 +148,15 @@ MonitorScope::menu()
         // Toggle the right-side data panel (Stats in time view / Peaks in freq view).
         ImGui::SameLine();
         if (showSidePanel_) {
-                if (ImGui::Button("Hide table"))
+                if (ImGui::Button(tr("Hide table", "隐藏表格")))
                         showSidePanel_ = false;
         } else {
-                if (ImGui::Button("Show table"))
+                if (ImGui::Button(tr("Show table", "显示表格")))
                         showSidePanel_ = true;
         }
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Show/hide the side data panel (Stats / Peaks)");
+                ImGui::SetTooltip("%s",
+                                  tr("Show/hide the side data panel (Stats / Peaks)", "显示/隐藏侧边数据面板（统计 / 峰值）"));
 
         // Hide/show all plot lines in this scope.
         ImGui::SameLine();
@@ -163,13 +169,13 @@ MonitorScope::menu()
                         }
 
                 if (anyVisible) {
-                        if (ImGui::Button("Hide line")) {
+                        if (ImGui::Button(tr("Hide line", "隐藏曲线"))) {
                                 for (auto &[_, ch] : chs_)
                                         if (ch)
                                                 ch->show_ = false;
                         }
                 } else {
-                        if (ImGui::Button("Show line")) {
+                        if (ImGui::Button(tr("Show line", "显示曲线"))) {
                                 for (auto &[_, ch] : chs_)
                                         if (ch)
                                                 ch->show_ = true;
@@ -178,11 +184,13 @@ MonitorScope::menu()
         }
 
         // Right-aligned buttons: Delete Scope, Hide Scope, and Pause/Resume
-        float delBtnWidth  = ImGui::CalcTextSize("Delete Scope").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-        float hideBtnWidth = std::max(ImGui::CalcTextSize("Hide Scope").x, ImGui::CalcTextSize("Show Scope").x) +
+        float delBtnWidth  = ImGui::CalcTextSize(tr("Delete Scope", "删除示波器")).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        float hideBtnWidth = std::max(ImGui::CalcTextSize(tr("Hide Scope", "隐藏示波器")).x,
+                                      ImGui::CalcTextSize(tr("Show Scope", "显示示波器")).x) +
                              ImGui::GetStyle().FramePadding.x * 2.0f;
         float pauseBtnWidth =
-            std::max(ImGui::CalcTextSize("Pause").x, ImGui::CalcTextSize("Resume").x) + ImGui::GetStyle().FramePadding.x * 2.0f;
+            std::max(ImGui::CalcTextSize(tr("Pause", "暂停")).x, ImGui::CalcTextSize(tr("Resume", "继续")).x) +
+            ImGui::GetStyle().FramePadding.x * 2.0f;
         float spacing         = ImGui::GetStyle().ItemSpacing.x;
         float totalRightWidth = delBtnWidth + spacing + hideBtnWidth + spacing + pauseBtnWidth;
         float availWidth      = ImGui::GetContentRegionAvail().x;
@@ -196,7 +204,7 @@ MonitorScope::menu()
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.1f, 0.1f, 0.6f));
         ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 0.8f));
         ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
-        if (ImGui::Button("Delete Scope")) {
+        if (ImGui::Button(tr("Delete Scope", "删除示波器"))) {
                 markPendingDelete();
         }
         ImGui::PopStyleColor(3);
@@ -204,12 +212,12 @@ MonitorScope::menu()
         ImGui::SameLine();
         if (hidden_) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.4f, 0.4f, 0.4f, 0.8f));
-                if (ImGui::Button("Show Scope"))
+                if (ImGui::Button(tr("Show Scope", "显示示波器")))
                         hidden_ = false;
                 ImGui::PopStyleColor();
         } else {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 0.6f));
-                if (ImGui::Button("Hide Scope"))
+                if (ImGui::Button(tr("Hide Scope", "隐藏示波器")))
                         hidden_ = true;
                 ImGui::PopStyleColor();
         }
@@ -217,12 +225,12 @@ MonitorScope::menu()
         ImGui::SameLine();
         if (paused_) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.8f, 0.2f, 0.6f)); // Yellow/Orange
-                if (ImGui::Button("Resume"))
+                if (ImGui::Button(tr("Resume", "继续")))
                         paused_ = false;
                 ImGui::PopStyleColor();
         } else {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 0.6f)); // Green
-                if (ImGui::Button("Pause"))
+                if (ImGui::Button(tr("Pause", "暂停")))
                         paused_ = true;
                 ImGui::PopStyleColor();
         }
@@ -253,12 +261,14 @@ MonitorScope::tableDraw()
                                    ImGuiTableFlags_Sortable))
                 return;
 
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Port", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Wave", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 100.0f);
+        ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
+                                ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(tr("Value###col_value", "数值###col_value"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(tr("Port###col_port", "端口###col_port"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(
+            tr("Wave###col_wave", "波形###col_wave"), ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 100.0f);
         ImGui::TableHeadersRow();
 
         ImGuiTableSortSpecs *sortSpecs = ImGui::TableGetSortSpecs();
@@ -458,7 +468,7 @@ MonitorScope::tableDraw()
                                                         it->second->selected_ = true;
                                         }
                                 }
-                                if (ImGui::MenuItem("Delete Selected")) {
+                                if (ImGui::MenuItem(tr("Delete Selected", "删除选中项"))) {
                                         for (auto &pair : chs_)
                                                 if (pair.second->selected_)
                                                         pair.second->markPendingDelete();
@@ -547,7 +557,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
                                 pair.second->selected_ = false;
                         ch->selected_ = true;
                 }
-                if (ImGui::MenuItem("Delete Selected")) {
+                if (ImGui::MenuItem(tr("Delete Selected", "删除选中项"))) {
                         for (auto &pair : chs_)
                                 if (pair.second->selected_)
                                         pair.second->markPendingDelete();
@@ -560,7 +570,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
                 payload.srcScope = this;
                 snprintf(payload.chName, sizeof(payload.chName), "%s", chName.c_str());
                 ImGui::SetDragDropPayload("DND_CHANNEL_MOVE", &payload, sizeof(ChannelMovePayload));
-                ImGui::Text("Move: %s", chName.c_str());
+                ImGui::Text(tr("Move: %s", "移动: %s"), chName.c_str());
                 ImGui::EndDragDropSource();
         }
 
@@ -618,7 +628,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
         // 4. Address
         ImGui::TableNextColumn();
         if (ch->isAddrUnknown())
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "UNKNOWN");
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", tr("UNKNOWN", "未知"));
         else
                 ImGui::Text("0x%zX", ch->getAddr());
 
@@ -657,17 +667,17 @@ MonitorScope::drawTableRow(const std::string               &chName,
         if (ImGui::BeginPopup("WaveCfg")) {
                 // Read current values from atomic shadow fields
                 auto &pending = ch->waveCfgPending_;
-                ImGui::Text("Wave Generator: %s", chName.c_str());
+                ImGui::Text(tr("Wave Generator: %s", "波形发生器: %s"), chName.c_str());
                 ImGui::Separator();
 
-                const char *types[]     = {"Sine", "Square", "Triangle"};
+                const char *types[]     = {tr("Sine", "正弦"), tr("Square", "方波"), tr("Triangle", "三角")};
                 i32         currentType = pending.type.load();
                 if (ImGui::Combo("##WaveType", &currentType, types, IM_ARRAYSIZE(types))) {
                         pending.type.store(currentType);
                         pending.dirty.store(true);
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Type");
+                        ImGui::SetTooltip("%s", tr("Type", "类型"));
 
                 ImGui::SetNextItemWidth(100);
                 f32 f = pending.freq.load();
@@ -686,7 +696,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
                         pending.dirty.store(true);
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Amp");
+                        ImGui::SetTooltip("%s", tr("Amp", "幅值"));
                 ImGui::SetNextItemWidth(100);
                 f32 o = pending.offset.load();
                 if (ImGui::InputFloat("##WaveOffset", &o, 0.0f, 0.0f, "%.1f") && ImGui::IsItemDeactivated() &&
@@ -695,7 +705,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
                         pending.dirty.store(true);
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Offset");
+                        ImGui::SetTooltip("%s", tr("Offset", "偏置"));
                 if (pending.type.load() != WAVE_TYPE_SINE) {
                         ImGui::SetNextItemWidth(100);
                         f32 d = pending.duty.load();
@@ -705,11 +715,11 @@ MonitorScope::drawTableRow(const std::string               &chName,
                                 pending.dirty.store(true);
                         }
                         if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("Duty");
+                                ImGui::SetTooltip("%s", tr("Duty", "占空比"));
                 }
 
                 ImGui::Separator();
-                if (ImGui::Button("Close"))
+                if (ImGui::Button(tr("Close", "关闭")))
                         ImGui::CloseCurrentPopup();
                 ImGui::EndPopup();
         }
@@ -901,9 +911,12 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
         if (!ImGui::BeginTable("##plotLayoutTable", layoutCols, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
                 return;
         }
-        ImGui::TableSetupColumn("Plot", ImGuiTableColumnFlags_WidthStretch, 0.75f);
+        ImGui::TableSetupColumn(tr("Plot###col_plot", "图形###col_plot"), ImGuiTableColumnFlags_WidthStretch, 0.75f);
         if (showSidePanel_)
-                ImGui::TableSetupColumn(showFft_ ? "Peaks" : "Stats", ImGuiTableColumnFlags_WidthFixed, 180.0f);
+                ImGui::TableSetupColumn(showFft_ ? tr("Peaks###col_panel", "峰值###col_panel")
+                                                 : tr("Stats###col_panel", "统计###col_panel"),
+                                        ImGuiTableColumnFlags_WidthFixed,
+                                        180.0f);
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
 
@@ -1140,14 +1153,14 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
 
                         // 5. Popup Configuration
                         if (ImPlot::BeginLegendPopup(chName.c_str())) {
-                                ImGui::Text("Channel: %s", chName.c_str());
+                                ImGui::Text(tr("Channel: %s", "通道: %s"), chName.c_str());
                                 if (ch->isEnum()) {
                                         const char *currentName = ch->findEnumName(static_cast<i64>(ch->getRVal()));
-                                        ImGui::Text("Value: %s (%lld)",
-                                                    currentName ? currentName : "Unknown",
+                                        ImGui::Text(tr("Value: %s (%lld)", "数值: %s (%lld)"),
+                                                    currentName ? currentName : tr("Unknown", "未知"),
                                                     static_cast<i64>(ch->getRVal()));
                                 } else {
-                                        ImGui::Text("Value: %f", ch->getRVal());
+                                        ImGui::Text(tr("Value: %f", "数值: %f"), ch->getRVal());
                                 }
                                 ImGui::Separator();
 
@@ -1160,12 +1173,12 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                         }
                                 }
                                 f32 colArr[4] = {curCol.x, curCol.y, curCol.z, curCol.w};
-                                if (ImGui::ColorEdit4("Color", colArr, ImGuiColorEditFlags_NoInputs)) {
+                                if (ImGui::ColorEdit4(tr("Color", "颜色"), colArr, ImGuiColorEditFlags_NoInputs)) {
                                         ch->useAutoColor() = false;
                                         memcpy(ch->getColor(), colArr, sizeof(colArr));
                                 }
                                 ImGui::SameLine();
-                                if (ImGui::Checkbox("Auto", &ch->useAutoColor())) {
+                                if (ImGui::Checkbox(tr("Auto", "自动"), &ch->useAutoColor())) {
                                         if (ch->useAutoColor()) {
                                                 static i32 shuffleIdx = 0;
                                                 shuffleIdx            = (shuffleIdx + 1) % ImPlot::GetColormapSize();
@@ -1175,15 +1188,15 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 }
 
                                 ImGui::SetNextItemWidth(100);
-                                const char *styleNames[] = {"Line", "Stairs"};
+                                const char *styleNames[] = {tr("Line", "折线"), tr("Stairs", "阶梯")};
                                 i32         currentStyle = ch->getPlotStyle();
                                 if (ImGui::Combo("##PlotStyle", &currentStyle, styleNames, 2)) {
                                         ch->getPlotStyle() = currentStyle;
                                 }
                                 if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip("Style");
-                                ImGui::Checkbox("Markers", &ch->showMarkers());
-                                if (ImGui::Button("Delete Channel"))
+                                        ImGui::SetTooltip("%s", tr("Style", "样式"));
+                                ImGui::Checkbox(tr("Markers", "标记点"), &ch->showMarkers());
+                                if (ImGui::Button(tr("Delete Channel", "删除通道")))
                                         ch->markPendingDelete();
                                 ImPlot::EndLegendPopup();
                         }
@@ -1209,12 +1222,12 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 for (auto &[chName, peaks] : channelPeaks_) {
                                         if (peaks.empty())
                                                 continue;
-                                        ImGui::Text("Peaks: %s", chName.c_str());
+                                        ImGui::Text(tr("Peaks: %s", "峰值: %s"), chName.c_str());
                                         if (ImGui::BeginTable(("##peaksTable_" + chName).c_str(),
                                                               2,
                                                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
                                                 ImGui::TableSetupColumn("Freq (Hz)");
-                                                ImGui::TableSetupColumn("Mag");
+                                                ImGui::TableSetupColumn(tr("Mag", "幅值"));
                                                 ImGui::TableHeadersRow();
 
                                                 for (const auto &p : peaks) {
@@ -1229,7 +1242,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                         ImGui::Spacing();
                                 }
                         } else {
-                                ImGui::Text("No peaks detected");
+                                ImGui::Text("%s", tr("No peaks detected", "未检测到峰值"));
                         }
                 } else {
                         if (!channelStats_.empty()) {
@@ -1238,8 +1251,8 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                         if (ImGui::BeginTable(("##statsTable_" + chName).c_str(),
                                                               2,
                                                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
-                                                ImGui::TableSetupColumn("Metric");
-                                                ImGui::TableSetupColumn("Value");
+                                                ImGui::TableSetupColumn(tr("Metric###col_metric", "指标###col_metric"));
+                                                ImGui::TableSetupColumn(tr("Value###col_statval", "数值###col_statval"));
                                                 ImGui::TableHeadersRow();
                                                 auto row = [](const char *k, const char *fmt, f64 v) {
                                                         ImGui::TableNextRow();
@@ -1248,11 +1261,11 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                         ImGui::TableSetColumnIndex(1);
                                                         ImGui::Text(fmt, v);
                                                 };
-                                                row("Min", "%.4f", s.min);
-                                                row("Max", "%.4f", s.max);
-                                                row("Pk-Pk", "%.4f", s.pkpk);
-                                                row("Mean", "%.4f", s.mean);
-                                                row("RMS", "%.4f", s.rms);
+                                                row(tr("Min", "最小值"), "%.4f", s.min);
+                                                row(tr("Max", "最大值"), "%.4f", s.max);
+                                                row(tr("Pk-Pk", "峰峰值"), "%.4f", s.pkpk);
+                                                row(tr("Mean", "平均值"), "%.4f", s.mean);
+                                                row(tr("RMS", "有效值"), "%.4f", s.rms);
                                                 ImGui::TableNextRow();
                                                 ImGui::TableSetColumnIndex(0);
                                                 ImGui::TextUnformatted("N");
@@ -1263,7 +1276,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                         ImGui::Spacing();
                                 }
                         } else {
-                                ImGui::Text("No data in window");
+                                ImGui::Text("%s", tr("No data in window", "窗口内无数据"));
                         }
                 }
         } // showSidePanel_
@@ -1478,15 +1491,15 @@ Monitor::updateDisplay()
 
                 // Double-click the title bar (or dock tab) to rename this dock.
                 {
-                        ImGuiWindow *win = ImGui::GetCurrentWindow();
-                        ImRect       tr  = win->DockIsActive ? win->DC.DockTabItemRect : win->TitleBarRect();
-                        if (ImGui::IsMouseHoveringRect(tr.Min, tr.Max, false) &&
+                        ImGuiWindow *win       = ImGui::GetCurrentWindow();
+                        ImRect       titleRect = win->DockIsActive ? win->DC.DockTabItemRect : win->TitleBarRect();
+                        if (ImGui::IsMouseHoveringRect(titleRect.Min, titleRect.Max, false) &&
                             ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
                                 snprintf(renameBuf_, sizeof(renameBuf_), "%s", getTitle().c_str());
                                 ImGui::OpenPopup("Rename Dock");
                         }
                         if (ImGui::BeginPopup("Rename Dock")) {
-                                ImGui::TextDisabled("重命名");
+                                ImGui::TextDisabled("%s", tr("Rename", "重命名"));
                                 ImGui::SetNextItemWidth(220);
                                 if (ImGui::IsWindowAppearing())
                                         ImGui::SetKeyboardFocusHere();
@@ -1497,7 +1510,7 @@ Monitor::updateDisplay()
                                                      ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
                                 ImGui::SameLine();
                                 if (ImGui::Button("OK"))
-                                        commit = true;
+                                        commit = true; // OK keeps its label across languages
                                 if (commit) {
                                         if (renameBuf_[0] != '\0')
                                                 setTitle(renameBuf_);
@@ -1510,21 +1523,42 @@ Monitor::updateDisplay()
                 if (csvLoading_.load(std::memory_order_acquire)) {
                         const char *frames[] = {"|", "/", "-", "\\"};
                         int         fi       = static_cast<int>(ImGui::GetTime() * 8.0) % 4;
-                        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s  正在解析 CSV...", frames[fi]);
+                        ImGui::TextColored(
+                            ImVec4(0.4f, 0.8f, 1.0f, 1.0f), tr("%s  Parsing CSV...", "%s  正在解析 CSV..."), frames[fi]);
                         ImGui::End();
                         return;
                 }
 
-                if (ImGui::Button("Add Scope")) {
+                if (ImGui::Button(tr("Add Scope", "添加示波器"))) {
                         char nameBuf[32];
                         snprintf(nameBuf, sizeof(nameBuf), "scope_%zu", scopes_.size());
                         addScope(nameBuf);
                 }
+
+                // Master pause for every scope's acquisition in this monitor.
+                ImGui::SameLine();
+                const bool monSampPaused = isSamplingPaused();
+                if (monSampPaused) {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.8f, 0.2f, 0.6f)); // Yellow
+                        if (ImGui::Button(tr("Resume All Scopes", "恢复全部采样")))
+                                setSamplingPaused(false);
+                        ImGui::PopStyleColor();
+                } else {
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.8f, 0.6f)); // Blue
+                        if (ImGui::Button(tr("Pause All Scopes", "暂停全部采样")))
+                                setSamplingPaused(true);
+                        ImGui::PopStyleColor();
+                }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s",
+                                          tr("Pause/resume acquisition for all scopes in this monitor",
+                                             "暂停/恢复此监视器内所有示波器的采样"));
+
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 0.5f, 0.0f, 0.6f)); // Orange
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.6f, 0.1f, 0.8f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.7f, 0.2f, 1.0f));
-                if (ImGui::Button("Clear Data")) {
+                if (ImGui::Button(tr("Clear Data", "清空数据"))) {
                         requestClearData();
                         JLinkPort::instance().reqRestart();
                         LOG_I("Monitor[%s] clear data requested from UI", name_.c_str());
@@ -1556,13 +1590,14 @@ Monitor::updateDisplay()
 
                 const bool exporting = csvExport_->running.load(std::memory_order_acquire);
                 ImGui::BeginDisabled(exporting);
-                const bool exportClicked = ImGui::Button("Export CSV");
+                const bool exportClicked = ImGui::Button(tr("Export CSV", "导出 CSV"));
                 ImGui::EndDisabled();
                 if (ImGui::IsItemHovered() && !exporting) {
                         if (estChans == 0)
-                                ImGui::SetTooltip("无数据可导出");
+                                ImGui::SetTooltip("%s", tr("No data to export", "无数据可导出"));
                         else
-                                ImGui::SetTooltip("预计导出大小: ~%s\n通道数: %zu   最大行数: %llu",
+                                ImGui::SetTooltip(tr("Estimated size: ~%s\nChannels: %zu   Max rows: %llu",
+                                                     "预计导出大小: ~%s\n通道数: %zu   最大行数: %llu"),
                                                   humanSize(estBytes).c_str(),
                                                   estChans,
                                                   static_cast<unsigned long long>(estMaxRows));
@@ -1667,7 +1702,10 @@ Monitor::updateDisplay()
                         const char *frames[] = {"|", "/", "-", "\\"};
                         const int   fi       = static_cast<int>(ImGui::GetTime() * 8.0) % 4;
                         const float pct      = total ? (100.0f * static_cast<float>(done) / static_cast<float>(total)) : 0.0f;
-                        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s  正在后台导出 CSV... %.0f%%", frames[fi], pct);
+                        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f),
+                                           tr("%s  Exporting CSV in background... %.0f%%", "%s  正在后台导出 CSV... %.0f%%"),
+                                           frames[fi],
+                                           pct);
                 }
 
                 ImGui::SameLine();
@@ -1680,7 +1718,7 @@ Monitor::updateDisplay()
                         historySeconds_ = h;
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("History(s)");
+                        ImGui::SetTooltip("%s", tr("History(s)", "历史时长(秒)"));
                 // Sync to all channels every frame to ensure newly added channels inherit the setting immediately
                 for (auto &[_, scope] : scopes_)
                         for (auto &[__, ch] : scope->getChannels())
@@ -1696,7 +1734,7 @@ Monitor::updateDisplay()
                         maxDisplayPoints_ = static_cast<u32>(maxPts);
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Max Pts");
+                        ImGui::SetTooltip("%s", tr("Max Pts", "最大显示点数"));
 
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(80);
@@ -1708,8 +1746,11 @@ Monitor::updateDisplay()
                         JLinkPort::instance().reqRestart();
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Target sample rate (Hz). HSS mode on J-Link Pro/Ultra+ can reach several "
-                                          "kHz to tens of kHz; POLL mode is limited by USB latency (~1-2kHz).");
+                        ImGui::SetTooltip("%s",
+                                          tr("Target sample rate (Hz). HSS mode on J-Link Pro/Ultra+ can reach several "
+                                             "kHz to tens of kHz; POLL mode is limited by USB latency (~1-2kHz).",
+                                             "目标采样率 (Hz)。J-Link Pro/Ultra+ 的 HSS 模式可达数 kHz 至数十 kHz；"
+                                             "POLL 模式受 USB 延迟限制（约 1-2kHz）。"));
 
                 ImGui::SameLine();
                 if (actualHz_ > 0.1f) {
@@ -1736,7 +1777,7 @@ Monitor::updateDisplay()
                               samplingMode_ == SamplingMode::HSS ? "HSS" : "POLL");
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Sampling Mode");
+                        ImGui::SetTooltip("%s", tr("Sampling Mode", "采样模式"));
                 ImGui::SameLine();
 
                 // Single MODE combo — targets FFT axis when any scope is in FFT view,
@@ -1748,7 +1789,7 @@ Monitor::updateDisplay()
                                 break;
                         }
 
-                const char *viewModeNames[] = {"FULL", "FOLLOW", "MANUAL"};
+                const char *viewModeNames[] = {tr("FULL", "全览"), tr("FOLLOW", "跟随"), tr("MANUAL", "手动")};
                 i32         curMode         = anyFft ? (i32)fftViewMode_ : (i32)viewMode_;
 
                 ImGui::SetNextItemWidth(90);
@@ -1759,7 +1800,9 @@ Monitor::updateDisplay()
                                 viewMode_ = static_cast<MonitorViewMode>(curMode);
                 }
                 if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip(anyFft ? "Frequency Domain View Mode" : "Time Domain View Mode");
+                        ImGui::SetTooltip("%s",
+                                          anyFft ? tr("Frequency Domain View Mode", "频域视图模式")
+                                                 : tr("Time Domain View Mode", "时域视图模式"));
 
                 ImGui::Separator();
 

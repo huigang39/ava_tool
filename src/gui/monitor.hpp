@@ -26,6 +26,10 @@
 #include "timeops.h"
 
 extern std::atomic<bool> g_monitorPaused;
+// Global "pause all J-Link sampling" switch (top bar). Unlike g_monitorPaused
+// (which is display-only and keeps acquiring), this stops J-Link acquisition
+// entirely: the sampler drops all J-Link read tasks, so HSS auto-stops.
+extern std::atomic<bool> g_jlinkSamplingPaused;
 
 struct ChannelMovePayload {
         MonitorScope *srcScope;
@@ -82,6 +86,9 @@ class Monitor
         int               maxSampleHz_{100};
         std::atomic<bool> pendingDelete_{false};
         std::atomic<bool> csvLoading_{false};
+        // Pause acquisition for every scope in this monitor at once (monitor toolbar).
+        // The sampler skips the whole monitor while set.
+        std::atomic<bool> samplingPaused_{false};
         // Background CSV export progress; shared with the detached writer thread.
         std::shared_ptr<CsvExportState> csvExport_{std::make_shared<CsvExportState>()};
 
@@ -154,6 +161,9 @@ class Monitor
 
         void markPendingDelete() { pendingDelete_.store(true, std::memory_order_release); }
         bool isPendingDelete() const { return pendingDelete_.load(std::memory_order_acquire); }
+
+        bool isSamplingPaused() const { return samplingPaused_.load(std::memory_order_acquire); }
+        void setSamplingPaused(bool p) { samplingPaused_.store(p, std::memory_order_release); }
 
         std::string        getName() { return name_; }
         const std::string &getTitle() const { return title_.empty() ? name_ : title_; }

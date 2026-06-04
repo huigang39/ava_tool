@@ -11,6 +11,7 @@
 
 #include "app_log.hpp"
 #include "core/jlink_port.hpp"
+#include "gui/i18n.hpp"
 
 JLinkPort &
 JLinkPort::instance()
@@ -384,7 +385,8 @@ JLinkPort::drawUI()
         snprintf(nameBuf, sizeof(nameBuf), "%s", dev.c_str());
 
         char btnLabel[128];
-        snprintf(btnLabel, sizeof(btnLabel), "%s##jlink_port_btn", nameBuf[0] != '\0' ? nameBuf : "Select Device");
+        snprintf(
+            btnLabel, sizeof(btnLabel), "%s##jlink_port_btn", nameBuf[0] != '\0' ? nameBuf : tr("Select Device", "选择设备"));
         if (ImGui::Button(btnLabel, ImVec2(180.0f, 0))) {
                 JLINKARM_DEVICE_SELECT_INFO sinfo;
                 sinfo.SizeOfStruct = sizeof(sinfo);
@@ -398,7 +400,7 @@ JLinkPort::drawUI()
                 }
         }
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Device");
+                ImGui::SetTooltip("%s", tr("Device", "设备"));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(180.0f);
         // Logarithmic slider: SWD speeds span a wide range (kHz .. tens of MHz).
@@ -414,7 +416,9 @@ JLinkPort::drawUI()
                 JLINKARM_SetSpeed(static_cast<u32>(spd));
         }
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("J-Link SWD speed (kHz). Drag to set; applies when you release. Ctrl+click to type.");
+                ImGui::SetTooltip("%s",
+                                  tr("J-Link SWD speed (kHz). Drag to set; applies when you release. Ctrl+click to type.",
+                                     "J-Link SWD 速度 (kHz)。拖动设置，松开后生效。Ctrl+点击可输入。"));
 
         ImGui::SameLine();
         const bool busy = busy_.load(std::memory_order_acquire);
@@ -422,22 +426,22 @@ JLinkPort::drawUI()
                 // An async connect/disconnect/reset is running — show a spinner-ish
                 // label instead of a button so the GUI never blocks on USB I/O.
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.5f, 0.5f, 0.6f));
-                ImGui::Button(isConnected_ ? "Working..." : "Connecting...");
+                ImGui::Button(isConnected_ ? tr("Working...", "处理中...") : tr("Connecting...", "连接中..."));
                 ImGui::PopStyleColor();
         } else if (!isConnected_) {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.2f, 0.2f, 1.0f)); // Red
-                if (ImGui::SmallButton("CONNECT"))
+                if (ImGui::SmallButton(tr("CONNECT", "连接")))
                         connectAsync();
                 ImGui::PopStyleColor();
         } else {
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.8f, 0.2f, 1.0f)); // Green
-                if (ImGui::SmallButton("DISCONNECT"))
+                if (ImGui::SmallButton(tr("DISCONNECT", "断开")))
                         disconnectAsync();
                 ImGui::PopStyleColor();
 
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.8f, 0.6f, 0.2f, 1.0f)); // Orange
-                if (ImGui::SmallButton("RESET MCU"))
+                if (ImGui::SmallButton(tr("RESET MCU", "复位 MCU")))
                         resetAsync();
                 ImGui::PopStyleColor();
         }
@@ -445,10 +449,12 @@ JLinkPort::drawUI()
         if (!lastErr_.empty()) {
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
-                ImGui::Text("Error: %s", lastErr_.c_str());
+                ImGui::Text(tr("Error: %s", "错误: %s"), lastErr_.c_str());
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip(
-                            "Try reducing the sampling frequency (Hz) if you see 'Low on memory' or 'Start failed'.");
+                            "%s",
+                            tr("Try reducing the sampling frequency (Hz) if you see 'Low on memory' or 'Start failed'.",
+                               "若出现 'Low on memory' 或 'Start failed'，请尝试降低采样频率 (Hz)。"));
                 ImGui::PopStyleColor();
         }
 }
