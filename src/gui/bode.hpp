@@ -8,6 +8,7 @@
 #include "timeops.h"
 
 class MonitorChannel;
+class Monitor;
 
 class Bode
 {
@@ -16,6 +17,10 @@ class Bode
         void updateDisplay();
 
       private:
+        // Sweep: drive a live swept-sine and measure H per step.
+        // FromData: offline FFT of the data already displayed in the plots.
+        enum class Mode { Sweep, FromData };
+
         struct BodePoint {
                 f64 freq;
                 f64 magDb;
@@ -48,10 +53,17 @@ class Bode
         BodeCurveStyle         bodePhsStyle_{};
         bool                   bodeStyleInit_{false};
 
+        // ---- From-data (offline FFT) mode state ----
+        Mode        bodeMode_{Mode::Sweep};
+        float       bodeOfflineThreshPct_{2.0f}; // keep only bins where |input| >= peak * pct%
+        std::string bodeOfflineStatus_{};
+
         void            generateBodeFreqs_();
         MonitorChannel *findChannelByKey_(const char *key);
+        Monitor        *findMonitorByKey_(const char *key);
         void            draw_();
         void            advanceSweep_();
+        void            computeFromData_();
 };
 
 #endif // !BODE_HPP

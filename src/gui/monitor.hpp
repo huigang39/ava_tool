@@ -32,6 +32,15 @@ struct ChannelMovePayload {
         char          chName[128];
 };
 
+// Progress/lifetime state for a background CSV export. Held via shared_ptr so
+// the writer thread can outlive the Monitor (e.g. window closed mid-export)
+// without dangling.
+struct CsvExportState {
+        std::atomic<bool> running{false};
+        std::atomic<u64>  rows{0};  // rows written so far
+        std::atomic<u64>  total{0}; // total rows to write
+};
+
 class Monitor
 {
       public:
@@ -73,6 +82,8 @@ class Monitor
         int               maxSampleHz_{100};
         std::atomic<bool> pendingDelete_{false};
         std::atomic<bool> csvLoading_{false};
+        // Background CSV export progress; shared with the detached writer thread.
+        std::shared_ptr<CsvExportState> csvExport_{std::make_shared<CsvExportState>()};
 
         f32                           actualHz_{0.0f};
         u64                           pointAccum_{0};

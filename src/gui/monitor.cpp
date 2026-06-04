@@ -8,6 +8,8 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <memory>
+#include <thread>
 #include <vector>
 
 #include "imgui.h"
@@ -25,6 +27,31 @@ std::mutex             Monitor::sMtxInstances_;
 
 class MonitorChannel;
 class MonitorScope;
+
+namespace
+{
+// Self-contained copy of one channel's series for a background CSV write.
+struct CsvExportChannel {
+        std::string      tag; // "<scope>::<channel>"
+        std::vector<f64> ts;
+        std::vector<f32> val;
+};
+
+std::string
+humanSize(u64 bytes)
+{
+        const char *units[] = {"B", "KB", "MB", "GB", "TB"};
+        f64         v       = static_cast<f64>(bytes);
+        int         u       = 0;
+        while (v >= 1024.0 && u < 4) {
+                v /= 1024.0;
+                ++u;
+        }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%.2f %s", v, units[u]);
+        return buf;
+}
+} // namespace
 
 /* -------------------------------------------------------------------------- */
 
@@ -1508,7 +1535,39 @@ Monitor::updateDisplay()
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f)); // Green
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 0.3f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
-                if (ImGui::Button("Export CSV")) {
+
+                // Cheap per-frame estimate of the resulting CSV size, shown as a tooltip so the
+                // user knows what they're about to write before picking a path.
+                u64    estMaxRows = 0; // longest channel → number of data rows
+                u64    estCells   = 0; // total populated "ts,val" pairs across all channels
+                size_t estChans   = 0;
+                for (auto &[scopeName, scope] : scopes_) {
+                        for (auto &[chName, ch] : scope->getChannels()) {
+                                const u64 n = static_cast<u64>(ch->read_.rawSize());
+                                if (n > estMaxRows)
+                                        estMaxRows = n;
+                                estCells += n;
+                                ++estChans;
+                        }
+                }
+                // ~9 chars per "%.6f" number, two numbers per populated cell, plus the comma
+                // separators (2 per channel per row) and one newline per row. Header negligible.
+                const u64 estBytes = estCells * 2ull * 9ull + estMaxRows * static_cast<u64>(estChans) * 2ull + estMaxRows;
+
+                const bool exporting = csvExport_->running.load(std::memory_order_acquire);
+                ImGui::BeginDisabled(exporting);
+                const bool exportClicked = ImGui::Button("Export CSV");
+                ImGui::EndDisabled();
+                if (ImGui::IsItemHovered() && !exporting) {
+                        if (estChans == 0)
+                                ImGui::SetTooltip("无数据可导出");
+                        else
+                                ImGui::SetTooltip("预计导出大小: ~%s\n通道数: %zu   最大行数: %llu",
+                                                  humanSize(estBytes).c_str(),
+                                                  estChans,
+                                                  static_cast<unsigned long long>(estMaxRows));
+                }
+                if (exportClicked) {
                         char dfltBuf[128];
                         auto now = std::time(nullptr);
                         std::strftime(dfltBuf, sizeof(dfltBuf), "%Y%m%d_%H%M%S_", std::localtime(&now));
@@ -1521,61 +1580,95 @@ Monitor::updateDisplay()
                                 if (fullpath.find(".csv") == std::string::npos)
                                         fullpath += ".csv";
 
-                                FILE *f = fopen(fullpath.c_str(), "w");
-                                if (f) {
-                                        // Each column pair is tagged "<scope>::<channel>::Time" /
-                                        // "<scope>::<channel>::Value" so the importer can restore the
-                                        // originating scope. "::" is used (instead of "_") because both
-                                        // scope and channel names may legitimately contain underscores.
-                                        std::vector<std::pair<std::string, MonitorChannel *>> channels;
-                                        for (auto &[scopeName, scope] : scopes_) {
-                                                for (auto &[chName, ch] : scope->getChannels()) {
-                                                        channels.push_back({scopeName + "::" + chName, ch.get()});
+                                // Snapshot the data now, while we hold mtxMonitors_, into a
+                                // self-contained buffer. The background writer then never touches
+                                // shared channel state, so sampling/UI stay unblocked.
+                                //
+                                // Each column pair is tagged "<scope>::<channel>::Time" /
+                                // "<scope>::<channel>::Value" so the importer can restore the
+                                // originating scope. "::" is used (instead of "_") because both
+                                // scope and channel names may legitimately contain underscores.
+                                auto   snapshot = std::make_shared<std::vector<CsvExportChannel>>();
+                                size_t maxLen   = 0;
+                                for (auto &[scopeName, scope] : scopes_) {
+                                        for (auto &[chName, ch] : scope->getChannels()) {
+                                                CsvExportChannel c;
+                                                c.tag         = scopeName + "::" + chName;
+                                                const usize n = ch->read_.rawSize();
+                                                c.ts.reserve(n);
+                                                c.val.reserve(n);
+                                                for (usize i = 0; i < n; ++i) {
+                                                        c.ts.push_back(ch->read_.rawTs(i));
+                                                        c.val.push_back(ch->read_.rawVal(i));
                                                 }
+                                                if (n > maxLen)
+                                                        maxLen = n;
+                                                snapshot->push_back(std::move(c));
                                         }
+                                }
 
-                                        // Write header
+                                auto state = csvExport_; // shared_ptr keeps progress state alive past Monitor
+                                state->rows.store(0, std::memory_order_release);
+                                state->total.store(static_cast<u64>(maxLen), std::memory_order_release);
+                                state->running.store(true, std::memory_order_release);
+
+                                std::string monName = name_;
+                                std::thread([snapshot, state, fullpath, maxLen, monName]() {
+                                        FILE *f = fopen(fullpath.c_str(), "w");
+                                        if (!f) {
+                                                LOG_E("Monitor[%s] failed to open %s for export",
+                                                      monName.c_str(),
+                                                      fullpath.c_str());
+                                                state->running.store(false, std::memory_order_release);
+                                                return;
+                                        }
+                                        const auto &channels = *snapshot;
+
+                                        // Header
                                         for (size_t i = 0; i < channels.size(); ++i) {
                                                 fprintf(f,
                                                         "%s::Time,%s::Value%s",
-                                                        channels[i].first.c_str(),
-                                                        channels[i].first.c_str(),
-                                                        (i == channels.size() - 1) ? "" : ",");
+                                                        channels[i].tag.c_str(),
+                                                        channels[i].tag.c_str(),
+                                                        (i + 1 == channels.size()) ? "" : ",");
                                         }
                                         fprintf(f, "\n");
 
-                                        // Find max length
-                                        size_t maxLen = 0;
-                                        for (auto &c : channels) {
-                                                if (c.second->read_.rawSize() > maxLen) {
-                                                        maxLen = c.second->read_.rawSize();
-                                                }
-                                        }
-
-                                        // Write data
+                                        // Data
                                         for (size_t row = 0; row < maxLen; ++row) {
                                                 for (size_t i = 0; i < channels.size(); ++i) {
-                                                        if (row < channels[i].second->read_.rawSize()) {
-                                                                fprintf(f,
-                                                                        "%.6f,%.6f",
-                                                                        channels[i].second->read_.rawTs(row),
-                                                                        channels[i].second->read_.rawVal(row));
+                                                        if (row < channels[i].ts.size()) {
+                                                                fprintf(
+                                                                    f, "%.6f,%.6f", channels[i].ts[row], channels[i].val[row]);
                                                         } else {
                                                                 fprintf(f, ",");
                                                         }
-                                                        if (i < channels.size() - 1)
+                                                        if (i + 1 < channels.size())
                                                                 fprintf(f, ",");
                                                 }
                                                 fprintf(f, "\n");
+                                                if ((row & 0x3FF) == 0)
+                                                        state->rows.store(static_cast<u64>(row), std::memory_order_release);
                                         }
                                         fclose(f);
-                                        LOG_I("Monitor[%s] exported to %s", name_.c_str(), fullpath.c_str());
-                                } else {
-                                        LOG_E("Monitor[%s] failed to open %s for export", name_.c_str(), fullpath.c_str());
-                                }
+                                        state->rows.store(static_cast<u64>(maxLen), std::memory_order_release);
+                                        state->running.store(false, std::memory_order_release);
+                                        LOG_I(
+                                            "Monitor[%s] exported to %s (%zu rows)", monName.c_str(), fullpath.c_str(), maxLen);
+                                }).detach();
                         }
                 }
                 ImGui::PopStyleColor(3);
+
+                if (exporting) {
+                        ImGui::SameLine();
+                        const u64   done     = csvExport_->rows.load(std::memory_order_acquire);
+                        const u64   total    = csvExport_->total.load(std::memory_order_acquire);
+                        const char *frames[] = {"|", "/", "-", "\\"};
+                        const int   fi       = static_cast<int>(ImGui::GetTime() * 8.0) % 4;
+                        const float pct      = total ? (100.0f * static_cast<float>(done) / static_cast<float>(total)) : 0.0f;
+                        ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "%s  正在后台导出 CSV... %.0f%%", frames[fi], pct);
+                }
 
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(100);
