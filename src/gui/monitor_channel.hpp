@@ -67,6 +67,7 @@ class MonitorChannel
         std::atomic<bool> wValDirty_{false};
         std::atomic<bool> pendingDelete_{false};
         bool              addrUnknown_{false}; // symbol missing from the (reloaded) ELF
+        bool              writable_{true};     // RW or RO — shown in the table R/W column
 
         // Primary data store — written ONLY by sampler thread (no lock needed).
         MmapVector<f32> rVals_{};
@@ -170,6 +171,9 @@ class MonitorChannel
 
         i64  getOrder() const { return order_; }
         void setOrder(i64 o) { order_ = o; }
+
+        bool isWritable() const { return writable_; }
+        void setWritable(bool w) { writable_ = w; }
 
         f32  &getRVal() { return rVal_; }
         f32   getDispVal() const { return dispVal_; } // GUI display value (frozen while paused)

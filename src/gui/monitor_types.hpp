@@ -7,6 +7,7 @@
 
 #include "module.h"
 #include <string>
+#include <vector>
 
 // Payload carried when dragging a single scalar symbol from the symbol browser
 // onto a monitor scope. Serialised into the ImGui drag-drop system as POD.
@@ -27,7 +28,11 @@ struct ChannelDropPayload {
         u64       typeOff;     // DWARF type offset
         u32       bitOffset;
         u32       bitSize;
+        bool      writable;
         EnumEntry enums[kMaxEnums];
+        // Source Variable (its watch list) when the drag started in a symbol browser;
+        // null otherwise. Lets a monitor drop mirror the symbol back into that watch list.
+        const void *srcWatch{nullptr};
 };
 
 // Payload for dragging a struct/array from the variable window to a monitor scope.
@@ -42,11 +47,13 @@ struct StructChannelPayload {
                 u8                            numEnums;
                 u32                           bitOffset;
                 u32                           bitSize;
+                bool                          writable;
                 ChannelDropPayload::EnumEntry enums[kMaxEnums];
         };
         int  count;
         char device[8];
         char shmName[64];
+        bool writable;
         // Root struct/array metadata, so a drop target (e.g. the variable watch
         // list) can add the whole struct as a single expandable entry instead of
         // the flattened scalar leaves the monitor consumes.
@@ -54,7 +61,26 @@ struct StructChannelPayload {
         u64   rootAddr;
         u64   rootTypeOff;
         Entry entries[kMaxEntries];
+        // See ChannelDropPayload::srcWatch.
+        const void *srcWatch{nullptr};
 };
+
+// A request, queued when a symbol-browser drag is dropped on a monitor, to mirror
+// that symbol into the originating Variable's watch list. Drained once per frame by
+// Gui::loop(), which dispatches it to the Variable whose pointer matches `target`.
+struct WatchMirrorRequest {
+        const void          *target{nullptr}; // the Variable* that should receive it
+        bool                 isStruct{false};
+        ChannelDropPayload   scalar{}; // valid when !isStruct
+        StructChannelPayload group{};  // valid when isStruct
+};
+
+inline std::vector<WatchMirrorRequest> &
+watchMirrorQueue()
+{
+        static std::vector<WatchMirrorRequest> q;
+        return q;
+}
 
 enum class MonitorViewMode { FULL, FOLLOW, MANUAL };
 

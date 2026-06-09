@@ -19,6 +19,7 @@
 
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
+#include "gui/tutorial_guide.hpp"
 #include "gui/ui_theme.hpp"
 #include "platform/native_dlg.hpp"
 
@@ -260,7 +261,7 @@ void
 MonitorScope::tableDraw()
 {
         if (!ImGui::BeginTable("MonitorTable",
-                               6,
+                               7,
                                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                    ImGuiTableFlags_Sortable))
                 return;
@@ -271,6 +272,8 @@ MonitorScope::tableDraw()
         ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn(tr("Port###col_port", "端口###col_port"), ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn(
+            tr("R/W###col_rw", "读写###col_rw"), ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 50.0f);
         ImGui::TableSetupColumn(
             tr("Wave###col_wave", "波形###col_wave"), ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 100.0f);
         ImGui::TableHeadersRow();
@@ -418,6 +421,19 @@ MonitorScope::tableDraw()
                         const bool wasOpen = expandedGroups_.count(fullPath) > 0;
                         ImGui::SetNextItemOpen(wasOpen);
                         bool open = ImGui::TreeNodeEx(label.c_str(), treeFlags);
+
+                        // Drag the whole struct/array group to another scope (moves every leaf
+                        // under it together — see the DND_CHANNEL_MOVE drop handler).
+                        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                                ChannelMovePayload payload;
+                                payload.srcScope = this;
+                                payload.isGroup  = true;
+                                snprintf(payload.chName, sizeof(payload.chName), "%s", fullPath.c_str());
+                                ImGui::SetDragDropPayload("DND_CHANNEL_MOVE", &payload, sizeof(ChannelMovePayload));
+                                ImGui::Text(tr("Move group: %s", "移动分组: %s"), label.c_str());
+                                ImGui::EndDragDropSource();
+                        }
+
                         if (open != wasOpen) {
                                 if (open)
                                         expandedGroups_.insert(fullPath);
@@ -481,6 +497,7 @@ MonitorScope::tableDraw()
                                 ImGui::EndPopup();
                         }
 
+                        ImGui::TableNextColumn();
                         ImGui::TableNextColumn();
                         ImGui::TableNextColumn();
                         ImGui::TableNextColumn();
@@ -578,9 +595,20 @@ MonitorScope::drawTableRow(const std::string               &chName,
                 ImGui::EndDragDropSource();
         }
 
-        // 2. Value (Interactive)
+        // 2. Value (Interactive if writable)
         ImGui::TableNextColumn();
-        if (ch->isEnum()) {
+        if (!ch->isWritable()) {
+                if (ch->isEnum()) {
+                        const f32   dispVal     = ch->getDispVal();
+                        const char *currentName = ch->findEnumName(static_cast<i64>(dispVal));
+                        if (currentName)
+                                ImGui::Text("%s (%lld)", currentName, static_cast<i64>(dispVal));
+                        else
+                                ImGui::Text("Unknown (%f)", dispVal);
+                } else {
+                        ImGui::Text("%.6f", ch->getDispVal());
+                }
+        } else if (ch->isEnum()) {
                 const f32   dispVal     = ch->getDispVal();
                 const char *currentName = ch->findEnumName(static_cast<i64>(dispVal));
                 char        previewBuf[128];
@@ -616,7 +644,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
                         }
                 } else {
                         f32 v = ch->getDispVal();
-                        ImGui::InputFloat("##val", &v, 0, 0, "%.3f");
+                        ImGui::InputFloat("##val", &v, 0, 0, "%.6f");
                         if (ImGui::IsItemDeactivated() &&
                             (ImGui::IsKeyPressed(ImGuiKey_Enter) || ImGui::IsKeyPressed(ImGuiKey_KeypadEnter))) {
                                 ch->setWVal(v);
@@ -646,7 +674,14 @@ MonitorScope::drawTableRow(const std::string               &chName,
         else
                 ImGui::Text("%s", dev.c_str());
 
-        // 6. Wave Control
+        // 6. R/W
+        ImGui::TableNextColumn();
+        if (ch->isWritable())
+                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "RW");
+        else
+                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RO");
+
+        // 7. Wave Control
         ImGui::TableNextColumn();
         f32 availX  = ImGui::GetContentRegionAvail().x;
         f32 spacing = ImGui::GetStyle().ItemSpacing.x;
@@ -1236,7 +1271,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                         ImGui::TableSetColumnIndex(0);
                                                         ImGui::Text("%.1f", p.freq);
                                                         ImGui::TableSetColumnIndex(1);
-                                                        ImGui::Text("%.3f", p.mag);
+                                                        ImGui::Text("%.6f", p.mag);
                                                 }
                                                 ImGui::EndTable();
                                         }
@@ -1262,11 +1297,11 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                         ImGui::TableSetColumnIndex(1);
                                                         ImGui::Text(fmt, v);
                                                 };
-                                                row(tr("Min", "最小值"), "%.4f", s.min);
-                                                row(tr("Max", "最大值"), "%.4f", s.max);
-                                                row(tr("Pk-Pk", "峰峰值"), "%.4f", s.pkpk);
-                                                row(tr("Mean", "平均值"), "%.4f", s.mean);
-                                                row(tr("RMS", "有效值"), "%.4f", s.rms);
+                                                row(tr("Min", "最小值"), "%.6f", s.min);
+                                                row(tr("Max", "最大值"), "%.6f", s.max);
+                                                row(tr("Pk-Pk", "峰峰值"), "%.6f", s.pkpk);
+                                                row(tr("Mean", "平均值"), "%.6f", s.mean);
+                                                row(tr("RMS", "有效值"), "%.6f", s.rms);
                                                 ImGui::TableNextRow();
                                                 ImGui::TableSetColumnIndex(0);
                                                 ImGui::TextUnformatted("N");
@@ -1366,6 +1401,15 @@ MonitorScope::dropTarget()
                                                         parent_->setModified();
                                         }
                                 }
+                                // Mirror the symbol back into the originating Variable's watch
+                                // list (only symbol-browser drags tag srcWatch).
+                                if (chPayload->srcWatch) {
+                                        WatchMirrorRequest req;
+                                        req.target   = chPayload->srcWatch;
+                                        req.isStruct = false;
+                                        req.scalar   = *chPayload;
+                                        watchMirrorQueue().push_back(req);
+                                }
                         }
                 }
 
@@ -1398,17 +1442,43 @@ MonitorScope::dropTarget()
                                                 }
                                         }
                                 }
+                                // Mirror the whole struct/array back into the source watch list.
+                                if (sp->srcWatch) {
+                                        WatchMirrorRequest req;
+                                        req.target   = sp->srcWatch;
+                                        req.isStruct = true;
+                                        req.group    = *sp;
+                                        watchMirrorQueue().push_back(req);
+                                }
                         }
                 }
 
                 if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE")) {
                         auto *data = static_cast<ChannelMovePayload *>(payload->Data);
                         if (data->srcScope != this) {
-                                auto it = data->srcScope->getChannels().find(data->chName);
-                                if (it != data->srcScope->getChannels().end()) {
-                                        // Transfer ownership
-                                        this->getChannels()[data->chName] = std::move(it->second);
-                                        data->srcScope->getChannels().erase(it);
+                                auto &src = data->srcScope->getChannels();
+                                if (data->isGroup) {
+                                        // Move every channel under the group: key == prefix or "prefix.".
+                                        const std::string        exact  = data->chName;
+                                        const std::string        prefix = exact + ".";
+                                        std::vector<std::string> toMove;
+                                        for (auto &[k, _] : src)
+                                                if (k == exact || k.rfind(prefix, 0) == 0)
+                                                        toMove.push_back(k);
+                                        for (auto &k : toMove) {
+                                                auto it = src.find(k);
+                                                if (it != src.end()) {
+                                                        this->getChannels()[k] = std::move(it->second);
+                                                        src.erase(it);
+                                                }
+                                        }
+                                } else {
+                                        auto it = src.find(data->chName);
+                                        if (it != src.end()) {
+                                                // Transfer ownership
+                                                this->getChannels()[data->chName] = std::move(it->second);
+                                                src.erase(it);
+                                        }
                                 }
                         }
                 }
@@ -1553,6 +1623,7 @@ Monitor::updateDisplay()
                         snprintf(nameBuf, sizeof(nameBuf), "scope_%zu", scopes_.size());
                         addScope(nameBuf);
                 }
+                TutorialGuide::instance().mark("monitor_window");
 
                 // Master pause for every scope's acquisition in this monitor.
                 const bool  monSampPaused = isSamplingPaused();

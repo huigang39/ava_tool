@@ -22,6 +22,9 @@
 #include "module.h"
 
 class MonitorChannel;
+struct ChannelDropPayload;
+struct StructChannelPayload;
+struct WatchMirrorRequest;
 
 enum class PortType { JLINK, UDP, SHM, MANUAL };
 
@@ -108,6 +111,7 @@ class Variable
         i32                             elfArrayMaxElems_{64};
         std::filesystem::file_time_type elfLastWriteTime_{};
         bool                            elfReloaded_{false};
+        std::atomic<bool>               propertiesChanged_{false};
         std::atomic<bool>               isElfLoading_{false};
         mutable std::mutex              mtxElf_{};
         std::shared_ptr<ElfLoadingTask> currentLoadingTask_;
@@ -165,6 +169,18 @@ class Variable
         std::string              enumSubEditMemberPath_;
         u64                      enumSubEditMemberTypeOff_{0};
 
+        i32 editPropIdx_{-1};
+        struct {
+                char     name[64]{};
+                DataType type     = DataType::U32;
+                PortType port     = PortType::JLINK;
+                bool     writable = true;
+                char     addrBuf[32]{};
+                char     udpIp[16]{};
+                int      udpPort = 8080;
+                char     shmName[64]{};
+        } editPropBuf_;
+
         void rebuildSearchPool();
         void flattenDwarfType(std::vector<SearchEntry> &pool,
                               const dwarf::Info        &info,
@@ -197,6 +213,7 @@ class Variable
         bool isModified() const { return isModified_; }
         void clearModified() { isModified_ = false; }
         void addRecursive(const std::string &fullPath, u64 addr, u64 typeOff, PortType port);
+        bool watchHasName(const std::string &name) const; // true if a watch entry already uses this name
         void draw();
         void drawVarVarTreeRow(const std::string &name,
                                u64                addr,
@@ -221,6 +238,11 @@ class Variable
         void drawAddVariableDialog();
         void drawEnumEditPopup();
         void drawSubEnumEditPopup();
+        void drawEditPropertiesPopup();
+
+        // Export / import the whole watch list to a .var file (JSON).
+        void exportVarFile(const std::string &path);
+        void importVarFile(const std::string &path);
 
         void handleDroppedFile(const std::string &path);
 
@@ -253,6 +275,13 @@ class Variable
 
         void updateDisplay();
 
+        // Add a dragged symbol to this window's watch list. Shared by the watch-list
+        // drop target and the "mirror from a monitor drop" path. Both dedup by name.
+        void addScalarToWatch(const ChannelDropPayload &p);
+        void addStructToWatch(const StructChannelPayload &s);
+        // Dispatch a queued mirror request (symbol-browser drag dropped onto a monitor).
+        void mirrorFromMonitorDrop(const WatchMirrorRequest &req);
+
         const std::string &getName() const { return name_; }
         const std::string &getTitle() const { return title_.empty() ? name_ : title_; }
         void               setTitle(const std::string &t)
@@ -268,6 +297,11 @@ class Variable
                 bool r       = elfReloaded_;
                 elfReloaded_ = false;
                 return r;
+        }
+        bool consumePropertiesChanged()
+        {
+                bool expected = true;
+                return propertiesChanged_.compare_exchange_strong(expected, false);
         }
         const ElfInfo     &getElfInfo() const { return elfInfo_; }
         const dwarf::Info &getDwarfInfo() const { return dwarfInfo_; }

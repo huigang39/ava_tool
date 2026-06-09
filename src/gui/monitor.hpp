@@ -33,7 +33,11 @@ extern std::atomic<bool> g_jlinkSamplingPaused;
 
 struct ChannelMovePayload {
         MonitorScope *srcScope;
-        char          chName[128];
+        // When isGroup is false: the exact channel key to move.
+        // When isGroup is true: a struct/array group path prefix — every channel whose
+        // key equals it or starts with "<chName>." is moved together.
+        char chName[128];
+        bool isGroup{false};
 };
 
 // Progress/lifetime state for a background CSV export. Held via shared_ptr so

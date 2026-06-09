@@ -33,6 +33,7 @@ extern "C" {
 #define OPTNONE
 #define ALIGN(align) __declspec(align(align))
 #define FUNC_UNUSED
+#define FUNC_USED
 #ifdef __cplusplus
 #define TYPEOF(var) decltype(var)
 #else
@@ -45,6 +46,7 @@ extern "C" {
 #define OPTNONE      __attribute__((optnone))
 #define ALIGN(align) __attribute__((aligned(align)))
 #define FUNC_UNUSED  __attribute__((unused))
+#define FUNC_USED    __attribute__((used))
 #define TYPEOF(var)  __typeof__(var)
 #define PACKED       __attribute__((packed))
 #if defined(__has_feature)

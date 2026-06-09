@@ -12,6 +12,7 @@
 #include "app_log.hpp"
 #include "core/jlink_port.hpp"
 #include "gui/i18n.hpp"
+#include "gui/tutorial_guide.hpp"
 #include "gui/ui_theme.hpp"
 
 JLinkPort &
@@ -400,6 +401,7 @@ JLinkPort::drawUI()
                                 setDeviceName(dinfo.sName);
                 }
         }
+        TutorialGuide::instance().mark("device_btn");
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tr("Device", "设备"));
         ImGui::SameLine();
@@ -407,6 +409,7 @@ JLinkPort::drawUI()
         // Logarithmic slider: SWD speeds span a wide range (kHz .. tens of MHz).
         int spd = speedKHz_.load(std::memory_order_relaxed);
         ImGui::SliderInt("##jlinkSpeed", &spd, 5, 50000, "%d kHz", ImGuiSliderFlags_Logarithmic);
+        TutorialGuide::instance().mark("speed_slider");
         const bool speedCommitted = ImGui::IsItemDeactivatedAfterEdit();
         if (spd < 1)
                 spd = 1;
@@ -432,10 +435,12 @@ JLinkPort::drawUI()
                 // Connect = constructive action → green.
                 if (ui::SmallButton(tr("CONNECT", "连接"), ui::BtnStyle::Success))
                         connectAsync();
+                TutorialGuide::instance().mark("connect_btn");
         } else {
                 // Disconnect = teardown → red; Reset = caution → amber.
                 if (ui::SmallButton(tr("DISCONNECT", "断开"), ui::BtnStyle::Danger))
                         disconnectAsync();
+                TutorialGuide::instance().mark("connect_btn");
 
                 ImGui::SameLine();
                 if (ui::SmallButton(tr("RESET MCU", "复位 MCU"), ui::BtnStyle::Warning))

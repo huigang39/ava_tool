@@ -37,6 +37,7 @@
 #include "gui/gui.hpp"
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
+#include "gui/tutorial_guide.hpp"
 #include "gui/ui_theme.hpp"
 #include "gui/variable.hpp"
 #include "platform/native_dlg.hpp"
@@ -144,6 +145,8 @@ Gui::Gui(const std::string &initialPath)
 
         if (motorProfiles_.empty())
                 motorProfiles_.push_back(MotorProfile{});
+
+        TutorialGuide::instance().loadState(getAppDir());
 }
 
 Gui::~Gui()
@@ -392,6 +395,7 @@ Gui::saveSession(const std::string &path)
                                 cJSON_AddNumberToObject(chObj, "plotStyle", ch->getPlotStyle());
                                 cJSON_AddBoolToObject(chObj, "showMarkers", ch->showMarkers());
                                 cJSON_AddBoolToObject(chObj, "show", ch->show());
+                                cJSON_AddBoolToObject(chObj, "writable", ch->isWritable());
 
                                 if (ch->isEnum()) {
                                         cJSON *enumsArr = cJSON_CreateArray();
@@ -688,6 +692,8 @@ Gui::loadSession(const std::string &path)
                                                 ch->showMarkers() = cJSON_IsTrue(sm);
                                         if (const cJSON *sh = cJSON_GetObjectItem(chItem, "show"); cJSON_IsBool(sh))
                                                 ch->show() = cJSON_IsTrue(sh);
+                                        if (const cJSON *wrt = cJSON_GetObjectItem(chItem, "writable"); cJSON_IsBool(wrt))
+                                                ch->setWritable(cJSON_IsTrue(wrt));
 
                                         if (const cJSON *enumsArr = cJSON_GetObjectItem(chItem, "enums");
                                             cJSON_IsArray(enumsArr)) {
@@ -855,23 +861,29 @@ Gui::drawBar()
                 if (!sessionToOpen.empty())
                         loadSession(sessionToOpen);
 
-                if (ImGui::BeginMenu(tr("Window", "窗口"))) {
-                        if (ImGui::MenuItem(tr("Add Monitor", "添加监视器"))) {
-                                std::string monitorName = "Monitor_" + std::to_string(monitors_.size());
+                // mark() right after BeginMenu so the highlight tracks the (closed) menu
+                // header — guiding the user to open it, not just appearing once it's open.
+                const bool windowMenuOpen = ImGui::BeginMenu(tr("Window", "窗口"));
+                TutorialGuide::instance().mark("menu_window");
+                if (windowMenuOpen) {
+                        if (ImGui::MenuItem(tr("Add Variable Monitor", "添加变量监视器"))) {
+                                std::string monitorName = "变量监视器_" + std::to_string(monitors_.size());
                                 monitors_[monitorName]  = std::make_shared<Monitor>(monitorName);
                                 isModified_             = true;
-                                LOG_I("Add Monitor: %s", monitorName.c_str());
+                                LOG_I("Add Variable Monitor: %s", monitorName.c_str());
                         }
-                        if (ImGui::MenuItem(tr("Add Variable", "添加变量"))) {
-                                std::string varName = "Variable_" + std::to_string(vars_.size());
+                        if (ImGui::MenuItem(tr("Add Variable Manager", "添加变量管理器"))) {
+                                std::string varName = "变量管理器_" + std::to_string(vars_.size());
                                 vars_[varName]      = std::make_shared<Variable>(varName);
                                 isModified_         = true;
-                                LOG_I("Add Variable Window: %s", varName.c_str());
+                                LOG_I("Add Variable Manager Window: %s", varName.c_str());
                         }
                         ImGui::EndMenu();
                 }
 
-                if (ImGui::BeginMenu(tr("Tools", "工具"))) {
+                const bool toolsMenuOpen = ImGui::BeginMenu(tr("Tools", "工具"));
+                TutorialGuide::instance().mark("menu_tools");
+                if (toolsMenuOpen) {
                         ImGui::MenuItem(tr("Joint Calculator", "电机参数计算器"), nullptr, &showCalculator_);
                         ImGui::Separator();
                         ImGui::MenuItem(tr("Bode Plot", "伯德图"), nullptr, &bode_.show_);
@@ -984,6 +996,10 @@ Gui::drawBar()
                         }
                         if (checking)
                                 ImGui::TextDisabled("%s", tr("  checking...", "  检查中..."));
+                        ImGui::Separator();
+                        if (ImGui::MenuItem(tr("Show Tutorial", "显示新手引导"))) {
+                                TutorialGuide::instance().start();
+                        }
                         ImGui::EndMenu();
                 }
 
@@ -998,9 +1014,11 @@ Gui::drawBar()
                 if (paused) {
                         if (ui::SmallButton(tr("RESUME", "继续"), ui::BtnStyle::Success))
                                 g_monitorPaused.store(false);
+                        TutorialGuide::instance().mark("pause_btn");
                 } else {
                         if (ui::SmallButton(tr("PAUSE", "暂停"), ui::BtnStyle::Warning))
                                 g_monitorPaused.store(true);
+                        TutorialGuide::instance().mark("pause_btn");
                 }
 
                 // Pause all J-Link acquisition (separate from the display-only pause above).
@@ -1209,14 +1227,31 @@ Gui::loop()
                                         if (it->second->consumeElfReloaded()) {
                                                 syncSymbolAddresses(it->second.get());
                                         }
+                                        if (it->second->consumePropertiesChanged()) {
+                                                syncVariableProperties(it->second.get());
+                                        }
                                         ++it;
                                 }
                         }
                 }
 
+                // Mirror symbols dropped from a symbol browser onto a monitor back into the
+                // originating Variable's watch list (requests queued by MonitorScope::dropTarget).
+                if (auto &mirrorQ = watchMirrorQueue(); !mirrorQ.empty()) {
+                        for (const auto &req : mirrorQ)
+                                for (auto &v : vars_ | std::views::values)
+                                        if (static_cast<const void *>(v.get()) == req.target) {
+                                                v->mirrorFromMonitorDrop(req);
+                                                break;
+                                        }
+                        mirrorQ.clear();
+                }
+
                 bode_.updateDisplay();
                 asmViewer_.draw(this);
                 seqEditor_.draw();
+
+                TutorialGuide::instance().draw();
 
                 processPendingCsvImports();
 
@@ -1410,6 +1445,49 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
 }
 
 void
+Gui::syncVariableProperties(Variable *var)
+{
+        std::lock_guard lk(mtxMonitors_);
+        for (auto &pair : monitors_) {
+                for (auto &spair : pair.second->getScopes()) {
+                        for (auto &cpair : spair.second->getChannels()) {
+                                MonitorChannel *ch = cpair.second.get();
+                                if (ch->getSymbolName().empty())
+                                        continue;
+                                for (const auto &v : var->vars_) {
+                                        bool isMatch = false;
+                                        if (ch->getSymbolName() == v.name) {
+                                                isMatch = true;
+                                        } else if (ch->getSymbolName().size() > v.name.size()) {
+                                                if (ch->getSymbolName().compare(0, v.name.size(), v.name) == 0) {
+                                                        char nextChar = ch->getSymbolName()[v.name.size()];
+                                                        if (nextChar == '.' || nextChar == '[') {
+                                                                isMatch = true;
+                                                        }
+                                                }
+                                        }
+
+                                        if (isMatch) {
+                                                ch->setWritable(v.writable);
+                                                ch->setAddr(v.addr);
+                                                const char *deviceNames[] = {"JLINK", "UDP", "SHM", "MANUAL"};
+                                                ch->setDevice(deviceNames[(int)v.port]);
+                                                if (v.port == PortType::UDP) {
+                                                        ch->setDevice("LOCAL");
+                                                }
+                                                if (v.port == PortType::SHM) {
+                                                        ch->setShmRegionName(v.shm.name);
+                                                        MonitorScope::shmInit(*ch);
+                                                }
+                                                break;
+                                        }
+                                }
+                        }
+                }
+        }
+}
+
+void
 Gui::drawCalculator()
 {
         if (!ImGui::Begin(tr("Motor Parameter Calculator###MotorCalc", "电机参数计算器###MotorCalc"), &showCalculator_)) {
@@ -1460,15 +1538,15 @@ Gui::drawCalculator()
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tr("Model", "型号"));
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("##MotorRs", &mp.Rs, 0.0f, 0.0f, "%.4f");
+        ImGui::InputFloat("##MotorRs", &mp.Rs, 0.0f, 0.0f, "%.6f");
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Rs (Ohm)");
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("##MotorLd", &mp.Ld, 0.0f, 0.0f, "%.6f");
+        ImGui::InputFloat("##MotorLd", &mp.Ld, 0.0f, 0.0f, "%.8f");
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Ld (H)");
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("##MotorLq", &mp.Lq, 0.0f, 0.0f, "%.6f");
+        ImGui::InputFloat("##MotorLq", &mp.Lq, 0.0f, 0.0f, "%.8f");
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Lq (H)");
         ImGui::SetNextItemWidth(150.0f);
@@ -1476,7 +1554,7 @@ Gui::drawCalculator()
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tr("Pole Pairs", "极对数"));
         ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("##MotorKt", &mp.Kt, 0.0f, 0.0f, "%.6f");
+        ImGui::InputFloat("##MotorKt", &mp.Kt, 0.0f, 0.0f, "%.8f");
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("Kt (Nm/A)");
 

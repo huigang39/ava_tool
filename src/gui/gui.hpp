@@ -85,6 +85,7 @@ class Gui
         void setLang(Lang lang);
         void drawCalculator();
         void syncSymbolAddresses(Variable *reloadedVar);
+        void syncVariableProperties(Variable *var);
 
         struct MotorProfile {
                 char  modelName[64] = "Motor_A";

@@ -15,6 +15,7 @@
 #include "gui/gui.hpp"
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
+#include "gui/tutorial_guide.hpp"
 #include "gui/ui_theme.hpp"
 #include "gui/variable.hpp"
 
@@ -89,7 +90,7 @@ decodeValue(const u8 *raw, DataType type, u32 bitOffset = 0, u32 bitSize = 0)
                         break;
                 }
                 case DataType::F32:
-                        snprintf(buf, sizeof(buf), "%.4f", *(f32 *)raw);
+                        snprintf(buf, sizeof(buf), "%.6f", *(f32 *)raw);
                         break;
                 case DataType::U64: {
                         u64 v = *(u64 *)raw;
@@ -111,7 +112,7 @@ decodeValue(const u8 *raw, DataType type, u32 bitOffset = 0, u32 bitSize = 0)
                         break;
                 }
                 case DataType::F64:
-                        snprintf(buf, sizeof(buf), "%.6f", *(f64 *)raw);
+                        snprintf(buf, sizeof(buf), "%.8f", *(f64 *)raw);
                         break;
                 default:
                         snprintf(buf, sizeof(buf), "Unknown");
@@ -738,6 +739,7 @@ Variable::drawSymbolLeaf(
                         snprintf(sp.rootName, sizeof(sp.rootName), "%s", fullPath.c_str());
                         sp.rootAddr    = addr;
                         sp.rootTypeOff = typeOff;
+                        sp.srcWatch    = this; // mirror back into this window's watch list on a monitor drop
                         flattenForStructPayload(dwarfInfo_, fullPath, addr, typeOff, sp, nullptr, 8);
                         ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
                 } else {
@@ -751,6 +753,7 @@ Variable::drawSymbolLeaf(
                         p.typeOff   = typeOff;
                         p.bitOffset = bitOffset;
                         p.bitSize   = bitSize;
+                        p.srcWatch  = this; // mirror back into this window's watch list on a monitor drop
                         fillEnumPayload(dwarfInfo_, typeOff, p);
                         ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                 }
@@ -924,6 +927,7 @@ flattenForStructPayload(const dwarf::Info                                       
                                 snprintf(e.name, sizeof(e.name), "%s", mPath.c_str());
                                 e.addr = mAddr;
                                 snprintf(e.type, sizeof(e.type), "%s", sType);
+                                e.writable = sp.writable;
                                 fillEntryEnums(e, m.type, mPath);
                         } else {
                                 flattenForStructPayload(info, mPath, mAddr, m.type, sp, memberOverrides, maxDepth - 1);
@@ -941,6 +945,7 @@ flattenForStructPayload(const dwarf::Info                                       
                                 snprintf(e.name, sizeof(e.name), "%s", idxPath.c_str());
                                 e.addr = eAddr;
                                 snprintf(e.type, sizeof(e.type), "%s", sType);
+                                e.writable = sp.writable;
                                 fillEntryEnums(e, t->inner, idxPath);
                         } else {
                                 flattenForStructPayload(info, idxPath, eAddr, t->inner, sp, memberOverrides, maxDepth - 1);
@@ -952,7 +957,15 @@ flattenForStructPayload(const dwarf::Info                                       
 void
 Variable::drawSymbolBrowser()
 {
-        ImGui::SeparatorText(tr("Symbol Browser", "符号浏览器"));
+        ImGui::SeparatorText(tr("AXF/ELF Symbol Parsing", "AXF/ELF符号解析"));
+        if (!elfPath_.empty()) {
+                std::error_code ec;
+                std::string     absPath = std::filesystem::absolute(elfPath_, ec).string();
+                if (ec || absPath.empty())
+                        absPath = elfPath_;
+                ImGui::TextWrapped("%s: %s", tr("File Path", "文件路径"), absPath.c_str());
+        }
+        TutorialGuide::instance().mark("variable_browser");
         if (isElfLoading_) {
                 ImGui::Text("%s", tr("Loading symbols...", "正在加载符号..."));
                 ImGui::SameLine();
@@ -1143,6 +1156,24 @@ Variable::drawVariableList()
         if (ImGui::Button(tr("Load File...", "加载文件...")))
                 state_ = WindowState::LoadElf;
         ImGui::SameLine();
+        if (ImGui::Button(tr("Export .var", "导出 .var"))) {
+                std::string defaultName = getTitle() + ".var";
+                std::string p           = nativeDlgSave("Export Variables", {{"Variable Files", {"var"}}}, defaultName);
+                if (!p.empty())
+                        exportVarFile(p);
+        }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tr("Save the whole watch list to a .var file", "将整个监视列表保存为 .var 文件"));
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Import .var", "导入 .var"))) {
+                std::string p = nativeDlgOpen("Import Variables", {{"Variable Files", {"var", "json"}}});
+                if (!p.empty())
+                        importVarFile(p);
+        }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip(
+                    "%s", tr("Merge variables from a .var file (skips duplicates)", "从 .var 文件合并变量（跳过重名）"));
+        ImGui::SameLine();
         ImGui::SetNextItemWidth(100);
         if (ImGui::SliderInt("##RefreshMs", (int *)&updateIntervalMs_, 10, 2000)) {
                 isModified_ = true;
@@ -1152,7 +1183,7 @@ Variable::drawVariableList()
 
         constexpr ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
-        if (ImGui::BeginTable("VarMonitorTable", 5, flags, ImVec2(0, 0))) {
+        if (ImGui::BeginTable("VarMonitorTable", 6, flags, ImVec2(0, 0))) {
                 ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
                                         ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
                 ImGui::TableSetupColumn(tr("Value###col_value", "数值###col_value"),
@@ -1160,6 +1191,7 @@ Variable::drawVariableList()
                 ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
                 ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthFixed, 150.0f);
                 ImGui::TableSetupColumn(tr("Port###col_port", "端口###col_port"), ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                ImGui::TableSetupColumn(tr("R/W###col_rw", "读写###col_rw"), ImGuiTableColumnFlags_WidthFixed, 50.0f);
                 ImGui::TableHeadersRow();
 
                 if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
@@ -1180,6 +1212,9 @@ Variable::drawVariableList()
                                                         break;
                                                 case 4:
                                                         cmp = (int)a.port - (int)b.port;
+                                                        break;
+                                                case 5:
+                                                        cmp = (int)a.writable - (int)b.writable;
                                                         break;
                                         }
                                         if (cmp == 0)
@@ -1252,6 +1287,25 @@ Variable::drawVariableList()
                                 if (ImGui::MenuItem(tr("Delete Selected", "删除选中项"))) {
                                         pendingDelete = true;
                                 }
+                                if (ImGui::MenuItem(tr("Edit Properties...", "编辑属性..."))) {
+                                        editPropIdx_ = i;
+                                        // Populate edit buffers from current var
+                                        snprintf(editPropBuf_.name, sizeof(editPropBuf_.name), "%s", v.name.c_str());
+                                        snprintf(editPropBuf_.addrBuf,
+                                                 sizeof(editPropBuf_.addrBuf),
+                                                 "%llX",
+                                                 (unsigned long long)v.addr);
+                                        editPropBuf_.type     = v.type;
+                                        editPropBuf_.port     = v.port;
+                                        editPropBuf_.writable = v.writable;
+                                        if (v.port == PortType::UDP) {
+                                                snprintf(editPropBuf_.udpIp, sizeof(editPropBuf_.udpIp), "%s", v.udp.ip);
+                                                editPropBuf_.udpPort = v.udp.port;
+                                        }
+                                        if (v.port == PortType::SHM) {
+                                                snprintf(editPropBuf_.shmName, sizeof(editPropBuf_.shmName), "%s", v.shm.name);
+                                        }
+                                }
                                 const bool isEnumType = (t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty();
                                 if (!isComplex && isEnumType &&
                                     ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
@@ -1289,6 +1343,7 @@ Variable::drawVariableList()
                         if (ImGui::BeginDragDropSource()) {
                                 if (isComplex) {
                                         StructChannelPayload sp{};
+                                        sp.writable = v.writable;
                                         snprintf(sp.device,
                                                  sizeof(sp.device),
                                                  "%s",
@@ -1304,6 +1359,7 @@ Variable::drawVariableList()
                                         ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
                                 } else {
                                         ChannelDropPayload p{};
+                                        p.writable = v.writable;
                                         snprintf(p.name, sizeof(p.name), "%s", v.name.c_str());
                                         p.addr = v.addr;
                                         snprintf(p.type, sizeof(p.type), "%s", Parser::dataTypeToStr(v.type));
@@ -1354,6 +1410,13 @@ Variable::drawVariableList()
                         const char *portNames[] = {"JLINK", "UDP", "SHM", "MANUAL"};
                         ImGui::TextUnformatted(portNames[(int)v.port]);
 
+                        // R/W
+                        ImGui::TableSetColumnIndex(5);
+                        if (v.writable)
+                                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "RW");
+                        else
+                                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RO");
+
                         if (open && isComplex) {
                                 {
                                         std::lock_guard lk(mtxElf_);
@@ -1372,65 +1435,92 @@ Variable::drawVariableList()
                 // STRUCT_CHANNEL (flattened for the monitor); here we re-add it as a
                 // single expandable watch-list entry using the carried root metadata.
                 if (const ImGuiPayload *sPayload = ImGui::AcceptDragDropPayload("STRUCT_CHANNEL")) {
-                        if (sPayload->DataSize == sizeof(StructChannelPayload)) {
-                                auto *s = static_cast<const StructChannelPayload *>(sPayload->Data);
-                                if (s->rootName[0] != '\0') {
-                                        VarEntry v;
-                                        v.name     = s->rootName;
-                                        v.addr     = s->rootAddr;
-                                        v.typeOff  = s->rootTypeOff;
-                                        v.writable = true;
-                                        v.type     = DataType::U32; // placeholder; tree uses typeOff
-                                        if (strcmp(s->device, "SHM") == 0) {
-                                                v.port = PortType::SHM;
-                                                snprintf(v.shm.name,
-                                                         sizeof(v.shm.name),
-                                                         "%s",
-                                                         s->shmName[0] != '\0' ? s->shmName : s->rootName);
-                                        } else if (strcmp(s->device, "LOCAL") == 0 || strcmp(s->device, "MANUAL") == 0) {
-                                                v.port     = PortType::MANUAL;
-                                                v.writable = false;
-                                        } else {
-                                                v.port = PortType::JLINK;
-                                        }
-                                        vars_.push_back(v);
-                                }
-                        }
+                        if (sPayload->DataSize == sizeof(StructChannelPayload))
+                                addStructToWatch(*static_cast<const StructChannelPayload *>(sPayload->Data));
                 }
 
                 const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("SYMBOL_CHANNEL");
                 if (!payload)
                         payload = ImGui::AcceptDragDropPayload("CHANNEL");
+                if (payload)
+                        addScalarToWatch(*static_cast<const ChannelDropPayload *>(payload->Data));
 
-                if (payload) {
-                        auto    *p = static_cast<ChannelDropPayload *>(payload->Data);
-                        VarEntry v;
-                        v.name      = p->name;
-                        v.addr      = p->addr;
-                        v.writable  = true;
-                        v.typeOff   = p->typeOff;
-                        v.bitOffset = p->bitOffset;
-                        v.bitSize   = p->bitSize;
-
-                        if (strcmp(p->device, "SHM") == 0) {
-                                v.port = PortType::SHM;
-                                snprintf(v.shm.name, sizeof(v.shm.name), "%s", p->name);
-                        } else if (strcmp(p->device, "LOCAL") == 0 || strcmp(p->device, "MANUAL") == 0) {
-                                v.port     = PortType::MANUAL;
-                                v.writable = false; // Manual/Bin data is usually readonly in this context
-                        } else {
-                                v.port = PortType::JLINK;
-                        }
-
-                        if (strcmp(p->type, "STRUCT") == 0 || strcmp(p->type, "ARRAY") == 0) {
-                                v.type = DataType::U32; // Placeholder
-                        } else {
-                                v.type = Parser::strToDataType(p->type);
-                        }
-                        vars_.push_back(v);
-                }
                 ImGui::EndDragDropTarget();
         }
+}
+
+bool
+Variable::watchHasName(const std::string &name) const
+{
+        for (const auto &v : vars_)
+                if (v.name == name)
+                        return true;
+        return false;
+}
+
+void
+Variable::addScalarToWatch(const ChannelDropPayload &p)
+{
+        if (watchHasName(p.name)) // avoid duplicate watch entries
+                return;
+        VarEntry v;
+        v.name      = p.name;
+        v.addr      = p.addr;
+        v.writable  = true;
+        v.typeOff   = p.typeOff;
+        v.bitOffset = p.bitOffset;
+        v.bitSize   = p.bitSize;
+
+        if (strcmp(p.device, "SHM") == 0) {
+                v.port = PortType::SHM;
+                snprintf(v.shm.name, sizeof(v.shm.name), "%s", p.name);
+        } else if (strcmp(p.device, "LOCAL") == 0 || strcmp(p.device, "MANUAL") == 0) {
+                v.port     = PortType::MANUAL;
+                v.writable = false; // Manual/Bin data is usually readonly in this context
+        } else {
+                v.port = PortType::JLINK;
+        }
+
+        if (strcmp(p.type, "STRUCT") == 0 || strcmp(p.type, "ARRAY") == 0)
+                v.type = DataType::U32; // Placeholder; tree uses typeOff
+        else
+                v.type = Parser::strToDataType(p.type);
+
+        vars_.push_back(v);
+        isModified_ = true;
+}
+
+void
+Variable::addStructToWatch(const StructChannelPayload &s)
+{
+        if (s.rootName[0] == '\0' || watchHasName(s.rootName))
+                return;
+        VarEntry v;
+        v.name     = s.rootName;
+        v.addr     = s.rootAddr;
+        v.typeOff  = s.rootTypeOff;
+        v.writable = true;
+        v.type     = DataType::U32; // placeholder; tree uses typeOff
+        if (strcmp(s.device, "SHM") == 0) {
+                v.port = PortType::SHM;
+                snprintf(v.shm.name, sizeof(v.shm.name), "%s", s.shmName[0] != '\0' ? s.shmName : s.rootName);
+        } else if (strcmp(s.device, "LOCAL") == 0 || strcmp(s.device, "MANUAL") == 0) {
+                v.port     = PortType::MANUAL;
+                v.writable = false;
+        } else {
+                v.port = PortType::JLINK;
+        }
+        vars_.push_back(v);
+        isModified_ = true;
+}
+
+void
+Variable::mirrorFromMonitorDrop(const WatchMirrorRequest &req)
+{
+        if (req.isStruct)
+                addStructToWatch(req.group);
+        else
+                addScalarToWatch(req.scalar);
 }
 
 void
@@ -1513,8 +1603,9 @@ Variable::drawAddVariableDialog()
                                 v.shm.inited = false;
                         }
                         vars_.push_back(v);
-                        isModified_ = true;
-                        state_      = WindowState::None;
+                        isModified_        = true;
+                        propertiesChanged_ = true;
+                        state_             = WindowState::None;
                         ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
@@ -1676,6 +1767,277 @@ Variable::drawSubEnumEditPopup()
                 }
                 ImGui::EndPopup();
         }
+}
+
+void
+Variable::drawEditPropertiesPopup()
+{
+        if (editPropIdx_ < 0 || editPropIdx_ >= (int)vars_.size()) {
+                editPropIdx_ = -1;
+                return;
+        }
+        ImGui::OpenPopup("###EditVarProperties");
+        if (ImGui::BeginPopupModal(tr("Edit Variable Properties###EditVarProperties", "编辑变量属性###EditVarProperties"),
+                                   nullptr,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+
+                ImGui::Text("%s", tr("Name", "名称"));
+                ImGui::SameLine(100);
+                ImGui::SetNextItemWidth(260);
+                ImGui::InputText("##editPropName", editPropBuf_.name, sizeof(editPropBuf_.name));
+
+                ImGui::Text("%s", tr("Type", "类型"));
+                ImGui::SameLine(100);
+                ImGui::SetNextItemWidth(260);
+                static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
+                int                typeIdx = (int)editPropBuf_.type;
+                if (typeIdx < 0 || typeIdx >= IM_ARRAYSIZE(types))
+                        typeIdx = 2;
+                if (ImGui::Combo("##editPropType", &typeIdx, types, IM_ARRAYSIZE(types)))
+                        editPropBuf_.type = Parser::strToDataType(types[typeIdx]);
+
+                ImGui::Text("%s", tr("Address", "地址"));
+                ImGui::SameLine(100);
+                ImGui::SetNextItemWidth(260);
+                ImGui::InputText("##editPropAddr", editPropBuf_.addrBuf, sizeof(editPropBuf_.addrBuf));
+
+                ImGui::Text("%s", tr("Port", "端口"));
+                ImGui::SameLine(100);
+                ImGui::SetNextItemWidth(260);
+                static const char *ports[] = {"JLINK", "UDP", "SHM", "MANUAL"};
+                int                portIdx = (int)editPropBuf_.port;
+                if (ImGui::Combo("##editPropPort", &portIdx, ports, IM_ARRAYSIZE(ports)))
+                        editPropBuf_.port = (PortType)portIdx;
+
+                if (editPropBuf_.port == PortType::UDP) {
+                        ImGui::Text("%s", tr("UDP IP", "UDP IP"));
+                        ImGui::SameLine(100);
+                        ImGui::SetNextItemWidth(260);
+                        ImGui::InputText("##editPropIp", editPropBuf_.udpIp, sizeof(editPropBuf_.udpIp));
+
+                        ImGui::Text("%s", tr("UDP Port", "UDP 端口"));
+                        ImGui::SameLine(100);
+                        ImGui::SetNextItemWidth(260);
+                        ImGui::InputInt("##editPropUPort", &editPropBuf_.udpPort);
+                }
+                if (editPropBuf_.port == PortType::SHM) {
+                        ImGui::Text("%s", tr("SHM Name", "SHM 名称"));
+                        ImGui::SameLine(100);
+                        ImGui::SetNextItemWidth(260);
+                        ImGui::InputText("##editPropShm", editPropBuf_.shmName, sizeof(editPropBuf_.shmName));
+                }
+
+                ImGui::Checkbox(tr("Writable", "可写"), &editPropBuf_.writable);
+
+                ImGui::Separator();
+                if (ui::Button(tr("Apply", "应用"), ui::BtnStyle::Success, ImVec2(100, 0))) {
+                        VarEntry &v = vars_[editPropIdx_];
+                        v.name      = editPropBuf_.name;
+                        v.type      = editPropBuf_.type;
+                        v.port      = editPropBuf_.port;
+                        v.writable  = editPropBuf_.writable;
+                        try {
+                                v.addr = std::stoull(editPropBuf_.addrBuf, nullptr, 16);
+                        } catch (...) {
+                                v.addr = 0;
+                        }
+                        if (v.port == PortType::UDP) {
+                                snprintf(v.udp.ip, sizeof(v.udp.ip), "%s", editPropBuf_.udpIp);
+                                v.udp.port = (u16)editPropBuf_.udpPort;
+                        }
+                        if (v.port == PortType::SHM) {
+                                snprintf(v.shm.name, sizeof(v.shm.name), "%s", editPropBuf_.shmName);
+                        }
+                        isModified_        = true;
+                        propertiesChanged_ = true;
+                        editPropIdx_       = -1;
+                        ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(tr("Cancel", "取消"), ImVec2(100, 0))) {
+                        editPropIdx_ = -1;
+                        ImGui::CloseCurrentPopup();
+                }
+                ImGui::EndPopup();
+        }
+}
+
+void
+Variable::exportVarFile(const std::string &path)
+{
+        cJSON *root = cJSON_CreateObject();
+        cJSON *vArr = cJSON_CreateArray();
+        for (const auto &v : vars_) {
+                cJSON *vObj = cJSON_CreateObject();
+                cJSON_AddStringToObject(vObj, "name", v.name.c_str());
+                cJSON_AddNumberToObject(vObj, "type", (int)v.type);
+                cJSON_AddStringToObject(vObj, "typeStr", Parser::dataTypeToStr(v.type));
+                cJSON_AddNumberToObject(vObj, "port", (int)v.port);
+                const char *portNames[] = {"JLINK", "UDP", "SHM", "MANUAL"};
+                cJSON_AddStringToObject(vObj, "portStr", portNames[(int)v.port]);
+                char addrBuf[32];
+                snprintf(addrBuf, sizeof(addrBuf), "0x%08llX", (unsigned long long)v.addr);
+                cJSON_AddStringToObject(vObj, "addr", addrBuf);
+                cJSON_AddBoolToObject(vObj, "writable", v.writable);
+                cJSON_AddNumberToObject(vObj, "typeOff", (double)v.typeOff);
+                cJSON_AddNumberToObject(vObj, "bitOffset", v.bitOffset);
+                cJSON_AddNumberToObject(vObj, "bitSize", v.bitSize);
+                if (v.port == PortType::UDP) {
+                        cJSON_AddStringToObject(vObj, "udpIp", v.udp.ip);
+                        cJSON_AddNumberToObject(vObj, "udpPort", v.udp.port);
+                } else if (v.port == PortType::SHM) {
+                        cJSON_AddStringToObject(vObj, "shmName", v.shm.name);
+                }
+                if (!v.enumDefs.empty()) {
+                        cJSON *eArr = cJSON_CreateArray();
+                        for (const auto &e : v.enumDefs) {
+                                cJSON *eObj = cJSON_CreateObject();
+                                cJSON_AddStringToObject(eObj, "name", e.name.c_str());
+                                cJSON_AddNumberToObject(eObj, "value", (double)e.value);
+                                cJSON_AddItemToArray(eArr, eObj);
+                        }
+                        cJSON_AddItemToObject(vObj, "enumDefs", eArr);
+                }
+                cJSON_AddItemToArray(vArr, vObj);
+        }
+        cJSON_AddItemToObject(root, "variables", vArr);
+
+        // Remember the ELF/AXF this list was built from, stored RELATIVE to the .var
+        // file so the pair stays portable when moved together (resolved on import).
+        if (!elfPath_.empty()) {
+                std::error_code             ec;
+                const std::filesystem::path baseDir = std::filesystem::path(path).parent_path();
+                const std::filesystem::path rel =
+                    baseDir.empty() ? std::filesystem::path(elfPath_) : std::filesystem::relative(elfPath_, baseDir, ec);
+                const std::string elfStored = (ec || rel.empty()) ? elfPath_ : rel.generic_string();
+                cJSON_AddStringToObject(root, "elfPath", elfStored.c_str());
+        }
+
+        char *jsonStr = cJSON_Print(root);
+        cJSON_Delete(root);
+        if (jsonStr) {
+                std::ofstream ofs(path, std::ios::trunc);
+                if (ofs)
+                        ofs << jsonStr;
+                free(jsonStr);
+                ImGui::InsertNotification(
+                    {ImGuiToastType::Success, 3000, tr("Exported %d variables", "已导出 %d 个变量"), (int)vars_.size()});
+        }
+}
+
+void
+Variable::importVarFile(const std::string &path)
+{
+        std::ifstream ifs(path);
+        if (!ifs) {
+                ImGui::InsertNotification({ImGuiToastType::Error, 3000, tr("Failed to open file", "无法打开文件")});
+                return;
+        }
+        std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        cJSON      *root = cJSON_Parse(content.c_str());
+        if (!root) {
+                ImGui::InsertNotification({ImGuiToastType::Error, 3000, tr("Invalid JSON", "JSON 格式错误")});
+                return;
+        }
+
+        cJSON *vArr = cJSON_GetObjectItem(root, "variables");
+        if (!cJSON_IsArray(vArr)) {
+                cJSON_Delete(root);
+                ImGui::InsertNotification(
+                    {ImGuiToastType::Error, 3000, tr("No 'variables' array found", "未找到 'variables' 数组")});
+                return;
+        }
+
+        int imported = 0;
+        for (int i = 0; i < cJSON_GetArraySize(vArr); ++i) {
+                cJSON *vObj  = cJSON_GetArrayItem(vArr, i);
+                cJSON *nItem = cJSON_GetObjectItem(vObj, "name");
+                if (!cJSON_IsString(nItem))
+                        continue;
+
+                VarEntry v;
+                v.name = nItem->valuestring;
+
+                // Check for duplicates
+                if (watchHasName(v.name))
+                        continue;
+
+                if (cJSON_GetObjectItem(vObj, "type"))
+                        v.type = (DataType)cJSON_GetObjectItem(vObj, "type")->valueint;
+                if (cJSON_GetObjectItem(vObj, "port"))
+                        v.port = (PortType)cJSON_GetObjectItem(vObj, "port")->valueint;
+
+                // Address: prefer string "0x..." format, fall back to numeric
+                cJSON *addrItem = cJSON_GetObjectItem(vObj, "addr");
+                if (cJSON_IsString(addrItem)) {
+                        try {
+                                v.addr = std::stoull(addrItem->valuestring, nullptr, 16);
+                        } catch (...) {
+                                v.addr = 0;
+                        }
+                } else if (cJSON_IsNumber(addrItem)) {
+                        v.addr = (u64)addrItem->valuedouble;
+                }
+
+                if (cJSON_GetObjectItem(vObj, "writable"))
+                        v.writable = cJSON_IsTrue(cJSON_GetObjectItem(vObj, "writable"));
+                if (cJSON_GetObjectItem(vObj, "typeOff"))
+                        v.typeOff = (u64)cJSON_GetObjectItem(vObj, "typeOff")->valuedouble;
+                if (cJSON_GetObjectItem(vObj, "bitOffset"))
+                        v.bitOffset = (u32)cJSON_GetObjectItem(vObj, "bitOffset")->valueint;
+                if (cJSON_GetObjectItem(vObj, "bitSize"))
+                        v.bitSize = (u32)cJSON_GetObjectItem(vObj, "bitSize")->valueint;
+
+                if (v.port == PortType::UDP) {
+                        if (cJSON_IsString(cJSON_GetObjectItem(vObj, "udpIp")))
+                                snprintf(v.udp.ip, sizeof(v.udp.ip), "%s", cJSON_GetObjectItem(vObj, "udpIp")->valuestring);
+                        if (cJSON_GetObjectItem(vObj, "udpPort"))
+                                v.udp.port = (u16)cJSON_GetObjectItem(vObj, "udpPort")->valueint;
+                } else if (v.port == PortType::SHM) {
+                        if (cJSON_IsString(cJSON_GetObjectItem(vObj, "shmName")))
+                                snprintf(
+                                    v.shm.name, sizeof(v.shm.name), "%s", cJSON_GetObjectItem(vObj, "shmName")->valuestring);
+                }
+
+                cJSON *eArr = cJSON_GetObjectItem(vObj, "enumDefs");
+                if (cJSON_IsArray(eArr)) {
+                        for (int j = 0; j < cJSON_GetArraySize(eArr); ++j) {
+                                cJSON            *eObj = cJSON_GetArrayItem(eArr, j);
+                                VarEntry::EnumDef d;
+                                if (cJSON_IsString(cJSON_GetObjectItem(eObj, "name")))
+                                        d.name = cJSON_GetObjectItem(eObj, "name")->valuestring;
+                                if (cJSON_GetObjectItem(eObj, "value"))
+                                        d.value = (i64)cJSON_GetObjectItem(eObj, "value")->valuedouble;
+                                v.enumDefs.push_back(d);
+                        }
+                }
+
+                vars_.push_back(v);
+                imported++;
+        }
+
+        // Resolve the ELF/AXF path stored relative to this .var file. Loading it
+        // re-syncs the imported variables' addresses/types against the symbol file.
+        std::string elfToLoad;
+        if (const cJSON *elfItem = cJSON_GetObjectItem(root, "elfPath");
+            cJSON_IsString(elfItem) && elfItem->valuestring[0] != '\0') {
+                const std::filesystem::path stored = elfItem->valuestring;
+                std::error_code             ec;
+                const std::filesystem::path resolved =
+                    stored.is_absolute() ? stored : (std::filesystem::path(path).parent_path() / stored).lexically_normal();
+                if (std::filesystem::exists(resolved, ec))
+                        elfToLoad = resolved.string();
+                else if (std::filesystem::exists(stored, ec)) // fall back to CWD-relative
+                        elfToLoad = stored.string();
+        }
+
+        cJSON_Delete(root);
+        isModified_        = true;
+        propertiesChanged_ = true;
+        ImGui::InsertNotification({ImGuiToastType::Success, 3000, tr("Imported %d variables", "已导入 %d 个变量"), imported});
+
+        if (!elfToLoad.empty() && elfToLoad != elfPath_)
+                loadElf(elfToLoad);
 }
 
 static void
@@ -2021,6 +2383,7 @@ Variable::draw()
         drawAddVariableDialog();
         drawEnumEditPopup();
         drawSubEnumEditPopup();
+        drawEditPropertiesPopup();
         if (state_ == WindowState::LoadElf) {
                 state_        = WindowState::None;
                 std::string p = nativeDlgOpen("Choose Symbol File", {{"Symbol Files", {"elf", "axf", "out", "json", "bin"}}});
@@ -2426,6 +2789,16 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                 ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
                                 ImGui::TableSetColumnIndex(4);
                                 ImGui::TextUnformatted(devLabel);
+
+                                ImGui::TableSetColumnIndex(5);
+                                bool parentWritable = true;
+                                if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
+                                        parentWritable = vars_[parentVarIdx].writable;
+                                }
+                                if (parentWritable)
+                                        ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "RW");
+                                else
+                                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RO");
                         }
 
                         if (open && isComplex) {
@@ -2533,6 +2906,16 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                 ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
                                 ImGui::TableSetColumnIndex(4);
                                 ImGui::TextUnformatted(devLabel);
+
+                                ImGui::TableSetColumnIndex(5);
+                                bool parentWritable = true;
+                                if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
+                                        parentWritable = vars_[parentVarIdx].writable;
+                                }
+                                if (parentWritable)
+                                        ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "RW");
+                                else
+                                        ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RO");
                         }
 
                         if (open && isComplex) {

@@ -253,6 +253,7 @@ SRC_CXX := \
     $(DIR_GUI)/bode.cpp \
     $(DIR_GUI)/assembly_viewer.cpp \
     $(DIR_GUI)/sequence_editor.cpp \
+    $(DIR_GUI)/tutorial_guide.cpp \
     $(DIR_CORE)/elf_parser.cpp \
     $(DIR_CORE)/dwarf_parser.cpp \
     $(DIR_CORE)/json_parser.cpp \
