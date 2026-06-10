@@ -867,15 +867,23 @@ Gui::drawBar()
                 TutorialGuide::instance().mark("menu_window");
                 if (windowMenuOpen) {
                         if (ImGui::MenuItem(tr("Add Variable Monitor", "添加变量监视器"))) {
-                                std::string monitorName = "变量监视器_" + std::to_string(monitors_.size());
-                                monitors_[monitorName]  = std::make_shared<Monitor>(monitorName);
-                                isModified_             = true;
+                                std::string monitorName;
+                                size_t      idx = monitors_.size();
+                                do {
+                                        monitorName = "变量监视器_" + std::to_string(idx++);
+                                } while (monitors_.count(monitorName));
+                                monitors_[monitorName] = std::make_shared<Monitor>(monitorName);
+                                isModified_            = true;
                                 LOG_I("Add Variable Monitor: %s", monitorName.c_str());
                         }
                         if (ImGui::MenuItem(tr("Add Variable Manager", "添加变量管理器"))) {
-                                std::string varName = "变量管理器_" + std::to_string(vars_.size());
-                                vars_[varName]      = std::make_shared<Variable>(varName);
-                                isModified_         = true;
+                                std::string varName;
+                                size_t      idx = vars_.size();
+                                do {
+                                        varName = "变量管理器_" + std::to_string(idx++);
+                                } while (vars_.count(varName));
+                                vars_[varName] = std::make_shared<Variable>(varName);
+                                isModified_    = true;
                                 LOG_I("Add Variable Manager Window: %s", varName.c_str());
                         }
                         ImGui::EndMenu();

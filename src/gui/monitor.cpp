@@ -184,8 +184,8 @@ MonitorScope::menu()
         }
 
         // Right-aligned buttons: reorder (up/down), Delete Scope, Hide Scope, Pause/Resume
-        float arrowW       = ImGui::GetFrameHeight(); // ArrowButton is square
-        float delBtnWidth  = ImGui::CalcTextSize(tr("Delete Scope", "删除示波器")).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        float arrowW = ImGui::GetFrameHeight(); // ArrowButton is square
+        float delBtnWidth = ImGui::CalcTextSize(tr("Delete Scope", "删除示波器")).x + ImGui::GetStyle().FramePadding.x * 2.0f;
         float hideBtnWidth = std::max(ImGui::CalcTextSize(tr("Hide Scope", "隐藏示波器")).x,
                                       ImGui::CalcTextSize(tr("Show Scope", "显示示波器")).x) +
                              ImGui::GetStyle().FramePadding.x * 2.0f;
@@ -1619,8 +1619,11 @@ Monitor::updateDisplay()
                 };
 
                 if (ImGui::Button(tr("Add Scope", "添加示波器"))) {
-                        char nameBuf[32];
-                        snprintf(nameBuf, sizeof(nameBuf), "scope_%zu", scopes_.size());
+                        char   nameBuf[32];
+                        size_t idx = scopes_.size();
+                        do {
+                                snprintf(nameBuf, sizeof(nameBuf), "scope_%zu", idx++);
+                        } while (scopes_.find(nameBuf) != scopes_.end());
                         addScope(nameBuf);
                 }
                 TutorialGuide::instance().mark("monitor_window");
