@@ -131,6 +131,10 @@ ifeq ($(COMPILER),msvc)
         FFTW_LIB     := $(DIR_MODULE)/lib/win/libfftw3f-3.lib
         FFTW_DLL     := $(DIR_MODULE)/lib/win/libfftw3f-3.dll
         MODULE_LIB   := $(DIR_MODULE)/lib/module/win/module.lib
+        # libffi: obtain via  vcpkg install libffi:x64-windows-static
+        # then copy the include/ and lib/x64-windows-static/ output here.
+        LIBFFI_DIR   := $(DIR_THIRDPARTY)/libffi
+        LIBFFI_LIB   := $(LIBFFI_DIR)/lib/win/ffi.lib
         IMGUI_NOTIFY := $(DIR_THIRDPARTY)/ImGuiNotify/win32
         INCLUDES     := /I"$(DIR_SRC)" /I"$(DIR_CORE)" /I"$(DIR_GUI)" \
                         /I"$(DIR_MODULE)" /I"$(DIR_MODULE)/inc" \
@@ -140,9 +144,10 @@ ifeq ($(COMPILER),msvc)
                         /I"$(IMGUI_NOTIFY)/backends" \
                         /I"$(IMGUI_NOTIFY)/fonts" \
                         /I"$(DIR_THIRDPARTY)/GLFW/inc" \
-                        /I"$(DIR_THIRDPARTY)/cJSON"
-        LDLIBS       := ws2_32.lib winmm.lib shlwapi.lib comdlg32.lib OpenGL32.lib advapi32.lib ole32.lib \
-                        "$(GLFW_LIB)" "$(JLINK_LIB)" "$(FFTW_LIB)" "$(MODULE_LIB)"
+                        /I"$(DIR_THIRDPARTY)/cJSON" \
+                        /I"$(LIBFFI_DIR)/include"
+        LDLIBS       := ws2_32.lib winmm.lib shlwapi.lib comdlg32.lib OpenGL32.lib advapi32.lib ole32.lib dbghelp.lib \
+                        "$(GLFW_LIB)" "$(JLINK_LIB)" "$(FFTW_LIB)" "$(MODULE_LIB)" "$(LIBFFI_LIB)"
         PLATFORM_DIR := win
     else
         $(error msvc 仅支持 win 平台)
@@ -169,8 +174,9 @@ else ifeq ($(COMPILER),gcc)
                         -I$(DIR_THIRDPARTY)/GLFW/inc \
                         -I$(DIR_THIRDPARTY)/cJSON
         LDFLAGS      := -Wl,-rpath,'$$ORIGIN'
+        # libffi: sudo apt install libffi-dev
         LDLIBS       := "$(GLFW_LIB)" "$(JLINK_LIB)" -lfftw3f \
-                        "$(MODULE_LIB)" -lGL -ldl -lpthread
+                        "$(MODULE_LIB)" -lGL -ldl -lpthread -lffi
         PLATFORM_DIR := linux
     else
         $(error gcc 仅支持 linux 平台)
@@ -206,8 +212,9 @@ else ifeq ($(COMPILER),clang)
         LDFLAGS      := -L$(MAC_BREW_PREFIX)/lib \
                         -L$(JLINK_DIR) \
                         -Wl,-rpath,$(JLINK_DIR)
+        # libffi: brew install libffi
         LDLIBS       := -lglfw -ljlinkarm -lfftw3f \
-                        "$(MODULE_LIB)" -lpthread \
+                        "$(MODULE_LIB)" -lpthread -lffi \
                         -framework Cocoa -framework IOKit \
                         -framework CoreVideo -framework OpenGL
         PLATFORM_DIR := mac/$(ARCH)
@@ -254,6 +261,7 @@ SRC_CXX := \
     $(DIR_GUI)/assembly_viewer.cpp \
     $(DIR_GUI)/sequence_editor.cpp \
     $(DIR_GUI)/tutorial_guide.cpp \
+    $(DIR_GUI)/sdk_panel.cpp \
     $(DIR_CORE)/elf_parser.cpp \
     $(DIR_CORE)/dwarf_parser.cpp \
     $(DIR_CORE)/json_parser.cpp \
@@ -262,6 +270,9 @@ SRC_CXX := \
     $(DIR_CORE)/sampler.cpp \
     $(DIR_CORE)/http_win.cpp \
     $(DIR_CORE)/updater.cpp \
+    $(DIR_CORE)/c_header_parser.cpp \
+    $(DIR_CORE)/sdk_loader.cpp \
+    $(DIR_CORE)/export_enum.cpp \
     $(filter %.cpp,$(SRC_NATIVE)) \
     $(DIR_THIRDPARTY)/imgui/imgui.cpp \
     $(DIR_THIRDPARTY)/imgui/imgui_demo.cpp \

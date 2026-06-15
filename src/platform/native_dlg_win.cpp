@@ -1,10 +1,8 @@
-#include "native_dlg.hpp"
-// clang-format off
-// windows.h must precede commdlg.h (commdlg.h → prsht.h needs CALLBACK/HWND from windows.h)
 #include <windows.h>
+
+#include "native_dlg.hpp"
 #include <commdlg.h>
 #include <shlobj.h>
-// clang-format on
 #include <string>
 #include <vector>
 

@@ -51,6 +51,7 @@ class MonitorChannel
 
       private:
         std::string name_{};
+        std::string label_{}; // User-facing alias; falls back to name_ when empty
         std::string type_{};
         usize       addr_{};
         std::string symbolName_{};
@@ -87,6 +88,7 @@ class MonitorChannel
         bool useAutoColor_{true};
         f32  lineWeight_{1.5f};
         int  plotStyle_{0}; // 0 = Line, 1 = Stairs
+        f32  gain_{1.0f};   // display/calculation multiplier applied to every raw sample
         bool showMarkers_{false};
         bool show_{true};
         i64  order_{0}; // Display/insertion order within the scope (lower = earlier)
@@ -143,10 +145,12 @@ class MonitorChannel
         MonitorChannel()  = default;
         ~MonitorChannel() = default;
 
-        std::string &getName() { return name_; }
-        void         setName(const std::string &name) { name_ = name; }
-        std::string &getType() { return type_; }
-        void         setType(const std::string &type)
+        std::string       &getName() { return name_; }
+        void               setName(const std::string &name) { name_ = name; }
+        const std::string &getLabel() const { return label_.empty() ? name_ : label_; }
+        void               setLabel(const std::string &l) { label_ = l; }
+        std::string       &getType() { return type_; }
+        void               setType(const std::string &type)
         {
                 type_     = type;
                 numBytes_ = typeBytes(type);
@@ -176,7 +180,8 @@ class MonitorChannel
         void setWritable(bool w) { writable_ = w; }
 
         f32  &getRVal() { return rVal_; }
-        f32   getDispVal() const { return dispVal_; } // GUI display value (frozen while paused)
+        f32   getDispVal() const { return dispVal_ * gain_; } // GUI display value (frozen while paused), gain applied
+        f32  &getGain() { return gain_; }
         bool &show() { return show_; }
         void  setShow(bool s) { show_ = s; }
         bool &selected() { return selected_; }

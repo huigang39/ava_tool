@@ -48,6 +48,22 @@
 
 std::vector<std::string> Gui::sDroppedFiles_{};
 
+// ── Efficiency tab persistent state ──────────────────────────────────────────
+// Shared by drawCalculator(), saveSession(), and loadSession() so the selected
+// channels, units, map range, and recorded data survive save/load round-trips.
+static struct {
+        std::string torqueLink, speedLink, voltageLink, currentLink;
+        int         refreshMs  = 200;
+        int         torqueUnit = 0, speedUnit = 0, voltageUnit = 0, currentUnit = 0;
+        float       spdMin = 0.f, spdMax = 6000.f, tqMin = 0.f, tqMax = 50.f;
+        int         activeTab = 0;
+        bool        forceTab  = false;
+        struct EffPoint {
+                float spdRpm, tqNm, eta;
+        };
+        std::vector<EffPoint> rawData; // raw recorded (speed, torque, eta) table
+} s_eff;
+
 void
 Gui::glfwErrCb(const i32 err, const char *desc)
 {
@@ -326,6 +342,34 @@ Gui::saveSession(const std::string &path)
 
         cJSON_AddBoolToObject(root, "showCalculator", showCalculator_);
 
+        {
+                cJSON *eff = cJSON_CreateObject();
+                cJSON_AddNumberToObject(eff, "activeTab", s_eff.activeTab);
+                cJSON_AddNumberToObject(eff, "refreshMs", s_eff.refreshMs);
+                cJSON_AddStringToObject(eff, "torqueLink", s_eff.torqueLink.c_str());
+                cJSON_AddStringToObject(eff, "speedLink", s_eff.speedLink.c_str());
+                cJSON_AddStringToObject(eff, "voltageLink", s_eff.voltageLink.c_str());
+                cJSON_AddStringToObject(eff, "currentLink", s_eff.currentLink.c_str());
+                cJSON_AddNumberToObject(eff, "torqueUnit", s_eff.torqueUnit);
+                cJSON_AddNumberToObject(eff, "speedUnit", s_eff.speedUnit);
+                cJSON_AddNumberToObject(eff, "voltageUnit", s_eff.voltageUnit);
+                cJSON_AddNumberToObject(eff, "currentUnit", s_eff.currentUnit);
+                cJSON_AddNumberToObject(eff, "spdMin", static_cast<double>(s_eff.spdMin));
+                cJSON_AddNumberToObject(eff, "spdMax", static_cast<double>(s_eff.spdMax));
+                cJSON_AddNumberToObject(eff, "tqMin", static_cast<double>(s_eff.tqMin));
+                cJSON_AddNumberToObject(eff, "tqMax", static_cast<double>(s_eff.tqMax));
+                cJSON *ptArr = cJSON_CreateArray();
+                for (const auto &p : s_eff.rawData) {
+                        cJSON *ptObj = cJSON_CreateObject();
+                        cJSON_AddNumberToObject(ptObj, "s", static_cast<double>(p.spdRpm));
+                        cJSON_AddNumberToObject(ptObj, "t", static_cast<double>(p.tqNm));
+                        cJSON_AddNumberToObject(ptObj, "e", static_cast<double>(p.eta));
+                        cJSON_AddItemToArray(ptArr, ptObj);
+                }
+                cJSON_AddItemToObject(eff, "mapData", ptArr);
+                cJSON_AddItemToObject(root, "efficiency", eff);
+        }
+
         cJSON *monitorsArr = cJSON_CreateArray();
         for (const auto &m : monitors_ | std::views::values) {
                 cJSON *mObj = cJSON_CreateObject();
@@ -348,6 +392,8 @@ Gui::saveSession(const std::string &path)
                 for (auto *s : orderedScopes) {
                         cJSON *sObj = cJSON_CreateObject();
                         cJSON_AddStringToObject(sObj, "name", s->getName().c_str());
+                        if (!s->getLabel().empty() && s->getLabel() != s->getName())
+                                cJSON_AddStringToObject(sObj, "label", s->getLabel().c_str());
                         cJSON_AddNumberToObject(sObj, "order", static_cast<f64>(s->getOrder()));
                         cJSON_AddStringToObject(sObj, "draw", s->getDraw() == MonitorScope::DrawEnum::PLOT ? "PLOT" : "TABLE");
                         cJSON_AddNumberToObject(sObj, "height", static_cast<f64>(s->getHeight()));
@@ -391,6 +437,9 @@ Gui::saveSession(const std::string &path)
 
                                 cJSON_AddBoolToObject(chObj, "useAutoColor", ch->useAutoColor());
                                 cJSON_AddNumberToObject(chObj, "lineWeight", ch->getLineWeight());
+                                cJSON_AddNumberToObject(chObj, "gain", ch->getGain());
+                                if (ch->getLabel() != ch->getName())
+                                        cJSON_AddStringToObject(chObj, "alias", ch->getLabel().c_str());
                                 cJSON_AddStringToObject(chObj, "symbolName", ch->getSymbolName().c_str());
                                 cJSON_AddNumberToObject(chObj, "plotStyle", ch->getPlotStyle());
                                 cJSON_AddBoolToObject(chObj, "showMarkers", ch->showMarkers());
@@ -543,6 +592,48 @@ Gui::loadSession(const std::string &path)
                 showCalculator_ = cJSON_IsTrue(sc);
         }
 
+        if (const cJSON *eff = cJSON_GetObjectItem(root, "efficiency"); cJSON_IsObject(eff)) {
+                auto getStr = [&](const char *k, std::string &out) {
+                        if (const cJSON *v = cJSON_GetObjectItem(eff, k); cJSON_IsString(v))
+                                out = v->valuestring;
+                };
+                auto getInt = [&](const char *k, int &out) {
+                        if (const cJSON *v = cJSON_GetObjectItem(eff, k); cJSON_IsNumber(v))
+                                out = v->valueint;
+                };
+                auto getFlt = [&](const char *k, float &out) {
+                        if (const cJSON *v = cJSON_GetObjectItem(eff, k); cJSON_IsNumber(v))
+                                out = static_cast<float>(v->valuedouble);
+                };
+                getStr("torqueLink", s_eff.torqueLink);
+                getStr("speedLink", s_eff.speedLink);
+                getStr("voltageLink", s_eff.voltageLink);
+                getStr("currentLink", s_eff.currentLink);
+                getInt("refreshMs", s_eff.refreshMs);
+                getInt("torqueUnit", s_eff.torqueUnit);
+                getInt("speedUnit", s_eff.speedUnit);
+                getInt("voltageUnit", s_eff.voltageUnit);
+                getInt("currentUnit", s_eff.currentUnit);
+                getFlt("spdMin", s_eff.spdMin);
+                getFlt("spdMax", s_eff.spdMax);
+                getFlt("tqMin", s_eff.tqMin);
+                getFlt("tqMax", s_eff.tqMax);
+                getInt("activeTab", s_eff.activeTab);
+                s_eff.forceTab = true;
+                s_eff.rawData.clear();
+                if (const cJSON *pts = cJSON_GetObjectItem(eff, "mapData"); cJSON_IsArray(pts)) {
+                        for (const cJSON *pt = pts->child; pt; pt = pt->next) {
+                                const cJSON *s = cJSON_GetObjectItem(pt, "s");
+                                const cJSON *t = cJSON_GetObjectItem(pt, "t");
+                                const cJSON *e = cJSON_GetObjectItem(pt, "e");
+                                if (cJSON_IsNumber(s) && cJSON_IsNumber(t) && cJSON_IsNumber(e))
+                                        s_eff.rawData.push_back({static_cast<float>(s->valuedouble),
+                                                                 static_cast<float>(t->valuedouble),
+                                                                 static_cast<float>(e->valuedouble)});
+                        }
+                }
+        }
+
         if (const cJSON *monitorsArr = cJSON_GetObjectItem(root, "monitors"); cJSON_IsArray(monitorsArr)) {
                 for (const cJSON *mItem = monitorsArr->child; mItem; mItem = mItem->next) {
                         const cJSON *nameItem = cJSON_GetObjectItem(mItem, "name");
@@ -592,6 +683,12 @@ Gui::loadSession(const std::string &path)
                                         const i64 ord = static_cast<i64>(orderItem->valuedouble);
                                         scope->setOrder(ord);
                                         monitor->noteScopeOrder(ord);
+                                }
+
+                                // Restore the saved label alias.
+                                if (const cJSON *labelItem = cJSON_GetObjectItem(sItem, "label");
+                                    cJSON_IsString(labelItem) && labelItem->valuestring[0] != '\0') {
+                                        scope->setLabel(labelItem->valuestring);
                                 }
 
                                 if (const cJSON *drawItem = cJSON_GetObjectItem(sItem, "draw"); cJSON_IsString(drawItem)) {
@@ -686,6 +783,10 @@ Gui::loadSession(const std::string &path)
                                                 ch->useAutoColor() = cJSON_IsTrue(uac);
                                         if (const cJSON *lw = cJSON_GetObjectItem(chItem, "lineWeight"); cJSON_IsNumber(lw))
                                                 ch->getLineWeight() = static_cast<f32>(lw->valuedouble);
+                                        if (const cJSON *gn = cJSON_GetObjectItem(chItem, "gain"); cJSON_IsNumber(gn))
+                                                ch->getGain() = static_cast<f32>(gn->valuedouble);
+                                        if (const cJSON *al = cJSON_GetObjectItem(chItem, "alias"); cJSON_IsString(al))
+                                                ch->setLabel(al->valuestring);
                                         if (const cJSON *ps = cJSON_GetObjectItem(chItem, "plotStyle"); cJSON_IsNumber(ps))
                                                 ch->getPlotStyle() = ps->valueint;
                                         if (const cJSON *sm = cJSON_GetObjectItem(chItem, "showMarkers"); cJSON_IsBool(sm))
@@ -886,6 +987,8 @@ Gui::drawBar()
                                 isModified_    = true;
                                 LOG_I("Add Variable Manager Window: %s", varName.c_str());
                         }
+                        if (ImGui::MenuItem(tr("Add SDK Caller", "添加 SDK 调用器")))
+                                newSdkPanel();
                         ImGui::EndMenu();
                 }
 
@@ -893,11 +996,8 @@ Gui::drawBar()
                 TutorialGuide::instance().mark("menu_tools");
                 if (toolsMenuOpen) {
                         ImGui::MenuItem(tr("Joint Calculator", "电机参数计算器"), nullptr, &showCalculator_);
-                        ImGui::Separator();
                         ImGui::MenuItem(tr("Bode Plot", "伯德图"), nullptr, &bode_.show_);
-                        ImGui::Separator();
                         ImGui::MenuItem(tr("Assembly Viewer", "汇编查看器"), nullptr, &asmViewer_.show_);
-                        ImGui::Separator();
                         bool seqOpen = seqEditor_.isOpen();
                         if (ImGui::MenuItem(tr("Sequence Editor", "序列编辑器"), nullptr, &seqOpen)) {
                                 seqEditor_.setOpen(seqOpen);
@@ -1259,6 +1359,14 @@ Gui::loop()
                 asmViewer_.draw(this);
                 seqEditor_.draw();
 
+                // Draw SDK windows; prune closed ones.
+                for (auto &sp : sdkPanels_)
+                        sp->draw();
+                sdkPanels_.erase(std::remove_if(sdkPanels_.begin(),
+                                                sdkPanels_.end(),
+                                                [](const std::shared_ptr<SdkPanel> &p) { return !p->open_; }),
+                                 sdkPanels_.end());
+
                 TutorialGuide::instance().draw();
 
                 processPendingCsvImports();
@@ -1266,6 +1374,9 @@ Gui::loop()
                 for (const auto &file : sDroppedFiles_) {
                         if (file.ends_with(".ava")) {
                                 loadSession(file);
+                        } else if (file.ends_with(".dll") || file.ends_with(".h") || file.ends_with(".hpp")) {
+                                for (auto &sp : sdkPanels_)
+                                        sp->pushDroppedFiles({file});
                         } else if (file.ends_with(".csv") || file.ends_with(".CSV")) {
                                 // Create the monitor immediately (shows loading spinner)
                                 std::string stem = std::filesystem::path(file).stem().string();
@@ -1503,103 +1614,661 @@ Gui::drawCalculator()
                 return;
         }
 
-        if (motorProfiles_.empty()) {
-                motorProfiles_.push_back(MotorProfile{});
-                currentMotorProfile_ = 0;
-        }
-        if (currentMotorProfile_ >= static_cast<i32>(motorProfiles_.size())) {
-                currentMotorProfile_ = 0;
+        if (!ImGui::BeginTabBar("##MotorCalcTabs")) {
+                ImGui::End();
+                return;
         }
 
-        ImGui::Text("%s", tr("Saved Profiles:", "已保存配置："));
-        ImGui::SetNextItemWidth(200.0f);
-        if (ImGui::BeginCombo("##motor_profiles", motorProfiles_[currentMotorProfile_].modelName)) {
-                for (i32 i = 0; i < static_cast<i32>(motorProfiles_.size()); ++i) {
-                        const bool is_selected = (currentMotorProfile_ == i);
-                        if (ImGui::Selectable(motorProfiles_[i].modelName, is_selected))
-                                currentMotorProfile_ = i;
-                        if (is_selected)
-                                ImGui::SetItemDefaultFocus();
+        ImGuiTabItemFlags tabFlag0 = (s_eff.forceTab && s_eff.activeTab == 0) ? ImGuiTabItemFlags_SetSelected : 0;
+        ImGuiTabItemFlags tabFlag1 = (s_eff.forceTab && s_eff.activeTab == 1) ? ImGuiTabItemFlags_SetSelected : 0;
+        if (s_eff.forceTab)
+                s_eff.forceTab = false;
+
+        // ══════════════════════════════════════════════════════════════════════
+        // Tab 1: Motor Parameters (existing)
+        // ══════════════════════════════════════════════════════════════════════
+        if (ImGui::BeginTabItem(tr("Motor Parameters", "电机参数"), nullptr, tabFlag0)) {
+                s_eff.activeTab = 0;
+                if (motorProfiles_.empty()) {
+                        motorProfiles_.push_back(MotorProfile{});
+                        currentMotorProfile_ = 0;
                 }
-                ImGui::EndCombo();
+                if (currentMotorProfile_ >= static_cast<i32>(motorProfiles_.size()))
+                        currentMotorProfile_ = 0;
+
+                ImGui::Text("%s", tr("Saved Profiles:", "已保存配置："));
+                ImGui::SetNextItemWidth(200.0f);
+                if (ImGui::BeginCombo("##motor_profiles", motorProfiles_[currentMotorProfile_].modelName)) {
+                        for (i32 i = 0; i < static_cast<i32>(motorProfiles_.size()); ++i) {
+                                const bool is_selected = (currentMotorProfile_ == i);
+                                if (ImGui::Selectable(motorProfiles_[i].modelName, is_selected))
+                                        currentMotorProfile_ = i;
+                                if (is_selected)
+                                        ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(tr("Add", "添加"))) {
+                        MotorProfile mp;
+                        snprintf(mp.modelName, sizeof(mp.modelName), "Motor_%d", static_cast<i32>(motorProfiles_.size() + 1));
+                        motorProfiles_.push_back(mp);
+                        currentMotorProfile_ = static_cast<i32>(motorProfiles_.size()) - 1;
+                }
+                ImGui::SameLine();
+                if (ui::Button(tr("Del", "删除"), ui::BtnStyle::Danger) && motorProfiles_.size() > 1) {
+                        motorProfiles_.erase(motorProfiles_.begin() + currentMotorProfile_);
+                        if (currentMotorProfile_ > 0)
+                                currentMotorProfile_--;
+                }
+
+                ImGui::Separator();
+                MotorProfile &mp = motorProfiles_[currentMotorProfile_];
+
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Input Parameters ---", "--- 输入参数 ---"));
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::InputText("##MotorModel", mp.modelName, sizeof(mp.modelName));
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Model", "型号"));
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::InputFloat("##MotorRs", &mp.Rs, 0.0f, 0.0f, "%.6f");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Rs (Ohm)");
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::InputFloat("##MotorLd", &mp.Ld, 0.0f, 0.0f, "%.8f");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Ld (H)");
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::InputFloat("##MotorLq", &mp.Lq, 0.0f, 0.0f, "%.8f");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Lq (H)");
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::InputInt("##MotorPolePairs", &mp.polePairs, 0, 0);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Pole Pairs", "极对数"));
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::InputFloat("##MotorKt", &mp.Kt, 0.0f, 0.0f, "%.8f");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Kt (Nm/A)");
+
+                ImGui::Separator();
+                ImGui::TextColored(
+                    ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Back-EMF Measurement ---", "--- 反电动势测量 ---"));
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::InputFloat("##MotorBackEmfFreq", &mp.backEmfFreq, 0.0f, 0.0f, "%.3f");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Frequency (Hz)", "频率 (Hz)"));
+                ImGui::SetNextItemWidth(150.0f);
+                ImGui::InputFloat("##MotorBackEmfVpp", &mp.backEmfVpp, 0.0f, 0.0f, "%.3f");
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Vpp (Line-to-Line) (V)", "线电压峰峰值 Vpp (V)"));
+
+                if (mp.polePairs < 1)
+                        mp.polePairs = 1;
+                if (mp.backEmfFreq <= 0)
+                        mp.backEmfFreq = 0.001f;
+
+                const f32 pi    = 3.14159265358979323846f;
+                f32       psi_m = mp.backEmfVpp / (4.0f * sqrtf(3.0f) * pi * mp.backEmfFreq);
+                f32       kt    = 1.5f * static_cast<f32>(mp.polePairs) * psi_m;
+                f32       kv    = (120.0f * mp.backEmfFreq) / (static_cast<f32>(mp.polePairs) * mp.backEmfVpp);
+
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Calculated Results ---", "--- 计算结果 ---"));
+                ImGui::Text(tr("Flux Linkage (Psi_m): %.6f Wb", "磁链 (Psi_m): %.6f Wb"), static_cast<f64>(psi_m));
+                ImGui::Text(tr("KV value: %.2f RPM/V", "KV 值: %.2f RPM/V"), static_cast<f64>(kv));
+                ImGui::Text(tr("Calculated Kt (Ref): %.6f Nm/A", "计算 Kt (参考): %.6f Nm/A"), static_cast<f64>(kt));
+
+                ImGui::EndTabItem();
         }
-        ImGui::SameLine();
-        if (ImGui::Button(tr("Add", "添加"))) {
-                MotorProfile mp;
-                snprintf(mp.modelName, sizeof(mp.modelName), "Motor_%d", static_cast<i32>(motorProfiles_.size() + 1));
-                motorProfiles_.push_back(mp);
-                currentMotorProfile_ = static_cast<i32>(motorProfiles_.size()) - 1;
+
+        // ══════════════════════════════════════════════════════════════════════
+        // Tab 2: Efficiency Calculator
+        // ══════════════════════════════════════════════════════════════════════
+        if (ImGui::BeginTabItem(tr("Efficiency", "效率计算"), nullptr, tabFlag1)) {
+                s_eff.activeTab         = 1;
+                static float effTorque  = 1.0f;
+                static float effSpeed   = 1000.0f;
+                static float effVoltage = 48.0f;
+                static float effCurrent = 1.0f;
+                // Unit dropdowns and channel links delegate to s_eff (saved with session)
+                auto               &effTorqueUnit    = s_eff.torqueUnit;
+                auto               &effSpeedUnit     = s_eff.speedUnit;
+                auto               &effVoltageUnit   = s_eff.voltageUnit;
+                auto               &effCurrentUnit   = s_eff.currentUnit;
+                auto               &effTorqueLink    = s_eff.torqueLink;
+                auto               &effSpeedLink     = s_eff.speedLink;
+                auto               &effVoltageLink   = s_eff.voltageLink;
+                auto               &effCurrentLink   = s_eff.currentLink;
+                static std::string *pendingVarLink   = nullptr;
+                static bool         doOpenVarPick    = false;
+                auto               &effRefreshMs     = s_eff.refreshMs;
+                static u64          effLastRefreshTs = 0;
+                // ── Efficiency map state ─────────────────────────────────────
+                constexpr int kMapBins     = 30;
+                static bool   effMapRec    = false;
+                auto         &effMapSpdMin = s_eff.spdMin;
+                auto         &effMapSpdMax = s_eff.spdMax;
+                auto         &effMapTqMin  = s_eff.tqMin;
+                auto         &effMapTqMax  = s_eff.tqMax;
+
+                // Conversion to SI
+                const float kTorqueToNm[]  = {1.0f, 0.001f, 0.00706155f, 0.11298f, 1.35582f};
+                const float kSpeedToRadS[] = {3.14159265f / 30.0f, 1.0f, 6.28318530f};
+                const float kVoltToV[]     = {1.0f, 0.001f, 1000.0f};
+                const float kCurrToA[]     = {1.0f, 0.001f};
+
+                // Read current value from a linked key.
+                // Monitor channel key: "@monName@scopeName@chName"  → getDispVal()
+                // Variable key:        "winKey::varName"             → valueStr
+                //                      "winKey::varName.field"       → struct field
+                auto getVarVal = [&](const std::string &key, float fallback) -> float {
+                        if (key.empty())
+                                return fallback;
+                        // ── Monitor channel path ─────────────────────────────
+                        if (key[0] == '@') {
+                                auto p1 = key.find('@', 1);
+                                if (p1 == std::string::npos)
+                                        return fallback;
+                                auto p2 = key.find('@', p1 + 1);
+                                if (p2 == std::string::npos)
+                                        return fallback;
+                                const std::string mname  = key.substr(1, p1 - 1);
+                                const std::string sname  = key.substr(p1 + 1, p2 - p1 - 1);
+                                const std::string chname = key.substr(p2 + 1);
+                                auto              mit    = monitors_.find(mname);
+                                if (mit == monitors_.end())
+                                        return fallback;
+                                auto sit = mit->second->getScopes().find(sname);
+                                if (sit == mit->second->getScopes().end())
+                                        return fallback;
+                                if (sit->second->getChannels().find(chname) == sit->second->getChannels().end())
+                                        return fallback;
+                                return static_cast<float>(sit->second->getChannelMean(chname));
+                        }
+                        // ── Variable manager path ────────────────────────────
+                        auto sep = key.find("::");
+                        if (sep == std::string::npos)
+                                return fallback;
+                        auto wit = vars_.find(key.substr(0, sep));
+                        if (wit == vars_.end())
+                                return fallback;
+                        const std::string rest = key.substr(sep + 2); // "varName" or "varName.path"
+                        auto              dot  = rest.find('.');
+                        if (dot == std::string::npos) {
+                                // Scalar top-level variable
+                                for (const auto &ve : wit->second->vars_) {
+                                        if (ve.name == rest && !ve.valueStr.empty()) {
+                                                try {
+                                                        return std::stof(ve.valueStr);
+                                                } catch (...) {
+                                                }
+                                        }
+                                }
+                                return fallback;
+                        }
+                        const std::string varName = rest.substr(0, dot);
+                        for (const auto &ve : wit->second->vars_) {
+                                if (ve.name != varName)
+                                        continue;
+                                if (!ve.structFields.empty()) {
+                                        // LOCAL struct: single-level field
+                                        float val = fallback;
+                                        wit->second->readLocalFieldAsFloat(varName, rest.substr(dot + 1), val);
+                                        return val;
+                                }
+                                // DWARF struct member: read from display-value cache
+                                float val = fallback;
+                                wit->second->getDwarfMemberAsFloat(rest, val);
+                                return val;
+                        }
+                        return fallback;
+                };
+
+                // Pull linked Monitor channel values at the selected refresh interval
+                bool effRefreshFired = false;
+                {
+                        u64 nowMs = static_cast<u64>(ImGui::GetTime() * 1000.0);
+                        if (nowMs - effLastRefreshTs >= static_cast<u64>(effRefreshMs)) {
+                                effLastRefreshTs = nowMs;
+                                effRefreshFired  = true;
+                                if (!effTorqueLink.empty())
+                                        effTorque = getVarVal(effTorqueLink, effTorque);
+                                if (!effSpeedLink.empty())
+                                        effSpeed = getVarVal(effSpeedLink, effSpeed);
+                                if (!effVoltageLink.empty())
+                                        effVoltage = getVarVal(effVoltageLink, effVoltage);
+                                if (!effCurrentLink.empty())
+                                        effCurrent = getVarVal(effCurrentLink, effCurrent);
+                        }
+                }
+
+                // col1=label col2=input col3=unit dropdown col4=link button
+                constexpr ImGuiTableFlags tfl  = ImGuiTableFlags_SizingFixedFit;
+                const float               col1 = 120.0f, col2 = 100.0f, col3 = 90.0f, col4 = 24.0f;
+
+                // Draw one input row with an optional variable-link button (col4)
+                auto inputRow = [&](const char  *lbl,
+                                    float       &val,
+                                    const char  *inputId,
+                                    const char  *fmt,
+                                    int         &unitIdx,
+                                    const char  *units,
+                                    const char  *unitId,
+                                    std::string &link,
+                                    int          fi) {
+                        char lnkId[16], unlId[16];
+                        snprintf(lnkId, sizeof(lnkId), "~##lb%d", fi);
+                        snprintf(unlId, sizeof(unlId), "X##ub%d", fi);
+
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::TextUnformatted(lbl);
+
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        if (!link.empty()) {
+                                ImGui::BeginDisabled(true);
+                                ImGui::InputFloat(inputId, &val, 0, 0, fmt);
+                                ImGui::EndDisabled();
+                                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                                        if (!link.empty() && link[0] == '@') {
+                                                // "@monName@scopeName@chName" → show "scopeName / chName"
+                                                auto p1 = link.find('@', 1);
+                                                auto p2 =
+                                                    (p1 != std::string::npos) ? link.find('@', p1 + 1) : std::string::npos;
+                                                if (p2 != std::string::npos) {
+                                                        const std::string scopePart = link.substr(p1 + 1, p2 - p1 - 1);
+                                                        const std::string chPart    = link.substr(p2 + 1);
+                                                        ImGui::SetTooltip("%s / %s", scopePart.c_str(), chPart.c_str());
+                                                } else {
+                                                        ImGui::SetTooltip("%s", link.c_str());
+                                                }
+                                        } else {
+                                                auto sep = link.find("::");
+                                                ImGui::SetTooltip(
+                                                    "%s", sep != std::string::npos ? link.c_str() + sep + 2 : link.c_str());
+                                        }
+                                }
+                        } else {
+                                ImGui::InputFloat(inputId, &val, 0, 0, fmt);
+                        }
+
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        if (!link.empty()) {
+                                ImGui::BeginDisabled(true);
+                                ImGui::Combo(unitId, &unitIdx, units);
+                                ImGui::EndDisabled();
+                        } else {
+                                ImGui::Combo(unitId, &unitIdx, units);
+                        }
+
+                        ImGui::TableSetColumnIndex(3);
+                        if (!link.empty()) {
+                                if (ImGui::SmallButton(unlId))
+                                        link.clear();
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s", tr("Unlink variable", "取消关联变量"));
+                        } else {
+                                if (ImGui::SmallButton(lnkId)) {
+                                        pendingVarLink = &link;
+                                        doOpenVarPick  = true;
+                                }
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s", tr("Link to variable", "关联变量"));
+                        }
+                };
+
+                // ── Mechanical Power input ──────────────────────────────────
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("Mechanical Power", "机械功率"));
+                if (ImGui::BeginTable("##effMech", 4, tfl)) {
+                        ImGui::TableSetupColumn("##l", ImGuiTableColumnFlags_WidthFixed, col1);
+                        ImGui::TableSetupColumn("##v", ImGuiTableColumnFlags_WidthFixed, col2);
+                        ImGui::TableSetupColumn("##u", ImGuiTableColumnFlags_WidthFixed, col3);
+                        ImGui::TableSetupColumn("##b", ImGuiTableColumnFlags_WidthFixed, col4);
+                        inputRow(tr("Torque", "扭矩"),
+                                 effTorque,
+                                 "##effTq",
+                                 "%.4f",
+                                 effTorqueUnit,
+                                 "Nm\0mNm\0oz.in\0lb.in\0lb.ft\0",
+                                 "##effTqU",
+                                 effTorqueLink,
+                                 0);
+                        inputRow(tr("Speed", "转速"),
+                                 effSpeed,
+                                 "##effSpd",
+                                 "%.3f",
+                                 effSpeedUnit,
+                                 "RPM\0rad/s\0Hz\0",
+                                 "##effSpdU",
+                                 effSpeedLink,
+                                 1);
+                        ImGui::EndTable();
+                }
+
+                // ── Refresh rate ────────────────────────────────────────────
+                ImGui::Spacing();
+                ImGui::TextUnformatted(tr("Refresh rate:", "刷新率:"));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(100.0f);
+                ImGui::SliderInt("##effRefreshMs", &effRefreshMs, 10, 2000);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Refresh (ms)", "刷新间隔(毫秒)"));
+
+                // ── DC Bus Power input ──────────────────────────────────────
+                ImGui::Spacing();
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("DC Bus Power", "直流母线功率"));
+                if (ImGui::BeginTable("##effElec", 4, tfl)) {
+                        ImGui::TableSetupColumn("##l", ImGuiTableColumnFlags_WidthFixed, col1);
+                        ImGui::TableSetupColumn("##v", ImGuiTableColumnFlags_WidthFixed, col2);
+                        ImGui::TableSetupColumn("##u", ImGuiTableColumnFlags_WidthFixed, col3);
+                        ImGui::TableSetupColumn("##b", ImGuiTableColumnFlags_WidthFixed, col4);
+                        inputRow(tr("Bus Voltage", "母线电压"),
+                                 effVoltage,
+                                 "##effVdc",
+                                 "%.4f",
+                                 effVoltageUnit,
+                                 "V\0mV\0kV\0",
+                                 "##effVdcU",
+                                 effVoltageLink,
+                                 2);
+                        inputRow(tr("Bus Current", "母线电流"),
+                                 effCurrent,
+                                 "##effIdc",
+                                 "%.4f",
+                                 effCurrentUnit,
+                                 "A\0mA\0",
+                                 "##effIdcU",
+                                 effCurrentLink,
+                                 3);
+                        ImGui::EndTable();
+                }
+
+                // ── Variable picker popup ───────────────────────────────────
+                // OpenPopup must be in the same ID-stack context as BeginPopup
+                if (doOpenVarPick) {
+                        ImGui::OpenPopup("##varPick");
+                        doOpenVarPick = false;
+                }
+                if (ImGui::BeginPopup("##varPick")) {
+                        static char varSearch[128]{};
+                        ImGui::SetNextItemWidth(220.0f);
+                        ImGui::InputTextWithHint("##vpSearch", tr("Search...", "搜索..."), varSearch, sizeof(varSearch));
+                        ImGui::Separator();
+
+                        const bool isSearching = varSearch[0] != '\0';
+
+                        // Case-insensitive substring match
+                        auto matches = [](const char *haystack, const char *needle) -> bool {
+                                if (!needle || needle[0] == '\0')
+                                        return true;
+                                for (const char *p = haystack; *p; ++p) {
+                                        const char *a = p, *b = needle;
+                                        while (*a && *b && tolower((u8)*a) == tolower((u8)*b)) {
+                                                ++a;
+                                                ++b;
+                                        }
+                                        if (!*b)
+                                                return true;
+                                }
+                                return false;
+                        };
+
+                        auto doSelect = [&](const std::string &key) {
+                                if (pendingVarLink)
+                                        *pendingVarLink = key;
+                                pendingVarLink = nullptr;
+                                varSearch[0]   = '\0';
+                                ImGui::CloseCurrentPopup();
+                        };
+
+                        if (ImGui::MenuItem(tr("-- manual --", "-- 手动输入 --"))) {
+                                if (pendingVarLink)
+                                        pendingVarLink->clear();
+                                pendingVarLink = nullptr;
+                                varSearch[0]   = '\0';
+                                ImGui::CloseCurrentPopup();
+                        }
+
+                        // ── Monitor channels (primary / recommended) ────────
+                        bool anyMonCh = false;
+                        for (auto &[mname, mon] : monitors_) {
+                                for (auto &[sname, scope] : mon->getScopes()) {
+                                        for (auto &[chname, ch] : scope->getChannels()) {
+                                                char fullName[256];
+                                                snprintf(fullName, sizeof(fullName), "[%s] %s", sname.c_str(), chname.c_str());
+                                                if (!matches(fullName, varSearch) && !matches(chname.c_str(), varSearch))
+                                                        continue;
+                                                if (!anyMonCh) {
+                                                        ImGui::TextDisabled("%s", tr("Monitor Channels", "监视器通道"));
+                                                        anyMonCh = true;
+                                                }
+                                                char lbl[320];
+                                                snprintf(lbl,
+                                                         sizeof(lbl),
+                                                         "%s  (avg %.4g)##mon_%s_%s_%s",
+                                                         fullName,
+                                                         scope->getChannelMean(chname),
+                                                         mname.c_str(),
+                                                         sname.c_str(),
+                                                         chname.c_str());
+                                                if (ImGui::MenuItem(lbl))
+                                                        doSelect("@" + mname + "@" + sname + "@" + chname);
+                                        }
+                                }
+                        }
+                        if (!anyMonCh)
+                                ImGui::TextDisabled("%s", tr("(no monitor channels)", "(无监视器通道)"));
+
+                        ImGui::EndPopup();
+                }
+
+                // ── Calculations ────────────────────────────────────────────
+                float torque_Nm  = effTorque * kTorqueToNm[effTorqueUnit];
+                float speed_rads = effSpeed * kSpeedToRadS[effSpeedUnit];
+                float voltage_V  = effVoltage * kVoltToV[effVoltageUnit];
+                float current_A  = effCurrent * kCurrToA[effCurrentUnit];
+
+                float P_mech    = torque_Nm * speed_rads;
+                float P_elec    = voltage_V * current_A;
+                float P_elec_ab = std::abs(P_elec);
+                float eta       = (P_elec_ab > 1e-9f) ? (std::abs(P_mech) / P_elec_ab * 100.0f) : 0.0f;
+
+                // ── Efficiency map recording ─────────────────────────────────
+                // Every refresh cycle appends a new scatter point.
+                if (effMapRec && effRefreshFired && eta > 0.f && eta <= 100.f) {
+                        float spdRpm = speed_rads * (30.f / 3.14159265f);
+                        s_eff.rawData.push_back({spdRpm, torque_Nm, eta});
+                }
+
+                // ── Results ─────────────────────────────────────────────────
+                ImGui::Spacing();
+                ImGui::Separator();
+                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("Results", "计算结果"));
+
+                if (ImGui::BeginTable("##effRes", 2, ImGuiTableFlags_SizingFixedFit)) {
+                        ImGui::TableSetupColumn("##rl", ImGuiTableColumnFlags_WidthFixed, 200.0f);
+                        ImGui::TableSetupColumn("##rv", ImGuiTableColumnFlags_WidthStretch);
+
+                        auto row = [](const char *label, const char *fmt, float val) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextUnformatted(label);
+                                ImGui::TableSetColumnIndex(1);
+                                char buf[64];
+                                snprintf(buf, sizeof(buf), fmt, val);
+                                ImGui::TextUnformatted(buf);
+                        };
+
+                        row(tr("Torque (Nm)", "扭矩 (Nm)"), "%.4f Nm", torque_Nm);
+                        row(tr("Speed (rad/s)", "转速 (rad/s)"), "%.3f rad/s", speed_rads);
+                        row(tr("Mech. Power", "机械功率"), "%.3f W", P_mech);
+                        row(tr("Bus Voltage (V)", "母线电压 (V)"), "%.4f V", voltage_V);
+                        row(tr("Bus Current (A)", "母线电流 (A)"), "%.4f A", current_A);
+                        row(tr("Elec. Power", "电气功率"), "%.3f W", P_elec);
+                        ImGui::EndTable();
+                }
+
+                ImGui::Spacing();
+                // Efficiency bar
+                ImVec4 etaColor = (eta >= 90.0f)   ? ImVec4(0.2f, 1.0f, 0.3f, 1.0f)
+                                  : (eta >= 70.0f) ? ImVec4(1.0f, 0.85f, 0.1f, 1.0f)
+                                                   : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+                ImGui::TextColored(etaColor, tr("Efficiency:  %.2f %%", "效率：  %.2f %%"), eta);
+                float barW = ImGui::GetContentRegionAvail().x;
+                float frac = std::min(std::max(eta / 100.0f, 0.0f), 1.0f);
+                ImGui::PushStyleColor(ImGuiCol_PlotHistogram, etaColor);
+                ImGui::ProgressBar(frac, ImVec2(barW, 12.0f), "");
+                ImGui::PopStyleColor();
+
+                if (eta > 100.0f)
+                        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.1f, 1.0f),
+                                           "%s",
+                                           tr("! Efficiency > 100%% — check inputs.", "! 效率 > 100%%，请检查输入。"));
+
+                // ── Efficiency Map ───────────────────────────────────────────
+                ImGui::Spacing();
+                if (ImGui::CollapsingHeader(tr("Efficiency Map", "效率图"))) {
+                        // ── Control buttons ───────────────────────────────────
+                        if (effMapRec) {
+                                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.75f, 0.12f, 0.12f, 1.f));
+                                if (ImGui::Button(tr("■  Stop", "■  停止记录")))
+                                        effMapRec = false;
+                                ImGui::PopStyleColor();
+                        } else {
+                                if (ImGui::Button(tr("▶  Record", "▶  开始记录")))
+                                        effMapRec = true;
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button(tr("Clear##emap", "清除##emap")))
+                                s_eff.rawData.clear();
+                        ImGui::SameLine();
+                        ImGui::Text(tr("Pts: %zu", "点数: %zu"), s_eff.rawData.size());
+                        ImGui::SameLine();
+                        if (ImGui::Button(tr("Export Table##etbl", "导出表格##etbl"))) {
+                                auto f = nativeDlgSave(
+                                    tr("Export Efficiency Table", "导出效率数据"), {{"CSV", {"csv"}}}, "efficiency_table");
+                                if (!f.empty()) {
+                                        std::ofstream ofs(f);
+                                        if (ofs) {
+                                                ofs << "Speed_RPM,Torque_Nm,Efficiency_%\n";
+                                                for (const auto &pt : s_eff.rawData)
+                                                        ofs << pt.spdRpm << "," << pt.tqNm << "," << pt.eta << "\n";
+                                        }
+                                }
+                        }
+                        ImGui::SameLine();
+                        if (ImGui::Button(tr("Export Map##emap2", "导出效率图##emap2"))) {
+                                auto f = nativeDlgSave(
+                                    tr("Export Efficiency Map", "导出效率图"), {{"CSV", {"csv"}}}, "efficiency_map");
+                                if (!f.empty()) {
+                                        std::ofstream ofs(f);
+                                        if (ofs) {
+                                                // Bin raw data into grid for CSV export
+                                                float mapVals[kMapBins * kMapBins]{};
+                                                float mapSum[kMapBins * kMapBins]{};
+                                                int   mapCnt[kMapBins * kMapBins]{};
+                                                float spdRange = effMapSpdMax - effMapSpdMin;
+                                                float tqRange  = effMapTqMax - effMapTqMin;
+                                                if (spdRange > 1.f && tqRange > 1e-3f) {
+                                                        for (const auto &pt : s_eff.rawData) {
+                                                                int xi = static_cast<int>((pt.spdRpm - effMapSpdMin) /
+                                                                                          spdRange * kMapBins);
+                                                                int yi = kMapBins - 1 -
+                                                                         static_cast<int>((pt.tqNm - effMapTqMin) / tqRange *
+                                                                                          kMapBins);
+                                                                xi           = std::max(0, std::min(xi, kMapBins - 1));
+                                                                yi           = std::max(0, std::min(yi, kMapBins - 1));
+                                                                int idx      = yi * kMapBins + xi;
+                                                                mapSum[idx] += pt.eta;
+                                                                mapCnt[idx]++;
+                                                        }
+                                                        for (int i = 0; i < kMapBins * kMapBins; ++i)
+                                                                mapVals[i] = mapCnt[i] > 0
+                                                                                 ? mapSum[i] / static_cast<float>(mapCnt[i])
+                                                                                 : 0.f;
+                                                }
+                                                // Column headers: speed bin centres
+                                                ofs << "Torque_Nm\\Speed_RPM";
+                                                for (int x = 0; x < kMapBins; ++x) {
+                                                        float spd = effMapSpdMin +
+                                                                    (x + 0.5f) * (effMapSpdMax - effMapSpdMin) / kMapBins;
+                                                        ofs << "," << spd;
+                                                }
+                                                ofs << "\n";
+                                                // Rows: high torque first (row 0 = top of map)
+                                                for (int y = 0; y < kMapBins; ++y) {
+                                                        float tq =
+                                                            effMapTqMax - (y + 0.5f) * (effMapTqMax - effMapTqMin) / kMapBins;
+                                                        ofs << tq;
+                                                        for (int x = 0; x < kMapBins; ++x)
+                                                                ofs << "," << mapVals[y * kMapBins + x];
+                                                        ofs << "\n";
+                                                }
+                                        }
+                                }
+                        }
+
+                        // ── Range controls ────────────────────────────────────
+                        ImGui::TextUnformatted(tr("Speed:", "转速:"));
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(60.f);
+                        ImGui::InputFloat("##mspd0", &effMapSpdMin, 0, 0, "%.0f");
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted("-");
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(60.f);
+                        ImGui::InputFloat("##mspd1", &effMapSpdMax, 0, 0, "%.0f");
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted("RPM");
+                        ImGui::SameLine();
+                        ImGui::Spacing();
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted(tr("Torque:", "转矩:"));
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(55.f);
+                        ImGui::InputFloat("##mtq0", &effMapTqMin, 0, 0, "%.1f");
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted("-");
+                        ImGui::SameLine();
+                        ImGui::SetNextItemWidth(55.f);
+                        ImGui::InputFloat("##mtq1", &effMapTqMax, 0, 0, "%.1f");
+                        ImGui::SameLine();
+                        ImGui::TextUnformatted("Nm");
+
+                        // ── Scatter plot (one dot per sampled point) ──────────
+                        ImPlot::PushColormap(ImPlotColormap_Hot);
+                        if (ImPlot::BeginPlot(
+                                "##effmap", ImVec2(ImGui::GetContentRegionAvail().x - 70.f, 280.f), ImPlotFlags_NoMouseText)) {
+                                ImPlot::SetupAxis(ImAxis_X1, tr("Speed (RPM)", "转速 (RPM)"));
+                                ImPlot::SetupAxis(ImAxis_Y1, tr("Torque (Nm)", "转矩 (Nm)"));
+                                ImPlot::SetupAxisLimits(ImAxis_X1, effMapSpdMin, effMapSpdMax, ImGuiCond_Always);
+                                ImPlot::SetupAxisLimits(ImAxis_Y1, effMapTqMin, effMapTqMax, ImGuiCond_Always);
+                                // Draw each point as a colored scatter marker
+                                const int cmapSize = ImPlot::GetColormapSize();
+                                for (size_t i = 0; i < s_eff.rawData.size(); ++i) {
+                                        const auto &pt  = s_eff.rawData[i];
+                                        float       t   = std::max(0.f, std::min(pt.eta / 100.f, 1.f));
+                                        int         idx = static_cast<int>(t * (cmapSize - 1));
+                                        ImVec4      col = ImPlot::GetColormapColor(idx);
+                                        ImPlot::SetNextMarkerStyle(ImPlotMarker_Circle, 5.f, col, IMPLOT_AUTO, col);
+                                        char label[32];
+                                        snprintf(label, sizeof(label), "##pt%zu", i);
+                                        ImPlot::PlotScatter(label, &pt.spdRpm, &pt.tqNm, 1);
+                                }
+                                ImPlot::EndPlot();
+                        }
+                        ImGui::SameLine();
+                        ImPlot::ColormapScale("##cscale", 0.0, 100.0, ImVec2(60.f, 280.f));
+                        ImPlot::PopColormap();
+                }
+
+                ImGui::EndTabItem();
         }
-        ImGui::SameLine();
-        if (ui::Button(tr("Del", "删除"), ui::BtnStyle::Danger) && motorProfiles_.size() > 1) {
-                motorProfiles_.erase(motorProfiles_.begin() + currentMotorProfile_);
-                if (currentMotorProfile_ > 0)
-                        currentMotorProfile_--;
-        }
 
-        ImGui::Separator();
-        MotorProfile &mp = motorProfiles_[currentMotorProfile_];
-
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Input Parameters ---", "--- 输入参数 ---"));
-        ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputText("##MotorModel", mp.modelName, sizeof(mp.modelName));
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", tr("Model", "型号"));
-        ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("##MotorRs", &mp.Rs, 0.0f, 0.0f, "%.6f");
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Rs (Ohm)");
-        ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("##MotorLd", &mp.Ld, 0.0f, 0.0f, "%.8f");
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Ld (H)");
-        ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("##MotorLq", &mp.Lq, 0.0f, 0.0f, "%.8f");
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Lq (H)");
-        ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputInt("##MotorPolePairs", &mp.polePairs, 0, 0);
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", tr("Pole Pairs", "极对数"));
-        ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("##MotorKt", &mp.Kt, 0.0f, 0.0f, "%.8f");
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("Kt (Nm/A)");
-
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Back-EMF Measurement ---", "--- 反电动势测量 ---"));
-        ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("##MotorBackEmfFreq", &mp.backEmfFreq, 0.0f, 0.0f, "%.3f");
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", tr("Frequency (Hz)", "频率 (Hz)"));
-        ImGui::SetNextItemWidth(150.0f);
-        ImGui::InputFloat("##MotorBackEmfVpp", &mp.backEmfVpp, 0.0f, 0.0f, "%.3f");
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", tr("Vpp (Line-to-Line) (V)", "线电压峰峰值 Vpp (V)"));
-
-        if (mp.polePairs < 1)
-                mp.polePairs = 1;
-        if (mp.backEmfFreq <= 0.0f)
-                mp.backEmfFreq = 0.001f;
-
-        // Calculations
-        // Flux linkage Psi_m = Vpp / (2 * sqrt(3) * 2 * pi * f_e)
-        // Ke (Vpeak_phase / rad/s_elec) = Psi_m
-        const f32 pi    = 3.14159265358979323846f;
-        f32       psi_m = mp.backEmfVpp / (4.0f * sqrtf(3.0f) * pi * mp.backEmfFreq);
-
-        // Kt (Nm/A) = 1.5 * P * Psi_m
-        f32 kt = 1.5f * static_cast<f32>(mp.polePairs) * psi_m;
-
-        // Kv (RPM/V_LL_peak) = 120 * f_e / (P * Vpp)
-        f32 kv = (120.0f * mp.backEmfFreq) / (static_cast<f32>(mp.polePairs) * mp.backEmfVpp);
-
-        ImGui::Separator();
-        ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Calculated Results ---", "--- 计算结果 ---"));
-        ImGui::Text(tr("Flux Linkage (Psi_m): %.6f Wb", "磁链 (Psi_m): %.6f Wb"), static_cast<f64>(psi_m));
-        ImGui::Text(tr("KV value: %.2f RPM/V", "KV 值: %.2f RPM/V"), static_cast<f64>(kv));
-        ImGui::Text(tr("Calculated Kt (Ref): %.6f Nm/A", "计算 Kt (参考): %.6f Nm/A"), static_cast<f64>(kt));
-
+        ImGui::EndTabBar();
         ImGui::End();
 }
 
@@ -2006,4 +2675,84 @@ Gui::drawUpdateUI()
                         ImGui::CloseCurrentPopup();
                 ImGui::EndPopup();
         }
+}
+
+void
+Gui::newSdkPanel()
+{
+        auto sp = std::make_shared<SdkPanel>();
+        sp->setWindowId(nextSdkWinId_++);
+        // LOCAL Variable buffer lookup — search all Variable windows for the named entry.
+        sp->onGetVarBuf_ = [this](const std::string &varName) -> void * {
+                std::lock_guard<std::mutex> lk(mtxMonitors_);
+                for (auto &[_, vw] : vars_) {
+                        for (const auto &ve : vw->vars_) {
+                                if (ve.port == PortType::LOCAL && ve.name == varName)
+                                        return vw->getLocalBuf(varName);
+                        }
+                }
+                return nullptr;
+        };
+        sp->onVarWritten_ = [this](const std::string &varName) {
+                for (auto &[_, vw] : vars_) {
+                        for (const auto &ve : vw->vars_) {
+                                if (ve.port == PortType::LOCAL && ve.name == varName) {
+                                        vw->notifyLocalWrite(varName);
+                                        return;
+                                }
+                        }
+                }
+        };
+        sp->onListLocalVars_ = [this]() -> std::vector<std::string> {
+                std::vector<std::string>    names;
+                std::lock_guard<std::mutex> lk(mtxMonitors_);
+                for (auto &[_, vw] : vars_)
+                        for (const auto &ve : vw->vars_)
+                                if (ve.port == PortType::LOCAL)
+                                        names.push_back(ve.name);
+                return names;
+        };
+
+        sp->onMonitorPush_ = [this](const std::string &chanKey, float val, double ts) {
+                // Split "ClassName::MethodName" → scope / channel.
+                std::string scope, chName;
+                auto        pos = chanKey.rfind("::");
+                if (pos != std::string::npos) {
+                        scope  = chanKey.substr(0, pos);
+                        chName = chanKey.substr(pos + 2);
+                } else {
+                        scope  = "SDK";
+                        chName = chanKey;
+                }
+
+                std::lock_guard<std::mutex> lk(mtxMonitors_);
+                auto                       &mon = monitors_["SDK"];
+                if (!mon)
+                        mon = std::make_shared<Monitor>("SDK");
+                mon->addScope(scope);
+                MonitorScope *sc = mon->getScopes()[scope].get();
+                if (!sc)
+                        return;
+                sc->addChannel(chName);
+                MonitorChannel *ch = sc->findChannel(chName);
+                if (!ch)
+                        return;
+                ch->pushBatch(&val, &ts, 1);
+                ch->publishSnapshot();
+        };
+        // Wire sequence editor LOCAL variable lookup (same lambda as SdkPanel).
+        if (!seqEditor_.onGetLocalBuf_) {
+                seqEditor_.onGetLocalBuf_ = [this](const std::string &varName) -> void * {
+                        std::lock_guard<std::mutex> lk(mtxMonitors_);
+                        for (auto &[_, vw] : vars_) {
+                                for (const auto &ve : vw->vars_) {
+                                        if (ve.port == PortType::LOCAL && ve.name == varName)
+                                                return vw->getLocalBuf(varName);
+                                }
+                        }
+                        return nullptr;
+                };
+        }
+        seqEditor_.registerSdkPanel(sp);
+        sdkPanels_.push_back(std::move(sp));
 }

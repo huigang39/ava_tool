@@ -2,6 +2,7 @@
 #define VARIABLE_HPP
 
 #include "timeops.h"
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <mutex>
@@ -26,7 +27,7 @@ struct ChannelDropPayload;
 struct StructChannelPayload;
 struct WatchMirrorRequest;
 
-enum class PortType { JLINK, UDP, SHM, MANUAL };
+enum class PortType { JLINK, UDP, SHM, MANUAL, LOCAL };
 
 struct VarEntry {
         std::string name;
@@ -64,6 +65,14 @@ struct VarEntry {
                 i64         value;
         };
         std::vector<EnumDef> enumDefs;
+        // Manually defined struct fields (LOCAL port only; non-empty → tree display)
+        struct StructField {
+                char     name[64]{};
+                DataType type{DataType::U32};
+                u32      byteOffset{0};
+        };
+        std::vector<StructField> structFields;
+
         // Per-member enum overrides for struct/array sub-variables (keyed by full member path)
         std::unordered_map<std::string, std::vector<EnumDef>> memberEnumDefs;
         // Paths of sub-variables hidden by the user (right-click → Delete)
@@ -156,6 +165,13 @@ class Variable
         void                       startPollThread();
         void                       stopPollThread();
 
+        // LOCAL port: variable-size in-process buffers keyed by variable name.
+        // Buffers are pre-allocated (see drawAddVariableDialog OK handler) and
+        // never resized after creation, so data() pointers remain stable for SDK threads.
+        mutable std::mutex                                    mtxLocal_;
+        std::unordered_map<std::string, std::vector<uint8_t>> localBufs_;
+        std::unordered_map<u64, u64>                          memberRefreshTs_; // addr → last refresh ms
+
         bool                                         isModified_{false};
         std::unordered_map<std::string, std::string> memberValueCache_;
         std::unordered_map<u64, PollVal>             syncReadCache_;
@@ -196,15 +212,17 @@ class Variable
 
         // Manual Variable Entry State
         struct {
-                char     name[64]{};
-                DataType type        = DataType::U32;
-                PortType port        = PortType::JLINK;
-                u64      addr        = 0;
-                bool     writable    = true;
-                char     udpIp[16]   = "127.0.0.1";
-                int      udpPort     = 8080;
-                char     shmName[64] = "GlobalVariable";
-                char     addrBuf[32] = "0"; // To avoid static persistence issues
+                char                               name[64]{};
+                DataType                           type        = DataType::U32;
+                PortType                           port        = PortType::JLINK;
+                u64                                addr        = 0;
+                bool                               writable    = true;
+                char                               udpIp[16]   = "127.0.0.1";
+                int                                udpPort     = 8080;
+                char                               shmName[64] = "GlobalVariable";
+                char                               addrBuf[32] = "0"; // To avoid static persistence issues
+                bool                               structMode  = false;
+                std::vector<VarEntry::StructField> structFields;
         } newVar_;
 
       public:
@@ -249,6 +267,32 @@ class Variable
         // Port interaction
         void updateVariables();
         void writeVariable(const VarEntry &v, const std::string &newVal);
+
+        // LOCAL port: returns a stable 8-byte buffer pointer for the named variable.
+        // Creates the entry on first call. Thread-safe. Used by SDK sequences to pass
+        // pointer arguments that write back into a Variable's local storage.
+        void *getLocalBuf(const std::string &name);
+        // Called after an SDK call writes to the buffer; nudges the display to refresh.
+        void notifyLocalWrite(const std::string &name);
+        // Read one LOCAL struct field as float. Returns false if var/field not found.
+        bool readLocalFieldAsFloat(const std::string &varName, const std::string &fieldName, float &out) const;
+
+        // Popup support: immediate members of a DWARF struct VarEntry.
+        // Pass typeOff=0/baseAddr=0 to start from the top-level variable.
+        struct PopupMember {
+                std::string name;
+                std::string valStr; // cached display value, "..." if not yet read
+                bool        isStruct{false};
+                u64         typeOff{0};
+                u64         addr{0};
+        };
+        std::vector<PopupMember>
+        getPopupMembers(const std::string &varName, const std::string &pathPrefix, u64 typeOff = 0, u64 baseAddr = 0) const;
+        // Read a DWARF struct member from the display-value cache as float.
+        bool getDwarfMemberAsFloat(const std::string &memberPath, float &out) const;
+        // Proactively refresh a DWARF member value via JLink (rate-limited ~100ms).
+        // Populates memberValueCache_ so getDwarfMemberAsFloat returns up-to-date data.
+        void refreshDwarfMember(const std::string &memberPath);
 
         // After ELF reload: refresh `ch`'s enum entries from this Variable's
         // current DWARF info + user overrides (enumDefs / memberEnumDefs).

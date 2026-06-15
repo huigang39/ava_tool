@@ -16,6 +16,7 @@
 #include "gui/bode.hpp"
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
+#include "gui/sdk_panel.hpp"
 #include "gui/variable.hpp"
 #include "sequence_editor.hpp"
 
@@ -104,6 +105,11 @@ class Gui
         Bode           bode_{};
         AssemblyViewer asmViewer_{};
         SequenceEditor seqEditor_{};
+
+        // SDK Debug — multi-instance windows
+        std::vector<std::shared_ptr<SdkPanel>> sdkPanels_;
+        int                                    nextSdkWinId_{0};
+        void                                   newSdkPanel();
 
         struct CsvChannelImport {
                 std::string         scope;   // scope this channel belongs to

@@ -62,6 +62,63 @@ humanSize(u64 bytes)
 void
 MonitorScope::menu()
 {
+        // Scope label (double-click to rename)
+        {
+                const std::string &displayLabel = getLabel();
+                ImGui::TextColored(ImVec4(0.55f, 0.85f, 1.0f, 1.0f), "%s", displayLabel.c_str());
+
+                // Double-click the label to open rename popup
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        snprintf(renameBuf_, sizeof(renameBuf_), "%s", getLabel().c_str());
+                        ImGui::OpenPopup("Rename Scope");
+                }
+                if (ImGui::IsItemHovered()) {
+                        ImGui::SetTooltip("%s", tr("Double-click to rename", "双击重命名"));
+                }
+
+                // Right-click context menu for rename / reset
+                if (ImGui::BeginPopupContextItem("##scopeLabelCtx")) {
+                        if (ImGui::MenuItem(tr("Rename...", "重命名..."))) {
+                                snprintf(renameBuf_, sizeof(renameBuf_), "%s", getLabel().c_str());
+                                ImGui::OpenPopup("Rename Scope");
+                        }
+                        if (!label_.empty()) {
+                                if (ImGui::MenuItem(tr("Reset to default name", "恢复默认名称"))) {
+                                        label_.clear();
+                                        if (parent_)
+                                                parent_->setModified();
+                                }
+                        }
+                        ImGui::EndPopup();
+                }
+
+                if (ImGui::BeginPopup("Rename Scope")) {
+                        ImGui::TextDisabled("%s", tr("Rename Scope", "重命名示波器"));
+                        ImGui::SetNextItemWidth(220);
+                        if (ImGui::IsWindowAppearing())
+                                ImGui::SetKeyboardFocusHere();
+                        bool commit =
+                            ImGui::InputText("##renameScope",
+                                             renameBuf_,
+                                             sizeof(renameBuf_),
+                                             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+                        ImGui::SameLine();
+                        if (ImGui::Button("OK"))
+                                commit = true;
+                        if (commit) {
+                                if (renameBuf_[0] != '\0') {
+                                        setLabel(renameBuf_);
+                                        if (parent_)
+                                                parent_->setModified();
+                                }
+                                ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::EndPopup();
+                }
+
+                ImGui::SameLine();
+        }
+
         // Scope Toolbar
         // Scope Toolbar
         if (ImGui::Button(e_draw == DrawEnum::PLOT ? tr("Plot view", "图形视图") : tr("Table view", "表格视图"))) {
@@ -261,7 +318,7 @@ void
 MonitorScope::tableDraw()
 {
         if (!ImGui::BeginTable("MonitorTable",
-                               7,
+                               6,
                                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                    ImGuiTableFlags_Sortable))
                 return;
@@ -272,8 +329,6 @@ MonitorScope::tableDraw()
         ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn(tr("Port###col_port", "端口###col_port"), ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn(
-            tr("R/W###col_rw", "读写###col_rw"), ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 50.0f);
         ImGui::TableSetupColumn(
             tr("Wave###col_wave", "波形###col_wave"), ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 100.0f);
         ImGui::TableHeadersRow();
@@ -545,7 +600,9 @@ MonitorScope::drawTableRow(const std::string               &chName,
 
         // 1. Name (Selectable for Shift/Ctrl support)
         ImGui::TableNextColumn();
-        const char *label      = displayLabel.empty() ? chName.c_str() : displayLabel.c_str();
+        // Use alias when set; fall back to the trie display label (short segment).
+        const bool  hasAlias = (ch->getLabel() != ch->getName());
+        const char *label = hasAlias ? ch->getLabel().c_str() : (displayLabel.empty() ? chName.c_str() : displayLabel.c_str());
         bool        isSelected = ch->selected_;
         if (ImGui::Selectable(label, isSelected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
                 selectedGroupPaths_.clear();
@@ -582,6 +639,31 @@ MonitorScope::drawTableRow(const std::string               &chName,
                         for (auto &pair : chs_)
                                 if (pair.second->selected_)
                                         pair.second->markPendingDelete();
+                }
+                // ── Alias / rename ───────────────────────────────────────────
+                ImGui::Separator();
+                ImGui::TextDisabled("%s", tr("Alias", "别名"));
+                static char tableAliasBuf[256]{};
+                if (ImGui::IsWindowAppearing())
+                        snprintf(tableAliasBuf, sizeof(tableAliasBuf), "%s", hasAlias ? ch->getLabel().c_str() : "");
+                ImGui::SetNextItemWidth(180);
+                bool commitAlias =
+                    ImGui::InputText("##tblAlias", tableAliasBuf, sizeof(tableAliasBuf), ImGuiInputTextFlags_EnterReturnsTrue);
+                ImGui::SameLine();
+                if (ImGui::SmallButton("OK"))
+                        commitAlias = true;
+                if (commitAlias) {
+                        ch->setLabel(tableAliasBuf[0] != '\0' ? tableAliasBuf : "");
+                        if (parent_)
+                                parent_->setModified();
+                }
+                if (hasAlias) {
+                        ImGui::SameLine();
+                        if (ImGui::SmallButton(tr("Reset##tblAlias", "重置##tblAlias"))) {
+                                ch->setLabel("");
+                                if (parent_)
+                                        parent_->setModified();
+                        }
                 }
                 ImGui::EndPopup();
         }
@@ -674,14 +756,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
         else
                 ImGui::Text("%s", dev.c_str());
 
-        // 6. R/W
-        ImGui::TableNextColumn();
-        if (ch->isWritable())
-                ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "RW");
-        else
-                ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RO");
-
-        // 7. Wave Control
+        // 6. Wave Control
         ImGui::TableNextColumn();
         f32 availX  = ImGui::GetContentRegionAvail().x;
         f32 spacing = ImGui::GetStyle().ItemSpacing.x;
@@ -1028,12 +1103,19 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 for (auto *pairPtr : orderedChs) {
                         auto &chName = pairPtr->first;
                         auto &ch     = pairPtr->second;
+
+                        // Build display label: "alias###internalName" so ImPlot shows
+                        // the user-facing label in the legend while the ID stays stable.
+                        const std::string &dispLabel = ch->getLabel();
+                        const std::string  plotId    = dispLabel + "###" + chName;
+
                         // 1. Handle Visibility
                         // For existing items: directly set Show so hide/show line
                         // takes effect immediately (bypasses ImPlotCond limitations).
                         // For brand-new items: HideNextItem(Once) sets the initial state.
                         if (auto *gp = ImPlot::GetCurrentContext(); gp && gp->CurrentPlot) {
-                                if (ImPlotItem *item = gp->CurrentPlot->Items.GetItem(chName.c_str())) {
+                                if (ImPlotItem *item = gp->CurrentPlot->Items.GetItem(
+                                        ImPlot::GetCurrentPlot()->Items.GetItemID(plotId.c_str()))) {
                                         item->Show = ch->show_;
                                         syncItems.emplace_back(ch.get(), item);
                                 }
@@ -1064,14 +1146,14 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                 const FftResult &r = it->second;
                                                 if (fftBars_) {
                                                         ImPlot::SetNextFillStyle(ImVec4(col[0], col[1], col[2], col[3]));
-                                                        ImPlot::PlotBars(chName.c_str(),
+                                                        ImPlot::PlotBars(plotId.c_str(),
                                                                          r.freqs.data(),
                                                                          r.mags.data(),
                                                                          (int)r.freqs.size(),
                                                                          r.df * 0.9);
                                                 } else {
                                                         ImPlot::PlotLine(
-                                                            chName.c_str(), r.freqs.data(), r.mags.data(), (int)r.freqs.size());
+                                                            plotId.c_str(), r.freqs.data(), r.mags.data(), (int)r.freqs.size());
                                                 }
                                                 plotted = true;
                                                 if (fftPeakCount_ > 0 && !r.peaks.empty())
@@ -1089,6 +1171,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 const u32 budget = (maxDisplayPoints > 0) ? maxDisplayPoints : 5000;
                                 const int level  = rd.pickLevel(xmin, xmax, budget);
 
+                                const f64 chGain = static_cast<f64>(ch->getGain());
                                 if (level < 0) {
                                         // Raw level fits — iterate the raw ring directly.
                                         const usize si = rd.rawLowerBound(xmin);
@@ -1099,7 +1182,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                 dys_.reserve(n);
                                                 for (usize i = si; i < ei; ++i) {
                                                         dxs_.push_back(rd.rawTs(i));
-                                                        dys_.push_back(static_cast<f64>(rd.rawVal(i)));
+                                                        dys_.push_back(static_cast<f64>(rd.rawVal(i)) * chGain);
                                                 }
                                         }
                                 } else {
@@ -1111,11 +1194,15 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                 dxs_.reserve(n * 2);
                                                 dys_.reserve(n * 2);
                                                 for (usize i = si; i < ei; ++i) {
-                                                        const LodSample &s = rd.lodAt(level, i);
+                                                        const LodSample &s   = rd.lodAt(level, i);
+                                                        f64              ylo = static_cast<f64>(s.vmin) * chGain;
+                                                        f64              yhi = static_cast<f64>(s.vmax) * chGain;
+                                                        if (chGain < 0.0)
+                                                                std::swap(ylo, yhi);
                                                         dxs_.push_back(s.t);
-                                                        dys_.push_back(static_cast<f64>(s.vmin));
+                                                        dys_.push_back(ylo);
                                                         dxs_.push_back(s.t);
-                                                        dys_.push_back(static_cast<f64>(s.vmax));
+                                                        dys_.push_back(yhi);
                                                 }
                                         }
                                 }
@@ -1123,16 +1210,17 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 if (!dxs_.empty()) {
                                         if (ch->getPlotStyle() == 1 && level < 0)
                                                 ImPlot::PlotStairs(
-                                                    chName.c_str(), dxs_.data(), dys_.data(), static_cast<i32>(dxs_.size()));
+                                                    plotId.c_str(), dxs_.data(), dys_.data(), static_cast<i32>(dxs_.size()));
                                         else
                                                 ImPlot::PlotLine(
-                                                    chName.c_str(), dxs_.data(), dys_.data(), static_cast<i32>(dxs_.size()));
+                                                    plotId.c_str(), dxs_.data(), dys_.data(), static_cast<i32>(dxs_.size()));
                                         plotted = true;
                                 }
 
-                                // Window stats: min/max are exact; mean/RMS are exact at raw level and
-                                // approximated from LOD bucket midpoints when downsampled.
-                                if (ch->show_) {
+                                // Window stats: always computed regardless of channel visibility so
+                                // external consumers (e.g. efficiency calculator) can read them even
+                                // when the channel line is hidden in the legend.
+                                {
                                         Stats s;
                                         s.min     = std::numeric_limits<f64>::infinity();
                                         s.max     = -std::numeric_limits<f64>::infinity();
@@ -1168,28 +1256,39 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                 }
                                         }
                                         if (s.count > 0) {
-                                                s.pkpk                = s.max - s.min;
-                                                s.mean                = sum / static_cast<f64>(s.count);
-                                                s.rms                 = std::sqrt(sumSq / static_cast<f64>(s.count));
+                                                s.pkpk = s.max - s.min;
+                                                s.mean = sum / static_cast<f64>(s.count);
+                                                s.rms  = std::sqrt(sumSq / static_cast<f64>(s.count));
+                                                // Apply channel gain to all statistics
+                                                if (chGain != 1.0) {
+                                                        s.min  *= chGain;
+                                                        s.max  *= chGain;
+                                                        s.mean *= chGain;
+                                                        s.rms  *= std::abs(chGain);
+                                                        if (chGain < 0.0)
+                                                                std::swap(s.min, s.max);
+                                                        s.pkpk = s.max - s.min;
+                                                }
                                                 channelStats_[chName] = s;
                                         }
                                 }
                         }
 
                         if (!plotted) {
-                                ImPlot::PlotLine(chName.c_str(), (const f64 *)nullptr, (const f64 *)nullptr, 0);
+                                ImPlot::PlotLine(plotId.c_str(), (const f64 *)nullptr, (const f64 *)nullptr, 0);
                         }
 
                         // 4. Update Legend Toggle
                         if (ImPlotContext *gp = ImPlot::GetCurrentContext(); gp && gp->CurrentPlot) {
-                                if (ImPlotItem *item = gp->CurrentPlot->Items.GetItem(chName.c_str())) {
+                                if (ImPlotItem *item = gp->CurrentPlot->Items.GetItem(
+                                        ImPlot::GetCurrentPlot()->Items.GetItemID(plotId.c_str()))) {
                                         ch->show_ = item->Show;
                                 }
                         }
 
                         // 5. Popup Configuration
-                        if (ImPlot::BeginLegendPopup(chName.c_str())) {
-                                ImGui::Text(tr("Channel: %s", "通道: %s"), chName.c_str());
+                        if (ImPlot::BeginLegendPopup(plotId.c_str())) {
+                                ImGui::Text(tr("Channel: %s", "通道: %s"), dispLabel.c_str());
                                 if (ch->isEnum()) {
                                         const char *currentName = ch->findEnumName(static_cast<i64>(ch->getRVal()));
                                         ImGui::Text(tr("Value: %s (%lld)", "数值: %s (%lld)"),
@@ -1203,7 +1302,8 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 ImVec4 curCol = ImVec4(col[0], col[1], col[2], col[3]);
                                 if (ch->useAutoColor()) {
                                         if (ImPlotContext *gp = ImPlot::GetCurrentContext(); gp && gp->CurrentPlot) {
-                                                if (ImPlotItem *item = gp->CurrentPlot->Items.GetItem(chName.c_str())) {
+                                                if (ImPlotItem *item = gp->CurrentPlot->Items.GetItem(
+                                                        ImPlot::GetCurrentPlot()->Items.GetItemID(plotId.c_str()))) {
                                                         curCol = ImGui::ColorConvertU32ToFloat4(item->Color);
                                                 }
                                         }
@@ -1232,8 +1332,46 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 if (ImGui::IsItemHovered())
                                         ImGui::SetTooltip("%s", tr("Style", "样式"));
                                 ImGui::Checkbox(tr("Markers", "标记点"), &ch->showMarkers());
+                                ImGui::Separator();
+                                ImGui::SetNextItemWidth(120);
+                                ImGui::DragFloat(tr("Gain##chg", "增益##chg"), &ch->getGain(), 0.001f, -1e6f, 1e6f, "%.4g");
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s",
+                                                          tr("Multiplier applied to all values (display & calculation)",
+                                                             "所有数值的乘数（显示与计算均生效）"));
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton(tr("Reset##gainrst", "重置##gainrst")))
+                                        ch->getGain() = 1.0f;
                                 if (ui::Button(tr("Delete Channel", "删除通道"), ui::BtnStyle::Danger))
                                         ch->markPendingDelete();
+
+                                // ── Rename channel ──────────────────────────────────
+                                ImGui::Separator();
+                                ImGui::TextDisabled("%s", tr("Rename", "重命名"));
+                                static char chRenameBuf[128]{};
+                                // Sync buffer once when popup first appears.
+                                if (ImGui::IsWindowAppearing())
+                                        snprintf(chRenameBuf, sizeof(chRenameBuf), "%s", dispLabel.c_str());
+                                ImGui::SetNextItemWidth(180);
+                                bool commitRename = ImGui::InputText(
+                                    "##chRename", chRenameBuf, sizeof(chRenameBuf), ImGuiInputTextFlags_EnterReturnsTrue);
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton("OK"))
+                                        commitRename = true;
+                                if (commitRename && chRenameBuf[0] != '\0') {
+                                        ch->setLabel(chRenameBuf);
+                                        if (parent_)
+                                                parent_->setModified();
+                                }
+                                if (!ch->getLabel().empty() && ch->getLabel() != ch->getName()) {
+                                        ImGui::SameLine();
+                                        if (ImGui::SmallButton(tr("Reset##chLblRst", "重置##chLblRst"))) {
+                                                ch->setLabel("");
+                                                if (parent_)
+                                                        parent_->setModified();
+                                        }
+                                }
+
                                 ImPlot::EndLegendPopup();
                         }
                 }
@@ -1283,7 +1421,11 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 } else {
                         if (!channelStats_.empty()) {
                                 for (auto &[chName, s] : channelStats_) {
-                                        ImGui::Text("%s", chName.c_str());
+                                        // Show alias when set, fall back to internal name.
+                                        auto        chIt = chs_.find(chName);
+                                        const char *displayName =
+                                            (chIt != chs_.end()) ? chIt->second->getLabel().c_str() : chName.c_str();
+                                        ImGui::Text("%s", displayName);
                                         if (ImGui::BeginTable(("##statsTable_" + chName).c_str(),
                                                               2,
                                                               ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
@@ -1297,6 +1439,12 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                         ImGui::TableSetColumnIndex(1);
                                                         ImGui::Text(fmt, v);
                                                 };
+                                                // Current (live) display value — first row
+                                                auto chIt = chs_.find(chName);
+                                                if (chIt != chs_.end())
+                                                        row(tr("Current", "当前值"),
+                                                            "%.6f",
+                                                            static_cast<f64>(chIt->second->getDispVal()));
                                                 row(tr("Min", "最小值"), "%.6f", s.min);
                                                 row(tr("Max", "最大值"), "%.6f", s.max);
                                                 row(tr("Pk-Pk", "峰峰值"), "%.6f", s.pkpk);

@@ -34,6 +34,8 @@ class MonitorScope
         };
         using ChannelMapType = std::unordered_map<std::string, std::shared_ptr<MonitorChannel>>;
         const std::string     &getName() const { return name_; }
+        const std::string     &getLabel() const { return label_.empty() ? name_ : label_; }
+        void                   setLabel(const std::string &l) { label_ = l; }
         void                   setDraw(DrawEnum d) { e_draw = d; }
         DrawEnum               getDraw() const { return e_draw; }
         f32                   &getHeight() { return height_; }
@@ -48,6 +50,8 @@ class MonitorScope
 
       private:
         std::string           name_{};
+        std::string           label_{}; // User-facing alias; falls back to name_ when empty
+        char                  renameBuf_[64]{};
         ChannelMapType        chs_{};
         DrawEnum              e_draw{};
         f32                   height_{200.0f};
@@ -200,6 +204,14 @@ class MonitorScope
                 for (auto &pair : chs_)
                         if (pair.second)
                                 pair.second->clearData();
+        }
+
+        // Returns the mean value computed over the visible window for `chName`.
+        // Returns 0.0 when the channel has no stats yet (scope not yet rendered or no data).
+        f64 getChannelMean(const std::string &chName) const
+        {
+                auto it = channelStats_.find(chName);
+                return (it != channelStats_.end() && it->second.count > 0) ? it->second.mean : 0.0;
         }
 };
 

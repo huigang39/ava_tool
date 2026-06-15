@@ -1237,8 +1237,10 @@ Variable::drawVariableList()
                                 std::lock_guard lk(mtxElf_);
                                 t = resolveAlias(dwarfInfo_, v.typeOff);
                         }
-                        const bool isComplex = t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
-                                                     t->kind == dwarf::TypeKind::ARRAY);
+                        const bool hasManualStruct = !v.structFields.empty();
+                        const bool isComplex =
+                            hasManualStruct || (t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
+                                                      t->kind == dwarf::TypeKind::ARRAY));
 
                         ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_OpenOnArrow;
                         if (isSelected)
@@ -1298,10 +1300,6 @@ Variable::drawVariableList()
                                         editPropBuf_.type     = v.type;
                                         editPropBuf_.port     = v.port;
                                         editPropBuf_.writable = v.writable;
-                                        if (v.port == PortType::UDP) {
-                                                snprintf(editPropBuf_.udpIp, sizeof(editPropBuf_.udpIp), "%s", v.udp.ip);
-                                                editPropBuf_.udpPort = v.udp.port;
-                                        }
                                         if (v.port == PortType::SHM) {
                                                 snprintf(editPropBuf_.shmName, sizeof(editPropBuf_.shmName), "%s", v.shm.name);
                                         }
@@ -1385,7 +1383,9 @@ Variable::drawVariableList()
 
                         // Type
                         ImGui::TableSetColumnIndex(2);
-                        if (isComplex) {
+                        if (hasManualStruct) {
+                                ImGui::TextUnformatted("STRUCT");
+                        } else if (isComplex) {
                                 ImGui::TextUnformatted(t->kind == dwarf::TypeKind::ARRAY ? "ARRAY" : "STRUCT");
                         } else if ((t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty()) {
                                 ImGui::TextUnformatted("ENUM");
@@ -1395,8 +1395,8 @@ Variable::drawVariableList()
 
                         // Address
                         ImGui::TableSetColumnIndex(3);
-                        if (v.port == PortType::UDP) {
-                                ImGui::Text("%s:%d", v.udp.ip, v.udp.port);
+                        if (v.port == PortType::LOCAL) {
+                                ImGui::TextDisabled("(local)");
                         } else if (v.port == PortType::SHM) {
                                 ImGui::TextUnformatted(v.shm.name);
                         } else if (v.addrUnknown) {
@@ -1407,8 +1407,12 @@ Variable::drawVariableList()
 
                         // Port
                         ImGui::TableSetColumnIndex(4);
-                        const char *portNames[] = {"JLINK", "UDP", "SHM", "MANUAL"};
-                        ImGui::TextUnformatted(portNames[(int)v.port]);
+                        const char *portLabel = (v.port == PortType::JLINK)    ? "JLINK"
+                                                : (v.port == PortType::SHM)    ? "SHM"
+                                                : (v.port == PortType::LOCAL)  ? "LOCAL"
+                                                : (v.port == PortType::MANUAL) ? "MANUAL"
+                                                                               : "UDP";
+                        ImGui::TextUnformatted(portLabel);
 
                         // R/W
                         ImGui::TableSetColumnIndex(5);
@@ -1418,7 +1422,40 @@ Variable::drawVariableList()
                                 ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RO");
 
                         if (open && isComplex) {
-                                {
+                                if (hasManualStruct) {
+                                        // Render manually defined struct fields from LOCAL buffer
+                                        std::lock_guard<std::mutex> lk(mtxLocal_);
+                                        auto                        it = localBufs_.find(v.name);
+                                        for (int fi = 0; fi < (int)v.structFields.size(); ++fi) {
+                                                const auto &sf = v.structFields[fi];
+                                                ImGui::PushID(fi);
+                                                ImGui::TableNextRow();
+                                                ImGui::TableSetColumnIndex(0);
+                                                ImGui::TreeNodeEx(sf.name,
+                                                                  ImGuiTreeNodeFlags_Leaf |
+                                                                      ImGuiTreeNodeFlags_NoTreePushOnOpen |
+                                                                      ImGuiTreeNodeFlags_SpanFullWidth);
+                                                ImGui::TableSetColumnIndex(1);
+                                                if (it != localBufs_.end()) {
+                                                        const auto &fbuf = it->second;
+                                                        u32         fsz  = Parser::typeBytes(sf.type);
+                                                        if (sf.byteOffset + fsz <= (u32)fbuf.size()) {
+                                                                uint8_t tmp[8]{};
+                                                                std::memcpy(tmp, fbuf.data() + sf.byteOffset, fsz);
+                                                                ImGui::TextUnformatted(decodeValue(tmp, sf.type, 0, 0).c_str());
+                                                        } else {
+                                                                ImGui::TextDisabled("---");
+                                                        }
+                                                } else {
+                                                        ImGui::TextDisabled("---");
+                                                }
+                                                ImGui::TableSetColumnIndex(2);
+                                                ImGui::TextUnformatted(Parser::dataTypeToStr(sf.type));
+                                                ImGui::TableSetColumnIndex(3);
+                                                ImGui::Text("+0x%X", sf.byteOffset);
+                                                ImGui::PopID();
+                                        }
+                                } else {
                                         std::lock_guard lk(mtxElf_);
                                         drawVarVarTreeRow(v.name, v.addr, v.typeOff, 1, v.port, v.shm.name, i);
                                 }
@@ -1541,10 +1578,11 @@ Variable::drawAddVariableDialog()
                         newVar_.type = Parser::strToDataType(types[typeIdx]);
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("Type", "类型"));
-                static const char *ports[] = {"JLINK", "UDP", "SHM"};
-                static int         portIdx = 0;
+                static const char    *ports[]   = {"JLINK", "SHM", "LOCAL"};
+                static const PortType portMap[] = {PortType::JLINK, PortType::SHM, PortType::LOCAL};
+                static int            portIdx   = 0;
                 if (ImGui::Combo("##newVarPort", &portIdx, ports, IM_ARRAYSIZE(ports)))
-                        newVar_.port = (PortType)portIdx;
+                        newVar_.port = portMap[portIdx];
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("Port", "端口"));
 
@@ -1552,21 +1590,6 @@ Variable::drawAddVariableDialog()
                         ImGui::InputText("##newVarAddress", newVar_.addrBuf, sizeof(newVar_.addrBuf));
                         if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("%s", tr("Address (Hex)", "地址（十六进制）"));
-                        try {
-                                newVar_.addr = std::stoull(newVar_.addrBuf, nullptr, 16);
-                        } catch (...) {
-                                newVar_.addr = 0;
-                        }
-                } else if (newVar_.port == PortType::UDP) {
-                        ImGui::InputText("##newVarTargetIp", newVar_.udpIp, sizeof(newVar_.udpIp));
-                        if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("%s", tr("Target IP", "目标 IP"));
-                        ImGui::InputInt("##newVarTargetPort", &newVar_.udpPort);
-                        if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("%s", tr("Target Port", "目标端口"));
-                        ImGui::InputText("##newVarOffsetAddr", newVar_.addrBuf, sizeof(newVar_.addrBuf));
-                        if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("%s", tr("Offset/Addr", "偏移/地址"));
                         try {
                                 newVar_.addr = std::stoull(newVar_.addrBuf, nullptr, 16);
                         } catch (...) {
@@ -1584,9 +1607,105 @@ Variable::drawAddVariableDialog()
                         } catch (...) {
                                 newVar_.addr = 0;
                         }
+                } else if (newVar_.port == PortType::LOCAL) {
+                        ImGui::Checkbox(tr("Define as struct##sf", "定义为结构体##sf"), &newVar_.structMode);
+
+                        if (!newVar_.structMode) {
+                                int localSz = (newVar_.addr > 0) ? (int)newVar_.addr : 8;
+                                ImGui::SetNextItemWidth(120.0f);
+                                if (ImGui::InputInt(tr("Size (bytes)##lsz", "大小(字节)##lsz"), &localSz)) {
+                                        if (localSz < 1)
+                                                localSz = 1;
+                                        if (localSz > 4096)
+                                                localSz = 4096;
+                                        newVar_.addr = (u64)localSz;
+                                }
+                                ImGui::TextDisabled("%s",
+                                                    tr("Use &varname in SDK sequence to pass as pointer arg.",
+                                                       "在 SDK 序列参数中输入 &varname 可将其作为指针参数传入。"));
+                        } else {
+                                // ── Struct field editor ──
+                                static const char *sfTypes[] = {
+                                    "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
+                                static const DataType sfTypeVals[] = {DataType::U8,
+                                                                      DataType::U16,
+                                                                      DataType::U32,
+                                                                      DataType::U64,
+                                                                      DataType::I8,
+                                                                      DataType::I16,
+                                                                      DataType::I32,
+                                                                      DataType::I64,
+                                                                      DataType::F32,
+                                                                      DataType::F64};
+                                constexpr int         kSfTypeCount = 10;
+
+                                constexpr ImGuiTableFlags tfl =
+                                    ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY;
+                                if (ImGui::BeginTable("##sftbl", 4, tfl, ImVec2(0, 120))) {
+                                        ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch);
+                                        ImGui::TableSetupColumn(tr("Type", "类型"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                                        ImGui::TableSetupColumn(tr("Offset", "偏移"), ImGuiTableColumnFlags_WidthFixed, 48.0f);
+                                        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 22.0f);
+                                        ImGui::TableHeadersRow();
+
+                                        int toDelete = -1;
+                                        for (int fi = 0; fi < (int)newVar_.structFields.size(); ++fi) {
+                                                auto &sf = newVar_.structFields[fi];
+                                                ImGui::PushID(fi);
+                                                ImGui::TableNextRow();
+
+                                                ImGui::TableSetColumnIndex(0);
+                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                ImGui::InputText("##fn", sf.name, sizeof(sf.name));
+
+                                                ImGui::TableSetColumnIndex(1);
+                                                int sfIdx = 2;
+                                                for (int k = 0; k < kSfTypeCount; ++k)
+                                                        if (sfTypeVals[k] == sf.type) {
+                                                                sfIdx = k;
+                                                                break;
+                                                        }
+                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                if (ImGui::Combo("##ft", &sfIdx, sfTypes, kSfTypeCount))
+                                                        sf.type = sfTypeVals[sfIdx];
+
+                                                ImGui::TableSetColumnIndex(2);
+                                                int off = (int)sf.byteOffset;
+                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                if (ImGui::InputInt("##fo", &off, 0, 0)) {
+                                                        if (off < 0)
+                                                                off = 0;
+                                                        sf.byteOffset = (u32)off;
+                                                }
+
+                                                ImGui::TableSetColumnIndex(3);
+                                                if (ImGui::SmallButton("X"))
+                                                        toDelete = fi;
+
+                                                ImGui::PopID();
+                                        }
+                                        if (toDelete >= 0)
+                                                newVar_.structFields.erase(newVar_.structFields.begin() + toDelete);
+                                        ImGui::EndTable();
+                                }
+
+                                if (ImGui::Button(tr("+ Field", "+ 添加字段"))) {
+                                        VarEntry::StructField sf{};
+                                        if (!newVar_.structFields.empty()) {
+                                                const auto &last = newVar_.structFields.back();
+                                                sf.byteOffset    = last.byteOffset + Parser::typeBytes(last.type);
+                                        }
+                                        snprintf(sf.name, sizeof(sf.name), "field%d", (int)newVar_.structFields.size());
+                                        newVar_.structFields.push_back(sf);
+                                }
+                        }
                 }
 
-                ImGui::Checkbox(tr("Writable", "可写"), &newVar_.writable);
+                if (newVar_.port != PortType::LOCAL)
+                        ImGui::Checkbox(tr("Writable", "可写"), &newVar_.writable);
+                else
+                        newVar_.writable = true;
+
                 if (ImGui::Button("OK", ImVec2(120, 0))) {
                         VarEntry v;
                         v.name     = newVar_.name;
@@ -1594,23 +1713,38 @@ Variable::drawAddVariableDialog()
                         v.port     = newVar_.port;
                         v.addr     = newVar_.addr;
                         v.writable = newVar_.writable;
-                        if (v.port == PortType::UDP) {
-                                snprintf(v.udp.ip, sizeof(v.udp.ip), "%s", newVar_.udpIp);
-                                v.udp.port = (u16)newVar_.udpPort;
-                        }
                         if (v.port == PortType::SHM) {
                                 snprintf(v.shm.name, sizeof(v.shm.name), "%s", newVar_.shmName);
                                 v.shm.inited = false;
+                        }
+                        if (v.port == PortType::LOCAL) {
+                                size_t bsz;
+                                if (newVar_.structMode && !newVar_.structFields.empty()) {
+                                        v.structFields = newVar_.structFields;
+                                        bsz            = 0;
+                                        for (const auto &sf : v.structFields)
+                                                bsz = std::max(bsz, (size_t)(sf.byteOffset + Parser::typeBytes(sf.type)));
+                                        if (bsz == 0)
+                                                bsz = 8;
+                                } else {
+                                        bsz = (v.addr > 0) ? (size_t)v.addr : 8;
+                                }
+                                std::lock_guard<std::mutex> lk(mtxLocal_);
+                                localBufs_.emplace(v.name, std::vector<uint8_t>(bsz, 0));
                         }
                         vars_.push_back(v);
                         isModified_        = true;
                         propertiesChanged_ = true;
                         state_             = WindowState::None;
+                        newVar_.structMode = false;
+                        newVar_.structFields.clear();
                         ImGui::CloseCurrentPopup();
                 }
                 ImGui::SameLine();
                 if (ImGui::Button(tr("Cancel", "取消"), ImVec2(120, 0))) {
-                        state_ = WindowState::None;
+                        state_             = WindowState::None;
+                        newVar_.structMode = false;
+                        newVar_.structFields.clear();
                         ImGui::CloseCurrentPopup();
                 }
                 ImGui::EndPopup();
@@ -1804,21 +1938,21 @@ Variable::drawEditPropertiesPopup()
                 ImGui::Text("%s", tr("Port", "端口"));
                 ImGui::SameLine(100);
                 ImGui::SetNextItemWidth(260);
-                static const char *ports[] = {"JLINK", "UDP", "SHM", "MANUAL"};
-                int                portIdx = (int)editPropBuf_.port;
+                static const char    *ports[]   = {"JLINK", "SHM", "LOCAL", "MANUAL"};
+                static const PortType portMap[] = {PortType::JLINK, PortType::SHM, PortType::LOCAL, PortType::MANUAL};
+                int                   portIdx   = 0;
+                for (int i = 0; i < 4; ++i)
+                        if (portMap[i] == editPropBuf_.port) {
+                                portIdx = i;
+                                break;
+                        }
                 if (ImGui::Combo("##editPropPort", &portIdx, ports, IM_ARRAYSIZE(ports)))
-                        editPropBuf_.port = (PortType)portIdx;
+                        editPropBuf_.port = portMap[portIdx];
 
-                if (editPropBuf_.port == PortType::UDP) {
-                        ImGui::Text("%s", tr("UDP IP", "UDP IP"));
-                        ImGui::SameLine(100);
-                        ImGui::SetNextItemWidth(260);
-                        ImGui::InputText("##editPropIp", editPropBuf_.udpIp, sizeof(editPropBuf_.udpIp));
-
-                        ImGui::Text("%s", tr("UDP Port", "UDP 端口"));
-                        ImGui::SameLine(100);
-                        ImGui::SetNextItemWidth(260);
-                        ImGui::InputInt("##editPropUPort", &editPropBuf_.udpPort);
+                if (editPropBuf_.port == PortType::LOCAL) {
+                        ImGui::TextDisabled("%s",
+                                            tr("In-process buffer — use &varname in SDK sequence.",
+                                               "进程内缓冲区，在 SDK 序列参数中用 &varname 引用。"));
                 }
                 if (editPropBuf_.port == PortType::SHM) {
                         ImGui::Text("%s", tr("SHM Name", "SHM 名称"));
@@ -1840,10 +1974,6 @@ Variable::drawEditPropertiesPopup()
                                 v.addr = std::stoull(editPropBuf_.addrBuf, nullptr, 16);
                         } catch (...) {
                                 v.addr = 0;
-                        }
-                        if (v.port == PortType::UDP) {
-                                snprintf(v.udp.ip, sizeof(v.udp.ip), "%s", editPropBuf_.udpIp);
-                                v.udp.port = (u16)editPropBuf_.udpPort;
                         }
                         if (v.port == PortType::SHM) {
                                 snprintf(v.shm.name, sizeof(v.shm.name), "%s", editPropBuf_.shmName);
@@ -1873,8 +2003,12 @@ Variable::exportVarFile(const std::string &path)
                 cJSON_AddNumberToObject(vObj, "type", (int)v.type);
                 cJSON_AddStringToObject(vObj, "typeStr", Parser::dataTypeToStr(v.type));
                 cJSON_AddNumberToObject(vObj, "port", (int)v.port);
-                const char *portNames[] = {"JLINK", "UDP", "SHM", "MANUAL"};
-                cJSON_AddStringToObject(vObj, "portStr", portNames[(int)v.port]);
+                const char *pname = (v.port == PortType::JLINK)    ? "JLINK"
+                                    : (v.port == PortType::SHM)    ? "SHM"
+                                    : (v.port == PortType::LOCAL)  ? "LOCAL"
+                                    : (v.port == PortType::MANUAL) ? "MANUAL"
+                                                                   : "UDP";
+                cJSON_AddStringToObject(vObj, "portStr", pname);
                 char addrBuf[32];
                 snprintf(addrBuf, sizeof(addrBuf), "0x%08llX", (unsigned long long)v.addr);
                 cJSON_AddStringToObject(vObj, "addr", addrBuf);
@@ -1882,10 +2016,7 @@ Variable::exportVarFile(const std::string &path)
                 cJSON_AddNumberToObject(vObj, "typeOff", (double)v.typeOff);
                 cJSON_AddNumberToObject(vObj, "bitOffset", v.bitOffset);
                 cJSON_AddNumberToObject(vObj, "bitSize", v.bitSize);
-                if (v.port == PortType::UDP) {
-                        cJSON_AddStringToObject(vObj, "udpIp", v.udp.ip);
-                        cJSON_AddNumberToObject(vObj, "udpPort", v.udp.port);
-                } else if (v.port == PortType::SHM) {
+                if (v.port == PortType::SHM) {
                         cJSON_AddStringToObject(vObj, "shmName", v.shm.name);
                 }
                 if (!v.enumDefs.empty()) {
@@ -2268,6 +2399,33 @@ Variable::updateVariables()
                                         ret = -2;
                                 }
                         }
+                } else if (v.port == PortType::LOCAL) {
+                        if (!v.structFields.empty()) {
+                                // Manual struct: show field count summary
+                                v.valueStr = "struct (" + std::to_string(v.structFields.size()) + " fields)";
+                                continue;
+                        }
+                        std::lock_guard<std::mutex> lk(mtxLocal_);
+                        auto                        it = localBufs_.find(v.name);
+                        if (it != localBufs_.end() && !it->second.empty()) {
+                                const auto &vd = it->second;
+                                if (vd.size() > sizeof(double)) {
+                                        // Struct-sized buffer: show hex dump, skip decodeValue.
+                                        char   hs[80] = {};
+                                        size_t showN  = std::min(vd.size(), (size_t)16);
+                                        size_t pos    = 0;
+                                        for (size_t b = 0; b < showN && pos + 3 < sizeof(hs); ++b)
+                                                pos += (size_t)snprintf(hs + pos, sizeof(hs) - pos, "%02X ", vd[b]);
+                                        if (vd.size() > 16 && pos > 0) {
+                                                hs[pos - 1] = '\0';
+                                                strncat(hs, "...", 4);
+                                        }
+                                        v.valueStr = hs;
+                                        continue; // outer for(auto& v : vars_)
+                                }
+                                std::memcpy(buf, vd.data(), std::min<size_t>(sz, vd.size()));
+                                ret = 0;
+                        }
                 }
 
                 if (ret == 0) {
@@ -2332,6 +2490,12 @@ Variable::writeVariable(const VarEntry &v, const std::string &newVal)
                         jlink_port_write_mem((u32)v.addr, sz, buf);
                 } else if (v.port == PortType::SHM && v.shm.inited) {
                         shm_write(const_cast<shm_t *>(&v.shm.handle), buf, sz);
+                } else if (v.port == PortType::LOCAL) {
+                        std::lock_guard<std::mutex> lk(mtxLocal_);
+                        auto                       &vec = localBufs_[v.name];
+                        if (vec.empty())
+                                vec.resize(8, 0); // fallback
+                        std::memcpy(vec.data(), buf, std::min<size_t>(sz, vec.size()));
                 }
         } catch (...) {
                 ImGui::InsertNotification({ImGuiToastType::Error, 2000, "Invalid input for %s", v.name.c_str()});
@@ -2466,11 +2630,19 @@ Variable::save(void *node) const
                 cJSON_AddNumberToObject(vObj, "addr", (double)v.addr);
                 cJSON_AddBoolToObject(vObj, "writable", v.writable);
                 cJSON_AddNumberToObject(vObj, "typeOff", (double)v.typeOff);
-                if (v.port == PortType::UDP) {
-                        cJSON_AddStringToObject(vObj, "ip", v.udp.ip);
-                        cJSON_AddNumberToObject(vObj, "uport", v.udp.port);
-                } else if (v.port == PortType::SHM) {
+                if (v.port == PortType::SHM) {
                         cJSON_AddStringToObject(vObj, "shmName", v.shm.name);
+                }
+                if (!v.structFields.empty()) {
+                        cJSON *sfArr = cJSON_CreateArray();
+                        for (const auto &sf : v.structFields) {
+                                cJSON *fObj = cJSON_CreateObject();
+                                cJSON_AddStringToObject(fObj, "name", sf.name);
+                                cJSON_AddNumberToObject(fObj, "type", (int)sf.type);
+                                cJSON_AddNumberToObject(fObj, "offset", (double)sf.byteOffset);
+                                cJSON_AddItemToArray(sfArr, fObj);
+                        }
+                        cJSON_AddItemToObject(vObj, "structFields", sfArr);
                 }
                 if (!v.hiddenMembers.empty()) {
                         cJSON *hmArr = cJSON_CreateArray();
@@ -2522,18 +2694,37 @@ Variable::load(const void *node)
                         v.writable = cJSON_IsTrue(cJSON_GetObjectItem(vObj, "writable"));
                         if (cJSON_GetObjectItem(vObj, "typeOff"))
                                 v.typeOff = (u64)cJSON_GetObjectItem(vObj, "typeOff")->valuedouble;
-                        if (v.port == PortType::UDP) {
-                                if (cJSON_GetObjectItem(vObj, "ip"))
-                                        snprintf(
-                                            v.udp.ip, sizeof(v.udp.ip), "%s", cJSON_GetObjectItem(vObj, "ip")->valuestring);
-                                if (cJSON_GetObjectItem(vObj, "uport"))
-                                        v.udp.port = (u16)cJSON_GetObjectItem(vObj, "uport")->valueint;
-                        } else if (v.port == PortType::SHM) {
+                        if (v.port == PortType::SHM) {
                                 if (cJSON_GetObjectItem(vObj, "shmName"))
                                         snprintf(v.shm.name,
                                                  sizeof(v.shm.name),
                                                  "%s",
                                                  cJSON_GetObjectItem(vObj, "shmName")->valuestring);
+                        }
+                        if (cJSON *sfArr = cJSON_GetObjectItem(vObj, "structFields"); cJSON_IsArray(sfArr)) {
+                                for (int si = 0; si < cJSON_GetArraySize(sfArr); ++si) {
+                                        cJSON                *fObj = cJSON_GetArrayItem(sfArr, si);
+                                        VarEntry::StructField sf;
+                                        if (auto *n = cJSON_GetObjectItem(fObj, "name"); cJSON_IsString(n))
+                                                strncpy(sf.name, n->valuestring, sizeof(sf.name) - 1);
+                                        if (auto *ty = cJSON_GetObjectItem(fObj, "type"); cJSON_IsNumber(ty))
+                                                sf.type = (DataType)(int)ty->valuedouble;
+                                        if (auto *off = cJSON_GetObjectItem(fObj, "offset"); cJSON_IsNumber(off))
+                                                sf.byteOffset = (u32)(int)off->valuedouble;
+                                        v.structFields.push_back(sf);
+                                }
+                        }
+                        if (v.port == PortType::LOCAL) {
+                                size_t bsz = (v.addr > 0) ? (size_t)v.addr : 8;
+                                if (!v.structFields.empty()) {
+                                        bsz = 0;
+                                        for (const auto &sf : v.structFields)
+                                                bsz = std::max(bsz, (size_t)(sf.byteOffset + Parser::typeBytes(sf.type)));
+                                        if (bsz == 0)
+                                                bsz = 8;
+                                }
+                                std::lock_guard<std::mutex> lk(mtxLocal_);
+                                localBufs_.emplace(v.name, std::vector<uint8_t>(bsz, 0));
                         }
                         cJSON *hmArr = cJSON_GetObjectItem(vObj, "hiddenMembers");
                         if (cJSON_IsArray(hmArr))
@@ -2616,7 +2807,11 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
         if (!t)
                 return;
 
-        const char *devLabel = (port == PortType::SHM) ? "SHM" : (port == PortType::UDP) ? "UDP" : "JLINK";
+        const char *devLabel = (port == PortType::SHM)      ? "SHM"
+                               : (port == PortType::LOCAL)  ? "LOCAL"
+                               : (port == PortType::MANUAL) ? "MANUAL"
+                               : (port == PortType::UDP)    ? "UDP"
+                                                            : "JLINK";
 
         auto drawValueCell =
             [&](u64 memberAddr, const char *sType, u64 memberTypeOff, const std::string &mPath, u32 bitOffset, u32 bitSize) {
@@ -2924,5 +3119,243 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                 ImGui::TreePop();
                         }
                 }
+        }
+}
+
+void *
+Variable::getLocalBuf(const std::string &name)
+{
+        std::lock_guard<std::mutex> lk(mtxLocal_);
+        auto                       &buf = localBufs_[name];
+        if (buf.empty())
+                buf.resize(8, 0); // fallback for entries not yet pre-allocated
+        return buf.data();
+}
+
+void
+Variable::notifyLocalWrite(const std::string & /*name*/)
+{
+        // updateVariables() reads localBufs_ on every tick automatically.
+}
+
+std::vector<Variable::PopupMember>
+Variable::getPopupMembers(const std::string &varName, const std::string &pathPrefix, u64 typeOff, u64 baseAddr) const
+{
+        std::vector<PopupMember> result;
+        const VarEntry          *ve = nullptr;
+        for (const auto &v : vars_)
+                if (v.name == varName) {
+                        ve = &v;
+                        break;
+                }
+        if (!ve)
+                return result;
+        if (typeOff == 0)
+                typeOff = ve->typeOff;
+        if (baseAddr == 0)
+                baseAddr = ve->addr;
+
+        const dwarf::Type *t = resolveAlias(dwarfInfo_, typeOff);
+        if (!t || t->kind != dwarf::TypeKind::STRUCT)
+                return result;
+
+        for (const auto &m : t->members) {
+                const std::string  mPath = pathPrefix + "." + m.name;
+                const dwarf::Type *mt    = resolveAlias(dwarfInfo_, m.type);
+                PopupMember        pm;
+                pm.name     = m.name;
+                pm.typeOff  = m.type;
+                pm.addr     = baseAddr + m.offset;
+                pm.isStruct = mt && mt->kind == dwarf::TypeKind::STRUCT;
+                if (!pm.isStruct) {
+                        auto it   = memberValueCache_.find(mPath);
+                        pm.valStr = (it != memberValueCache_.end()) ? it->second : "...";
+                }
+                result.push_back(std::move(pm));
+        }
+        return result;
+}
+
+bool
+Variable::getDwarfMemberAsFloat(const std::string &memberPath, float &out) const
+{
+        auto it = memberValueCache_.find(memberPath);
+        if (it == memberValueCache_.end())
+                return false;
+        try {
+                out = std::stof(it->second);
+                return true;
+        } catch (...) {
+        }
+        return false;
+}
+
+void
+Variable::refreshDwarfMember(const std::string &memberPath)
+{
+        // memberPath e.g. "motorState.speed" or "motorState.ctrl.ref"
+        auto dot = memberPath.find('.');
+        if (dot == std::string::npos)
+                return;
+        const std::string varName = memberPath.substr(0, dot);
+        std::string       subPath = memberPath.substr(dot + 1); // "speed" or "ctrl.ref"
+
+        // Find parent VarEntry
+        const VarEntry *ve = nullptr;
+        for (const auto &v : vars_)
+                if (v.name == varName) {
+                        ve = &v;
+                        break;
+                }
+        if (!ve || ve->port != PortType::JLINK)
+                return;
+        if (!JLinkPort::instance().isConnected())
+                return;
+
+        // Walk DWARF type tree along subPath to get final address + DataType
+        u64 addr    = ve->addr;
+        u64 typeOff = ve->typeOff;
+
+        while (!subPath.empty()) {
+                const dwarf::Type *t = resolveAlias(dwarfInfo_, typeOff);
+                if (!t || t->kind != dwarf::TypeKind::STRUCT)
+                        return;
+
+                std::string elem;
+                auto        nd = subPath.find('.');
+                if (nd == std::string::npos) {
+                        elem = subPath;
+                        subPath.clear();
+                } else {
+                        elem    = subPath.substr(0, nd);
+                        subPath = subPath.substr(nd + 1);
+                }
+                bool found = false;
+                for (const auto &m : t->members) {
+                        if (m.name == elem) {
+                                addr    += m.offset;
+                                typeOff  = m.type;
+                                found    = true;
+                                break;
+                        }
+                }
+                if (!found)
+                        return;
+        }
+
+        // Resolve leaf type → type string via existing scalarPayloadType helper
+        const char *sType = scalarPayloadType(dwarfInfo_, typeOff);
+        if (!sType)
+                return; // nested struct / pointer — not a numeric leaf
+        DataType dt = Parser::strToDataType(sType);
+
+        u32 sz = Parser::typeBytes(dt);
+        if (sz == 0 || sz > 8)
+                return;
+
+        // Rate-limit to ~100 ms per address
+        u64   now    = get_mono_ts_ms();
+        auto &lastTs = memberRefreshTs_[addr];
+        if (now - lastTs < 100)
+                return;
+        lastTs = now;
+
+        u8   buf[8]{};
+        bool ok                       = JLinkPort::instance().readMem((u32)addr, sz, buf);
+        memberValueCache_[memberPath] = ok ? decodeValue(buf, dt, 0, 0) : "ERR";
+}
+
+bool
+Variable::readLocalFieldAsFloat(const std::string &varName, const std::string &fieldName, float &out) const
+{
+        const VarEntry *ve = nullptr;
+        for (const auto &v : vars_)
+                if (v.name == varName) {
+                        ve = &v;
+                        break;
+                }
+        if (!ve || ve->structFields.empty())
+                return false;
+
+        const VarEntry::StructField *sf = nullptr;
+        for (const auto &f : ve->structFields)
+                if (fieldName == f.name) {
+                        sf = &f;
+                        break;
+                }
+        if (!sf)
+                return false;
+
+        u32 fsz = Parser::typeBytes(sf->type);
+        if (fsz == 0)
+                return false;
+
+        std::lock_guard<std::mutex> lk(mtxLocal_);
+        auto                        it = localBufs_.find(varName);
+        if (it == localBufs_.end())
+                return false;
+        const auto &buf = it->second;
+        if (sf->byteOffset + fsz > (u32)buf.size())
+                return false;
+
+        uint8_t tmp[8]{};
+        std::memcpy(tmp, buf.data() + sf->byteOffset, fsz);
+        switch (sf->type) {
+                case DataType::F32: {
+                        float v;
+                        std::memcpy(&v, tmp, 4);
+                        out = v;
+                        return true;
+                }
+                case DataType::F64: {
+                        double v;
+                        std::memcpy(&v, tmp, 8);
+                        out = (float)v;
+                        return true;
+                }
+                case DataType::U8:
+                        out = (float)tmp[0];
+                        return true;
+                case DataType::I8:
+                        out = (float)(int8_t)tmp[0];
+                        return true;
+                case DataType::U16: {
+                        uint16_t v;
+                        std::memcpy(&v, tmp, 2);
+                        out = (float)v;
+                        return true;
+                }
+                case DataType::I16: {
+                        int16_t v;
+                        std::memcpy(&v, tmp, 2);
+                        out = (float)v;
+                        return true;
+                }
+                case DataType::U32: {
+                        uint32_t v;
+                        std::memcpy(&v, tmp, 4);
+                        out = (float)v;
+                        return true;
+                }
+                case DataType::I32: {
+                        int32_t v;
+                        std::memcpy(&v, tmp, 4);
+                        out = (float)v;
+                        return true;
+                }
+                case DataType::U64: {
+                        uint64_t v;
+                        std::memcpy(&v, tmp, 8);
+                        out = (float)v;
+                        return true;
+                }
+                case DataType::I64: {
+                        int64_t v;
+                        std::memcpy(&v, tmp, 8);
+                        out = (float)v;
+                        return true;
+                }
+                default:
+                        return false;
         }
 }
