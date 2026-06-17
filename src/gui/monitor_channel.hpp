@@ -89,6 +89,7 @@ class MonitorChannel
         f32  lineWeight_{1.5f};
         int  plotStyle_{0}; // 0 = Line, 1 = Stairs
         f32  gain_{1.0f};   // display/calculation multiplier applied to every raw sample
+        f32  bias_{0.0f};   // display/calculation offset added after the gain (value * gain + bias)
         bool showMarkers_{false};
         bool show_{true};
         i64  order_{0}; // Display/insertion order within the scope (lower = earlier)
@@ -180,8 +181,10 @@ class MonitorChannel
         void setWritable(bool w) { writable_ = w; }
 
         f32  &getRVal() { return rVal_; }
-        f32   getDispVal() const { return dispVal_ * gain_; } // GUI display value (frozen while paused), gain applied
+        // GUI display value (frozen while paused), gain & bias applied: value * gain + bias
+        f32   getDispVal() const { return dispVal_ * gain_ + bias_; }
         f32  &getGain() { return gain_; }
+        f32  &getBias() { return bias_; }
         bool &show() { return show_; }
         void  setShow(bool s) { show_ = s; }
         bool &selected() { return selected_; }

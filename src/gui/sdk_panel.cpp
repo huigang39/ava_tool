@@ -436,7 +436,11 @@ SdkPanel::drawCFunctionsTab()
                 const CFuncDecl &fn  = parseResult_.functions[i];
                 bool             sel = (i == selectedFnIdx_);
                 char             label[256];
-                snprintf(label, sizeof(label), "%s  %s", ctypeLabel(fn.retType), fn.name.c_str());
+                snprintf(label,
+                         sizeof(label),
+                         "%s  %s",
+                         fn.retRaw.empty() ? ctypeLabel(fn.retType) : fn.retRaw.c_str(),
+                         fn.name.c_str());
                 if (ImGui::Selectable(label, sel) && !sel)
                         selectFn(i);
                 // Drag to SequenceEditor to create an SDK call step
@@ -607,7 +611,11 @@ SdkPanel::drawCppClassesTab()
                         if (m.isCtor || m.isDtor)
                                 snprintf(mLbl, sizeof(mLbl), "%s %s", prefix, m.name.c_str());
                         else
-                                snprintf(mLbl, sizeof(mLbl), "%s  %s", ctypeLabel(m.retType), m.name.c_str());
+                                snprintf(mLbl,
+                                         sizeof(mLbl),
+                                         "%s  %s",
+                                         m.retRaw.empty() ? ctypeLabel(m.retType) : m.retRaw.c_str(),
+                                         m.name.c_str());
                         if (ImGui::Selectable(mLbl, selM) && !selM)
                                 selectMethod(selectedClassIdx_, mi);
                         // Drag to SequenceEditor to create an SDK call step

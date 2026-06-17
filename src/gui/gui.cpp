@@ -438,6 +438,7 @@ Gui::saveSession(const std::string &path)
                                 cJSON_AddBoolToObject(chObj, "useAutoColor", ch->useAutoColor());
                                 cJSON_AddNumberToObject(chObj, "lineWeight", ch->getLineWeight());
                                 cJSON_AddNumberToObject(chObj, "gain", ch->getGain());
+                                cJSON_AddNumberToObject(chObj, "bias", ch->getBias());
                                 if (ch->getLabel() != ch->getName())
                                         cJSON_AddStringToObject(chObj, "alias", ch->getLabel().c_str());
                                 cJSON_AddStringToObject(chObj, "symbolName", ch->getSymbolName().c_str());
@@ -785,6 +786,8 @@ Gui::loadSession(const std::string &path)
                                                 ch->getLineWeight() = static_cast<f32>(lw->valuedouble);
                                         if (const cJSON *gn = cJSON_GetObjectItem(chItem, "gain"); cJSON_IsNumber(gn))
                                                 ch->getGain() = static_cast<f32>(gn->valuedouble);
+                                        if (const cJSON *bs = cJSON_GetObjectItem(chItem, "bias"); cJSON_IsNumber(bs))
+                                                ch->getBias() = static_cast<f32>(bs->valuedouble);
                                         if (const cJSON *al = cJSON_GetObjectItem(chItem, "alias"); cJSON_IsString(al))
                                                 ch->setLabel(al->valuestring);
                                         if (const cJSON *ps = cJSON_GetObjectItem(chItem, "plotStyle"); cJSON_IsNumber(ps))

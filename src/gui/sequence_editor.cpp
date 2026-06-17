@@ -22,11 +22,11 @@ kindLabel(SeqStepKind k)
 {
         switch (k) {
                 case SeqStepKind::Action:
-                        return "Action";
+                        return "do";
                 case SeqStepKind::Sleep:
-                        return "Sleep";
+                        return "delay";
                 case SeqStepKind::If:
-                        return "If";
+                        return "if";
                 case SeqStepKind::While:
                         return "While";
                 case SeqStepKind::For:
@@ -44,11 +44,11 @@ kindLabelCn(SeqStepKind k)
 {
         switch (k) {
                 case SeqStepKind::Action:
-                        return "动作";
+                        return "do";
                 case SeqStepKind::Sleep:
-                        return "延时";
+                        return "delay";
                 case SeqStepKind::If:
-                        return "条件";
+                        return "if";
                 case SeqStepKind::While:
                         return "循环";
                 case SeqStepKind::For:
@@ -180,6 +180,32 @@ SequenceEditor::writeAction(const SequenceAction &action)
         }
 }
 
+// ─── execSdkOp ────────────────────────────────────────────────────────────────
+// Executes a single SDK-call operation from a "do" step's body (sampler/seq thread).
+
+void
+SequenceEditor::execSdkOp(const SdkStepInfo &sdk)
+{
+        LOG_I("[SeqEditor] SdkOp label='%s' panelId=%d isCFunc=%d ci=%d mi=%d",
+              sdk.label.c_str(),
+              sdk.panelWinId,
+              (int)sdk.isCFunc,
+              sdk.classIdx,
+              sdk.methodIdx);
+        auto panel = findSdkPanel(sdk.panelWinId);
+        if (!panel) {
+                LOG_E("[SeqEditor] SdkOp: panel id=%d not found", sdk.panelWinId);
+                return;
+        }
+        if (sdk.isCFunc) {
+                auto r = panel->directCallC(sdk.methodIdx, sdk.args);
+                LOG_I("[SeqEditor] SdkOp C result ok=%d: %s", (int)r.ok, r.text.c_str());
+        } else {
+                auto r = panel->directCall(sdk.classIdx, sdk.methodIdx, sdk.objIdx, sdk.args);
+                LOG_I("[SeqEditor] SdkOp C++ result ok=%d: %s", (int)r.ok, r.text.c_str());
+        }
+}
+
 // ─── Background execution ─────────────────────────────────────────────────────
 
 bool
@@ -221,9 +247,17 @@ SequenceEditor::seqExecStep(const SequenceStep &step, SeqCtx &ctx)
                 case SeqStepKind::Action:
                         if (step.delayMs > 0)
                                 std::this_thread::sleep_for(std::chrono::milliseconds(step.delayMs));
-                        for (const auto &action : step.actions) {
-                                LOG_I("[SeqEditor] Action: %s = %s", action.name.c_str(), action.targetValue.c_str());
-                                ctx.editor->writeAction(action);
+                        for (const auto &op : step.ops) {
+                                if (ctx.editor->seqStopReq_.load())
+                                        return SExecResult::Stop;
+                                if (op.kind == SeqOpKind::Write) {
+                                        LOG_I("[SeqEditor] do/write: %s = %s",
+                                              op.action.name.c_str(),
+                                              op.action.targetValue.c_str());
+                                        ctx.editor->writeAction(op.action);
+                                } else {
+                                        ctx.editor->execSdkOp(op.sdk);
+                                }
                         }
                         break;
 
@@ -231,33 +265,6 @@ SequenceEditor::seqExecStep(const SequenceStep &step, SeqCtx &ctx)
                         LOG_I("[SeqEditor] Sleep %d ms", step.sleepMs);
                         std::this_thread::sleep_for(std::chrono::milliseconds(step.sleepMs));
                         break;
-
-                case SeqStepKind::SdkCall: {
-                        LOG_I("[SeqEditor] SdkCall label='%s' panelId=%d isCFunc=%d ci=%d mi=%d",
-                              step.sdkCall.label.c_str(),
-                              step.sdkCall.panelWinId,
-                              (int)step.sdkCall.isCFunc,
-                              step.sdkCall.classIdx,
-                              step.sdkCall.methodIdx);
-                        if (step.delayMs > 0)
-                                std::this_thread::sleep_for(std::chrono::milliseconds(step.delayMs));
-                        auto panel = ctx.editor->findSdkPanel(step.sdkCall.panelWinId);
-                        if (!panel) {
-                                LOG_E("[SeqEditor] SdkCall: panel id=%d not found", step.sdkCall.panelWinId);
-                                break;
-                        }
-                        LOG_I("[SeqEditor] SdkCall: calling via panel");
-                        if (step.sdkCall.isCFunc) {
-                                auto r = panel->directCallC(step.sdkCall.methodIdx, step.sdkCall.args);
-                                LOG_I("[SeqEditor] SdkCall C result ok=%d: %s", (int)r.ok, r.text.c_str());
-                        } else {
-                                auto r = panel->directCall(
-                                    step.sdkCall.classIdx, step.sdkCall.methodIdx, step.sdkCall.objIdx, step.sdkCall.args);
-                                LOG_I("[SeqEditor] SdkCall C++ result ok=%d: %s", (int)r.ok, r.text.c_str());
-                        }
-                        LOG_I("[SeqEditor] SdkCall: done");
-                        break;
-                }
 
                 case SeqStepKind::If: {
                         if (ctx.editor->seqEvalCond(step))
@@ -335,8 +342,8 @@ SequenceEditor::selectedStepPtr()
 void
 SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
 {
-        static const char *kinds[]   = {"Action", "Sleep", "If", "While", "For", "Break", "SDK"};
-        static const char *kindsCn[] = {"动作", "延时", "条件", "循环", "For", "Break", "SDK"};
+        static const char *kinds[]   = {"do", "delay", "if", "While", "For", "Break"};
+        static const char *kindsCn[] = {"do", "delay", "if", "循环", "For", "Break"};
         static const char *ops[]     = {"==", "!=", "<", ">", "<=", ">="};
 
         int toDelete = -1;
@@ -347,7 +354,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                 // Kind selector
                 int ki = (int)s.kind;
                 ImGui::SetNextItemWidth(60.0f);
-                if (ImGui::Combo("##k", &ki, g_lang == Lang::ZH ? kindsCn : kinds, 7)) {
+                if (ImGui::Combo("##k", &ki, g_lang == Lang::ZH ? kindsCn : kinds, 6)) {
                         s.kind      = (SeqStepKind)ki;
                         isModified_ = true;
                 }
@@ -363,7 +370,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                 ImGui::TextDisabled("ms");
                                 break;
                         case SeqStepKind::Action:
-                                ImGui::TextDisabled("(%d)", (int)s.actions.size());
+                                ImGui::TextDisabled("(%d)", (int)s.ops.size());
                                 break;
                         case SeqStepKind::If:
                         case SeqStepKind::While: {
@@ -425,9 +432,6 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                         case SeqStepKind::Break:
                                 ImGui::TextDisabled("---");
                                 break;
-                        case SeqStepKind::SdkCall:
-                                ImGui::TextDisabled("%s", s.sdkCall.label.c_str());
-                                break;
                         default:
                                 break;
                 }
@@ -474,29 +478,148 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
 
 // ─── acceptSdkPayload ─────────────────────────────────────────────────────────
 
-void
-SequenceEditor::acceptSdkPayload(const void *data, int insertAfter)
+// Build a variable-write action from a single-channel drag payload.
+static SequenceAction
+actionFromChannel(const ChannelDropPayload *p)
 {
-        const auto &pl    = *static_cast<const SdkDragPayload *>(data);
-        auto        panel = findSdkPanel(pl.panelWinId);
+        SequenceAction action;
+        action.name      = p->name;
+        action.addr      = p->addr;
+        action.type      = Parser::strToDataType(p->type);
+        action.port      = p->device;
+        action.shmName   = p->shmName;
+        action.typeOff   = p->typeOff;
+        action.bitOffset = p->bitOffset;
+        action.bitSize   = p->bitSize;
+        action.isEnum    = (p->numEnums > 0);
+        for (int e = 0; e < p->numEnums; ++e)
+                action.enumDefs.push_back({p->enums[e].value, p->enums[e].name});
+        action.targetValue = action.isEnum ? p->enums[0].name : "0";
+        return action;
+}
+
+// Build an SDK-call op from a drag payload. Returns false if the source panel
+// has since closed.
+bool
+SequenceEditor::makeSdkOp(const SdkDragPayload &pl, SeqOp &out)
+{
+        auto panel = findSdkPanel(pl.panelWinId);
         if (!panel)
-                return;
-        SequenceStep ns;
-        ns.kind               = SeqStepKind::SdkCall;
-        ns.sdkCall.panelWinId = pl.panelWinId;
-        ns.sdkCall.isCFunc    = pl.isCFunc;
-        ns.sdkCall.classIdx   = pl.classIdx;
-        ns.sdkCall.methodIdx  = pl.methodIdx;
-        ns.sdkCall.objIdx     = pl.objIdx;
-        ns.sdkCall.label = pl.isCFunc ? panel->getCFuncLabel(pl.methodIdx) : panel->getCallLabel(pl.classIdx, pl.methodIdx);
+                return false;
+        out.kind           = SeqOpKind::Sdk;
+        out.sdk.panelWinId = pl.panelWinId;
+        out.sdk.isCFunc    = pl.isCFunc;
+        out.sdk.classIdx   = pl.classIdx;
+        out.sdk.methodIdx  = pl.methodIdx;
+        out.sdk.objIdx     = pl.objIdx;
+        out.sdk.label = pl.isCFunc ? panel->getCFuncLabel(pl.methodIdx) : panel->getCallLabel(pl.classIdx, pl.methodIdx);
         int np = pl.isCFunc ? panel->getCFuncParamCount(pl.methodIdx) : panel->getParamCount(pl.classIdx, pl.methodIdx);
-        ns.sdkCall.args.resize(np);
-        if (insertAfter < 0 || insertAfter >= (int)steps_.size())
-                steps_.push_back(std::move(ns));
-        else
-                steps_.insert(steps_.begin() + insertAfter + 1, std::move(ns));
-        selectedStep_ = insertAfter < 0 ? (int)steps_.size() - 1 : insertAfter + 1;
-        isModified_   = true;
+        out.sdk.args.resize(np);
+        return true;
+}
+
+// Within an active BeginDragDropTarget(): accept SDK functions / variables and
+// forward each resulting op to `sink`. Returns true if anything was consumed.
+bool
+SequenceEditor::acceptOpDrops(const std::function<void(SeqOp)> &sink)
+{
+        if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("SDK_CALL")) {
+                SeqOp op;
+                if (makeSdkOp(*static_cast<const SdkDragPayload *>(dp->Data), op)) {
+                        sink(std::move(op));
+                        return true;
+                }
+                return false;
+        }
+        if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("CHANNEL")) {
+                sink({SeqOpKind::Write, actionFromChannel(static_cast<ChannelDropPayload *>(dp->Data)), {}});
+                return true;
+        }
+        if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("SYMBOL_CHANNEL")) {
+                sink({SeqOpKind::Write, actionFromChannel(static_cast<ChannelDropPayload *>(dp->Data)), {}});
+                return true;
+        }
+        if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("STRUCT_CHANNEL")) {
+                auto *sp = static_cast<StructChannelPayload *>(dp->Data);
+                for (int j = 0; j < sp->count; ++j) {
+                        SequenceAction action;
+                        action.name      = sp->entries[j].name;
+                        action.addr      = sp->entries[j].addr;
+                        action.type      = Parser::strToDataType(sp->entries[j].type);
+                        action.port      = sp->device;
+                        action.shmName   = sp->shmName;
+                        action.typeOff   = 0;
+                        action.bitOffset = sp->entries[j].bitOffset;
+                        action.bitSize   = sp->entries[j].bitSize;
+                        action.isEnum    = (sp->entries[j].numEnums > 0);
+                        for (int e = 0; e < sp->entries[j].numEnums; ++e)
+                                action.enumDefs.push_back({sp->entries[j].enums[e].value, sp->entries[j].enums[e].name});
+                        action.targetValue = action.isEnum ? sp->entries[j].enums[0].name : "0";
+                        sink({SeqOpKind::Write, std::move(action), {}});
+                }
+                return sp->count > 0;
+        }
+        if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE")) {
+                auto           *m_p = static_cast<ChannelMovePayload *>(dp->Data);
+                MonitorChannel *ch  = m_p->srcScope->findChannel(m_p->chName);
+                if (ch) {
+                        SequenceAction action;
+                        action.name      = ch->getName();
+                        action.addr      = ch->getAddr();
+                        action.type      = Parser::strToDataType(ch->getType());
+                        action.port      = ch->getDevice();
+                        action.shmName   = ch->getShmRegionName();
+                        action.typeOff   = 0;
+                        action.bitOffset = ch->getBitOffset();
+                        action.bitSize   = ch->getBitSize();
+                        action.isEnum    = !ch->getEnums().empty();
+                        for (const auto &e : ch->getEnums())
+                                action.enumDefs.push_back({e.value, e.name});
+                        action.targetValue = action.isEnum ? ch->getEnums()[0].name : "0";
+                        sink({SeqOpKind::Write, std::move(action), {}});
+                        return true;
+                }
+        }
+        return false;
+}
+
+// Append an op to a step body (used by If/While/For): extend the trailing "do"
+// step, or start a new one if the body is empty / ends with a non-"do" step.
+static void
+appendOpToBody(std::vector<SequenceStep> &body, SeqOp op)
+{
+        if (body.empty() || body.back().kind != SeqStepKind::Action)
+                body.push_back(SequenceStep{}); // default kind == Action ("do")
+        body.back().ops.push_back(std::move(op));
+}
+
+// Drop a dragged SDK function into a fresh or existing "do" step (used by the
+// window-background and trailing drop zones). If stepIdx points at a "do" step
+// the call is appended to it; otherwise it is wrapped in a new "do" step
+// (inserted after stepIdx, or at the end when stepIdx < 0).
+void
+SequenceEditor::acceptSdkPayload(const void *data, int stepIdx)
+{
+        SeqOp op;
+        if (!makeSdkOp(*static_cast<const SdkDragPayload *>(data), op))
+                return;
+
+        if (stepIdx >= 0 && stepIdx < (int)steps_.size() && steps_[stepIdx].kind == SeqStepKind::Action) {
+                steps_[stepIdx].ops.push_back(std::move(op));
+                selectedStep_ = stepIdx;
+        } else {
+                SequenceStep ns;
+                ns.kind = SeqStepKind::Action;
+                ns.ops.push_back(std::move(op));
+                if (stepIdx < 0 || stepIdx >= (int)steps_.size()) {
+                        steps_.push_back(std::move(ns));
+                        selectedStep_ = (int)steps_.size() - 1;
+                } else {
+                        steps_.insert(steps_.begin() + stepIdx + 1, std::move(ns));
+                        selectedStep_ = stepIdx + 1;
+                }
+        }
+        isModified_ = true;
 }
 
 // ─── drawStepList ─────────────────────────────────────────────────────────────
@@ -520,9 +643,9 @@ SequenceEditor::drawStepList()
                                                  "%d  %s (%d)",
                                                  i + 1,
                                                  step.name.c_str(),
-                                                 (int)step.actions.size());
+                                                 (int)step.ops.size());
                                 else
-                                        snprintf(label, sizeof(label), "%d  %s (%d)", i + 1, kl, (int)step.actions.size());
+                                        snprintf(label, sizeof(label), "%d  %s (%d)", i + 1, kl, (int)step.ops.size());
                                 break;
                         case SeqStepKind::Sleep:
                                 snprintf(label, sizeof(label), "%d  %s  %d ms", i + 1, kl, step.sleepMs);
@@ -560,9 +683,6 @@ SequenceEditor::drawStepList()
                         case SeqStepKind::Break:
                                 snprintf(label, sizeof(label), "%d  %s", i + 1, kl);
                                 break;
-                        case SeqStepKind::SdkCall:
-                                snprintf(label, sizeof(label), "%d  [SDK] %s", i + 1, step.sdkCall.label.c_str());
-                                break;
                         default:
                                 snprintf(label, sizeof(label), "%d  %s", i + 1, kl);
                                 break;
@@ -585,101 +705,19 @@ SequenceEditor::drawStepList()
                 }
                 ImGui::PopStyleColor();
 
-                // Drop target on step item: hardware channels OR SDK_CALL (inserts after)
-                if (ImGui::BeginDragDropTarget()) {
-                        if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("SDK_CALL"))
-                                acceptSdkPayload(dp->Data, i);
-                        else if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("SYMBOL_CHANNEL")) {
-                                if (!running) {
-                                        auto          *p = static_cast<ChannelDropPayload *>(dp->Data);
-                                        SequenceAction action;
-                                        action.name      = p->name;
-                                        action.addr      = p->addr;
-                                        action.type      = Parser::strToDataType(p->type);
-                                        action.port      = p->device;
-                                        action.shmName   = p->shmName;
-                                        action.typeOff   = p->typeOff;
-                                        action.bitOffset = p->bitOffset;
-                                        action.bitSize   = p->bitSize;
-                                        action.isEnum    = (p->numEnums > 0);
-                                        for (int e = 0; e < p->numEnums; ++e)
-                                                action.enumDefs.push_back({p->enums[e].value, p->enums[e].name});
-                                        action.targetValue = action.isEnum ? p->enums[0].name : "0";
-                                        if (steps_[i].kind == SeqStepKind::Action) {
-                                                steps_[i].actions.push_back(action);
-                                                selectedStep_ = i;
-                                                isModified_   = true;
-                                        }
-                                }
-                        } else if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("CHANNEL")) {
-                                if (!running) {
-                                        auto          *p = static_cast<ChannelDropPayload *>(dp->Data);
-                                        SequenceAction action;
-                                        action.name      = p->name;
-                                        action.addr      = p->addr;
-                                        action.type      = Parser::strToDataType(p->type);
-                                        action.port      = p->device;
-                                        action.shmName   = p->shmName;
-                                        action.typeOff   = p->typeOff;
-                                        action.bitOffset = p->bitOffset;
-                                        action.bitSize   = p->bitSize;
-                                        action.isEnum    = (p->numEnums > 0);
-                                        for (int e = 0; e < p->numEnums; ++e)
-                                                action.enumDefs.push_back({p->enums[e].value, p->enums[e].name});
-                                        action.targetValue = action.isEnum ? p->enums[0].name : "0";
-                                        if (steps_[i].kind == SeqStepKind::Action) {
-                                                steps_[i].actions.push_back(action);
-                                                selectedStep_ = i;
-                                                isModified_   = true;
-                                        }
-                                }
-                        } else if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("STRUCT_CHANNEL")) {
-                                if (!running) {
-                                        auto *sp = static_cast<StructChannelPayload *>(dp->Data);
-                                        for (int j = 0; j < sp->count; ++j) {
-                                                SequenceAction action;
-                                                action.name      = sp->entries[j].name;
-                                                action.addr      = sp->entries[j].addr;
-                                                action.type      = Parser::strToDataType(sp->entries[j].type);
-                                                action.port      = sp->device;
-                                                action.shmName   = sp->shmName;
-                                                action.typeOff   = 0;
-                                                action.bitOffset = sp->entries[j].bitOffset;
-                                                action.bitSize   = sp->entries[j].bitSize;
-                                                action.isEnum    = (sp->entries[j].numEnums > 0);
-                                                for (int e = 0; e < sp->entries[j].numEnums; ++e)
-                                                        action.enumDefs.push_back(
-                                                            {sp->entries[j].enums[e].value, sp->entries[j].enums[e].name});
-                                                action.targetValue = action.isEnum ? sp->entries[j].enums[0].name : "0";
-                                                if (steps_[i].kind == SeqStepKind::Action)
-                                                        steps_[i].actions.push_back(action);
-                                        }
-                                        selectedStep_ = i;
-                                        isModified_   = true;
-                                }
-                        } else if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE")) {
-                                if (!running) {
-                                        auto           *m_p = static_cast<ChannelMovePayload *>(dp->Data);
-                                        MonitorChannel *ch  = m_p->srcScope->findChannel(m_p->chName);
-                                        if (ch && steps_[i].kind == SeqStepKind::Action) {
-                                                SequenceAction action;
-                                                action.name      = ch->getName();
-                                                action.addr      = ch->getAddr();
-                                                action.type      = Parser::strToDataType(ch->getType());
-                                                action.port      = ch->getDevice();
-                                                action.shmName   = ch->getShmRegionName();
-                                                action.typeOff   = 0;
-                                                action.bitOffset = ch->getBitOffset();
-                                                action.bitSize   = ch->getBitSize();
-                                                action.isEnum    = !ch->getEnums().empty();
-                                                for (const auto &e : ch->getEnums())
-                                                        action.enumDefs.push_back({e.value, e.name});
-                                                action.targetValue = action.isEnum ? ch->getEnums()[0].name : "0";
-                                                steps_[i].actions.push_back(action);
-                                                selectedStep_ = i;
-                                                isModified_   = true;
-                                        }
-                                }
+                // Drop target on step item: SDK functions / variables go into a "do"
+                // step's body, or into the body of an If/While/For (as a nested "do" step).
+                if (!running && ImGui::BeginDragDropTarget()) {
+                        SequenceStep &st  = steps_[i];
+                        bool          mod = false;
+                        if (st.kind == SeqStepKind::Action)
+                                mod = acceptOpDrops([&](SeqOp op) { st.ops.push_back(std::move(op)); });
+                        else if (st.kind == SeqStepKind::If || st.kind == SeqStepKind::While ||
+                                 st.kind == SeqStepKind::For)
+                                mod = acceptOpDrops([&](SeqOp op) { appendOpToBody(st.body, std::move(op)); });
+                        if (mod) {
+                                selectedStep_ = i;
+                                isModified_   = true;
                         }
                         ImGui::EndDragDropTarget();
                 }
@@ -729,11 +767,11 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
 
         // ── Kind selector ──
         {
-                static const char *kinds[]   = {"Action", "Sleep", "If", "While", "For", "Break", "SDK Call"};
-                static const char *kindsCn[] = {"动作", "延时", "条件", "循环", "For", "Break", "SDK 调用"};
+                static const char *kinds[]   = {"do", "delay", "if", "While", "For", "Break"};
+                static const char *kindsCn[] = {"do", "delay", "if", "循环", "For", "Break"};
                 int                ki        = (int)step.kind;
                 ImGui::SetNextItemWidth(100.0f);
-                if (ImGui::Combo(tr("Kind", "类型"), &ki, g_lang == Lang::ZH ? kindsCn : kinds, 7)) {
+                if (ImGui::Combo(tr("Kind", "类型"), &ki, g_lang == Lang::ZH ? kindsCn : kinds, 6)) {
                         step.kind   = (SeqStepKind)ki;
                         isModified_ = true;
                 }
@@ -753,39 +791,33 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                 isModified_  = true;
                         }
                         ImGui::Spacing();
-                        ImGui::Text("%s", tr("Actions (drag variables):", "动作（拖入变量）："));
-                        if (ImGui::BeginChild("ActionList", ImVec2(0, 0), true)) {
-                                if (ImGui::BeginTable("ActTbl",
-                                                      3,
-                                                      ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                                          ImGuiTableFlags_Resizable)) {
-                                        ImGui::TableSetupColumn(
-                                            tr("Variable", "变量"), ImGuiTableColumnFlags_WidthStretch, 0.45f);
-                                        ImGui::TableSetupColumn(tr("Value", "数值"), ImGuiTableColumnFlags_WidthStretch, 0.40f);
-                                        ImGui::TableSetupColumn(tr("Del", "删"), ImGuiTableColumnFlags_WidthFixed, 50.0f);
-                                        ImGui::TableHeadersRow();
-                                        for (int i = 0; i < (int)step.actions.size(); ++i) {
-                                                ImGui::PushID(i);
-                                                ImGui::TableNextRow();
-                                                ImGui::TableNextColumn();
+                        ImGui::Text("%s",
+                                    tr("Actions (drag variables / SDK functions):", "动作（拖入变量 / SDK 函数）："));
+                        if (ImGui::BeginChild("OpList", ImVec2(0, 0), true)) {
+                                int toDelete = -1;
+                                for (int i = 0; i < (int)step.ops.size(); ++i) {
+                                        ImGui::PushID(i);
+                                        SeqOp &op = step.ops[i];
+                                        if (op.kind == SeqOpKind::Write) {
+                                                SequenceAction &a = op.action;
                                                 ImGui::AlignTextToFramePadding();
-                                                ImGui::TextUnformatted(step.actions[i].name.c_str());
-                                                ImGui::TableNextColumn();
-                                                ImGui::SetNextItemWidth(-FLT_MIN);
-                                                if (step.actions[i].isEnum && !step.actions[i].enumDefs.empty()) {
-                                                        std::string preview = step.actions[i].targetValue;
-                                                        for (const auto &[val, nm] : step.actions[i].enumDefs)
+                                                ImGui::TextUnformatted(a.name.c_str());
+                                                ImGui::SameLine();
+                                                ImGui::SetNextItemWidth(180.0f);
+                                                if (a.isEnum && !a.enumDefs.empty()) {
+                                                        std::string preview = a.targetValue;
+                                                        for (const auto &[val, nm] : a.enumDefs)
                                                                 if (nm == preview) {
                                                                         preview += " (" + std::to_string(val) + ")";
                                                                         break;
                                                                 }
                                                         if (ImGui::BeginCombo("##v", preview.c_str())) {
-                                                                for (const auto &[val, nm] : step.actions[i].enumDefs) {
-                                                                        bool        sel = (step.actions[i].targetValue == nm);
+                                                                for (const auto &[val, nm] : a.enumDefs) {
+                                                                        bool        sel = (a.targetValue == nm);
                                                                         std::string lbl = nm + " (" + std::to_string(val) + ")";
                                                                         if (ImGui::Selectable(lbl.c_str(), sel)) {
-                                                                                step.actions[i].targetValue = nm;
-                                                                                isModified_                 = true;
+                                                                                a.targetValue = nm;
+                                                                                isModified_   = true;
                                                                         }
                                                                         if (sel)
                                                                                 ImGui::SetItemDefaultFocus();
@@ -794,25 +826,53 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                         }
                                                 } else {
                                                         char vbuf[64];
-                                                        strncpy(vbuf, step.actions[i].targetValue.c_str(), sizeof(vbuf) - 1);
+                                                        strncpy(vbuf, a.targetValue.c_str(), sizeof(vbuf) - 1);
                                                         vbuf[sizeof(vbuf) - 1] = '\0';
                                                         if (ImGui::InputText("##v", vbuf, sizeof(vbuf))) {
-                                                                step.actions[i].targetValue = vbuf;
-                                                                isModified_                 = true;
+                                                                a.targetValue = vbuf;
+                                                                isModified_   = true;
                                                         }
                                                 }
-                                                ImGui::TableNextColumn();
-                                                if (ui::Button(tr("Del", "删"), ui::BtnStyle::Danger, ImVec2(-FLT_MIN, 0))) {
-                                                        step.actions.erase(step.actions.begin() + i);
-                                                        isModified_ = true;
-                                                        --i;
+                                                ImGui::SameLine();
+                                                if (ui::Button(tr("Del", "删"), ui::BtnStyle::Danger))
+                                                        toDelete = i;
+                                        } else {
+                                                // SDK call op — header + (when expanded) argument editor.
+                                                auto panel = findSdkPanel(op.sdk.panelWinId);
+                                                bool open  = ImGui::TreeNodeEx(
+                                                    "##sdkop", ImGuiTreeNodeFlags_DefaultOpen, "[SDK] %s", op.sdk.label.c_str());
+                                                ImGui::SameLine();
+                                                if (ui::Button(tr("Del", "删"), ui::BtnStyle::Danger))
+                                                        toDelete = i;
+                                                if (open) {
+                                                        if (panel)
+                                                                drawSdkStepDetail(op.sdk, panel);
+                                                        else
+                                                                ImGui::TextDisabled(
+                                                                    tr("SDK panel (id=%d) closed.", "SDK 窗口 (id=%d) 已关闭。"),
+                                                                    op.sdk.panelWinId);
+                                                        ImGui::TreePop();
                                                 }
-                                                ImGui::PopID();
                                         }
-                                        ImGui::EndTable();
+                                        ImGui::Separator();
+                                        ImGui::PopID();
+                                }
+                                if (step.ops.empty())
+                                        ImGui::TextDisabled(
+                                            "%s",
+                                            tr("Drag variables or SDK functions here.", "把变量或 SDK 函数拖到这里。"));
+                                if (toDelete >= 0) {
+                                        step.ops.erase(step.ops.begin() + toDelete);
+                                        isModified_ = true;
                                 }
                         }
                         ImGui::EndChild();
+                        // The body child is a drop target for SDK functions and variables.
+                        if (ImGui::BeginDragDropTarget()) {
+                                if (acceptOpDrops([&](SeqOp op) { step.ops.push_back(std::move(op)); }))
+                                        isModified_ = true;
+                                ImGui::EndDragDropTarget();
+                        }
                         break;
                 }
 
@@ -864,11 +924,17 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                         }
 
                         // ── Body ──
-                        ImGui::Text("%s", tr("Body:", "执行体："));
+                        ImGui::Text("%s", tr("Body:", "动作："));
                         if (ImGui::BeginChild("BodyList", ImVec2(0, step.hasElse ? -160.0f : -60.0f), true)) {
                                 drawBodySteps(step.body, 0);
                         }
                         ImGui::EndChild();
+                        // Dropping a variable / SDK function here adds it as a nested "do" step.
+                        if (ImGui::BeginDragDropTarget()) {
+                                if (acceptOpDrops([&](SeqOp op) { appendOpToBody(step.body, std::move(op)); }))
+                                        isModified_ = true;
+                                ImGui::EndDragDropTarget();
+                        }
                         if (ImGui::Button(tr("+ Add Body Step", "+ 添加步骤"))) {
                                 step.body.push_back(SequenceStep{});
                                 isModified_ = true;
@@ -881,6 +947,11 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                         drawBodySteps(step.elseBody, 0);
                                 }
                                 ImGui::EndChild();
+                                if (ImGui::BeginDragDropTarget()) {
+                                        if (acceptOpDrops([&](SeqOp op) { appendOpToBody(step.elseBody, std::move(op)); }))
+                                                isModified_ = true;
+                                        ImGui::EndDragDropTarget();
+                                }
                                 if (ImGui::Button(tr("+ Add Else Step", "+ 添加 Else 步骤"))) {
                                         step.elseBody.push_back(SequenceStep{});
                                         isModified_ = true;
@@ -910,11 +981,16 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                 isModified_  = true;
                         }
                         ImGui::Spacing();
-                        ImGui::Text("%s", tr("Body:", "执行体："));
+                        ImGui::Text("%s", tr("Body:", "动作："));
                         if (ImGui::BeginChild("ForBody", ImVec2(0, -60.0f), true)) {
                                 drawBodySteps(step.body, 0);
                         }
                         ImGui::EndChild();
+                        if (ImGui::BeginDragDropTarget()) {
+                                if (acceptOpDrops([&](SeqOp op) { appendOpToBody(step.body, std::move(op)); }))
+                                        isModified_ = true;
+                                ImGui::EndDragDropTarget();
+                        }
                         if (ImGui::Button(tr("+ Add Body Step", "+ 添加步骤"))) {
                                 step.body.push_back(SequenceStep{});
                                 isModified_ = true;
@@ -926,26 +1002,6 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                         ImGui::TextDisabled(
                             "%s", tr("Breaks out of the nearest While or For loop.", "跳出最近的 While 或 For 循环。"));
                         break;
-
-                case SeqStepKind::SdkCall: {
-                        int delay = (int)step.delayMs;
-                        if (ImGui::InputInt(tr("Pre-delay (ms)", "前置延时 (ms)"), &delay, 10, 100)) {
-                                if (delay < 0)
-                                        delay = 0;
-                                step.delayMs = (u32)delay;
-                                isModified_  = true;
-                        }
-                        ImGui::Spacing();
-                        auto panel = findSdkPanel(step.sdkCall.panelWinId);
-                        if (panel) {
-                                drawSdkStepDetail(step.sdkCall, panel);
-                        } else {
-                                ImGui::TextDisabled(tr("SDK panel (id=%d) closed.", "SDK 窗口 (id=%d) 已关闭。"),
-                                                    step.sdkCall.panelWinId);
-                                ImGui::Text("%s: %s", tr("Call", "调用"), step.sdkCall.label.c_str());
-                        }
-                        break;
-                }
 
                 default:
                         break;
@@ -1070,7 +1126,7 @@ SequenceEditor::draw()
 
         // ── Add Step buttons ──────────────────────────────────────────────────
         if (!running) {
-                if (ImGui::Button(tr("+ Action", "+ 动作"))) {
+                if (ImGui::Button(tr("+ do", "+ do"))) {
                         SequenceStep s;
                         s.kind    = SeqStepKind::Action;
                         s.delayMs = 0;
@@ -1079,7 +1135,7 @@ SequenceEditor::draw()
                         isModified_   = true;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button(tr("+ Sleep", "+ 延时"))) {
+                if (ImGui::Button(tr("+ delay", "+ delay"))) {
                         SequenceStep s;
                         s.kind = SeqStepKind::Sleep;
                         steps_.push_back(s);
@@ -1087,7 +1143,7 @@ SequenceEditor::draw()
                         isModified_   = true;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button(tr("+ If", "+ 条件"))) {
+                if (ImGui::Button(tr("+ if", "+ if"))) {
                         SequenceStep s;
                         s.kind = SeqStepKind::If;
                         steps_.push_back(s);
@@ -1145,29 +1201,16 @@ SequenceEditor::draw()
         }
         ImGui::EndChild();
 
-        // Also accept channel drops on the entire left-column area
-        if (!running && ImGui::BeginDragDropTarget()) {
-                if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("CHANNEL")) {
-                        auto          *p = static_cast<ChannelDropPayload *>(dp->Data);
-                        SequenceAction action;
-                        action.name      = p->name;
-                        action.addr      = p->addr;
-                        action.type      = Parser::strToDataType(p->type);
-                        action.port      = p->device;
-                        action.shmName   = p->shmName;
-                        action.typeOff   = p->typeOff;
-                        action.bitOffset = p->bitOffset;
-                        action.bitSize   = p->bitSize;
-                        action.isEnum    = (p->numEnums > 0);
-                        for (int e = 0; e < p->numEnums; ++e)
-                                action.enumDefs.push_back({p->enums[e].value, p->enums[e].name});
-                        action.targetValue = action.isEnum ? p->enums[0].name : "0";
-                        if (selectedStep_ >= 0 && selectedStep_ < (int)steps_.size() &&
-                            steps_[selectedStep_].kind == SeqStepKind::Action) {
-                                steps_[selectedStep_].actions.push_back(action);
-                                isModified_ = true;
-                        }
-                }
+        // Also accept drops on the entire left-column area → selected step's body.
+        if (!running && selectedStep_ >= 0 && selectedStep_ < (int)steps_.size() && ImGui::BeginDragDropTarget()) {
+                SequenceStep &st  = steps_[selectedStep_];
+                bool          mod = false;
+                if (st.kind == SeqStepKind::Action)
+                        mod = acceptOpDrops([&](SeqOp op) { st.ops.push_back(std::move(op)); });
+                else if (st.kind == SeqStepKind::If || st.kind == SeqStepKind::While || st.kind == SeqStepKind::For)
+                        mod = acceptOpDrops([&](SeqOp op) { appendOpToBody(st.body, std::move(op)); });
+                if (mod)
+                        isModified_ = true;
                 ImGui::EndDragDropTarget();
         }
 
@@ -1216,8 +1259,8 @@ SequenceEditor::registerSdkPanel(std::weak_ptr<SdkPanel> sp)
 
 // ─── JSON serialization ───────────────────────────────────────────────────────
 
-static void
-saveAction(cJSON *arr, const SequenceAction &action)
+static cJSON *
+actionToObj(const SequenceAction &action)
 {
         cJSON *obj = cJSON_CreateObject();
         cJSON_AddStringToObject(obj, "name", action.name.c_str());
@@ -1236,7 +1279,30 @@ saveAction(cJSON *arr, const SequenceAction &action)
                         cJSON_AddStringToObject(ed, std::to_string(val).c_str(), nm.c_str());
                 cJSON_AddItemToObject(obj, "enumDefs", ed);
         }
-        cJSON_AddItemToArray(arr, obj);
+        return obj;
+}
+
+// Serialize a single "do" step operation (variable write or SDK call).
+static cJSON *
+saveOp(const SeqOp &op)
+{
+        cJSON *obj = cJSON_CreateObject();
+        cJSON_AddNumberToObject(obj, "opKind", (int)op.kind);
+        if (op.kind == SeqOpKind::Write) {
+                cJSON_AddItemToObject(obj, "action", actionToObj(op.action));
+        } else {
+                cJSON_AddNumberToObject(obj, "sdkWinId", op.sdk.panelWinId);
+                cJSON_AddBoolToObject(obj, "sdkIsCFunc", op.sdk.isCFunc);
+                cJSON_AddNumberToObject(obj, "sdkClassIdx", op.sdk.classIdx);
+                cJSON_AddNumberToObject(obj, "sdkMethIdx", op.sdk.methodIdx);
+                cJSON_AddNumberToObject(obj, "sdkObjIdx", op.sdk.objIdx);
+                cJSON_AddStringToObject(obj, "sdkLabel", op.sdk.label.c_str());
+                cJSON *argsArr = cJSON_CreateArray();
+                for (const auto &a : op.sdk.args)
+                        cJSON_AddItemToArray(argsArr, cJSON_CreateString(a.c_str()));
+                cJSON_AddItemToObject(obj, "sdkArgs", argsArr);
+        }
+        return obj;
 }
 
 static cJSON *saveStep(const SequenceStep &step);
@@ -1249,10 +1315,10 @@ saveStep(const SequenceStep &step)
         cJSON_AddNumberToObject(obj, "kind", (int)step.kind);
         cJSON_AddNumberToObject(obj, "delayMs", step.delayMs);
 
-        cJSON *actArr = cJSON_CreateArray();
-        for (const auto &a : step.actions)
-                saveAction(actArr, a);
-        cJSON_AddItemToObject(obj, "actions", actArr);
+        cJSON *opsArr = cJSON_CreateArray();
+        for (const auto &op : step.ops)
+                cJSON_AddItemToArray(opsArr, saveOp(op));
+        cJSON_AddItemToObject(obj, "ops", opsArr);
 
         cJSON_AddNumberToObject(obj, "sleepMs", step.sleepMs);
         cJSON_AddStringToObject(obj, "condVar", step.condVar);
@@ -1263,20 +1329,6 @@ saveStep(const SequenceStep &step)
         cJSON_AddNumberToObject(obj, "forTo", static_cast<double>(step.forTo));
         cJSON_AddNumberToObject(obj, "forStep", static_cast<double>(step.forStep));
         cJSON_AddBoolToObject(obj, "hasElse", step.hasElse);
-
-        // SdkCall fields
-        cJSON_AddNumberToObject(obj, "sdkWinId", step.sdkCall.panelWinId);
-        cJSON_AddBoolToObject(obj, "sdkIsCFunc", step.sdkCall.isCFunc);
-        cJSON_AddNumberToObject(obj, "sdkClassIdx", step.sdkCall.classIdx);
-        cJSON_AddNumberToObject(obj, "sdkMethIdx", step.sdkCall.methodIdx);
-        cJSON_AddNumberToObject(obj, "sdkObjIdx", step.sdkCall.objIdx);
-        cJSON_AddStringToObject(obj, "sdkLabel", step.sdkCall.label.c_str());
-        cJSON *argsArr = cJSON_CreateArray();
-        for (const auto &a : step.sdkCall.args) {
-                cJSON *s = cJSON_CreateString(a.c_str());
-                cJSON_AddItemToArray(argsArr, s);
-        }
-        cJSON_AddItemToObject(obj, "sdkArgs", argsArr);
 
         // Body
         cJSON *bodyArr = cJSON_CreateArray();
@@ -1367,30 +1419,54 @@ loadStep(const cJSON *obj)
         if (const cJSON *he = cJSON_GetObjectItem(obj, "hasElse"); cJSON_IsBool(he))
                 s.hasElse = cJSON_IsTrue(he);
 
-        // Actions
-        const cJSON *actArr = cJSON_GetObjectItem(obj, "actions");
-        if (cJSON_IsArray(actArr))
-                for (const cJSON *a = actArr->child; a; a = a->next)
-                        s.actions.push_back(loadAction(a));
+        // Reads the SDK-call fields (object form for ops, or the legacy top-level
+        // standalone SdkCall step) into an SdkStepInfo.
+        auto readSdk = [](const cJSON *o) {
+                SdkStepInfo sdk;
+                if (const cJSON *w = cJSON_GetObjectItem(o, "sdkWinId"); cJSON_IsNumber(w))
+                        sdk.panelWinId = w->valueint;
+                if (const cJSON *cf = cJSON_GetObjectItem(o, "sdkIsCFunc"); cJSON_IsBool(cf))
+                        sdk.isCFunc = cJSON_IsTrue(cf);
+                if (const cJSON *ci = cJSON_GetObjectItem(o, "sdkClassIdx"); cJSON_IsNumber(ci))
+                        sdk.classIdx = ci->valueint;
+                if (const cJSON *mi = cJSON_GetObjectItem(o, "sdkMethIdx"); cJSON_IsNumber(mi))
+                        sdk.methodIdx = mi->valueint;
+                if (const cJSON *oi = cJSON_GetObjectItem(o, "sdkObjIdx"); cJSON_IsNumber(oi))
+                        sdk.objIdx = oi->valueint;
+                if (const cJSON *sl = cJSON_GetObjectItem(o, "sdkLabel"); cJSON_IsString(sl))
+                        sdk.label = sl->valuestring;
+                if (const cJSON *aa = cJSON_GetObjectItem(o, "sdkArgs"); cJSON_IsArray(aa))
+                        for (const cJSON *a = aa->child; a; a = a->next)
+                                if (cJSON_IsString(a))
+                                        sdk.args.push_back(a->valuestring);
+                return sdk;
+        };
 
-        // SdkCall
-        if (const cJSON *w = cJSON_GetObjectItem(obj, "sdkWinId"); cJSON_IsNumber(w))
-                s.sdkCall.panelWinId = w->valueint;
-        if (const cJSON *cf = cJSON_GetObjectItem(obj, "sdkIsCFunc"); cJSON_IsBool(cf))
-                s.sdkCall.isCFunc = cJSON_IsTrue(cf);
-        if (const cJSON *ci = cJSON_GetObjectItem(obj, "sdkClassIdx"); cJSON_IsNumber(ci))
-                s.sdkCall.classIdx = ci->valueint;
-        if (const cJSON *mi = cJSON_GetObjectItem(obj, "sdkMethIdx"); cJSON_IsNumber(mi))
-                s.sdkCall.methodIdx = mi->valueint;
-        if (const cJSON *oi = cJSON_GetObjectItem(obj, "sdkObjIdx"); cJSON_IsNumber(oi))
-                s.sdkCall.objIdx = oi->valueint;
-        if (const cJSON *sl = cJSON_GetObjectItem(obj, "sdkLabel"); cJSON_IsString(sl))
-                s.sdkCall.label = sl->valuestring;
-        const cJSON *argsArr = cJSON_GetObjectItem(obj, "sdkArgs");
-        if (cJSON_IsArray(argsArr))
-                for (const cJSON *a = argsArr->child; a; a = a->next)
-                        if (cJSON_IsString(a))
-                                s.sdkCall.args.push_back(a->valuestring);
+        // Ops (current format): ordered mix of writes and SDK calls.
+        if (const cJSON *opsArr = cJSON_GetObjectItem(obj, "ops"); cJSON_IsArray(opsArr)) {
+                for (const cJSON *o = opsArr->child; o; o = o->next) {
+                        SeqOp op;
+                        if (const cJSON *ok = cJSON_GetObjectItem(o, "opKind"); cJSON_IsNumber(ok))
+                                op.kind = (SeqOpKind)ok->valueint;
+                        if (op.kind == SeqOpKind::Write) {
+                                if (const cJSON *ao = cJSON_GetObjectItem(o, "action"); cJSON_IsObject(ao))
+                                        op.action = loadAction(ao);
+                        } else {
+                                op.sdk = readSdk(o);
+                        }
+                        s.ops.push_back(std::move(op));
+                }
+        } else {
+                // Legacy: a step held an "actions" array and/or was a standalone SdkCall.
+                if (const cJSON *actArr = cJSON_GetObjectItem(obj, "actions"); cJSON_IsArray(actArr))
+                        for (const cJSON *a = actArr->child; a; a = a->next)
+                                s.ops.push_back({SeqOpKind::Write, loadAction(a), {}});
+                if (s.kind == SeqStepKind::SdkCall) {
+                        // Convert the standalone SDK step into a "do" step with one SDK op.
+                        s.ops.push_back({SeqOpKind::Sdk, {}, readSdk(obj)});
+                        s.kind = SeqStepKind::Action;
+                }
+        }
 
         // Body
         const cJSON *bodyArr = cJSON_GetObjectItem(obj, "body");

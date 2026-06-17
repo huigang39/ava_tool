@@ -55,15 +55,27 @@ struct SdkStepInfo {
         std::string              label;
 };
 
+// Kept for backward compatibility: SdkCall is no longer a user-creatable step
+// kind. Old .seq files / sessions storing a standalone SdkCall step are converted
+// on load into a "do" (Action) step containing a single SDK operation.
 enum class SeqStepKind { Action, Sleep, If, While, For, Break, SdkCall };
+
+// A single operation inside a "do" (Action) step's execution body (动作).
+// The body is an ordered mix of variable writes and SDK function calls.
+enum class SeqOpKind { Write, Sdk };
+
+struct SeqOp {
+        SeqOpKind      kind{SeqOpKind::Write};
+        SequenceAction action{}; // valid when kind == Write
+        SdkStepInfo    sdk{};     // valid when kind == Sdk
+};
 
 struct SequenceStep {
         std::string name;
         SeqStepKind kind{SeqStepKind::Action};
         u32         delayMs{0};
 
-        std::vector<SequenceAction> actions;   // for Action
-        SdkStepInfo                 sdkCall{}; // for SdkCall
+        std::vector<SeqOp> ops; // execution body for "do" steps (writes + SDK calls, in order)
 
         int sleepMs{500}; // for Sleep
 
@@ -113,6 +125,7 @@ class SequenceEditor
 
       private:
         void                      writeAction(const SequenceAction &action);
+        void                      execSdkOp(const SdkStepInfo &sdk);
         void                      refreshSeqFiles();
         std::shared_ptr<SdkPanel> findSdkPanel(int winId) const;
 
@@ -122,6 +135,11 @@ class SequenceEditor
         void          drawBodySteps(std::vector<SequenceStep> &steps, int depth);
         void          drawSdkStepDetail(SdkStepInfo &sdk, std::shared_ptr<SdkPanel> panel);
         void          acceptSdkPayload(const void *data, int insertAfter);
+        // Build an SDK op from a drag payload; false if the source panel is gone.
+        bool          makeSdkOp(const SdkDragPayload &pl, SeqOp &out);
+        // Inside an active drag-drop target: consume any SDK/variable payload and
+        // hand each resulting op to `sink`. Returns true if anything was added.
+        bool          acceptOpDrops(const std::function<void(SeqOp)> &sink);
         SequenceStep *selectedStepPtr();
 
         // Background execution

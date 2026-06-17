@@ -1172,6 +1172,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 const int level  = rd.pickLevel(xmin, xmax, budget);
 
                                 const f64 chGain = static_cast<f64>(ch->getGain());
+                                const f64 chBias = static_cast<f64>(ch->getBias());
                                 if (level < 0) {
                                         // Raw level fits — iterate the raw ring directly.
                                         const usize si = rd.rawLowerBound(xmin);
@@ -1182,7 +1183,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                 dys_.reserve(n);
                                                 for (usize i = si; i < ei; ++i) {
                                                         dxs_.push_back(rd.rawTs(i));
-                                                        dys_.push_back(static_cast<f64>(rd.rawVal(i)) * chGain);
+                                                        dys_.push_back(static_cast<f64>(rd.rawVal(i)) * chGain + chBias);
                                                 }
                                         }
                                 } else {
@@ -1195,8 +1196,8 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                 dys_.reserve(n * 2);
                                                 for (usize i = si; i < ei; ++i) {
                                                         const LodSample &s   = rd.lodAt(level, i);
-                                                        f64              ylo = static_cast<f64>(s.vmin) * chGain;
-                                                        f64              yhi = static_cast<f64>(s.vmax) * chGain;
+                                                        f64              ylo = static_cast<f64>(s.vmin) * chGain + chBias;
+                                                        f64              yhi = static_cast<f64>(s.vmax) * chGain + chBias;
                                                         if (chGain < 0.0)
                                                                 std::swap(ylo, yhi);
                                                         dxs_.push_back(s.t);
@@ -1259,12 +1260,19 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                 s.pkpk = s.max - s.min;
                                                 s.mean = sum / static_cast<f64>(s.count);
                                                 s.rms  = std::sqrt(sumSq / static_cast<f64>(s.count));
-                                                // Apply channel gain to all statistics
-                                                if (chGain != 1.0) {
-                                                        s.min  *= chGain;
-                                                        s.max  *= chGain;
-                                                        s.mean *= chGain;
-                                                        s.rms  *= std::abs(chGain);
+                                                // Apply channel gain & bias to all statistics:
+                                                // transformed value y = x * gain + bias.
+                                                if (chGain != 1.0 || chBias != 0.0) {
+                                                        // RMS(y) = sqrt(g^2*E[x^2] + 2*g*b*E[x] + b^2),
+                                                        // computed from the raw mean (s.mean) and
+                                                        // raw mean-square (s.rms^2) before transforming.
+                                                        const f64 meanRaw = s.mean;
+                                                        const f64 msRaw   = s.rms * s.rms;
+                                                        s.rms             = std::sqrt(chGain * chGain * msRaw +
+                                                                                      2.0 * chGain * chBias * meanRaw + chBias * chBias);
+                                                        s.min             = s.min * chGain + chBias;
+                                                        s.max             = s.max * chGain + chBias;
+                                                        s.mean            = meanRaw * chGain + chBias;
                                                         if (chGain < 0.0)
                                                                 std::swap(s.min, s.max);
                                                         s.pkpk = s.max - s.min;
@@ -1342,6 +1350,15 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 ImGui::SameLine();
                                 if (ImGui::SmallButton(tr("Reset##gainrst", "重置##gainrst")))
                                         ch->getGain() = 1.0f;
+                                ImGui::SetNextItemWidth(120);
+                                ImGui::DragFloat(tr("Bias##chb", "偏置##chb"), &ch->getBias(), 0.001f, -1e6f, 1e6f, "%.4g");
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s",
+                                                          tr("Offset added after gain (value * gain + bias)",
+                                                             "增益之后叠加的偏置（数值 * 增益 + 偏置）"));
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton(tr("Reset##biasrst", "重置##biasrst")))
+                                        ch->getBias() = 0.0f;
                                 if (ui::Button(tr("Delete Channel", "删除通道"), ui::BtnStyle::Danger))
                                         ch->markPendingDelete();
 
