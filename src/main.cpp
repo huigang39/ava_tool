@@ -248,26 +248,23 @@ main(int argc, char **argv)
         std::thread tFft(fftThreadFunc, gui.get());
 
         // ---- Core isolation: evict GUI + flusher from sampler core ----
-        // Wait for the sampler thread to bind (typically < 1ms).
-        while (g_samplerBoundCore.load() < 0)
+        // Wait until setupThread() has run (-1 is the uninitialised sentinel).
+        while (g_samplerBoundCore.load() == -1)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
+        // Only CPUBound mode pins to a specific core; Low/Normal return -2.
         const int samplerCore = g_samplerBoundCore.load();
+        if (samplerCore >= 0) {
 #ifdef _WIN32
-        {
                 DWORD_PTR procMask = 0, sysMask = 0;
                 GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask);
                 DWORD_PTR excludeMask = procMask & ~(1ull << samplerCore);
                 if (excludeMask) {
-                        // Main thread (will become GUI thread in gui->loop())
                         SetThreadAffinityMask(GetCurrentThread(), excludeMask);
-                        // Log flusher thread
                         SetThreadAffinityMask(flusher.native_handle(), excludeMask);
                         LOG_I("Core isolation: GUI+flusher excluded from core %d (mask=0x%llx)", samplerCore, (u64)excludeMask);
                 }
-        }
 #elif defined(__linux__)
-        {
                 const int n = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
                 if (n >= 2) {
                         cpu_set_t cs;
@@ -276,14 +273,12 @@ main(int argc, char **argv)
                                 if (i != samplerCore)
                                         CPU_SET(i, &cs);
                         }
-                        // Main thread (GUI)
                         pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
-                        // Log flusher thread
                         pthread_setaffinity_np(flusher.native_handle(), sizeof(cs), &cs);
                         LOG_I("Core isolation: GUI+flusher excluded from core %d", samplerCore);
                 }
-        }
 #endif
+        }
 
         gui->loop();
 

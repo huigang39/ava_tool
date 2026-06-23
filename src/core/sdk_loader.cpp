@@ -409,42 +409,35 @@ SdkLoader::findMangledForMethod(const CMethodDecl &method) const
 {
         // Build the qualified name we expect to appear in the demangled symbol.
         // Constructor: "ClassName::ClassName"  Destructor: "ClassName::~ClassName"
-        std::string qualName = method.fullClassName + "::" + method.name;
+        std::string qualName  = method.fullClassName + "::" + method.name;
+        std::string shortName = method.className + "::" + method.name;
 
-        // Score-based matching: prefer exact qualified-name match, then
-        // fall back to class-name + method-name match ignoring namespace.
+        // Score-based matching: prefer full qualified-name match (scores ≥ 10),
+        // then fall back to class-name + method-name match ignoring outer namespace
+        // (scores 1–5, used when the DLL was compiled with a different namespace).
         const ExportedSymbol *best      = nullptr;
         int                   bestScore = 0;
 
-        for (const auto &sym : exports_) {
+        auto scoreAndUpdate = [&](const ExportedSymbol &sym, const std::string &needle, int baseScore) {
                 const std::string &dem = sym.demangled;
-
-                // Quick contains-check for qualified name.
-                size_t pos = dem.find(qualName);
+                size_t             pos = dem.find(needle);
                 if (pos == std::string::npos)
-                        continue;
-
-                // Make sure it's a word boundary (not "Foo::BarInit" matching "Bar").
-                bool boundAfter = (pos + qualName.size() >= dem.size() || !isIdChar2(dem[pos + qualName.size()]));
+                        return;
+                bool boundAfter = (pos + needle.size() >= dem.size() || !isIdChar2(dem[pos + needle.size()]));
                 if (!boundAfter)
-                        continue;
+                        return;
 
-                // Score: higher if the demangled name STARTS with the qualified name
-                // or begins with a return-type prefix (MSVC format starts with "public:…").
-                int score = 1;
-                if (dem == qualName || dem.find(qualName + "(") != std::string::npos)
-                        score = 3;
-                else if (dem.find(qualName) != std::string::npos)
-                        score = 2;
+                int score = baseScore;
+                if (dem == needle || dem.find(needle + "(") != std::string::npos)
+                        score = baseScore + 2;
 
                 // Prefer matching parameter count when we can parse it quickly.
                 size_t lp = dem.rfind('(');
                 size_t rp = dem.rfind(')');
                 if (lp != std::string::npos && rp != std::string::npos && rp > lp) {
-                        std::string args = dem.substr(lp + 1, rp - lp - 1);
-                        // Count commas at depth 0.
-                        int  depth2 = 0, commas = 0;
-                        bool empty = true;
+                        std::string args   = dem.substr(lp + 1, rp - lp - 1);
+                        int         depth2 = 0, commas = 0;
+                        bool        empty = true;
                         for (char c : args) {
                                 if (c == '(' || c == '<')
                                         ++depth2;
@@ -456,8 +449,6 @@ SdkLoader::findMangledForMethod(const CMethodDecl &method) const
                                         empty = false;
                         }
                         size_t demParamCount = empty ? 0 : (size_t)(commas + 1);
-                        // For C++ methods the DLL has `this` hidden; headers show user params.
-                        // Just check the declared param count matches (ctor may differ by 1 for MSVC).
                         if (demParamCount == method.params.size() ||
                             (method.isCtor && demParamCount == 0 && method.params.empty()))
                                 score += 2;
@@ -467,6 +458,17 @@ SdkLoader::findMangledForMethod(const CMethodDecl &method) const
                         bestScore = score;
                         best      = &sym;
                 }
+        };
+
+        // First pass: full qualified name (namespace included) — high base score.
+        for (const auto &sym : exports_)
+                scoreAndUpdate(sym, qualName, 10);
+
+        // Second pass: class name only, ignoring outer namespace — lower base score.
+        // Only runs when the first pass found nothing (DLL compiled with different namespace).
+        if (!best && shortName != qualName) {
+                for (const auto &sym : exports_)
+                        scoreAndUpdate(sym, shortName, 1);
         }
 
         return best ? &best->mangled : nullptr;

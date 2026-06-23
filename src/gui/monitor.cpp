@@ -1269,7 +1269,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                         const f64 meanRaw = s.mean;
                                                         const f64 msRaw   = s.rms * s.rms;
                                                         s.rms             = std::sqrt(chGain * chGain * msRaw +
-                                                                                      2.0 * chGain * chBias * meanRaw + chBias * chBias);
+                                                                          2.0 * chGain * chBias * meanRaw + chBias * chBias);
                                                         s.min             = s.min * chGain + chBias;
                                                         s.max             = s.max * chGain + chBias;
                                                         s.mean            = meanRaw * chGain + chBias;
@@ -1438,8 +1438,11 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 } else {
                         if (!channelStats_.empty()) {
                                 for (auto &[chName, s] : channelStats_) {
+                                        // Skip stats for hidden channels.
+                                        auto chIt = chs_.find(chName);
+                                        if (chIt != chs_.end() && !chIt->second->show())
+                                                continue;
                                         // Show alias when set, fall back to internal name.
-                                        auto        chIt = chs_.find(chName);
                                         const char *displayName =
                                             (chIt != chs_.end()) ? chIt->second->getLabel().c_str() : chName.c_str();
                                         ImGui::Text("%s", displayName);
@@ -1457,7 +1460,6 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                                         ImGui::Text(fmt, v);
                                                 };
                                                 // Current (live) display value — first row
-                                                auto chIt = chs_.find(chName);
                                                 if (chIt != chs_.end())
                                                         row(tr("Current", "当前值"),
                                                             "%.6f",

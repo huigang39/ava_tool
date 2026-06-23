@@ -258,6 +258,7 @@ SRC_CXX := \
     $(DIR_GUI)/monitor.cpp \
     $(DIR_GUI)/variable.cpp \
     $(DIR_GUI)/bode.cpp \
+    $(DIR_GUI)/audio_fft.cpp \
     $(DIR_GUI)/assembly_viewer.cpp \
     $(DIR_GUI)/sequence_editor.cpp \
     $(DIR_GUI)/tutorial_guide.cpp \

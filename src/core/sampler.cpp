@@ -41,52 +41,59 @@ extern std::atomic<bool> g_appRunning;
 extern std::atomic<bool> g_monitorPaused;
 extern std::atomic<bool> g_jlinkSamplingPaused;
 
-std::atomic<int>  g_samplerCpuCore{-1}; // -1 = auto (highest available)
-std::atomic<bool> g_samplerCpuRebind{false};
-std::atomic<int>  g_samplerBoundCore{-1};
+std::atomic<int>  g_samplerRunMode{1};   // 0=Low, 1=Normal, 2=CPUBound
+std::atomic<bool> g_samplerRebind{false};
+std::atomic<int>  g_samplerBoundCore{-1}; // -1=uninit, -2=no binding, >=0=core id
 
 // ---------------------------------------------------------------------------
-// Pin the calling thread to a dedicated CPU core at the absolute highest OS
-// scheduling priority.
+// Apply the requested run mode to the calling (sampler) thread.
 //
-// Priority hierarchy (Windows):
-//   REALTIME_PRIORITY_CLASS + THREAD_PRIORITY_TIME_CRITICAL = priority 31
-//   (fallback: HIGH_PRIORITY_CLASS + TIME_CRITICAL = priority 15)
+//  0 = Low      : normal priority, no affinity binding, always sleep 1ms.
+//  1 = Normal   : ABOVE_NORMAL priority, no affinity, adaptive sleep.
+//  2 = CPUBound : ABOVE_NORMAL + HIGHEST priority, pinned to highest core,
+//                 spin-loop (no sleep) for minimum jitter.
 //
-// Priority hierarchy (Linux):
-//   SCHED_FIFO at sched_get_priority_max — non-preemptible by anything below.
-//
-// Core isolation is done separately from main.cpp by setting per-thread
-// affinities on all OTHER threads to exclude this core.  We cannot use
-// SetProcessAffinityMask here because thread affinity must be a subset of
-// the process mask — excluding the sampler core from the process would
-// evict the sampler itself.
+// g_samplerBoundCore is set to:
+//   >= 0  in CPUBound mode (the actual core); main.cpp uses this to isolate
+//         GUI / flusher threads away from that core.
+//   -2    in Low / Normal mode (no pinning); main.cpp skips isolation.
 // ---------------------------------------------------------------------------
 static void
-setupRealtimeThread(int coreId)
+setupThread(int mode)
 {
 #ifdef _WIN32
-        // ---- 1. Elevate process priority class ----
-        HANDLE hProc = GetCurrentProcess();
-        SetPriorityClass(hProc, ABOVE_NORMAL_PRIORITY_CLASS);
-        LOG_I("Sampler: process class set to ABOVE_NORMAL");
-
-        // ---- 2. Thread priority to HIGHEST ----
+        HANDLE hProc   = GetCurrentProcess();
         HANDLE hThread = GetCurrentThread();
-        SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST);
 
-        // ---- 3. Determine target core ----
-        DWORD_PTR procMask = 0, sysMask = 0;
-        GetProcessAffinityMask(hProc, &procMask, &sysMask);
+        if (mode == 0) {
+                // Low: normal priority, let OS schedule freely
+                SetPriorityClass(hProc, NORMAL_PRIORITY_CLASS);
+                SetThreadPriority(hThread, THREAD_PRIORITY_NORMAL);
+                DWORD_PTR procMask = 0, sysMask = 0;
+                GetProcessAffinityMask(hProc, &procMask, &sysMask);
+                SetThreadAffinityMask(hThread, procMask); // clear any previous pinning
+                g_samplerBoundCore.store(-2);
+                LOG_I("Sampler: Low mode (normal priority, no affinity)");
 
-        int       targetCore = -1;
-        DWORD_PTR targetMask = 0;
+        } else if (mode == 1) {
+                // Normal: slightly elevated priority, no fixed core
+                SetPriorityClass(hProc, ABOVE_NORMAL_PRIORITY_CLASS);
+                SetThreadPriority(hThread, THREAD_PRIORITY_ABOVE_NORMAL);
+                DWORD_PTR procMask = 0, sysMask = 0;
+                GetProcessAffinityMask(hProc, &procMask, &sysMask);
+                SetThreadAffinityMask(hThread, procMask);
+                g_samplerBoundCore.store(-2);
+                LOG_I("Sampler: Normal mode (ABOVE_NORMAL priority, no affinity)");
 
-        if (coreId >= 0 && coreId < 64 && (procMask & (1ull << coreId))) {
-                targetCore = coreId;
-                targetMask = (1ull << coreId);
         } else {
-                // Auto: pick the highest available core
+                // CPUBound: elevated priority + pin to highest available core
+                SetPriorityClass(hProc, ABOVE_NORMAL_PRIORITY_CLASS);
+                SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST);
+
+                DWORD_PTR procMask = 0, sysMask = 0;
+                GetProcessAffinityMask(hProc, &procMask, &sysMask);
+                int       targetCore = -1;
+                DWORD_PTR targetMask = 0;
                 for (int b = 63; b >= 0; --b) {
                         if (procMask & (1ull << b)) {
                                 targetCore = b;
@@ -94,58 +101,82 @@ setupRealtimeThread(int coreId)
                                 break;
                         }
                 }
+                if (targetMask)
+                        SetThreadAffinityMask(hThread, targetMask);
+                g_samplerBoundCore.store(targetCore);
+                LOG_I("Sampler: CPUBound mode (HIGHEST priority, pinned to core %d, mask=0x%llx)",
+                      targetCore,
+                      (u64)targetMask);
         }
-
-        // ---- 4. Bind sampler thread to the target core ----
-        if (targetMask)
-                SetThreadAffinityMask(hThread, targetMask);
-
-        g_samplerBoundCore.store(targetCore);
-        LOG_I("Sampler thread: REALTIME+TIME_CRITICAL, pinned to core %d (mask=0x%llx)", targetCore, (u64)targetMask);
 
 #elif defined(__linux__)
-        // ---- 1. SCHED_FIFO at absolute maximum priority ----
-        sched_param sp{};
-        sp.sched_priority = sched_get_priority_max(SCHED_FIFO);
-        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
-                LOG_W("Sampler thread: failed to set SCHED_FIFO max (need CAP_SYS_NICE / root?)");
-                sp.sched_priority = sched_get_priority_max(SCHED_RR);
-                if (pthread_setschedparam(pthread_self(), SCHED_RR, &sp) != 0) {
-                        LOG_W("Sampler thread: SCHED_RR fallback also failed");
+        if (mode == 0) {
+                sched_param sp{};
+                sp.sched_priority = 0;
+                pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+                const int n = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
+                cpu_set_t cs;
+                CPU_ZERO(&cs);
+                for (int i = 0; i < n; ++i) CPU_SET(i, &cs);
+                pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+                g_samplerBoundCore.store(-2);
+                LOG_I("Sampler: Low mode (SCHED_OTHER, no affinity)");
+
+        } else if (mode == 1) {
+                sched_param sp{};
+                sp.sched_priority = 0;
+                pthread_setschedparam(pthread_self(), SCHED_OTHER, &sp);
+                const int n = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
+                cpu_set_t cs;
+                CPU_ZERO(&cs);
+                for (int i = 0; i < n; ++i) CPU_SET(i, &cs);
+                pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+                g_samplerBoundCore.store(-2);
+                LOG_I("Sampler: Normal mode (SCHED_OTHER, no affinity)");
+
+        } else {
+                sched_param sp{};
+                sp.sched_priority = sched_get_priority_max(SCHED_FIFO);
+                if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0) {
+                        LOG_W("Sampler: SCHED_FIFO failed, trying SCHED_RR");
+                        sp.sched_priority = sched_get_priority_max(SCHED_RR);
+                        pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
                 }
+                const int n    = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
+                const int core = (n > 1) ? (n - 1) : 0;
+                cpu_set_t cs;
+                CPU_ZERO(&cs);
+                CPU_SET(core, &cs);
+                pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+                g_samplerBoundCore.store(core);
+                LOG_I("Sampler: CPUBound mode (SCHED_FIFO prio=%d, pinned to core %d)",
+                      sp.sched_priority,
+                      core);
         }
 
-        // ---- 2. Determine and bind to target core ----
-        const int n    = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
-        int       core = (coreId >= 0 && coreId < n) ? coreId : ((n > 1) ? (n - 1) : 0);
-
-        cpu_set_t cs;
-        CPU_ZERO(&cs);
-        CPU_SET(core, &cs);
-        pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
-
-        g_samplerBoundCore.store(core);
-        LOG_I("Sampler thread: SCHED_FIFO prio=%d, pinned to core %d", sp.sched_priority, core);
-
 #elif defined(__APPLE__)
-        (void)coreId;
-        sched_param sp{};
-        sp.sched_priority = sched_get_priority_max(SCHED_FIFO);
-        pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
-        thread_affinity_policy_data_t pol{1};
-        thread_policy_set(pthread_mach_thread_np(pthread_self()),
-                          THREAD_AFFINITY_POLICY,
-                          (thread_policy_t)&pol,
-                          THREAD_AFFINITY_POLICY_COUNT);
-        g_samplerBoundCore.store(0);
-        LOG_I("Sampler thread: SCHED_FIFO prio=%d, affinity hint set", sp.sched_priority);
+        if (mode == 2) {
+                sched_param sp{};
+                sp.sched_priority = sched_get_priority_max(SCHED_FIFO);
+                pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+                thread_affinity_policy_data_t pol{1};
+                thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                                  THREAD_AFFINITY_POLICY,
+                                  (thread_policy_t)&pol,
+                                  THREAD_AFFINITY_POLICY_COUNT);
+                g_samplerBoundCore.store(0);
+                LOG_I("Sampler: CPUBound mode (SCHED_FIFO prio=%d)", sp.sched_priority);
+        } else {
+                g_samplerBoundCore.store(-2);
+                LOG_I("Sampler: %s mode", mode == 0 ? "Low" : "Normal");
+        }
 #endif
 }
 
 void
 threadFunc(Gui *gui)
 {
-        setupRealtimeThread(g_samplerCpuCore.load());
+        setupThread(g_samplerRunMode.load());
         LOG_I("Sampler thread started.");
         u64                                          lastTime = get_mono_ts_us();
         std::vector<HssBlock>                        lastBlocks;
@@ -276,8 +307,8 @@ threadFunc(Gui *gui)
         constexpr u64         kRefreshMaxUs = 50000; // force a blocking refresh after 50ms
 
         while (g_appRunning.load()) {
-                if (g_samplerCpuRebind.exchange(false, std::memory_order_acq_rel)) {
-                        setupRealtimeThread(g_samplerCpuCore.load());
+                if (g_samplerRebind.exchange(false, std::memory_order_acq_rel)) {
+                        setupThread(g_samplerRunMode.load());
                 }
                 const u64 iterStartUs = get_mono_ts_us();
                 iterCounter++;
@@ -1076,7 +1107,7 @@ threadFunc(Gui *gui)
 
                                 LOG_PERF("[HB tNow_ms=%llu] connected=%d hssRunning=%d paused=%d "
                                          "monitors=%zu scopes=%zu channels=%zu pts=%llu "
-                                         "shmTasks=%zu pollTasks=%zu waveTasks=%zu tempChs=%zu cpuCore=%d",
+                                         "shmTasks=%zu pollTasks=%zu waveTasks=%zu tempChs=%zu runMode=%d",
                                          nowMs - sessionStartMs,
                                          (int)JLinkPort::instance().isConnected(),
                                          (int)JLinkPort::instance().isHssRunning(),
@@ -1089,30 +1120,43 @@ threadFunc(Gui *gui)
                                          pollTasks.size(),
                                          waveTasks.size(),
                                          tempChs.size(),
-                                         g_samplerCpuCore.load());
+                                         g_samplerRunMode.load());
                                 hbLastDumpMs = nowMs;
                         }
                 }
 
-                // Adaptive sleep: yield CPU to other processes to avoid starving them.
-                // The sampler runs at elevated priority on a dedicated core; without
-                // yielding, it can monopolise the core and cause other apps to stutter.
-                if (waveTasks.empty() && !JLinkPort::instance().isHssRunning() && pollTasks.empty()) {
-                        // No real-time work — sleep via the OS scheduler (1ms granularity).
+                // Sleep strategy depends on run mode.
+                const int runMode = g_samplerRunMode.load(std::memory_order_relaxed);
+                if (runMode == 0) {
+                        // Low: always sleep 1ms — minimal CPU footprint.
 #ifdef _WIN32
                         Sleep(1);
 #else
                         usleep(1000);
 #endif
-                } else {
-                        // Active sampling — yield the remainder of our time slice so
-                        // other threads/processes get a chance to run.  The J-Link USB
-                        // I/O already blocks for 200-500µs per call, so this costs
-                        // essentially nothing in terms of throughput.
+                } else if (runMode == 1) {
+                        // Normal: adaptive — sleep when idle, yield when active.
+                        if (waveTasks.empty() && !JLinkPort::instance().isHssRunning() && pollTasks.empty()) {
 #ifdef _WIN32
-                        SwitchToThread();
+                                Sleep(1);
 #else
-                        sched_yield();
+                                usleep(1000);
+#endif
+                        } else {
+#ifdef _WIN32
+                                SwitchToThread();
+#else
+                                sched_yield();
+#endif
+                        }
+                } else {
+                        // CPUBound: spin — no sleep, minimum jitter.
+                        // The J-Link USB I/O already blocks 200-500µs per call so
+                        // throughput is not affected; we just skip voluntary yields.
+#ifdef _WIN32
+                        YieldProcessor();
+#elif defined(__GNUC__)
+                        __builtin_ia32_pause();
 #endif
                 }
         }

@@ -187,14 +187,16 @@ class Variable
 
         i32 editPropIdx_{-1};
         struct {
-                char     name[64]{};
-                DataType type     = DataType::U32;
-                PortType port     = PortType::JLINK;
-                bool     writable = true;
-                char     addrBuf[32]{};
-                char     udpIp[16]{};
-                int      udpPort = 8080;
-                char     shmName[64]{};
+                char                               name[64]{};
+                DataType                           type     = DataType::U32;
+                PortType                           port     = PortType::JLINK;
+                bool                               writable = true;
+                char                               addrBuf[32]{};
+                char                               udpIp[16]{};
+                int                                udpPort = 8080;
+                char                               shmName[64]{};
+                bool                               structMode{false};
+                std::vector<VarEntry::StructField> structFields;
         } editPropBuf_;
 
         void rebuildSearchPool();
@@ -274,6 +276,12 @@ class Variable
         void *getLocalBuf(const std::string &name);
         // Called after an SDK call writes to the buffer; nudges the display to refresh.
         void notifyLocalWrite(const std::string &name);
+        // Programmatically add a LOCAL scalar variable (used by sequence editor "create output vars").
+        // No-op if a variable with this name already exists.
+        void addLocalVar(const std::string &name, DataType type, size_t bufSize);
+        // Programmatically add a LOCAL struct variable with predefined fields.
+        // No-op if a variable with this name already exists.
+        void addLocalStructVar(const std::string &name, const std::vector<VarEntry::StructField> &fields, size_t totalSize);
         // Read one LOCAL struct field as float. Returns false if var/field not found.
         bool readLocalFieldAsFloat(const std::string &varName, const std::string &fieldName, float &out) const;
 

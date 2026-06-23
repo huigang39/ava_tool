@@ -180,7 +180,7 @@ class MonitorChannel
         bool isWritable() const { return writable_; }
         void setWritable(bool w) { writable_ = w; }
 
-        f32  &getRVal() { return rVal_; }
+        f32 &getRVal() { return rVal_; }
         // GUI display value (frozen while paused), gain & bias applied: value * gain + bias
         f32   getDispVal() const { return dispVal_ * gain_ + bias_; }
         f32  &getGain() { return gain_; }

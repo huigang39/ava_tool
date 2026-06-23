@@ -11,11 +11,23 @@
 #include "timeops.h"
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <sstream>
 #include <thread>
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
+
+static uint64_t
+nowStampMs()
+{
+        auto        now   = std::chrono::system_clock::now();
+        std::time_t t     = std::chrono::system_clock::to_time_t(now);
+        struct tm   tmBuf = {};
+        localtime_s(&tmBuf, &t);
+        auto ms_frac = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+        return (uint64_t)(tmBuf.tm_hour * 3600000 + tmBuf.tm_min * 60000 + tmBuf.tm_sec * 1000 + ms_frac.count());
+}
 
 static const char *
 kindLabel(SeqStepKind k)
@@ -178,6 +190,16 @@ SequenceEditor::writeAction(const SequenceAction &action)
                 if (shm_init(&shm_handle, cfg) == 0)
                         shm_write(&shm_handle, buf, sz);
         }
+
+        {
+                SeqLogEntry e;
+                e.tsMs  = nowStampMs();
+                e.desc  = "Write: " + action.name;
+                e.value = "= " + action.targetValue;
+                e.ok    = true;
+                std::lock_guard<std::mutex> lk(seqMtx_);
+                seqLog_.push_back(std::move(e));
+        }
 }
 
 // ─── execSdkOp ────────────────────────────────────────────────────────────────
@@ -195,14 +217,51 @@ SequenceEditor::execSdkOp(const SdkStepInfo &sdk)
         auto panel = findSdkPanel(sdk.panelWinId);
         if (!panel) {
                 LOG_E("[SeqEditor] SdkOp: panel id=%d not found", sdk.panelWinId);
+                SeqLogEntry e;
+                e.tsMs  = nowStampMs();
+                e.desc  = "SDK: " + sdk.label;
+                e.value = "panel not found";
+                e.ok    = false;
+                std::lock_guard<std::mutex> lk(seqMtx_);
+                seqLog_.push_back(std::move(e));
                 return;
         }
-        if (sdk.isCFunc) {
+        if (sdk.isPython) {
+                auto r = panel->directCallPy(sdk.pyFuncName, sdk.args);
+                LOG_I("[SeqEditor] SdkOp Py result ok=%d: %s", (int)r.ok, r.text.c_str());
+                SeqLogEntry e;
+                e.tsMs  = nowStampMs();
+                e.desc  = "SDK: " + sdk.label;
+                e.ok    = r.ok;
+                e.value = r.ok ? "OK" : "FAIL";
+                if (!r.text.empty())
+                        e.value += ": " + r.text;
+                std::lock_guard<std::mutex> lk(seqMtx_);
+                seqLog_.push_back(std::move(e));
+        } else if (sdk.isCFunc) {
                 auto r = panel->directCallC(sdk.methodIdx, sdk.args);
                 LOG_I("[SeqEditor] SdkOp C result ok=%d: %s", (int)r.ok, r.text.c_str());
+                SeqLogEntry e;
+                e.tsMs  = nowStampMs();
+                e.desc  = "SDK: " + sdk.label;
+                e.ok    = r.ok;
+                e.value = r.ok ? "OK" : "FAIL";
+                if (!r.text.empty())
+                        e.value += ": " + r.text;
+                std::lock_guard<std::mutex> lk(seqMtx_);
+                seqLog_.push_back(std::move(e));
         } else {
                 auto r = panel->directCall(sdk.classIdx, sdk.methodIdx, sdk.objIdx, sdk.args);
                 LOG_I("[SeqEditor] SdkOp C++ result ok=%d: %s", (int)r.ok, r.text.c_str());
+                SeqLogEntry e;
+                e.tsMs  = nowStampMs();
+                e.desc  = "SDK: " + sdk.label;
+                e.ok    = r.ok;
+                e.value = r.ok ? "OK" : "FAIL";
+                if (!r.text.empty())
+                        e.value += ": " + r.text;
+                std::lock_guard<std::mutex> lk(seqMtx_);
+                seqLog_.push_back(std::move(e));
         }
 }
 
@@ -336,115 +395,548 @@ SequenceEditor::selectedStepPtr()
         return &steps_[selectedStep_];
 }
 
+// Map a CType (from c_header_parser) to a DataType for LOCAL struct field storage.
+static DataType
+ctypeToDataType(CType t, size_t sz)
+{
+        switch (t) {
+                case CType::I8:
+                        return DataType::I8;
+                case CType::I16:
+                        return DataType::I16;
+                case CType::I32:
+                        return DataType::I32;
+                case CType::I64:
+                        return DataType::I64;
+                case CType::U8:
+                        return DataType::U8;
+                case CType::U16:
+                        return DataType::U16;
+                case CType::U32:
+                        return DataType::U32;
+                case CType::U64:
+                        return DataType::U64;
+                case CType::F32:
+                        return DataType::F32;
+                case CType::F64:
+                        return DataType::F64;
+                case CType::Bool:
+                        return DataType::U8;
+                case CType::Ptr:
+                        return DataType::U64;
+                default:
+                        break;
+        }
+        switch (sz) {
+                case 1:
+                        return DataType::U8;
+                case 2:
+                        return DataType::U16;
+                case 8:
+                        return DataType::U64;
+                default:
+                        return DataType::U32;
+        }
+}
+
+// Build a SeqStructField list from a CStructDecl (flattens single-level arrays).
+static std::vector<SeqStructField>
+structDeclToFields(const CStructDecl &sd)
+{
+        std::vector<SeqStructField> out;
+        for (const auto &f : sd.fields) {
+                if (f.isArray && f.arrayCount > 0) {
+                        size_t   elemSz = ctypeSize(f.arrayElemType);
+                        DataType et     = ctypeToDataType(f.arrayElemType, elemSz);
+                        for (size_t ai = 0; ai < f.arrayCount; ++ai) {
+                                SeqStructField sf;
+                                sf.name       = f.name + "[" + std::to_string(ai) + "]";
+                                sf.type       = et;
+                                sf.byteOffset = (uint32_t)(f.offset + ai * elemSz);
+                                out.push_back(sf);
+                        }
+                } else {
+                        SeqStructField sf;
+                        sf.name       = f.name;
+                        sf.type       = ctypeToDataType(f.type, f.size);
+                        sf.byteOffset = (uint32_t)f.offset;
+                        out.push_back(sf);
+                }
+        }
+        return out;
+}
+
+// Map a raw C ptr/ref parameter type string to a DataType for LOCAL var creation.
+static DataType
+ptrTypeFromRaw(const std::string &rawType)
+{
+        std::string t = rawType;
+        // Strip trailing ptr/ref/space qualifiers
+        while (!t.empty() && (t.back() == '*' || t.back() == '&' || t.back() == ' '))
+                t.pop_back();
+        // Strip leading const/volatile only (keep unsigned/signed for correct mapping)
+        for (bool changed = true; changed;) {
+                changed = false;
+                for (const char *q : {"const ", "volatile "}) {
+                        size_t ql = strlen(q);
+                        if (t.size() >= ql && t.compare(0, ql, q) == 0) {
+                                t       = t.substr(ql);
+                                changed = true;
+                        }
+                }
+        }
+        if (t == "float")
+                return DataType::F32;
+        if (t == "double")
+                return DataType::F64;
+        if (t == "int8_t" || t == "signed char")
+                return DataType::I8;
+        if (t == "int16_t" || t == "short" || t == "signed short")
+                return DataType::I16;
+        if (t == "int32_t" || t == "int" || t == "long" || t == "signed int" || t == "signed long")
+                return DataType::I32;
+        if (t == "int64_t" || t == "long long" || t == "signed long long")
+                return DataType::I64;
+        if (t == "uint8_t" || t == "char" || t == "unsigned char")
+                return DataType::U8;
+        if (t == "uint16_t" || t == "unsigned short")
+                return DataType::U16;
+        if (t == "uint32_t" || t == "unsigned int" || t == "unsigned long")
+                return DataType::U32;
+        if (t == "uint64_t" || t == "unsigned long long")
+                return DataType::U64;
+        return DataType::U32;
+}
+
 // ─── drawBodySteps ────────────────────────────────────────────────────────────
 // Renders an inline editable list of steps (used for If/While/For bodies).
 
 void
 SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
 {
-        static const char *kinds[]   = {"do", "delay", "if", "While", "For", "Break"};
-        static const char *kindsCn[] = {"do", "delay", "if", "循环", "For", "Break"};
-        static const char *ops[]     = {"==", "!=", "<", ">", "<=", ">="};
+        static const char *condOps[] = {"==", "!=", "<", ">", "<=", ">="};
 
-        int toDelete = -1;
+        bool topLevel = (depth == 0);
+        if (topLevel) {
+                static ImGuiTableFlags tblFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                                  ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY;
+                if (!ImGui::BeginTable("##bodytbl", 4, tblFlags))
+                        return;
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 28.0f);
+                ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch, 0.35f);
+                ImGui::TableSetupColumn(tr("Value / Args", "值/参数"), ImGuiTableColumnFlags_WidthStretch, 0.65f);
+                ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 32.0f);
+                ImGui::TableHeadersRow();
+        }
+
+        float indent       = depth * 14.0f;
+        int   stepToDelete = -1;
+
         for (int i = 0; i < (int)steps.size(); ++i) {
                 SequenceStep &s = steps[i];
                 ImGui::PushID(i + depth * 1000);
 
-                // Kind selector
-                int ki = (int)s.kind;
-                ImGui::SetNextItemWidth(60.0f);
-                if (ImGui::Combo("##k", &ki, g_lang == Lang::ZH ? kindsCn : kinds, 6)) {
-                        s.kind      = (SeqStepKind)ki;
-                        isModified_ = true;
-                }
-                ImGui::SameLine();
+                if (s.kind == SeqStepKind::Action) {
+                        // ── Render ops directly as table rows (same format as "do" detail) ──
+                        int opToDelete = -1;
+                        for (int j = 0; j < (int)s.ops.size(); ++j) {
+                                ImGui::PushID(j + 20000);
+                                SeqOp &op = s.ops[j];
 
-                // Kind-specific compact fields
-                switch (s.kind) {
-                        case SeqStepKind::Sleep:
-                                ImGui::SetNextItemWidth(55.0f);
-                                if (ImGui::InputInt("##ms", &s.sleepMs, 0))
-                                        isModified_ = true;
-                                ImGui::SameLine();
-                                ImGui::TextDisabled("ms");
-                                break;
-                        case SeqStepKind::Action:
-                                ImGui::TextDisabled("(%d)", (int)s.ops.size());
-                                break;
-                        case SeqStepKind::If:
-                        case SeqStepKind::While: {
-                                ImGui::SetNextItemWidth(72.0f);
-                                if (ImGui::InputText("##cv", s.condVar, sizeof(s.condVar)))
-                                        isModified_ = true;
-                                ImGui::SameLine();
-                                int opi = 0;
-                                for (int oi = 0; oi < 6; ++oi)
-                                        if (strcmp(s.condOp, ops[oi]) == 0) {
-                                                opi = oi;
-                                                break;
+                                if (op.kind == SeqOpKind::Write) {
+                                        SequenceAction &a = op.action;
+                                        ImGui::TableNextRow();
+
+                                        ImGui::TableSetColumnIndex(0);
+                                        if (indent > 0.0f)
+                                                ImGui::Indent(indent);
+                                        ImGui::Text("%d", j + 1);
+                                        if (indent > 0.0f)
+                                                ImGui::Unindent(indent);
+
+                                        ImGui::TableSetColumnIndex(1);
+                                        ImGui::AlignTextToFramePadding();
+                                        ImGui::TextUnformatted(a.name.c_str());
+
+                                        ImGui::TableSetColumnIndex(2);
+                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                        if (a.isEnum && !a.enumDefs.empty()) {
+                                                std::string preview = a.targetValue;
+                                                for (const auto &[val, nm] : a.enumDefs)
+                                                        if (nm == preview) {
+                                                                preview += " (" + std::to_string(val) + ")";
+                                                                break;
+                                                        }
+                                                if (ImGui::BeginCombo("##v", preview.c_str())) {
+                                                        for (const auto &[val, nm] : a.enumDefs) {
+                                                                bool        sel = (a.targetValue == nm);
+                                                                std::string lbl = nm + " (" + std::to_string(val) + ")";
+                                                                if (ImGui::Selectable(lbl.c_str(), sel)) {
+                                                                        a.targetValue = nm;
+                                                                        isModified_   = true;
+                                                                }
+                                                                if (sel)
+                                                                        ImGui::SetItemDefaultFocus();
+                                                        }
+                                                        ImGui::EndCombo();
+                                                }
+                                        } else {
+                                                char vbuf[64];
+                                                strncpy(vbuf, a.targetValue.c_str(), sizeof(vbuf) - 1);
+                                                vbuf[sizeof(vbuf) - 1] = '\0';
+                                                if (ImGui::InputText("##v", vbuf, sizeof(vbuf))) {
+                                                        a.targetValue = vbuf;
+                                                        isModified_   = true;
+                                                }
                                         }
-                                ImGui::SetNextItemWidth(46.0f);
-                                if (ImGui::Combo("##op", &opi, ops, 6)) {
-                                        strncpy(s.condOp, ops[opi], sizeof(s.condOp) - 1);
-                                        isModified_ = true;
-                                }
-                                ImGui::SameLine();
-                                int64_t cv = s.condVal;
-                                ImGui::SetNextItemWidth(52.0f);
-                                if (ImGui::InputScalar("##cv2", ImGuiDataType_S64, &cv)) {
-                                        s.condVal   = cv;
-                                        isModified_ = true;
-                                }
-                                break;
-                        }
-                        case SeqStepKind::For: {
-                                ImGui::SetNextItemWidth(40.0f);
-                                if (ImGui::InputText("##fv", s.forVar, sizeof(s.forVar)))
-                                        isModified_ = true;
-                                ImGui::SameLine();
-                                ImGui::TextDisabled("=");
-                                int64_t ff = s.forFrom, ft = s.forTo, fs = s.forStep;
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(44.0f);
-                                if (ImGui::InputScalar("##ff", ImGuiDataType_S64, &ff)) {
-                                        s.forFrom   = ff;
-                                        isModified_ = true;
-                                }
-                                ImGui::SameLine();
-                                ImGui::TextDisabled("..");
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(44.0f);
-                                if (ImGui::InputScalar("##ft", ImGuiDataType_S64, &ft)) {
-                                        s.forTo     = ft;
-                                        isModified_ = true;
-                                }
-                                ImGui::SameLine();
-                                ImGui::TextDisabled("+");
-                                ImGui::SameLine();
-                                ImGui::SetNextItemWidth(36.0f);
-                                if (ImGui::InputScalar("##fs", ImGuiDataType_S64, &fs)) {
-                                        s.forStep   = fs;
-                                        isModified_ = true;
-                                }
-                                break;
-                        }
-                        case SeqStepKind::Break:
-                                ImGui::TextDisabled("---");
-                                break;
-                        default:
-                                break;
-                }
 
-                ImGui::SameLine();
-                if (ImGui::SmallButton("X"))
-                        toDelete = i;
+                                        ImGui::TableSetColumnIndex(3);
+                                        if (ui::Button(tr("X", "X"), ui::BtnStyle::Danger, ImVec2(-FLT_MIN, 0)))
+                                                opToDelete = j;
 
-                // Nested body for compound steps
-                if (s.kind == SeqStepKind::If || s.kind == SeqStepKind::While || s.kind == SeqStepKind::For) {
-                        if (depth < 4) {
-                                ImGui::Indent(16.0f);
+                                } else {
+                                        // SDK op
+                                        auto panel   = findSdkPanel(op.sdk.panelWinId);
+                                        int  nParams = 0;
+                                        if (panel) {
+                                                if (op.sdk.isPython)
+                                                        nParams = panel->getPyFuncParamCount(op.sdk.pyFuncName);
+                                                else if (op.sdk.isCFunc)
+                                                        nParams = panel->getCFuncParamCount(op.sdk.methodIdx);
+                                                else
+                                                        nParams = panel->getParamCount(op.sdk.classIdx, op.sdk.methodIdx);
+                                        }
+                                        op.sdk.args.resize(nParams);
+
+                                        ImGui::TableNextRow();
+
+                                        ImGui::TableSetColumnIndex(0);
+                                        if (indent > 0.0f)
+                                                ImGui::Indent(indent);
+                                        ImGui::Text("%d", j + 1);
+                                        if (indent > 0.0f)
+                                                ImGui::Unindent(indent);
+
+                                        ImGui::TableSetColumnIndex(1);
+                                        bool open = ImGui::TreeNodeEx(
+                                            "##sdkn", ImGuiTreeNodeFlags_DefaultOpen, "[SDK] %s", op.sdk.label.c_str());
+
+                                        ImGui::TableSetColumnIndex(3);
+                                        if (ui::Button(tr("X", "X"), ui::BtnStyle::Danger, ImVec2(-FLT_MIN, 0)))
+                                                opToDelete = j;
+
+                                        if (open) {
+                                                if (!panel) {
+                                                        ImGui::TableNextRow();
+                                                        ImGui::TableSetColumnIndex(1);
+                                                        ImGui::Indent(indent + 16.0f);
+                                                        ImGui::TextDisabled(
+                                                            tr("SDK panel (id=%d) closed.", "SDK 窗口 (id=%d) 已关闭。"),
+                                                            op.sdk.panelWinId);
+                                                        ImGui::Unindent(indent + 16.0f);
+                                                } else {
+                                                        if (!op.sdk.isCFunc && !op.sdk.isPython) {
+                                                                auto        objs = panel->listObjects(op.sdk.classIdx);
+                                                                const char *cur  = tr("(none)", "(无对象)");
+                                                                for (const auto &o : objs)
+                                                                        if (o.idx == op.sdk.objIdx) {
+                                                                                cur = o.label.c_str();
+                                                                                break;
+                                                                        }
+                                                                ImGui::TableNextRow();
+                                                                ImGui::TableSetColumnIndex(1);
+                                                                ImGui::Indent(indent + 16.0f);
+                                                                ImGui::TextDisabled(tr("Object:", "对象:"));
+                                                                ImGui::Unindent(indent + 16.0f);
+                                                                ImGui::TableSetColumnIndex(2);
+                                                                ImGui::SetNextItemWidth(-50.0f);
+                                                                if (ImGui::BeginCombo("##objsel", cur)) {
+                                                                        for (const auto &o : objs) {
+                                                                                bool sel = (o.idx == op.sdk.objIdx);
+                                                                                char cl[128];
+                                                                                snprintf(cl,
+                                                                                         sizeof(cl),
+                                                                                         "%s  (%s)",
+                                                                                         o.label.c_str(),
+                                                                                         o.className.c_str());
+                                                                                if (ImGui::Selectable(cl, sel)) {
+                                                                                        op.sdk.objIdx = o.idx;
+                                                                                        isModified_   = true;
+                                                                                }
+                                                                                if (sel)
+                                                                                        ImGui::SetItemDefaultFocus();
+                                                                        }
+                                                                        ImGui::EndCombo();
+                                                                }
+                                                                ImGui::SameLine();
+                                                                if (ImGui::SmallButton(tr("New##newobj", "新建##newobj"))) {
+                                                                        int ni = panel->newObject(op.sdk.classIdx);
+                                                                        if (ni >= 0) {
+                                                                                op.sdk.objIdx = ni;
+                                                                                isModified_   = true;
+                                                                        }
+                                                                }
+                                                        }
+                                                        std::vector<std::string> localVars;
+                                                        if (panel->onListLocalVars_)
+                                                                localVars = panel->onListLocalVars_();
+                                                        for (int p = 0; p < nParams; ++p) {
+                                                                ImGui::PushID(p);
+                                                                std::string pname =
+                                                                    op.sdk.isCFunc
+                                                                        ? panel->getCFuncParamName(op.sdk.methodIdx, p)
+                                                                        : panel->getParamName(
+                                                                              op.sdk.classIdx, op.sdk.methodIdx, p);
+                                                                std::string ptype =
+                                                                    op.sdk.isCFunc
+                                                                        ? panel->getCFuncParamRawType(op.sdk.methodIdx, p)
+                                                                        : panel->getParamRawType(
+                                                                              op.sdk.classIdx, op.sdk.methodIdx, p);
+                                                                bool isPtr =
+                                                                    op.sdk.isCFunc
+                                                                        ? panel->isCFuncParamPtrOrRef(op.sdk.methodIdx, p)
+                                                                        : panel->isParamPtrOrRef(
+                                                                              op.sdk.classIdx, op.sdk.methodIdx, p);
+                                                                ImGui::TableNextRow();
+                                                                ImGui::TableSetColumnIndex(1);
+                                                                ImGui::Indent(indent + 16.0f);
+                                                                if (!pname.empty())
+                                                                        ImGui::TextUnformatted(pname.c_str());
+                                                                else
+                                                                        ImGui::Text(tr("Arg %d", "参数%d"), p);
+                                                                if (!ptype.empty() && ImGui::IsItemHovered())
+                                                                        ImGui::SetTooltip("%s", ptype.c_str());
+                                                                ImGui::Unindent(indent + 16.0f);
+                                                                ImGui::TableSetColumnIndex(2);
+                                                                char argBuf[512]{};
+                                                                strncpy(argBuf, op.sdk.args[p].c_str(), sizeof(argBuf) - 1);
+                                                                float inputW =
+                                                                    (isPtr && !localVars.empty()) ? -50.0f : -FLT_MIN;
+                                                                ImGui::SetNextItemWidth(inputW);
+                                                                if (ImGui::InputText("##arg", argBuf, sizeof(argBuf))) {
+                                                                        op.sdk.args[p] = argBuf;
+                                                                        isModified_    = true;
+                                                                }
+                                                                if (!ptype.empty() && ImGui::IsItemHovered())
+                                                                        ImGui::SetTooltip("%s", ptype.c_str());
+                                                                if (isPtr && !localVars.empty()) {
+                                                                        ImGui::SameLine();
+                                                                        char btnId[16];
+                                                                        snprintf(btnId, sizeof(btnId), "v##p%d", p);
+                                                                        if (ImGui::Button(btnId)) {
+                                                                                char pid[32];
+                                                                                snprintf(pid, sizeof(pid), "##vp%d", p);
+                                                                                ImGui::OpenPopup(pid);
+                                                                        }
+                                                                        char pid[32];
+                                                                        snprintf(pid, sizeof(pid), "##vp%d", p);
+                                                                        if (ImGui::BeginPopup(pid)) {
+                                                                                for (const auto &vn : localVars)
+                                                                                        if (ImGui::Selectable(vn.c_str())) {
+                                                                                                op.sdk.args[p] = "&" + vn;
+                                                                                                isModified_    = true;
+                                                                                        }
+                                                                                ImGui::EndPopup();
+                                                                        }
+                                                                }
+                                                                ImGui::PopID();
+                                                        }
+                                                        // "Create output vars" button for body-step SDK ops
+                                                        if (onAddLocalVar_) {
+                                                                bool anyPtr = false;
+                                                                for (int p = 0; p < nParams && !anyPtr; ++p) {
+                                                                        anyPtr =
+                                                                            op.sdk.isCFunc
+                                                                                ? panel->isCFuncParamPtrOrRef(op.sdk.methodIdx,
+                                                                                                              p)
+                                                                                : panel->isParamPtrOrRef(
+                                                                                      op.sdk.classIdx, op.sdk.methodIdx, p);
+                                                                }
+                                                                if (anyPtr) {
+                                                                        ImGui::TableNextRow();
+                                                                        ImGui::TableSetColumnIndex(1);
+                                                                        ImGui::Indent(indent + 16.0f);
+                                                                        if (ImGui::SmallButton(
+                                                                                tr("→ Create output vars", "→ 创建输出变量"))) {
+                                                                                for (int p = 0; p < nParams; ++p) {
+                                                                                        bool ip =
+                                                                                            op.sdk.isCFunc
+                                                                                                ? panel->isCFuncParamPtrOrRef(
+                                                                                                      op.sdk.methodIdx, p)
+                                                                                                : panel->isParamPtrOrRef(
+                                                                                                      op.sdk.classIdx,
+                                                                                                      op.sdk.methodIdx,
+                                                                                                      p);
+                                                                                        if (!ip)
+                                                                                                continue;
+                                                                                        std::string pn =
+                                                                                            op.sdk.isCFunc
+                                                                                                ? panel->getCFuncParamName(
+                                                                                                      op.sdk.methodIdx, p)
+                                                                                                : panel->getParamName(
+                                                                                                      op.sdk.classIdx,
+                                                                                                      op.sdk.methodIdx,
+                                                                                                      p);
+                                                                                        std::string pt =
+                                                                                            op.sdk.isCFunc
+                                                                                                ? panel->getCFuncParamRawType(
+                                                                                                      op.sdk.methodIdx, p)
+                                                                                                : panel->getParamRawType(
+                                                                                                      op.sdk.classIdx,
+                                                                                                      op.sdk.methodIdx,
+                                                                                                      p);
+                                                                                        if (pn.empty())
+                                                                                                pn = "arg" + std::to_string(p);
+                                                                                        const CStructDecl *sd =
+                                                                                            panel->getParamStructDecl(
+                                                                                                op.sdk.isCFunc,
+                                                                                                op.sdk.classIdx,
+                                                                                                op.sdk.methodIdx,
+                                                                                                p);
+                                                                                        if (sd && onAddLocalStructVar_) {
+                                                                                                onAddLocalStructVar_(
+                                                                                                    pn,
+                                                                                                    structDeclToFields(*sd),
+                                                                                                    sd->totalSize);
+                                                                                        } else if (onAddLocalVar_) {
+                                                                                                DataType dt =
+                                                                                                    ptrTypeFromRaw(pt);
+                                                                                                size_t sz =
+                                                                                                    Parser::typeBytes(dt);
+                                                                                                if (sz == 0)
+                                                                                                        sz = 4;
+                                                                                                onAddLocalVar_(pn, dt, sz);
+                                                                                        }
+                                                                                        if (op.sdk.args[p].empty()) {
+                                                                                                op.sdk.args[p] = "&" + pn;
+                                                                                                isModified_    = true;
+                                                                                        }
+                                                                                }
+                                                                        }
+                                                                        if (ImGui::IsItemHovered())
+                                                                                ImGui::SetTooltip(
+                                                                                    "%s",
+                                                                                    tr("Create pointer params as LOCAL "
+                                                                                       "variables in Variable Manager",
+                                                                                       "将指针参数新建为变量管理器中的LOCAL变量"
+                                                                                       "，并自动填入参数"));
+                                                                        ImGui::Unindent(indent + 16.0f);
+                                                                }
+                                                        }
+                                                }
+                                                ImGui::TreePop();
+                                        }
+                                }
+                                ImGui::PopID();
+                        }
+                        if (opToDelete >= 0) {
+                                s.ops.erase(s.ops.begin() + opToDelete);
+                                if (s.ops.empty())
+                                        stepToDelete = i;
+                                isModified_ = true;
+                        }
+
+                } else {
+                        // ── Control flow step: single colored badge row ───────────────
+                        ImGui::TableNextRow();
+
+                        ImGui::TableSetColumnIndex(0);
+                        if (indent > 0.0f)
+                                ImGui::Indent(indent);
+                        ImVec4 badgeCol = (s.kind == SeqStepKind::Sleep)   ? ImVec4(0.6f, 0.8f, 1.0f, 1.0f)
+                                          : (s.kind == SeqStepKind::Break) ? ImVec4(1.0f, 0.5f, 0.5f, 1.0f)
+                                                                           : ImVec4(1.0f, 0.85f, 0.4f, 1.0f);
+                        ImGui::TextColored(badgeCol, "%s", tr(kindLabel(s.kind), kindLabelCn(s.kind)));
+                        if (indent > 0.0f)
+                                ImGui::Unindent(indent);
+
+                        ImGui::TableSetColumnIndex(1);
+                        switch (s.kind) {
+                                case SeqStepKind::Sleep:
+                                        ImGui::SetNextItemWidth(60.0f);
+                                        if (ImGui::InputInt("##ms", &s.sleepMs, 0))
+                                                isModified_ = true;
+                                        ImGui::SameLine();
+                                        ImGui::TextDisabled("ms");
+                                        break;
+                                case SeqStepKind::If:
+                                case SeqStepKind::While: {
+                                        ImGui::SetNextItemWidth(72.0f);
+                                        if (ImGui::InputText("##cv", s.condVar, sizeof(s.condVar)))
+                                                isModified_ = true;
+                                        ImGui::SameLine();
+                                        int opi = 0;
+                                        for (int oi = 0; oi < 6; ++oi)
+                                                if (strcmp(s.condOp, condOps[oi]) == 0) {
+                                                        opi = oi;
+                                                        break;
+                                                }
+                                        ImGui::SetNextItemWidth(46.0f);
+                                        if (ImGui::Combo("##op", &opi, condOps, 6)) {
+                                                strncpy(s.condOp, condOps[opi], sizeof(s.condOp) - 1);
+                                                isModified_ = true;
+                                        }
+                                        ImGui::SameLine();
+                                        int64_t cv = s.condVal;
+                                        ImGui::SetNextItemWidth(52.0f);
+                                        if (ImGui::InputScalar("##cv2", ImGuiDataType_S64, &cv)) {
+                                                s.condVal   = cv;
+                                                isModified_ = true;
+                                        }
+                                        break;
+                                }
+                                case SeqStepKind::For: {
+                                        ImGui::SetNextItemWidth(40.0f);
+                                        if (ImGui::InputText("##fv", s.forVar, sizeof(s.forVar)))
+                                                isModified_ = true;
+                                        ImGui::SameLine();
+                                        ImGui::TextDisabled("=");
+                                        int64_t ff = s.forFrom, ft = s.forTo, fs = s.forStep;
+                                        ImGui::SameLine();
+                                        ImGui::SetNextItemWidth(44.0f);
+                                        if (ImGui::InputScalar("##ff", ImGuiDataType_S64, &ff)) {
+                                                s.forFrom   = ff;
+                                                isModified_ = true;
+                                        }
+                                        ImGui::SameLine();
+                                        ImGui::TextDisabled("..");
+                                        ImGui::SameLine();
+                                        ImGui::SetNextItemWidth(44.0f);
+                                        if (ImGui::InputScalar("##ft", ImGuiDataType_S64, &ft)) {
+                                                s.forTo     = ft;
+                                                isModified_ = true;
+                                        }
+                                        ImGui::SameLine();
+                                        ImGui::TextDisabled("+");
+                                        ImGui::SameLine();
+                                        ImGui::SetNextItemWidth(36.0f);
+                                        if (ImGui::InputScalar("##fs", ImGuiDataType_S64, &fs)) {
+                                                s.forStep   = fs;
+                                                isModified_ = true;
+                                        }
+                                        break;
+                                }
+                                case SeqStepKind::Break:
+                                        ImGui::TextDisabled("---");
+                                        break;
+                                default:
+                                        break;
+                        }
+
+                        ImGui::TableSetColumnIndex(3);
+                        if (ImGui::SmallButton("X"))
+                                stepToDelete = i;
+
+                        // ── Nested body for compound steps ────────────────────────────
+                        if (depth < 4 &&
+                            (s.kind == SeqStepKind::If || s.kind == SeqStepKind::While || s.kind == SeqStepKind::For)) {
                                 drawBodySteps(s.body, depth + 1);
+
+                                float subIndent = (depth + 1) * 14.0f;
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::Indent(subIndent);
                                 if (ImGui::SmallButton(tr("+##bb", "+##bb"))) {
                                         s.body.push_back(SequenceStep{});
                                         isModified_ = true;
@@ -456,24 +948,40 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                 s.hasElse   = he;
                                                 isModified_ = true;
                                         }
-                                        if (s.hasElse) {
-                                                ImGui::TextDisabled("else:");
-                                                drawBodySteps(s.elseBody, depth + 1);
-                                                if (ImGui::SmallButton(tr("+##be", "+##be"))) {
-                                                        s.elseBody.push_back(SequenceStep{});
-                                                        isModified_ = true;
-                                                }
-                                        }
                                 }
-                                ImGui::Unindent(16.0f);
+                                ImGui::Unindent(subIndent);
+
+                                if (s.kind == SeqStepKind::If && s.hasElse) {
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::Indent(subIndent);
+                                        ImGui::TextDisabled("else:");
+                                        ImGui::Unindent(subIndent);
+
+                                        drawBodySteps(s.elseBody, depth + 1);
+
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::Indent(subIndent);
+                                        if (ImGui::SmallButton(tr("+##be", "+##be"))) {
+                                                s.elseBody.push_back(SequenceStep{});
+                                                isModified_ = true;
+                                        }
+                                        ImGui::Unindent(subIndent);
+                                }
                         }
                 }
+
                 ImGui::PopID();
         }
-        if (toDelete >= 0) {
-                steps.erase(steps.begin() + toDelete);
+
+        if (stepToDelete >= 0) {
+                steps.erase(steps.begin() + stepToDelete);
                 isModified_ = true;
         }
+
+        if (topLevel)
+                ImGui::EndTable();
 }
 
 // ─── acceptSdkPayload ─────────────────────────────────────────────────────────
@@ -509,27 +1017,38 @@ SequenceEditor::makeSdkOp(const SdkDragPayload &pl, SeqOp &out)
         out.kind           = SeqOpKind::Sdk;
         out.sdk.panelWinId = pl.panelWinId;
         out.sdk.isCFunc    = pl.isCFunc;
+        out.sdk.isPython   = pl.isPython;
         out.sdk.classIdx   = pl.classIdx;
         out.sdk.methodIdx  = pl.methodIdx;
         out.sdk.objIdx     = pl.objIdx;
-        out.sdk.label = pl.isCFunc ? panel->getCFuncLabel(pl.methodIdx) : panel->getCallLabel(pl.classIdx, pl.methodIdx);
-        int np = pl.isCFunc ? panel->getCFuncParamCount(pl.methodIdx) : panel->getParamCount(pl.classIdx, pl.methodIdx);
-        out.sdk.args.resize(np);
+        if (pl.isPython) {
+                out.sdk.pyFuncName = pl.pyName;
+                out.sdk.label      = panel->getPyFuncLabel(pl.pyName);
+                out.sdk.args.resize(panel->getPyFuncParamCount(pl.pyName));
+        } else {
+                out.sdk.label =
+                    pl.isCFunc ? panel->getCFuncLabel(pl.methodIdx) : panel->getCallLabel(pl.classIdx, pl.methodIdx);
+                int np = pl.isCFunc ? panel->getCFuncParamCount(pl.methodIdx) : panel->getParamCount(pl.classIdx, pl.methodIdx);
+                out.sdk.args.resize(np);
+        }
         return true;
 }
 
 // Within an active BeginDragDropTarget(): accept SDK functions / variables and
 // forward each resulting op to `sink`. Returns true if anything was consumed.
+// noSdk=true: only accept variable/channel drops (used by left sidebar).
 bool
-SequenceEditor::acceptOpDrops(const std::function<void(SeqOp)> &sink)
+SequenceEditor::acceptOpDrops(const std::function<void(SeqOp)> &sink, bool noSdk)
 {
-        if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("SDK_CALL")) {
-                SeqOp op;
-                if (makeSdkOp(*static_cast<const SdkDragPayload *>(dp->Data), op)) {
-                        sink(std::move(op));
-                        return true;
+        if (!noSdk) {
+                if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("SDK_CALL")) {
+                        SeqOp op;
+                        if (makeSdkOp(*static_cast<const SdkDragPayload *>(dp->Data), op)) {
+                                sink(std::move(op));
+                                return true;
+                        }
+                        return false;
                 }
-                return false;
         }
         if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("CHANNEL")) {
                 sink({SeqOpKind::Write, actionFromChannel(static_cast<ChannelDropPayload *>(dp->Data)), {}});
@@ -705,16 +1224,14 @@ SequenceEditor::drawStepList()
                 }
                 ImGui::PopStyleColor();
 
-                // Drop target on step item: SDK functions / variables go into a "do"
-                // step's body, or into the body of an If/While/For (as a nested "do" step).
+                // Drop target on step item: variables only (no SDK) on the left sidebar.
                 if (!running && ImGui::BeginDragDropTarget()) {
                         SequenceStep &st  = steps_[i];
                         bool          mod = false;
                         if (st.kind == SeqStepKind::Action)
-                                mod = acceptOpDrops([&](SeqOp op) { st.ops.push_back(std::move(op)); });
-                        else if (st.kind == SeqStepKind::If || st.kind == SeqStepKind::While ||
-                                 st.kind == SeqStepKind::For)
-                                mod = acceptOpDrops([&](SeqOp op) { appendOpToBody(st.body, std::move(op)); });
+                                mod = acceptOpDrops([&](SeqOp op) { st.ops.push_back(std::move(op)); }, true);
+                        else if (st.kind == SeqStepKind::If || st.kind == SeqStepKind::While || st.kind == SeqStepKind::For)
+                                mod = acceptOpDrops([&](SeqOp op) { appendOpToBody(st.body, std::move(op)); }, true);
                         if (mod) {
                                 selectedStep_ = i;
                                 isModified_   = true;
@@ -723,17 +1240,6 @@ SequenceEditor::drawStepList()
                 }
 
                 ImGui::PopID();
-        }
-
-        // ── Invisible drop zone fills remaining height so any empty area accepts SDK drops ──
-        float dropH = ImGui::GetContentRegionAvail().y;
-        if (dropH < 4.0f)
-                dropH = 4.0f;
-        ImGui::InvisibleButton("##sdk_drop_area", ImVec2(-FLT_MIN, dropH));
-        if (ImGui::BeginDragDropTarget()) {
-                if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("SDK_CALL"))
-                        acceptSdkPayload(dp->Data, -1);
-                ImGui::EndDragDropTarget();
         }
 }
 
@@ -783,87 +1289,393 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
         switch (step.kind) {
 
                 case SeqStepKind::Action: {
-                        int delay = (int)step.delayMs;
-                        if (ImGui::InputInt(tr("Pre-delay (ms)", "前置延时 (ms)"), &delay, 10, 100)) {
-                                if (delay < 0)
-                                        delay = 0;
-                                step.delayMs = (u32)delay;
-                                isModified_  = true;
-                        }
-                        ImGui::Spacing();
-                        ImGui::Text("%s",
-                                    tr("Actions (drag variables / SDK functions):", "动作（拖入变量 / SDK 函数）："));
+                        ImGui::Text("%s", tr("Actions (drag variables / SDK functions):", "动作（拖入变量 / SDK 函数）："));
                         if (ImGui::BeginChild("OpList", ImVec2(0, 0), true)) {
-                                int toDelete = -1;
-                                for (int i = 0; i < (int)step.ops.size(); ++i) {
-                                        ImGui::PushID(i);
-                                        SeqOp &op = step.ops[i];
-                                        if (op.kind == SeqOpKind::Write) {
-                                                SequenceAction &a = op.action;
-                                                ImGui::AlignTextToFramePadding();
-                                                ImGui::TextUnformatted(a.name.c_str());
-                                                ImGui::SameLine();
-                                                ImGui::SetNextItemWidth(180.0f);
-                                                if (a.isEnum && !a.enumDefs.empty()) {
-                                                        std::string preview = a.targetValue;
-                                                        for (const auto &[val, nm] : a.enumDefs)
-                                                                if (nm == preview) {
-                                                                        preview += " (" + std::to_string(val) + ")";
-                                                                        break;
-                                                                }
-                                                        if (ImGui::BeginCombo("##v", preview.c_str())) {
-                                                                for (const auto &[val, nm] : a.enumDefs) {
-                                                                        bool        sel = (a.targetValue == nm);
-                                                                        std::string lbl = nm + " (" + std::to_string(val) + ")";
-                                                                        if (ImGui::Selectable(lbl.c_str(), sel)) {
-                                                                                a.targetValue = nm;
-                                                                                isModified_   = true;
+                                static ImGuiTableFlags opTblFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                                                    ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY;
+                                if (ImGui::BeginTable("##optbl", 4, opTblFlags)) {
+                                        ImGui::TableSetupScrollFreeze(0, 1);
+                                        ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 28.0f);
+                                        ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch, 0.35f);
+                                        ImGui::TableSetupColumn(
+                                            tr("Value / Args", "值/参数"), ImGuiTableColumnFlags_WidthStretch, 0.65f);
+                                        ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 32.0f);
+                                        ImGui::TableHeadersRow();
+
+                                        int toDelete = -1;
+                                        for (int i = 0; i < (int)step.ops.size(); ++i) {
+                                                ImGui::PushID(i);
+                                                SeqOp &op = step.ops[i];
+
+                                                if (op.kind == SeqOpKind::Write) {
+                                                        SequenceAction &a = op.action;
+                                                        ImGui::TableNextRow();
+
+                                                        ImGui::TableSetColumnIndex(0);
+                                                        ImGui::Text("%d", i + 1);
+
+                                                        ImGui::TableSetColumnIndex(1);
+                                                        ImGui::AlignTextToFramePadding();
+                                                        ImGui::TextUnformatted(a.name.c_str());
+
+                                                        ImGui::TableSetColumnIndex(2);
+                                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                                        if (a.isEnum && !a.enumDefs.empty()) {
+                                                                std::string preview = a.targetValue;
+                                                                for (const auto &[val, nm] : a.enumDefs)
+                                                                        if (nm == preview) {
+                                                                                preview += " (" + std::to_string(val) + ")";
+                                                                                break;
                                                                         }
-                                                                        if (sel)
-                                                                                ImGui::SetItemDefaultFocus();
+                                                                if (ImGui::BeginCombo("##v", preview.c_str())) {
+                                                                        for (const auto &[val, nm] : a.enumDefs) {
+                                                                                bool        sel = (a.targetValue == nm);
+                                                                                std::string lbl =
+                                                                                    nm + " (" + std::to_string(val) + ")";
+                                                                                if (ImGui::Selectable(lbl.c_str(), sel)) {
+                                                                                        a.targetValue = nm;
+                                                                                        isModified_   = true;
+                                                                                }
+                                                                                if (sel)
+                                                                                        ImGui::SetItemDefaultFocus();
+                                                                        }
+                                                                        ImGui::EndCombo();
                                                                 }
-                                                                ImGui::EndCombo();
+                                                        } else {
+                                                                char vbuf[64];
+                                                                strncpy(vbuf, a.targetValue.c_str(), sizeof(vbuf) - 1);
+                                                                vbuf[sizeof(vbuf) - 1] = '\0';
+                                                                if (ImGui::InputText("##v", vbuf, sizeof(vbuf))) {
+                                                                        a.targetValue = vbuf;
+                                                                        isModified_   = true;
+                                                                }
                                                         }
+
+                                                        ImGui::TableSetColumnIndex(3);
+                                                        if (ui::Button(tr("X", "X"), ui::BtnStyle::Danger, ImVec2(-FLT_MIN, 0)))
+                                                                toDelete = i;
+
                                                 } else {
-                                                        char vbuf[64];
-                                                        strncpy(vbuf, a.targetValue.c_str(), sizeof(vbuf) - 1);
-                                                        vbuf[sizeof(vbuf) - 1] = '\0';
-                                                        if (ImGui::InputText("##v", vbuf, sizeof(vbuf))) {
-                                                                a.targetValue = vbuf;
-                                                                isModified_   = true;
+                                                        // SDK call op
+                                                        auto panel   = findSdkPanel(op.sdk.panelWinId);
+                                                        int  nParams = 0;
+                                                        if (panel) {
+                                                                if (op.sdk.isPython)
+                                                                        nParams = panel->getPyFuncParamCount(op.sdk.pyFuncName);
+                                                                else if (op.sdk.isCFunc)
+                                                                        nParams = panel->getCFuncParamCount(op.sdk.methodIdx);
+                                                                else
+                                                                        nParams = panel->getParamCount(op.sdk.classIdx,
+                                                                                                       op.sdk.methodIdx);
+                                                        }
+                                                        op.sdk.args.resize(nParams);
+
+                                                        ImGui::TableNextRow();
+
+                                                        ImGui::TableSetColumnIndex(0);
+                                                        ImGui::Text("%d", i + 1);
+
+                                                        ImGui::TableSetColumnIndex(1);
+                                                        bool open = ImGui::TreeNodeEx("##sdkn",
+                                                                                      ImGuiTreeNodeFlags_DefaultOpen,
+                                                                                      "[SDK] %s",
+                                                                                      op.sdk.label.c_str());
+
+                                                        ImGui::TableSetColumnIndex(3);
+                                                        if (ui::Button(tr("X", "X"), ui::BtnStyle::Danger, ImVec2(-FLT_MIN, 0)))
+                                                                toDelete = i;
+
+                                                        if (open) {
+                                                                if (!panel) {
+                                                                        ImGui::TableNextRow();
+                                                                        ImGui::TableSetColumnIndex(1);
+                                                                        ImGui::Indent(16.0f);
+                                                                        ImGui::TextDisabled(tr("SDK panel (id=%d) closed.",
+                                                                                               "SDK 窗口 (id=%d) 已关闭。"),
+                                                                                            op.sdk.panelWinId);
+                                                                        ImGui::Unindent(16.0f);
+                                                                } else {
+                                                                        // Object selector for C++ methods
+                                                                        if (!op.sdk.isCFunc && !op.sdk.isPython) {
+                                                                                auto objs = panel->listObjects(op.sdk.classIdx);
+                                                                                const char *curLabel = tr("(none)", "(无对象)");
+                                                                                for (const auto &o : objs)
+                                                                                        if (o.idx == op.sdk.objIdx) {
+                                                                                                curLabel = o.label.c_str();
+                                                                                                break;
+                                                                                        }
+
+                                                                                ImGui::TableNextRow();
+                                                                                ImGui::TableSetColumnIndex(1);
+                                                                                ImGui::Indent(16.0f);
+                                                                                ImGui::TextDisabled(tr("Object:", "对象:"));
+                                                                                ImGui::Unindent(16.0f);
+
+                                                                                ImGui::TableSetColumnIndex(2);
+                                                                                ImGui::SetNextItemWidth(-50.0f);
+                                                                                if (ImGui::BeginCombo("##objsel", curLabel)) {
+                                                                                        for (const auto &o : objs) {
+                                                                                                bool sel =
+                                                                                                    (o.idx == op.sdk.objIdx);
+                                                                                                char combo_label[128];
+                                                                                                snprintf(combo_label,
+                                                                                                         sizeof(combo_label),
+                                                                                                         "%s  (%s)",
+                                                                                                         o.label.c_str(),
+                                                                                                         o.className.c_str());
+                                                                                                if (ImGui::Selectable(
+                                                                                                        combo_label, sel)) {
+                                                                                                        op.sdk.objIdx = o.idx;
+                                                                                                        isModified_   = true;
+                                                                                                }
+                                                                                                if (sel)
+                                                                                                        ImGui::
+                                                                                                            SetItemDefaultFocus();
+                                                                                        }
+                                                                                        ImGui::EndCombo();
+                                                                                }
+                                                                                ImGui::SameLine();
+                                                                                if (ImGui::SmallButton(
+                                                                                        tr("New##newobj", "新建##newobj"))) {
+                                                                                        int ni =
+                                                                                            panel->newObject(op.sdk.classIdx);
+                                                                                        if (ni >= 0) {
+                                                                                                op.sdk.objIdx = ni;
+                                                                                                isModified_   = true;
+                                                                                        }
+                                                                                }
+                                                                        }
+
+                                                                        // Arg rows
+                                                                        std::vector<std::string> localVars;
+                                                                        if (panel->onListLocalVars_)
+                                                                                localVars = panel->onListLocalVars_();
+
+                                                                        for (int p = 0; p < nParams; ++p) {
+                                                                                ImGui::PushID(p);
+                                                                                std::string pname =
+                                                                                    op.sdk.isCFunc
+                                                                                        ? panel->getCFuncParamName(
+                                                                                              op.sdk.methodIdx, p)
+                                                                                        : panel->getParamName(op.sdk.classIdx,
+                                                                                                              op.sdk.methodIdx,
+                                                                                                              p);
+                                                                                std::string ptype =
+                                                                                    op.sdk.isCFunc
+                                                                                        ? panel->getCFuncParamRawType(
+                                                                                              op.sdk.methodIdx, p)
+                                                                                        : panel->getParamRawType(
+                                                                                              op.sdk.classIdx,
+                                                                                              op.sdk.methodIdx,
+                                                                                              p);
+                                                                                bool isPtr = op.sdk.isCFunc
+                                                                                                 ? panel->isCFuncParamPtrOrRef(
+                                                                                                       op.sdk.methodIdx, p)
+                                                                                                 : panel->isParamPtrOrRef(
+                                                                                                       op.sdk.classIdx,
+                                                                                                       op.sdk.methodIdx,
+                                                                                                       p);
+
+                                                                                ImGui::TableNextRow();
+
+                                                                                ImGui::TableSetColumnIndex(1);
+                                                                                ImGui::Indent(16.0f);
+                                                                                if (!pname.empty())
+                                                                                        ImGui::TextUnformatted(pname.c_str());
+                                                                                else
+                                                                                        ImGui::Text(tr("Arg %d", "参数%d"), p);
+                                                                                if (!ptype.empty() && ImGui::IsItemHovered())
+                                                                                        ImGui::SetTooltip("%s", ptype.c_str());
+                                                                                ImGui::Unindent(16.0f);
+
+                                                                                ImGui::TableSetColumnIndex(2);
+                                                                                char argBuf[512]{};
+                                                                                strncpy(argBuf,
+                                                                                        op.sdk.args[p].c_str(),
+                                                                                        sizeof(argBuf) - 1);
+                                                                                float inputW = (isPtr && !localVars.empty())
+                                                                                                   ? -50.0f
+                                                                                                   : -FLT_MIN;
+                                                                                ImGui::SetNextItemWidth(inputW);
+                                                                                if (ImGui::InputText(
+                                                                                        "##arg", argBuf, sizeof(argBuf))) {
+                                                                                        op.sdk.args[p] = argBuf;
+                                                                                        isModified_    = true;
+                                                                                }
+                                                                                if (!ptype.empty() && ImGui::IsItemHovered())
+                                                                                        ImGui::SetTooltip("%s", ptype.c_str());
+                                                                                if (isPtr && !localVars.empty()) {
+                                                                                        ImGui::SameLine();
+                                                                                        char btnId[16];
+                                                                                        snprintf(
+                                                                                            btnId, sizeof(btnId), "v##p%d", p);
+                                                                                        if (ImGui::Button(btnId)) {
+                                                                                                char popupId[32];
+                                                                                                snprintf(popupId,
+                                                                                                         sizeof(popupId),
+                                                                                                         "##vp%d",
+                                                                                                         p);
+                                                                                                ImGui::OpenPopup(popupId);
+                                                                                        }
+                                                                                        char popupId[32];
+                                                                                        snprintf(popupId,
+                                                                                                 sizeof(popupId),
+                                                                                                 "##vp%d",
+                                                                                                 p);
+                                                                                        if (ImGui::BeginPopup(popupId)) {
+                                                                                                for (const auto &vn : localVars)
+                                                                                                        if (ImGui::Selectable(
+                                                                                                                vn.c_str())) {
+                                                                                                                op.sdk.args[p] =
+                                                                                                                    "&" + vn;
+                                                                                                                isModified_ =
+                                                                                                                    true;
+                                                                                                        }
+                                                                                                ImGui::EndPopup();
+                                                                                        }
+                                                                                }
+                                                                                ImGui::PopID();
+                                                                        }
+                                                                        // "Create output vars" button: one click
+                                                                        // creates LOCAL vars for all ptr/ref params
+                                                                        if (onAddLocalVar_) {
+                                                                                bool anyPtr = false;
+                                                                                for (int p = 0; p < nParams; ++p) {
+                                                                                        bool ip =
+                                                                                            op.sdk.isCFunc
+                                                                                                ? panel->isCFuncParamPtrOrRef(
+                                                                                                      op.sdk.methodIdx, p)
+                                                                                                : panel->isParamPtrOrRef(
+                                                                                                      op.sdk.classIdx,
+                                                                                                      op.sdk.methodIdx,
+                                                                                                      p);
+                                                                                        if (ip) {
+                                                                                                anyPtr = true;
+                                                                                                break;
+                                                                                        }
+                                                                                }
+                                                                                if (anyPtr) {
+                                                                                        ImGui::TableNextRow();
+                                                                                        ImGui::TableSetColumnIndex(1);
+                                                                                        ImGui::Indent(16.0f);
+                                                                                        if (ImGui::SmallButton(
+                                                                                                tr("→ Create output vars",
+                                                                                                   "→ 创建输出变量"))) {
+                                                                                                for (int p = 0; p < nParams;
+                                                                                                     ++p) {
+                                                                                                        bool ip =
+                                                                                                            op.sdk.isCFunc
+                                                                                                                ? panel->isCFuncParamPtrOrRef(
+                                                                                                                      op.sdk
+                                                                                                                          .methodIdx,
+                                                                                                                      p)
+                                                                                                                : panel->isParamPtrOrRef(
+                                                                                                                      op.sdk
+                                                                                                                          .classIdx,
+                                                                                                                      op.sdk
+                                                                                                                          .methodIdx,
+                                                                                                                      p);
+                                                                                                        if (!ip)
+                                                                                                                continue;
+                                                                                                        std::string pn =
+                                                                                                            op.sdk.isCFunc
+                                                                                                                ? panel->getCFuncParamName(
+                                                                                                                      op.sdk
+                                                                                                                          .methodIdx,
+                                                                                                                      p)
+                                                                                                                : panel->getParamName(
+                                                                                                                      op.sdk
+                                                                                                                          .classIdx,
+                                                                                                                      op.sdk
+                                                                                                                          .methodIdx,
+                                                                                                                      p);
+                                                                                                        std::string pt =
+                                                                                                            op.sdk.isCFunc
+                                                                                                                ? panel->getCFuncParamRawType(
+                                                                                                                      op.sdk
+                                                                                                                          .methodIdx,
+                                                                                                                      p)
+                                                                                                                : panel->getParamRawType(
+                                                                                                                      op.sdk
+                                                                                                                          .classIdx,
+                                                                                                                      op.sdk
+                                                                                                                          .methodIdx,
+                                                                                                                      p);
+                                                                                                        if (pn.empty())
+                                                                                                                pn =
+                                                                                                                    "arg" +
+                                                                                                                    std::
+                                                                                                                        to_string(
+                                                                                                                            p);
+                                                                                                        const CStructDecl *sd =
+                                                                                                            panel->getParamStructDecl(
+                                                                                                                op.sdk.isCFunc,
+                                                                                                                op.sdk.classIdx,
+                                                                                                                op.sdk
+                                                                                                                    .methodIdx,
+                                                                                                                p);
+                                                                                                        if (sd &&
+                                                                                                            onAddLocalStructVar_) {
+                                                                                                                onAddLocalStructVar_(
+                                                                                                                    pn,
+                                                                                                                    structDeclToFields(
+                                                                                                                        *sd),
+                                                                                                                    sd->totalSize);
+                                                                                                        } else {
+                                                                                                                DataType dt =
+                                                                                                                    ptrTypeFromRaw(
+                                                                                                                        pt);
+                                                                                                                size_t sz =
+                                                                                                                    Parser::
+                                                                                                                        typeBytes(
+                                                                                                                            dt);
+                                                                                                                if (sz == 0)
+                                                                                                                        sz = 4;
+                                                                                                                onAddLocalVar_(
+                                                                                                                    pn, dt, sz);
+                                                                                                        }
+                                                                                                        if (op.sdk.args[p]
+                                                                                                                .empty()) {
+                                                                                                                op.sdk.args[p] =
+                                                                                                                    "&" + pn;
+                                                                                                                isModified_ =
+                                                                                                                    true;
+                                                                                                        }
+                                                                                                }
+                                                                                        }
+                                                                                        if (ImGui::IsItemHovered())
+                                                                                                ImGui::SetTooltip(
+                                                                                                    "%s",
+                                                                                                    tr("Create pointer params "
+                                                                                                       "as LOCAL variables in "
+                                                                                                       "Variable Manager",
+                                                                                                       "将指针参数新建为变量管"
+                                                                                                       "理器中的LOCAL变量，并自"
+                                                                                                       "动填入参数"));
+                                                                                        ImGui::Unindent(16.0f);
+                                                                                }
+                                                                        }
+                                                                }
+                                                                ImGui::TreePop();
                                                         }
                                                 }
-                                                ImGui::SameLine();
-                                                if (ui::Button(tr("Del", "删"), ui::BtnStyle::Danger))
-                                                        toDelete = i;
-                                        } else {
-                                                // SDK call op — header + (when expanded) argument editor.
-                                                auto panel = findSdkPanel(op.sdk.panelWinId);
-                                                bool open  = ImGui::TreeNodeEx(
-                                                    "##sdkop", ImGuiTreeNodeFlags_DefaultOpen, "[SDK] %s", op.sdk.label.c_str());
-                                                ImGui::SameLine();
-                                                if (ui::Button(tr("Del", "删"), ui::BtnStyle::Danger))
-                                                        toDelete = i;
-                                                if (open) {
-                                                        if (panel)
-                                                                drawSdkStepDetail(op.sdk, panel);
-                                                        else
-                                                                ImGui::TextDisabled(
-                                                                    tr("SDK panel (id=%d) closed.", "SDK 窗口 (id=%d) 已关闭。"),
-                                                                    op.sdk.panelWinId);
-                                                        ImGui::TreePop();
-                                                }
+                                                ImGui::PopID();
                                         }
-                                        ImGui::Separator();
-                                        ImGui::PopID();
-                                }
-                                if (step.ops.empty())
-                                        ImGui::TextDisabled(
-                                            "%s",
-                                            tr("Drag variables or SDK functions here.", "把变量或 SDK 函数拖到这里。"));
-                                if (toDelete >= 0) {
-                                        step.ops.erase(step.ops.begin() + toDelete);
-                                        isModified_ = true;
+
+                                        if (step.ops.empty()) {
+                                                ImGui::TableNextRow();
+                                                ImGui::TableSetColumnIndex(1);
+                                                ImGui::TextDisabled(
+                                                    "%s",
+                                                    tr("Drag variables or SDK functions here.", "把变量或 SDK 函数拖到这里。"));
+                                        }
+
+                                        if (toDelete >= 0) {
+                                                step.ops.erase(step.ops.begin() + toDelete);
+                                                isModified_ = true;
+                                        }
+
+                                        ImGui::EndTable();
                                 }
                         }
                         ImGui::EndChild();
@@ -1032,12 +1844,6 @@ SequenceEditor::draw()
                 ImGui::End();
                 return;
         }
-        // Window-level drop target — catches drops anywhere on the window background.
-        if (ImGui::BeginDragDropTarget()) {
-                if (const ImGuiPayload *dp = ImGui::AcceptDragDropPayload("SDK_CALL"))
-                        acceptSdkPayload(dp->Data, -1);
-                ImGui::EndDragDropTarget();
-        }
 
         bool running = seqRunning_.load();
 
@@ -1067,12 +1873,22 @@ SequenceEditor::draw()
                                                 seqExecSteps(steps_, ctx);
                                         } catch (const std::exception &ex) {
                                                 LOG_E("[SeqEditor] exception: %s", ex.what());
+                                                SeqLogEntry le;
+                                                le.tsMs  = nowStampMs();
+                                                le.desc  = "EXCEPTION";
+                                                le.value = ex.what();
+                                                le.ok    = false;
                                                 std::lock_guard<std::mutex> lk(seqMtx_);
-                                                seqLog_.push_back(std::string("EXCEPTION: ") + ex.what());
+                                                seqLog_.push_back(std::move(le));
                                         } catch (...) {
                                                 LOG_E("[SeqEditor] unknown exception");
+                                                SeqLogEntry le;
+                                                le.tsMs  = nowStampMs();
+                                                le.desc  = "EXCEPTION";
+                                                le.value = "unknown";
+                                                le.ok    = false;
                                                 std::lock_guard<std::mutex> lk(seqMtx_);
-                                                seqLog_.push_back("EXCEPTION: unknown");
+                                                seqLog_.push_back(std::move(le));
                                         }
                                         LOG_I("[SeqEditor] thread finished");
                                         seqRunning_.store(false);
@@ -1185,63 +2001,121 @@ SequenceEditor::draw()
         ImGui::Separator();
 
         // ── Split view ────────────────────────────────────────────────────────
+        // BeginTable's outer_size.y only clips rendering; inner BeginChild(0,0)
+        // windows still fill remaining *window* space and won't respond to the
+        // table height.  Wrap in BeginChild instead — it enforces explicit height.
         static ImGuiTableFlags splitFlags = ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV;
-        if (!ImGui::BeginTable("SplitView", 2, splitFlags)) {
-                ImGui::End();
-                return;
-        }
-        ImGui::TableSetupColumn("Left", ImGuiTableColumnFlags_WidthFixed, 220.0f);
-        ImGui::TableSetupColumn("Right", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableNextRow();
+        const float            logReserve = 6.0f + 20.0f + seqLogHeight_; // splitter + label row + log
+        const float            topH       = std::max(80.0f, ImGui::GetContentRegionAvail().y - logReserve);
+        if (ImGui::BeginChild("SeqTopPane", ImVec2(0, topH), false, ImGuiWindowFlags_NoScrollbar)) {
+                if (ImGui::BeginTable("SplitView", 2, splitFlags)) {
+                        ImGui::TableSetupColumn("Left", ImGuiTableColumnFlags_WidthFixed, 220.0f);
+                        ImGui::TableSetupColumn("Right", ImGuiTableColumnFlags_WidthStretch);
+                        ImGui::TableNextRow();
 
-        // ── Left: Step list ───────────────────────────────────────────────────
-        ImGui::TableSetColumnIndex(0);
-        if (ImGui::BeginChild("StepsList", ImVec2(0, 0), true)) {
-                drawStepList();
-        }
-        ImGui::EndChild();
+                        // ── Left: Step list ───────────────────────────────────────────────
+                        ImGui::TableSetColumnIndex(0);
+                        if (ImGui::BeginChild("StepsList", ImVec2(0, 0), true)) {
+                                drawStepList();
+                        }
+                        ImGui::EndChild();
 
-        // Also accept drops on the entire left-column area → selected step's body.
-        if (!running && selectedStep_ >= 0 && selectedStep_ < (int)steps_.size() && ImGui::BeginDragDropTarget()) {
-                SequenceStep &st  = steps_[selectedStep_];
-                bool          mod = false;
-                if (st.kind == SeqStepKind::Action)
-                        mod = acceptOpDrops([&](SeqOp op) { st.ops.push_back(std::move(op)); });
-                else if (st.kind == SeqStepKind::If || st.kind == SeqStepKind::While || st.kind == SeqStepKind::For)
-                        mod = acceptOpDrops([&](SeqOp op) { appendOpToBody(st.body, std::move(op)); });
-                if (mod)
-                        isModified_ = true;
-                ImGui::EndDragDropTarget();
-        }
+                        // Also accept variable drops on the entire left-column area (no SDK).
+                        if (!running && selectedStep_ >= 0 && selectedStep_ < (int)steps_.size() &&
+                            ImGui::BeginDragDropTarget()) {
+                                SequenceStep &st  = steps_[selectedStep_];
+                                bool          mod = false;
+                                if (st.kind == SeqStepKind::Action)
+                                        mod = acceptOpDrops([&](SeqOp op) { st.ops.push_back(std::move(op)); }, true);
+                                else if (st.kind == SeqStepKind::If || st.kind == SeqStepKind::While ||
+                                         st.kind == SeqStepKind::For)
+                                        mod = acceptOpDrops([&](SeqOp op) { appendOpToBody(st.body, std::move(op)); }, true);
+                                if (mod)
+                                        isModified_ = true;
+                                ImGui::EndDragDropTarget();
+                        }
 
-        // ── Right: Step detail ────────────────────────────────────────────────
-        ImGui::TableSetColumnIndex(1);
-        if (ImGui::BeginChild("StepDetails", ImVec2(0, 0), true)) {
-                SequenceStep *step = selectedStepPtr();
-                if (step && !running) {
-                        drawStepDetail(*step);
-                } else if (step && running) {
-                        ImGui::Text(tr("Step %d running…", "步骤 %d 执行中…"), selectedStep_ + 1);
-                } else {
-                        ImGui::TextDisabled("%s", tr("Select a step to edit.", "选择一个步骤以编辑。"));
+                        // ── Right: Step detail ────────────────────────────────────────────
+                        ImGui::TableSetColumnIndex(1);
+                        if (ImGui::BeginChild("StepDetails", ImVec2(0, 0), true)) {
+                                SequenceStep *step = selectedStepPtr();
+                                if (step) {
+                                        if (running)
+                                                ImGui::BeginDisabled();
+                                        drawStepDetail(*step);
+                                        if (running)
+                                                ImGui::EndDisabled();
+                                } else {
+                                        ImGui::TextDisabled("%s", tr("Select a step to edit.", "选择一个步骤以编辑。"));
+                                }
+                        }
+                        ImGui::EndChild();
+
+                        ImGui::EndTable();
                 }
         }
         ImGui::EndChild();
 
-        ImGui::EndTable();
+        // ── Log splitter handle ────────────────────────────────────────────────
+        {
+                ImVec2 splitterPos = ImGui::GetCursorScreenPos();
+                float  w           = ImGui::GetContentRegionAvail().x;
+                ImGui::InvisibleButton("##logSplit", ImVec2(w, 6.0f));
+                if (ImGui::IsItemActive())
+                        seqLogHeight_ = std::max(40.0f, seqLogHeight_ - ImGui::GetIO().MouseDelta.y);
+                ImU32 col = ImGui::IsItemHovered() || ImGui::IsItemActive() ? ImGui::GetColorU32(ImGuiCol_SeparatorActive)
+                                                                            : ImGui::GetColorU32(ImGuiCol_Separator);
+                ImGui::GetWindowDrawList()->AddLine(
+                    ImVec2(splitterPos.x, splitterPos.y + 3.0f), ImVec2(splitterPos.x + w, splitterPos.y + 3.0f), col, 2.0f);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
 
         // ── Log ───────────────────────────────────────────────────────────────
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(tr("Log", "日志"));
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr("Clear##logclear", "清空##logclear"))) {
+                std::lock_guard<std::mutex> lk(seqMtx_);
+                seqLog_.clear();
+        }
+
+        std::vector<SeqLogEntry> logSnapshot;
         {
                 std::lock_guard<std::mutex> lk(seqMtx_);
-                if (!seqLog_.empty()) {
-                        ImGui::Separator();
-                        if (ImGui::TreeNode(tr("Log##seqlog", "日志##seqlog"))) {
-                                for (int i = (int)seqLog_.size() - 1; i >= 0; --i)
-                                        ImGui::TextUnformatted(seqLog_[i].c_str());
-                                ImGui::TreePop();
+                logSnapshot = seqLog_;
+        }
+
+        if (ImGui::BeginChild("SeqLog", ImVec2(0, seqLogHeight_), true, ImGuiWindowFlags_HorizontalScrollbar)) {
+                for (int i = (int)logSnapshot.size() - 1; i >= 0; --i) {
+                        const SeqLogEntry &e  = logSnapshot[i];
+                        uint64_t           ms = e.tsMs;
+                        char               ts[24];
+                        snprintf(ts,
+                                 sizeof(ts),
+                                 "[%02d:%02d:%02d.%03d] ",
+                                 (int)(ms / 3600000),
+                                 (int)((ms % 3600000) / 60000),
+                                 (int)((ms % 60000) / 1000),
+                                 (int)(ms % 1000));
+                        ImGui::TextDisabled("%s", ts);
+                        ImGui::SameLine(0, 0);
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                              e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f));
+                        ImGui::TextUnformatted(e.desc.c_str());
+                        ImGui::PopStyleColor();
+                        if (!e.value.empty()) {
+                                ImGui::SameLine();
+                                ImGui::TextDisabled(" \xe2\x86\x92 ");
+                                ImGui::SameLine();
+                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                                      e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
+                                ImGui::TextUnformatted(e.value.c_str());
+                                ImGui::PopStyleColor();
                         }
                 }
         }
+        ImGui::EndChild();
 
         ImGui::End();
 }
@@ -1293,10 +2167,12 @@ saveOp(const SeqOp &op)
         } else {
                 cJSON_AddNumberToObject(obj, "sdkWinId", op.sdk.panelWinId);
                 cJSON_AddBoolToObject(obj, "sdkIsCFunc", op.sdk.isCFunc);
+                cJSON_AddBoolToObject(obj, "sdkIsPython", op.sdk.isPython);
                 cJSON_AddNumberToObject(obj, "sdkClassIdx", op.sdk.classIdx);
                 cJSON_AddNumberToObject(obj, "sdkMethIdx", op.sdk.methodIdx);
                 cJSON_AddNumberToObject(obj, "sdkObjIdx", op.sdk.objIdx);
                 cJSON_AddStringToObject(obj, "sdkLabel", op.sdk.label.c_str());
+                cJSON_AddStringToObject(obj, "sdkPyFuncName", op.sdk.pyFuncName.c_str());
                 cJSON *argsArr = cJSON_CreateArray();
                 for (const auto &a : op.sdk.args)
                         cJSON_AddItemToArray(argsArr, cJSON_CreateString(a.c_str()));
@@ -1427,6 +2303,10 @@ loadStep(const cJSON *obj)
                         sdk.panelWinId = w->valueint;
                 if (const cJSON *cf = cJSON_GetObjectItem(o, "sdkIsCFunc"); cJSON_IsBool(cf))
                         sdk.isCFunc = cJSON_IsTrue(cf);
+                if (const cJSON *py = cJSON_GetObjectItem(o, "sdkIsPython"); cJSON_IsBool(py))
+                        sdk.isPython = cJSON_IsTrue(py);
+                if (const cJSON *pn = cJSON_GetObjectItem(o, "sdkPyFuncName"); cJSON_IsString(pn))
+                        sdk.pyFuncName = pn->valuestring;
                 if (const cJSON *ci = cJSON_GetObjectItem(o, "sdkClassIdx"); cJSON_IsNumber(ci))
                         sdk.classIdx = ci->valueint;
                 if (const cJSON *mi = cJSON_GetObjectItem(o, "sdkMethIdx"); cJSON_IsNumber(mi))
@@ -1558,6 +2438,32 @@ SequenceEditor::drawSdkStepDetail(SdkStepInfo &sdk, std::shared_ptr<SdkPanel> pa
 {
         ImGui::Text(tr("SDK Call: %s", "SDK 调用：%s"), sdk.label.c_str());
         ImGui::Separator();
+
+        // ── Python function ───────────────────────────────────────────────────
+        if (sdk.isPython) {
+                int nPy = panel->getPyFuncParamCount(sdk.pyFuncName);
+                sdk.args.resize(nPy);
+                for (int i = 0; i < nPy; ++i) {
+                        ImGui::PushID(i);
+                        std::string pname = panel->getPyFuncParamName(sdk.pyFuncName, i);
+                        char        argBuf[512]{};
+                        strncpy(argBuf, sdk.args[i].c_str(), sizeof(argBuf) - 1);
+                        char lbl[80];
+                        snprintf(lbl, sizeof(lbl), "%s##p%d", pname.empty() ? "arg" : pname.c_str(), i);
+                        float w = ImGui::GetContentRegionAvail().x - 8.0f;
+                        if (w > 200.0f)
+                                w = 200.0f;
+                        if (w < 80.0f)
+                                w = 80.0f;
+                        ImGui::SetNextItemWidth(w);
+                        if (ImGui::InputText(lbl, argBuf, sizeof(argBuf))) {
+                                sdk.args[i] = argBuf;
+                                isModified_ = true;
+                        }
+                        ImGui::PopID();
+                }
+                return;
+        }
 
         // ── Object selector for C++ methods ──────────────────────────────────
         if (!sdk.isCFunc) {

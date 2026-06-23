@@ -21,15 +21,18 @@ void threadFunc(Gui *gui);
 // g_appRunning is set to false.
 void fftThreadFunc(Gui *gui);
 
-// CPU core the sampler thread should bind to. -1 = auto (highest available).
-// Written by GUI, read by sampler thread on the next iteration after
-// g_samplerCpuRebind is set.
-extern std::atomic<int>  g_samplerCpuCore;
-extern std::atomic<bool> g_samplerCpuRebind;
+// Sampler run mode.  Written by GUI; sampler thread re-applies on next
+// iteration after g_samplerRebind is set.
+//   0 = Low      : normal priority, no affinity, always Sleep(1ms)
+//   1 = Normal   : slightly elevated priority, no affinity, adaptive sleep
+//   2 = CPUBound : realtime priority + core pinning + spin-loop
+extern std::atomic<int>  g_samplerRunMode;   // default 1
+extern std::atomic<bool> g_samplerRebind;
 
-// After setupRealtimeThread() runs, this holds the actual core the sampler
-// bound to.  main.cpp reads it to exclude that core from all other threads.
-// -1 means not yet bound.
+// After setupThread() runs:
+//   >= 0 : sampler is pinned to this core (CPUBound mode)
+//   -2   : running in Low/Normal mode (no core pinning)
+//   -1   : not yet initialised (initial value — main.cpp waits on this)
 extern std::atomic<int> g_samplerBoundCore;
 
 #endif // !SAMPLER_HPP

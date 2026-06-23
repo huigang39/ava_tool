@@ -1297,9 +1297,11 @@ Variable::drawVariableList()
                                                  sizeof(editPropBuf_.addrBuf),
                                                  "%llX",
                                                  (unsigned long long)v.addr);
-                                        editPropBuf_.type     = v.type;
-                                        editPropBuf_.port     = v.port;
-                                        editPropBuf_.writable = v.writable;
+                                        editPropBuf_.type         = v.type;
+                                        editPropBuf_.port         = v.port;
+                                        editPropBuf_.writable     = v.writable;
+                                        editPropBuf_.structMode   = !v.structFields.empty();
+                                        editPropBuf_.structFields = v.structFields;
                                         if (v.port == PortType::SHM) {
                                                 snprintf(editPropBuf_.shmName, sizeof(editPropBuf_.shmName), "%s", v.shm.name);
                                         }
@@ -1572,19 +1574,59 @@ Variable::drawAddVariableDialog()
                 ImGui::InputText("##newVarName", newVar_.name, sizeof(newVar_.name));
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("Name", "名称"));
-                static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
-                static int         typeIdx = 2;
-                if (ImGui::Combo("##newVarType", &typeIdx, types, IM_ARRAYSIZE(types)))
-                        newVar_.type = Parser::strToDataType(types[typeIdx]);
-                if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("%s", tr("Type", "类型"));
                 static const char    *ports[]   = {"JLINK", "SHM", "LOCAL"};
                 static const PortType portMap[] = {PortType::JLINK, PortType::SHM, PortType::LOCAL};
                 static int            portIdx   = 0;
-                if (ImGui::Combo("##newVarPort", &portIdx, ports, IM_ARRAYSIZE(ports)))
+                if (ImGui::Combo("##newVarPort", &portIdx, ports, IM_ARRAYSIZE(ports))) {
                         newVar_.port = portMap[portIdx];
+                        if (newVar_.port != PortType::LOCAL)
+                                newVar_.structMode = false;
+                }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("Port", "端口"));
+
+                if (newVar_.port == PortType::LOCAL) {
+                        // LOCAL port: type dropdown includes "Struct" option
+                        static const char *localTypes[] = {
+                            "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64", "Struct"};
+                        static const DataType localTypeVals[] = {DataType::U8,
+                                                                 DataType::U16,
+                                                                 DataType::U32,
+                                                                 DataType::U64,
+                                                                 DataType::I8,
+                                                                 DataType::I16,
+                                                                 DataType::I32,
+                                                                 DataType::I64,
+                                                                 DataType::F32,
+                                                                 DataType::F64};
+                        static int            localTypeIdx    = 2;
+                        // Keep visual selection consistent with structMode
+                        if (newVar_.structMode && localTypeIdx < 10)
+                                localTypeIdx = 10;
+                        else if (!newVar_.structMode && localTypeIdx == 10)
+                                localTypeIdx = 2;
+                        if (ImGui::Combo("##newVarType", &localTypeIdx, localTypes, IM_ARRAYSIZE(localTypes))) {
+                                if (localTypeIdx < 10) {
+                                        newVar_.type       = localTypeVals[localTypeIdx];
+                                        newVar_.structMode = false;
+                                        // Auto-size buffer to match type
+                                        size_t tsz = Parser::typeBytes(newVar_.type);
+                                        if (tsz > 0)
+                                                newVar_.addr = (u64)tsz;
+                                } else {
+                                        newVar_.structMode = true;
+                                }
+                        }
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", tr("Type", "类型"));
+                } else {
+                        static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
+                        static int         typeIdx = 2;
+                        if (ImGui::Combo("##newVarType", &typeIdx, types, IM_ARRAYSIZE(types)))
+                                newVar_.type = Parser::strToDataType(types[typeIdx]);
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", tr("Type", "类型"));
+                }
 
                 if (newVar_.port == PortType::JLINK) {
                         ImGui::InputText("##newVarAddress", newVar_.addrBuf, sizeof(newVar_.addrBuf));
@@ -1608,8 +1650,6 @@ Variable::drawAddVariableDialog()
                                 newVar_.addr = 0;
                         }
                 } else if (newVar_.port == PortType::LOCAL) {
-                        ImGui::Checkbox(tr("Define as struct##sf", "定义为结构体##sf"), &newVar_.structMode);
-
                         if (!newVar_.structMode) {
                                 int localSz = (newVar_.addr > 0) ? (int)newVar_.addr : 8;
                                 ImGui::SetNextItemWidth(120.0f);
@@ -1923,12 +1963,49 @@ Variable::drawEditPropertiesPopup()
                 ImGui::Text("%s", tr("Type", "类型"));
                 ImGui::SameLine(100);
                 ImGui::SetNextItemWidth(260);
-                static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
-                int                typeIdx = (int)editPropBuf_.type;
-                if (typeIdx < 0 || typeIdx >= IM_ARRAYSIZE(types))
-                        typeIdx = 2;
-                if (ImGui::Combo("##editPropType", &typeIdx, types, IM_ARRAYSIZE(types)))
-                        editPropBuf_.type = Parser::strToDataType(types[typeIdx]);
+                if (editPropBuf_.port == PortType::LOCAL) {
+                        static const char *typesLocal[] = {
+                            "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64", "STRUCT"};
+                        static const DataType typeValsLocal[] = {DataType::U8,
+                                                                 DataType::U16,
+                                                                 DataType::U32,
+                                                                 DataType::U64,
+                                                                 DataType::I8,
+                                                                 DataType::I16,
+                                                                 DataType::I32,
+                                                                 DataType::I64,
+                                                                 DataType::F32,
+                                                                 DataType::F64,
+                                                                 DataType::UNKNOWN};
+                        int                   localTypeIdx    = editPropBuf_.structMode ? 10 : 2;
+                        if (!editPropBuf_.structMode) {
+                                const char *curName = Parser::dataTypeToStr(editPropBuf_.type);
+                                for (int k = 0; k < 10; ++k)
+                                        if (strcmp(typesLocal[k], curName) == 0) {
+                                                localTypeIdx = k;
+                                                break;
+                                        }
+                        }
+                        if (ImGui::Combo("##editPropType", &localTypeIdx, typesLocal, IM_ARRAYSIZE(typesLocal))) {
+                                if (localTypeIdx == 10) {
+                                        editPropBuf_.structMode = true;
+                                } else {
+                                        editPropBuf_.structMode = false;
+                                        editPropBuf_.type       = typeValsLocal[localTypeIdx];
+                                }
+                        }
+                } else {
+                        static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
+                        const char        *curName = Parser::dataTypeToStr(editPropBuf_.type);
+                        int                typeIdx = 2;
+                        for (int k = 0; k < IM_ARRAYSIZE(types); ++k)
+                                if (strcmp(types[k], curName) == 0) {
+                                        typeIdx = k;
+                                        break;
+                                }
+                        if (ImGui::Combo("##editPropType", &typeIdx, types, IM_ARRAYSIZE(types)))
+                                editPropBuf_.type = Parser::strToDataType(types[typeIdx]);
+                }
 
                 ImGui::Text("%s", tr("Address", "地址"));
                 ImGui::SameLine(100);
@@ -1953,6 +2030,73 @@ Variable::drawEditPropertiesPopup()
                         ImGui::TextDisabled("%s",
                                             tr("In-process buffer — use &varname in SDK sequence.",
                                                "进程内缓冲区，在 SDK 序列参数中用 &varname 引用。"));
+                        if (editPropBuf_.structMode) {
+                                static const char *sfTypes[] = {
+                                    "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
+                                static const DataType     sfTypeVals[] = {DataType::U8,
+                                                                          DataType::U16,
+                                                                          DataType::U32,
+                                                                          DataType::U64,
+                                                                          DataType::I8,
+                                                                          DataType::I16,
+                                                                          DataType::I32,
+                                                                          DataType::I64,
+                                                                          DataType::F32,
+                                                                          DataType::F64};
+                                constexpr int             kSfTypeCount = 10;
+                                constexpr ImGuiTableFlags tfl =
+                                    ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY;
+                                if (ImGui::BeginTable("##epSfTbl", 4, tfl, ImVec2(0, 120))) {
+                                        ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch);
+                                        ImGui::TableSetupColumn(tr("Type", "类型"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                                        ImGui::TableSetupColumn(tr("Offset", "偏移"), ImGuiTableColumnFlags_WidthFixed, 48.0f);
+                                        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 22.0f);
+                                        ImGui::TableHeadersRow();
+                                        int toDelete = -1;
+                                        for (int fi = 0; fi < (int)editPropBuf_.structFields.size(); ++fi) {
+                                                auto &sf = editPropBuf_.structFields[fi];
+                                                ImGui::PushID(fi);
+                                                ImGui::TableNextRow();
+                                                ImGui::TableSetColumnIndex(0);
+                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                ImGui::InputText("##fn", sf.name, sizeof(sf.name));
+                                                ImGui::TableSetColumnIndex(1);
+                                                int sfIdx = 2;
+                                                for (int k = 0; k < kSfTypeCount; ++k)
+                                                        if (sfTypeVals[k] == sf.type) {
+                                                                sfIdx = k;
+                                                                break;
+                                                        }
+                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                if (ImGui::Combo("##ft", &sfIdx, sfTypes, kSfTypeCount))
+                                                        sf.type = sfTypeVals[sfIdx];
+                                                ImGui::TableSetColumnIndex(2);
+                                                int off = (int)sf.byteOffset;
+                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                if (ImGui::InputInt("##fo", &off, 0, 0)) {
+                                                        if (off < 0)
+                                                                off = 0;
+                                                        sf.byteOffset = (u32)off;
+                                                }
+                                                ImGui::TableSetColumnIndex(3);
+                                                if (ImGui::SmallButton("X"))
+                                                        toDelete = fi;
+                                                ImGui::PopID();
+                                        }
+                                        if (toDelete >= 0)
+                                                editPropBuf_.structFields.erase(editPropBuf_.structFields.begin() + toDelete);
+                                        ImGui::EndTable();
+                                }
+                                if (ImGui::Button(tr("+ Field", "+ 添加字段"))) {
+                                        VarEntry::StructField sf{};
+                                        if (!editPropBuf_.structFields.empty()) {
+                                                const auto &last = editPropBuf_.structFields.back();
+                                                sf.byteOffset    = last.byteOffset + Parser::typeBytes(last.type);
+                                        }
+                                        snprintf(sf.name, sizeof(sf.name), "field%d", (int)editPropBuf_.structFields.size());
+                                        editPropBuf_.structFields.push_back(sf);
+                                }
+                        }
                 }
                 if (editPropBuf_.port == PortType::SHM) {
                         ImGui::Text("%s", tr("SHM Name", "SHM 名称"));
@@ -1977,6 +2121,24 @@ Variable::drawEditPropertiesPopup()
                         }
                         if (v.port == PortType::SHM) {
                                 snprintf(v.shm.name, sizeof(v.shm.name), "%s", editPropBuf_.shmName);
+                        }
+                        if (v.port == PortType::LOCAL && editPropBuf_.structMode) {
+                                v.isStruct     = true;
+                                v.structFields = editPropBuf_.structFields;
+                                size_t totalSz = 0;
+                                for (const auto &sf : v.structFields)
+                                        totalSz = std::max<size_t>(totalSz, sf.byteOffset + Parser::typeBytes(sf.type));
+                                if (totalSz == 0)
+                                        totalSz = 8;
+                                std::lock_guard lk(mtxLocal_);
+                                localBufs_[v.name].assign(totalSz, 0);
+                        } else if (v.port == PortType::LOCAL && !editPropBuf_.structMode) {
+                                v.isStruct = false;
+                                v.structFields.clear();
+                                std::lock_guard lk(mtxLocal_);
+                                auto            it = localBufs_.find(v.name);
+                                if (it != localBufs_.end())
+                                        it->second.assign(Parser::typeBytes(v.type), 0);
                         }
                         isModified_        = true;
                         propertiesChanged_ = true;
@@ -3136,6 +3298,56 @@ void
 Variable::notifyLocalWrite(const std::string & /*name*/)
 {
         // updateVariables() reads localBufs_ on every tick automatically.
+}
+
+void
+Variable::addLocalVar(const std::string &name, DataType type, size_t bufSize)
+{
+        if (watchHasName(name))
+                return;
+        VarEntry v;
+        v.name     = name;
+        v.type     = type;
+        v.port     = PortType::LOCAL;
+        v.addr     = 0;
+        v.writable = true;
+        {
+                std::lock_guard<std::mutex> lk(mtxLocal_);
+                localBufs_.emplace(name, std::vector<uint8_t>(bufSize > 0 ? bufSize : 8, 0));
+        }
+        vars_.push_back(v);
+        isModified_        = true;
+        propertiesChanged_ = true;
+}
+
+void
+Variable::addLocalStructVar(const std::string &name, const std::vector<VarEntry::StructField> &fields, size_t totalSize)
+{
+        if (watchHasName(name))
+                return;
+        // Compute buffer size from fields if totalSize was not supplied.
+        size_t bsz = totalSize;
+        if (bsz == 0) {
+                for (const auto &sf : fields)
+                        bsz = std::max(bsz, (size_t)(sf.byteOffset + Parser::typeBytes(sf.type)));
+        }
+        if (bsz == 0)
+                bsz = 8;
+
+        VarEntry v;
+        v.name         = name;
+        v.type         = DataType::U8; // per-byte access; display driven by structFields
+        v.port         = PortType::LOCAL;
+        v.addr         = 0;
+        v.writable     = true;
+        v.structFields = fields;
+        {
+                std::lock_guard<std::mutex> lk(mtxLocal_);
+                localBufs_.emplace(name, std::vector<uint8_t>(bsz, 0));
+        }
+        vars_.push_back(v);
+        isModified_        = true;
+        propertiesChanged_ = true;
 }
 
 std::vector<Variable::PopupMember>

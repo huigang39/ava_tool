@@ -174,7 +174,7 @@ Gui::~Gui()
                 glfwHideWindow(window_);
         }
 
-        if (isModified_ || ImGui::GetIO().WantSaveIniSettings) {
+        if (!skipAutoSave_ && (isModified_ || ImGui::GetIO().WantSaveIniSettings)) {
                 saveSession();
         }
 
@@ -514,6 +514,23 @@ Gui::saveSession(const std::string &path)
         cJSON_AddNumberToObject(root, "currentMotorProfile", currentMotorProfile_);
         cJSON_AddStringToObject(root, "imguiLayout", ImGui::SaveIniSettingsToMemory());
         seqEditor_.saveSession(root);
+
+        // Tool page visibility
+        cJSON_AddBoolToObject(root, "showBode", bode_.show_);
+        cJSON_AddBoolToObject(root, "showAudioFft", audioFft_.show_);
+        cJSON_AddBoolToObject(root, "showAsmViewer", asmViewer_.show_);
+        cJSON_AddBoolToObject(root, "showSeqEditor", seqEditor_.isOpen());
+
+        // SDK panels
+        const std::string sdkBaseDir = std::filesystem::path(targetPath).parent_path().string();
+        cJSON_AddNumberToObject(root, "nextSdkWinId", nextSdkWinId_);
+        cJSON *sdkArr = cJSON_CreateArray();
+        for (const auto &sp : sdkPanels_) {
+                cJSON *spObj = cJSON_CreateObject();
+                sp->save(spObj, sdkBaseDir);
+                cJSON_AddItemToArray(sdkArr, spObj);
+        }
+        cJSON_AddItemToObject(root, "sdkPanels", sdkArr);
 
         u64                   pStart = get_mono_ts_ms();
         char                 *out    = cJSON_Print(root); // formatted/pretty-printed for human readability
@@ -897,6 +914,29 @@ Gui::loadSession(const std::string &path)
 
         seqEditor_.loadSession(root);
 
+        // Tool page visibility
+        if (const cJSON *v = cJSON_GetObjectItem(root, "showBode"); cJSON_IsBool(v))
+                bode_.show_ = cJSON_IsTrue(v);
+        if (const cJSON *v = cJSON_GetObjectItem(root, "showAudioFft"); cJSON_IsBool(v))
+                audioFft_.show_ = cJSON_IsTrue(v);
+        if (const cJSON *v = cJSON_GetObjectItem(root, "showAsmViewer"); cJSON_IsBool(v))
+                asmViewer_.show_ = cJSON_IsTrue(v);
+        if (const cJSON *v = cJSON_GetObjectItem(root, "showSeqEditor"); cJSON_IsBool(v))
+                seqEditor_.setOpen(cJSON_IsTrue(v));
+
+        // SDK panels
+        sdkPanels_.clear();
+        const std::string sdkBaseDir = std::filesystem::path(targetPath).parent_path().string();
+        if (const cJSON *sdkArr = cJSON_GetObjectItem(root, "sdkPanels"); cJSON_IsArray(sdkArr)) {
+                for (const cJSON *spObj = sdkArr->child; spObj; spObj = spObj->next) {
+                        newSdkPanel();
+                        sdkPanels_.back()->load(spObj, sdkBaseDir);
+                }
+        }
+        // nextSdkWinId_ must be > any restored winId so new panels don't collide.
+        if (const cJSON *n = cJSON_GetObjectItem(root, "nextSdkWinId"); cJSON_IsNumber(n))
+                nextSdkWinId_ = std::max(nextSdkWinId_, n->valueint);
+
         for (auto &pair : monitors_)
                 pair.second->clearModified();
 
@@ -1000,6 +1040,7 @@ Gui::drawBar()
                 if (toolsMenuOpen) {
                         ImGui::MenuItem(tr("Joint Calculator", "电机参数计算器"), nullptr, &showCalculator_);
                         ImGui::MenuItem(tr("Bode Plot", "伯德图"), nullptr, &bode_.show_);
+                        ImGui::MenuItem(tr("Audio FFT", "音频FFT"), nullptr, &audioFft_.show_);
                         ImGui::MenuItem(tr("Assembly Viewer", "汇编查看器"), nullptr, &asmViewer_.show_);
                         bool seqOpen = seqEditor_.isOpen();
                         if (ImGui::MenuItem(tr("Sequence Editor", "序列编辑器"), nullptr, &seqOpen)) {
@@ -1009,59 +1050,27 @@ Gui::drawBar()
                 }
 
                 if (ImGui::BeginMenu(tr("Settings", "设置"))) {
-                        if (ImGui::BeginMenu(tr("Sampler CPU Core", "采样器 CPU 核心"))) {
-#ifdef _WIN32
-                                // Show elevation status
-                                BOOL                     isAdmin    = FALSE;
-                                PSID                     adminGroup = NULL;
-                                SID_IDENTIFIER_AUTHORITY ntAuth     = SECURITY_NT_AUTHORITY;
-                                if (AllocateAndInitializeSid(&ntAuth,
-                                                             2,
-                                                             SECURITY_BUILTIN_DOMAIN_RID,
-                                                             DOMAIN_ALIAS_RID_ADMINS,
-                                                             0,
-                                                             0,
-                                                             0,
-                                                             0,
-                                                             0,
-                                                             0,
-                                                             &adminGroup)) {
-                                        CheckTokenMembership(NULL, adminGroup, &isAdmin);
-                                        FreeSid(adminGroup);
-                                }
-                                if (!isAdmin) {
-                                        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.2f, 1.0f),
-                                                           "%s",
-                                                           tr("Not Admin (priority capped)", "非管理员（优先级受限）"));
-                                        ImGui::Separator();
-                                }
-#endif
-                                const int cur = g_samplerCpuCore.load();
-                                const int n   = static_cast<int>(std::thread::hardware_concurrency());
-
-                                auto applyCoreChange = [&](int newCore) {
-#ifdef _WIN32
-                                        if (!isAdmin) {
-                                                pendingElevationCore_ = newCore;
-                                                showElevationModal_   = true;
-                                                return;
-                                        }
-#endif
-                                        g_samplerCpuCore.store(newCore);
-                                        g_samplerCpuRebind.store(true);
+                        if (ImGui::BeginMenu(tr("Sampler Run Mode", "采样器运行模式"))) {
+                                const int cur       = g_samplerRunMode.load();
+                                auto      applyMode = [&](int m) {
+                                        g_samplerRunMode.store(m);
+                                        g_samplerRebind.store(true);
                                 };
-
-                                if (ImGui::MenuItem(tr("Auto (highest)", "自动（最高）"), nullptr, cur < 0)) {
-                                        applyCoreChange(-1);
-                                }
-                                ImGui::Separator();
-                                for (int i = 0; i < n; ++i) {
-                                        char label[32];
-                                        snprintf(label, sizeof(label), "Core %d", i);
-                                        if (ImGui::MenuItem(label, nullptr, cur == i)) {
-                                                applyCoreChange(i);
-                                        }
-                                }
+                                if (ImGui::MenuItem(tr("Low CPU Usage", "低占用模式"), nullptr, cur == 0))
+                                        applyMode(0);
+                                ImGui::TextDisabled("%s",
+                                                    tr("  Sleep 1ms per iter, normal priority",
+                                                       "  每次迭代睡眠 1ms，普通优先级"));
+                                if (ImGui::MenuItem(tr("Normal", "普通模式"), nullptr, cur == 1))
+                                        applyMode(1);
+                                ImGui::TextDisabled("%s",
+                                                    tr("  Adaptive sleep, slightly elevated priority",
+                                                       "  自适应睡眠，稍高优先级"));
+                                if (ImGui::MenuItem(tr("CPU-Bound (High Perf)", "CPU 绑定高占用模式"), nullptr, cur == 2))
+                                        applyMode(2);
+                                ImGui::TextDisabled("%s",
+                                                    tr("  Spin-loop, highest priority, core pinned",
+                                                       "  自旋循环，最高优先级，绑定 CPU 核心"));
                                 ImGui::EndMenu();
                         }
 
@@ -1359,6 +1368,7 @@ Gui::loop()
                 }
 
                 bode_.updateDisplay();
+                audioFft_.draw();
                 asmViewer_.draw(this);
                 seqEditor_.draw();
 
@@ -1399,55 +1409,6 @@ Gui::loop()
                         }
                 }
                 sDroppedFiles_.clear();
-#ifdef _WIN32
-                if (showElevationModal_) {
-                        ImGui::OpenPopup("###Elevate");
-                        if (ImGui::BeginPopupModal(tr("Elevate?###Elevate", "需要管理员权限？###Elevate"),
-                                                   NULL,
-                                                   ImGuiWindowFlags_AlwaysAutoResize)) {
-                                ImGui::Text("%s",
-                                            tr("Changing the sampler core requires administrator privileges.",
-                                               "更改采样器核心需要管理员权限。"));
-                                ImGui::Text("%s",
-                                            tr("The app will save the current session and relaunch elevated.",
-                                               "程序将保存当前会话并以管理员身份重启。"));
-                                ImGui::Separator();
-                                if (ui::Button(
-                                        tr("Relaunch as Admin", "以管理员身份重启"), ui::BtnStyle::Warning, ImVec2(160, 0))) {
-                                        const int newCore = pendingElevationCore_;
-                                        saveSession();
-                                        LOG_I("UAC elevation: relaunching as admin (core=%d)", newCore);
-
-                                        char exePath[MAX_PATH];
-                                        GetModuleFileNameA(NULL, exePath, MAX_PATH);
-
-                                        SHELLEXECUTEINFOA sei = {};
-                                        sei.cbSize            = sizeof(sei);
-                                        sei.lpVerb            = "runas";
-                                        sei.lpFile            = exePath;
-                                        sei.lpParameters      = currentSessionPath_.c_str();
-                                        sei.nShow             = SW_SHOWNORMAL;
-                                        sei.fMask             = SEE_MASK_NOASYNC;
-
-                                        if (ShellExecuteExA(&sei)) {
-                                                glfwSetWindowShouldClose(window_, GLFW_TRUE);
-                                                wantsToQuit_ = true;
-                                        } else {
-                                                LOG_W("UAC elevation cancelled or failed");
-                                        }
-                                        showElevationModal_ = false;
-                                        ImGui::CloseCurrentPopup();
-                                }
-                                ImGui::SetItemDefaultFocus();
-                                ImGui::SameLine();
-                                if (ImGui::Button(tr("Cancel", "取消"), ImVec2(120, 0))) {
-                                        showElevationModal_ = false;
-                                        ImGui::CloseCurrentPopup();
-                                }
-                                ImGui::EndPopup();
-                        }
-                }
-#endif
                 if (showQuitModal_) {
                         ImGui::OpenPopup("###Quit");
                         if (ImGui::BeginPopupModal(
@@ -1471,6 +1432,7 @@ Gui::loop()
                                 ImGui::SetItemDefaultFocus();
                                 ImGui::SameLine();
                                 if (ui::Button(tr("Don't Save", "不保存"), ui::BtnStyle::Danger, ImVec2(120, 0))) {
+                                        skipAutoSave_  = true;
                                         wantsToQuit_   = true;
                                         showQuitModal_ = false;
                                         ImGui::CloseCurrentPopup();
@@ -2755,6 +2717,33 @@ Gui::newSdkPanel()
                         }
                         return nullptr;
                 };
+        }
+        // Wire sequence editor LOCAL variable creation (for "→ Create output vars" button).
+        if (!seqEditor_.onAddLocalVar_) {
+                seqEditor_.onAddLocalVar_ = [this](const std::string &name, DataType type, size_t bufSize) {
+                        std::lock_guard<std::mutex> lk(mtxMonitors_);
+                        if (vars_.empty())
+                                return;
+                        vars_.begin()->second->addLocalVar(name, type, bufSize);
+                };
+        }
+        if (!seqEditor_.onAddLocalStructVar_) {
+                seqEditor_.onAddLocalStructVar_ =
+                    [this](const std::string &name, const std::vector<SeqStructField> &fields, size_t totalSize) {
+                            std::lock_guard<std::mutex> lk(mtxMonitors_);
+                            if (vars_.empty())
+                                    return;
+                            std::vector<VarEntry::StructField> vfs;
+                            vfs.reserve(fields.size());
+                            for (const auto &f : fields) {
+                                    VarEntry::StructField vf{};
+                                    strncpy(vf.name, f.name.c_str(), sizeof(vf.name) - 1);
+                                    vf.type       = f.type;
+                                    vf.byteOffset = f.byteOffset;
+                                    vfs.push_back(vf);
+                            }
+                            vars_.begin()->second->addLocalStructVar(name, vfs, totalSize);
+                    };
         }
         seqEditor_.registerSdkPanel(sp);
         sdkPanels_.push_back(std::move(sp));

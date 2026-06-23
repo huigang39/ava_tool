@@ -6,9 +6,16 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <string>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
+#include "cJSON.h"
 
 #include "core/export_enum.hpp"
 #include "core/session_time.hpp"
@@ -385,6 +392,671 @@ SdkPanel::findParamStruct(const CParam &p) const
         if (raw.size() > 6 && raw.substr(0, 6) == "const ")
                 raw = raw.substr(6);
         return findStruct(parseResult_, raw);
+}
+
+// ─── Python runner script (embedded) ─────────────────────────────────────────
+
+static const char kPyRunnerScript[] =
+    "import sys, json, importlib.util, traceback, ast, os\n"
+    "_module = None\n"
+    "_objs   = {}\n"
+    "_nid    = 0\n"
+    // Duplicate stdout FD before any user code can change it.
+    // All RPC replies go through _rpc_fd so subprocess/print from user code
+    // cannot pollute the JSON-RPC pipe even if FD 1 is temporarily redirected.
+    "_rpc_fd = os.dup(sys.stdout.fileno())\n"
+    "\n"
+    "def _send(obj):\n"
+    "    os.write(_rpc_fd, (json.dumps(obj) + '\\n').encode())\n"
+    "\n"
+    "def _cvt(v):\n"
+    "    if not isinstance(v, str): return v\n"
+    "    try: return ast.literal_eval(v)\n"
+    "    except Exception: return v\n"
+    "\n"
+    // Redirect FD 1 -> stderr during user-code execution so that user print()
+    // calls and subprocess stdout cannot leak into the RPC pipe.
+    "def _isolated(fn):\n"
+    "    saved = os.dup(1)\n"
+    "    os.dup2(2, 1)\n"
+    "    try:\n"
+    "        return fn()\n"
+    "    finally:\n"
+    "        os.dup2(saved, 1)\n"
+    "        os.close(saved)\n"
+    "\n"
+    "def _run():\n"
+    "    global _module, _objs, _nid\n"
+    "    for raw in sys.stdin:\n"
+    "        raw = raw.strip()\n"
+    "        if not raw: continue\n"
+    "        try: cmd = json.loads(raw)\n"
+    "        except Exception:\n"
+    "            _send({'ok': False, 'error': 'bad JSON'})\n"
+    "            continue\n"
+    "        a = cmd.get('action', '')\n"
+    "        try:\n"
+    "            if a == 'ping':\n"
+    "                _send({'ok': True, 'result': 'pong'})\n"
+    "            elif a == 'load':\n"
+    "                spec = importlib.util.spec_from_file_location('_ava_user', cmd['path'])\n"
+    "                mod  = importlib.util.module_from_spec(spec)\n"
+    "                _isolated(lambda: spec.loader.exec_module(mod))\n"
+    "                _module = mod\n"
+    "                _send({'ok': True, 'result': 'loaded'})\n"
+    "            elif a == 'call_func':\n"
+    "                fn   = getattr(_module, cmd['name'])\n"
+    "                args = [_cvt(v) for v in cmd.get('args', [])]\n"
+    "                r    = _isolated(lambda: fn(*args))\n"
+    "                _send({'ok': True, 'result': str(r) if r is not None else 'None'})\n"
+    "            elif a == 'new_obj':\n"
+    "                cls  = getattr(_module, cmd['class'])\n"
+    "                args = [_cvt(v) for v in cmd.get('args', [])]\n"
+    "                oid  = _nid; _nid += 1\n"
+    "                _objs[oid] = _isolated(lambda: cls(*args))\n"
+    "                _send({'ok': True, 'result': '{}#{}'.format(cmd['class'], oid), 'id': oid})\n"
+    "            elif a == 'call_meth':\n"
+    "                obj = _objs.get(cmd['id'])\n"
+    "                if obj is None:\n"
+    "                    _send({'ok': False, 'error': 'object not found: id={}'.format(cmd['id'])})\n"
+    "                    continue\n"
+    "                m    = getattr(obj, cmd['name'])\n"
+    "                args = [_cvt(v) for v in cmd.get('args', [])]\n"
+    "                r    = _isolated(lambda: m(*args))\n"
+    "                _send({'ok': True, 'result': str(r) if r is not None else 'None'})\n"
+    "            elif a == 'del_obj':\n"
+    "                _objs.pop(cmd['id'], None)\n"
+    "                _send({'ok': True, 'result': 'deleted'})\n"
+    "            else:\n"
+    "                _send({'ok': False, 'error': 'unknown: ' + a})\n"
+    "        except Exception:\n"
+    "            _send({'ok': False, 'error': traceback.format_exc()})\n"
+    "\n"
+    "_run()\n";
+
+// ─── PyRunner — persistent Python subprocess ──────────────────────────────────
+
+struct SdkPanel::PyRunner {
+#ifdef _WIN32
+        HANDLE hProc{nullptr};
+        HANDLE hStdinW{nullptr};
+        HANDLE hStdoutR{nullptr};
+#endif
+        bool alive_{false};
+
+        ~PyRunner() { shutdown(); }
+
+        bool launch(const std::string &scriptPath, const std::string &pyExe)
+        {
+#ifdef _WIN32
+                SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+                HANDLE              hStdinR = nullptr, hStdoutW = nullptr;
+                if (!CreatePipe(&hStdinR, &hStdinW, &sa, 0))
+                        return false;
+                if (!CreatePipe(&hStdoutR, &hStdoutW, &sa, 0)) {
+                        CloseHandle(hStdinR);
+                        CloseHandle(hStdinW);
+                        hStdinW = nullptr;
+                        return false;
+                }
+                SetHandleInformation(hStdinW, HANDLE_FLAG_INHERIT, 0);
+                SetHandleInformation(hStdoutR, HANDLE_FLAG_INHERIT, 0);
+
+                std::string cmd = "\"" + pyExe + "\" -u \"" + scriptPath + "\"";
+
+                STARTUPINFOA si{};
+                si.cb         = sizeof(si);
+                si.dwFlags    = STARTF_USESTDHANDLES;
+                si.hStdInput  = hStdinR;
+                si.hStdOutput = hStdoutW;
+                si.hStdError  = GetStdHandle(STD_ERROR_HANDLE);
+
+                PROCESS_INFORMATION pi{};
+                bool                ok = CreateProcessA(
+                              nullptr, cmd.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi) != 0;
+                CloseHandle(hStdinR);
+                CloseHandle(hStdoutW);
+
+                if (!ok) {
+                        CloseHandle(hStdinW);
+                        CloseHandle(hStdoutR);
+                        hStdinW = hStdoutR = nullptr;
+                        return false;
+                }
+                hProc = pi.hProcess;
+                CloseHandle(pi.hThread);
+                alive_ = true;
+                // Ping to verify
+                auto r = xact(R"({"action":"ping"})", 3000);
+                if (r.find("pong") == std::string::npos) {
+                        shutdown();
+                        return false;
+                }
+                return true;
+#else
+                (void)scriptPath;
+                (void)pyExe;
+                return false;
+#endif
+        }
+
+        void shutdown()
+        {
+#ifdef _WIN32
+                if (hProc) {
+                        TerminateProcess(hProc, 0);
+                        WaitForSingleObject(hProc, 2000);
+                        CloseHandle(hProc);
+                        hProc = nullptr;
+                }
+                if (hStdinW) {
+                        CloseHandle(hStdinW);
+                        hStdinW = nullptr;
+                }
+                if (hStdoutR) {
+                        CloseHandle(hStdoutR);
+                        hStdoutR = nullptr;
+                }
+#endif
+                alive_ = false;
+        }
+
+        bool isAlive()
+        {
+#ifdef _WIN32
+                if (!alive_ || !hProc)
+                        return false;
+                DWORD exit = 0;
+                if (GetExitCodeProcess(hProc, &exit) && exit != STILL_ACTIVE)
+                        alive_ = false;
+#endif
+                return alive_;
+        }
+
+        std::string xact(const std::string &jsonLine, int timeoutMs = 5000)
+        {
+                if (!alive_)
+                        return R"({"ok":false,"error":"runner not started"})";
+#ifdef _WIN32
+                std::string msg = jsonLine + "\n";
+                DWORD       written;
+                if (!WriteFile(hStdinW, msg.c_str(), (DWORD)msg.size(), &written, nullptr) || written != (DWORD)msg.size()) {
+                        alive_ = false;
+                        return R"({"ok":false,"error":"write failed"})";
+                }
+                // Read response line with timeout via PeekNamedPipe polling.
+                std::string result;
+                char        c;
+                DWORD       rd;
+                DWORD       deadline = GetTickCount() + (DWORD)timeoutMs;
+                while (true) {
+                        DWORD avail = 0;
+                        if (!PeekNamedPipe(hStdoutR, nullptr, 0, nullptr, &avail, nullptr)) {
+                                alive_ = false;
+                                break;
+                        }
+                        if (avail == 0) {
+                                DWORD ex = 0;
+                                if (GetExitCodeProcess(hProc, &ex) && ex != STILL_ACTIVE) {
+                                        alive_ = false;
+                                        break;
+                                }
+                                if (GetTickCount() >= deadline)
+                                        return R"({"ok":false,"error":"timeout"})";
+                                Sleep(2);
+                                continue;
+                        }
+                        if (!ReadFile(hStdoutR, &c, 1, &rd, nullptr) || rd == 0) {
+                                alive_ = false;
+                                break;
+                        }
+                        if (c == '\n')
+                                break;
+                        if (c != '\r')
+                                result += c;
+                }
+                return result.empty() ? R"({"ok":false,"error":"no response"})" : result;
+#else
+                return R"({"ok":false,"error":"not supported"})";
+#endif
+        }
+};
+
+// ─── Python response parser ───────────────────────────────────────────────────
+
+struct PyResp {
+        bool        ok{false};
+        std::string result;
+        std::string error;
+        int         id{-1};
+};
+
+static PyResp
+parsePyResp(const std::string &json)
+{
+        PyResp r;
+        cJSON *obj = cJSON_Parse(json.c_str());
+        if (!obj) {
+                r.error = "invalid JSON: " + json;
+                return r;
+        }
+        if (const cJSON *v = cJSON_GetObjectItem(obj, "ok"))
+                r.ok = cJSON_IsTrue(v);
+        if (const cJSON *v = cJSON_GetObjectItem(obj, "result"); cJSON_IsString(v))
+                r.result = v->valuestring;
+        if (const cJSON *v = cJSON_GetObjectItem(obj, "error"); cJSON_IsString(v))
+                r.error = v->valuestring;
+        if (const cJSON *v = cJSON_GetObjectItem(obj, "id"); cJSON_IsNumber(v))
+                r.id = v->valueint;
+        cJSON_Delete(obj);
+        return r;
+}
+
+// ─── Python file parser ───────────────────────────────────────────────────────
+
+static void
+parsePyParams(const std::string &raw, std::vector<PyParam> &out, bool skipSelf)
+{
+        bool   first = skipSelf;
+        size_t i     = 0;
+        while (i <= raw.size()) {
+                // Find next comma at depth 0
+                size_t j     = i;
+                int    depth = 0;
+                while (j < raw.size()) {
+                        char ch = raw[j];
+                        if (ch == '(' || ch == '[' || ch == '{')
+                                ++depth;
+                        else if (ch == ')' || ch == ']' || ch == '}')
+                                --depth;
+                        else if (ch == ',' && depth == 0)
+                                break;
+                        ++j;
+                }
+                std::string tok = raw.substr(i, j - i);
+                i               = j + 1;
+
+                // Trim
+                while (!tok.empty() &&
+                       (tok.front() == ' ' || tok.front() == '\t' || tok.front() == '\n' || tok.front() == '\r'))
+                        tok.erase(tok.begin());
+                while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t' || tok.back() == '\n' || tok.back() == '\r'))
+                        tok.pop_back();
+
+                if (tok.empty() || tok[0] == '*')
+                        continue;
+                if (first && (tok == "self" || tok == "cls")) {
+                        first = false;
+                        continue;
+                }
+                first = false;
+
+                PyParam p;
+                size_t  eqPos = tok.find('=');
+                if (eqPos != std::string::npos) {
+                        p.defaultVal = tok.substr(eqPos + 1);
+                        tok          = tok.substr(0, eqPos);
+                        while (!p.defaultVal.empty() && p.defaultVal.front() == ' ')
+                                p.defaultVal.erase(p.defaultVal.begin());
+                        while (!tok.empty() && tok.back() == ' ')
+                                tok.pop_back();
+                }
+                size_t colonPos = tok.find(':');
+                if (colonPos != std::string::npos)
+                        tok = tok.substr(0, colonPos);
+                while (!tok.empty() && tok.back() == ' ')
+                        tok.pop_back();
+
+                p.name = tok;
+                if (!p.name.empty())
+                        out.push_back(std::move(p));
+        }
+}
+
+static PyParseResult
+parsePyFile(const std::string &src)
+{
+        PyParseResult r;
+        // Normalize CRLF
+        std::string s;
+        s.reserve(src.size());
+        for (char c : src)
+                if (c != '\r')
+                        s += c;
+
+        std::istringstream iss(s);
+        std::string        line;
+        int                classIdx = -1;
+
+        while (std::getline(iss, line)) {
+                if (line.empty())
+                        continue;
+
+                // Count leading indent (tab = 4 for column tracking)
+                int    indent = 0;
+                size_t p      = 0;
+                while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) {
+                        if (line[p] == '\t')
+                                indent = ((indent / 4) + 1) * 4;
+                        else
+                                ++indent;
+                        ++p;
+                }
+                std::string trimmed = line.substr(p);
+                if (trimmed.empty() || trimmed[0] == '#')
+                        continue;
+
+                // Leaving a class body when we see a top-level non-empty line
+                if (classIdx >= 0 && indent == 0)
+                        classIdx = -1;
+
+                if (indent == 0 && trimmed.size() > 6 && trimmed.substr(0, 6) == "class ") {
+                        size_t      ni = 6;
+                        std::string name;
+                        while (ni < trimmed.size() && (isalnum((unsigned char)trimmed[ni]) || trimmed[ni] == '_'))
+                                name += trimmed[ni++];
+                        if (!name.empty()) {
+                                PyClassDecl cls;
+                                cls.name = name;
+                                classIdx = (int)r.classes.size();
+                                r.classes.push_back(std::move(cls));
+                        }
+                } else if (trimmed.size() > 4 && trimmed.substr(0, 4) == "def ") {
+                        size_t      ni = 4;
+                        std::string name;
+                        while (ni < trimmed.size() && (isalnum((unsigned char)trimmed[ni]) || trimmed[ni] == '_'))
+                                name += trimmed[ni++];
+                        if (name.empty())
+                                continue;
+
+                        // Extract param string between '(' and matching ')'
+                        size_t pOpen  = trimmed.find('(', ni);
+                        size_t pClose = std::string::npos;
+                        if (pOpen != std::string::npos) {
+                                int depth = 0;
+                                for (size_t k = pOpen + 1; k < trimmed.size(); ++k) {
+                                        if (trimmed[k] == '(')
+                                                ++depth;
+                                        else if (trimmed[k] == ')') {
+                                                if (depth == 0) {
+                                                        pClose = k;
+                                                        break;
+                                                }
+                                                --depth;
+                                        }
+                                }
+                        }
+                        std::string paramStr;
+                        if (pOpen != std::string::npos && pClose != std::string::npos)
+                                paramStr = trimmed.substr(pOpen + 1, pClose - pOpen - 1);
+
+                        PyFuncDecl fn;
+                        fn.name = name;
+                        parsePyParams(paramStr, fn.params, classIdx >= 0);
+
+                        if (classIdx >= 0)
+                                r.classes[classIdx].methods.push_back(std::move(fn));
+                        else
+                                r.functions.push_back(std::move(fn));
+                }
+        }
+        return r;
+}
+
+// ─── SdkPanel destructor ─────────────────────────────────────────────────────
+
+SdkPanel::SdkPanel()  = default; // PyRunner complete here — unique_ptr can be default-init'd
+SdkPanel::~SdkPanel() = default; // PyRunner shut down via unique_ptr destructor
+
+// ─── doStartPyRunner ─────────────────────────────────────────────────────────
+
+void
+SdkPanel::doStartPyRunner()
+{
+        if (!pyRunner_)
+                pyRunner_ = std::make_unique<PyRunner>();
+        if (pyRunner_->isAlive())
+                return;
+
+        // Write runner script to temp dir.
+        std::filesystem::path tmpScript = std::filesystem::temp_directory_path() / "ava_py_runner.py";
+        {
+                std::ofstream f(tmpScript);
+                if (!f) {
+                        setStatus(tr("Failed to write Python runner script", "无法写入 Python 运行脚本"), true);
+                        return;
+                }
+                f << kPyRunnerScript;
+        }
+
+        for (const char *exe : {"python", "python3"}) {
+                if (pyRunner_->launch(tmpScript.string(), exe)) {
+                        setStatus(tr("Python runner started", "Python 已启动"), false);
+                        return;
+                }
+        }
+        setStatus(tr("Python not found — install Python and add to PATH", "未找到 Python — 请安装 Python 并添加到 PATH"), true);
+}
+
+// ─── doLoadPy ────────────────────────────────────────────────────────────────
+
+void
+SdkPanel::doLoadPy()
+{
+        if (!pyPath_[0])
+                return;
+        std::ifstream f(std::filesystem::u8path(pyPath_));
+        if (!f) {
+                setStatus(tr("Cannot open Python file", "无法打开 Python 文件"), true);
+                return;
+        }
+        std::ostringstream ss;
+        ss << f.rdbuf();
+
+        pyResult_   = parsePyFile(ss.str());
+        pySelFnIdx_ = pySelClsIdx_ = pySelMethIdx_ = pySelObjIdx_ = -1;
+        pyFnArgBufs_.clear();
+        pyMethArgBufs_.clear();
+        pyObjects_.clear();
+
+        if (!pyRunner_ || !pyRunner_->isAlive())
+                doStartPyRunner();
+
+        if (pyRunner_ && pyRunner_->isAlive()) {
+                cJSON *cmd = cJSON_CreateObject();
+                cJSON_AddStringToObject(cmd, "action", "load");
+                // Python prefers forward slashes
+                std::string fwdPath = pyPath_;
+                for (char &c : fwdPath)
+                        if (c == '\\')
+                                c = '/';
+                cJSON_AddStringToObject(cmd, "path", fwdPath.c_str());
+                char *s  = cJSON_PrintUnformatted(cmd);
+                auto  rr = parsePyResp(pyRunner_->xact(s));
+                cJSON_free(s);
+                cJSON_Delete(cmd);
+                if (!rr.ok) {
+                        setStatus(tr("Python load error: ", "Python 加载错误: ") + rr.error, true);
+                        return;
+                }
+        }
+
+        char buf[256];
+        snprintf(buf,
+                 sizeof(buf),
+                 tr("Python: %d function(s), %d class(es)", "Python: %d 个函数, %d 个类"),
+                 (int)pyResult_.functions.size(),
+                 (int)pyResult_.classes.size());
+        setStatus(buf, false);
+}
+
+// ─── doCallPyFunc ────────────────────────────────────────────────────────────
+
+void
+SdkPanel::doCallPyFunc()
+{
+        if (pySelFnIdx_ < 0 || pySelFnIdx_ >= (int)pyResult_.functions.size())
+                return;
+        if (!pyRunner_ || !pyRunner_->isAlive()) {
+                setStatus(tr("Python not running", "Python 未运行"), true);
+                return;
+        }
+        const PyFuncDecl &fn = pyResult_.functions[pySelFnIdx_];
+
+        cJSON *args = cJSON_CreateArray();
+        for (size_t i = 0; i < fn.params.size(); ++i)
+                cJSON_AddItemToArray(args, cJSON_CreateString(i < pyFnArgBufs_.size() ? pyFnArgBufs_[i].text : ""));
+
+        cJSON *cmd = cJSON_CreateObject();
+        cJSON_AddStringToObject(cmd, "action", "call_func");
+        cJSON_AddStringToObject(cmd, "name", fn.name.c_str());
+        cJSON_AddItemToObject(cmd, "args", args);
+        char *s  = cJSON_PrintUnformatted(cmd);
+        auto  rr = parsePyResp(pyRunner_->xact(s, 10000));
+        cJSON_free(s);
+        cJSON_Delete(cmd);
+
+        pyLastResult_   = rr.ok ? rr.result : rr.error;
+        pyLastResultOk_ = rr.ok;
+
+        std::string call = fn.name + "(";
+        for (size_t i = 0; i < fn.params.size(); ++i) {
+                if (i)
+                        call += ", ";
+                call += (i < pyFnArgBufs_.size()) ? pyFnArgBufs_[i].text : "";
+        }
+        call += ")";
+        pushHistory(call, pyLastResult_, rr.ok, sessionTimeSec());
+}
+
+// ─── doNewPyObject / doNewPyObjectWithArgs ────────────────────────────────────
+
+void
+SdkPanel::doNewPyObject()
+{
+        doNewPyObjectWithArgs({});
+}
+
+void
+SdkPanel::doNewPyObjectWithArgs(const std::vector<std::string> &ctorArgs)
+{
+        if (pySelClsIdx_ < 0 || pySelClsIdx_ >= (int)pyResult_.classes.size())
+                return;
+        if (!pyRunner_ || !pyRunner_->isAlive()) {
+                setStatus(tr("Python not running", "Python 未运行"), true);
+                return;
+        }
+        const PyClassDecl &cls = pyResult_.classes[pySelClsIdx_];
+
+        cJSON *args = cJSON_CreateArray();
+        for (const auto &a : ctorArgs)
+                cJSON_AddItemToArray(args, cJSON_CreateString(a.c_str()));
+
+        cJSON *cmd = cJSON_CreateObject();
+        cJSON_AddStringToObject(cmd, "action", "new_obj");
+        cJSON_AddStringToObject(cmd, "class", cls.name.c_str());
+        cJSON_AddItemToObject(cmd, "args", args);
+        char *s  = cJSON_PrintUnformatted(cmd);
+        auto  rr = parsePyResp(pyRunner_->xact(s));
+        cJSON_free(s);
+        cJSON_Delete(cmd);
+
+        if (!rr.ok) {
+                setStatus(tr("Create object failed: ", "创建对象失败: ") + rr.error, true);
+                return;
+        }
+        PyObjEntry e;
+        e.pyId      = rr.id;
+        e.className = cls.name;
+        char lbl[64];
+        snprintf(lbl, sizeof(lbl), "obj%d", (int)pyObjects_.size());
+        e.label = lbl;
+        pyObjects_.push_back(std::move(e));
+        pySelObjIdx_ = (int)pyObjects_.size() - 1;
+
+        char buf[128];
+        snprintf(buf, sizeof(buf), tr("Created %s#%d", "已创建 %s#%d"), cls.name.c_str(), rr.id);
+        setStatus(buf, false);
+}
+
+// ─── doCallPyMeth ────────────────────────────────────────────────────────────
+
+void
+SdkPanel::doCallPyMeth()
+{
+        if (pySelClsIdx_ < 0 || pySelMethIdx_ < 0)
+                return;
+        const PyClassDecl &cls = pyResult_.classes[pySelClsIdx_];
+        if (pySelMethIdx_ >= (int)cls.methods.size())
+                return;
+        const PyFuncDecl &meth   = cls.methods[pySelMethIdx_];
+        bool              isInit = (meth.name == "__init__");
+
+        if (!pyRunner_ || !pyRunner_->isAlive()) {
+                setStatus(tr("Python not running", "Python 未运行"), true);
+                return;
+        }
+
+        if (isInit) {
+                // Delegate to new-object path passing the __init__ args.
+                std::vector<std::string> ctorArgs;
+                for (size_t i = 0; i < meth.params.size(); ++i)
+                        ctorArgs.push_back(i < pyMethArgBufs_.size() ? pyMethArgBufs_[i].text : "");
+                doNewPyObjectWithArgs(ctorArgs);
+                return;
+        }
+
+        if (pySelObjIdx_ < 0 || pySelObjIdx_ >= (int)pyObjects_.size()) {
+                setStatus(tr("Select an object first", "请先选择一个对象"), true);
+                return;
+        }
+
+        cJSON *args = cJSON_CreateArray();
+        for (size_t i = 0; i < meth.params.size(); ++i)
+                cJSON_AddItemToArray(args, cJSON_CreateString(i < pyMethArgBufs_.size() ? pyMethArgBufs_[i].text : ""));
+
+        cJSON *cmd = cJSON_CreateObject();
+        cJSON_AddStringToObject(cmd, "action", "call_meth");
+        cJSON_AddNumberToObject(cmd, "id", pyObjects_[pySelObjIdx_].pyId);
+        cJSON_AddStringToObject(cmd, "name", meth.name.c_str());
+        cJSON_AddItemToObject(cmd, "args", args);
+        char *s  = cJSON_PrintUnformatted(cmd);
+        auto  rr = parsePyResp(pyRunner_->xact(s, 10000));
+        cJSON_free(s);
+        cJSON_Delete(cmd);
+
+        std::string result = rr.ok ? rr.result : rr.error;
+        std::string call   = cls.name + "." + meth.name + "(";
+        for (size_t i = 0; i < meth.params.size(); ++i) {
+                if (i)
+                        call += ", ";
+                call += (i < pyMethArgBufs_.size()) ? pyMethArgBufs_[i].text : "";
+        }
+        call += ")";
+        pushHistory(call, result, rr.ok, sessionTimeSec());
+        if (!rr.ok)
+                setStatus(rr.error, true);
+}
+
+// ─── doDeletePyObject ────────────────────────────────────────────────────────
+
+void
+SdkPanel::doDeletePyObject(int idx)
+{
+        if (idx < 0 || idx >= (int)pyObjects_.size())
+                return;
+        if (pyRunner_ && pyRunner_->isAlive()) {
+                cJSON *cmd = cJSON_CreateObject();
+                cJSON_AddStringToObject(cmd, "action", "del_obj");
+                cJSON_AddNumberToObject(cmd, "id", pyObjects_[idx].pyId);
+                char *s = cJSON_PrintUnformatted(cmd);
+                pyRunner_->xact(s);
+                cJSON_free(s);
+                cJSON_Delete(cmd);
+        }
+        pyObjects_.erase(pyObjects_.begin() + idx);
+        if (pySelObjIdx_ >= (int)pyObjects_.size())
+                pySelObjIdx_ = (int)pyObjects_.size() - 1;
 }
 
 // ─── drawCFunctionsTab ────────────────────────────────────────────────────────
@@ -962,6 +1634,353 @@ SdkPanel::drawCppClassesTab()
         ImGui::EndChild(); // ##methcall
 }
 
+// ─── drawPythonTab ────────────────────────────────────────────────────────────
+
+void
+SdkPanel::drawPythonTab()
+{
+        // ── Python file path row ──────────────────────────────────────────────
+        if (ImGui::Button(tr("Browse##py", "浏览##py"))) {
+                std::string p =
+                    nativeDlgOpen(tr("Select Python script", "选择 Python 脚本"), {{"Python", {"py"}}, {"All Files", {"*"}}});
+                if (!p.empty()) {
+                        strncpy(pyPath_, p.c_str(), sizeof(pyPath_) - 1);
+                        pyPath_[sizeof(pyPath_) - 1] = '\0';
+                        doLoadPy();
+                }
+        }
+        ImGui::SameLine();
+        bool runnerOk = pyRunner_ && pyRunner_->isAlive();
+        ImGui::TextDisabled(runnerOk ? tr("[py: online]", "[py: 在线]") : tr("[py: offline]", "[py: 离线]"));
+        if (pyPath_[0]) {
+                std::string fullPath(pyPath_);
+                auto        slash = fullPath.find_last_of("/\\");
+                std::string fname = (slash != std::string::npos) ? fullPath.substr(slash + 1) : fullPath;
+                ImGui::SameLine();
+                ImGui::TextDisabled("— %s", fname.c_str());
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (pyResult_.functions.empty() && pyResult_.classes.empty()) {
+                ImGui::TextDisabled("%s", tr("Load a .py file to begin.", "加载 .py 文件开始使用。"));
+                return;
+        }
+
+        if (!ImGui::BeginTabBar("##pytabs"))
+                return;
+
+        // ── Functions sub-tab ─────────────────────────────────────────────────
+        if (ImGui::BeginTabItem(tr("Functions##pyf", "函数##pyf"))) {
+                ImGui::Spacing();
+                if (pyResult_.functions.empty()) {
+                        ImGui::TextDisabled("%s", tr("No top-level functions found.", "未找到顶层函数。"));
+                } else {
+                        float &lw = pySplitW_;
+                        ImGui::BeginChild("##pyfnlist", ImVec2(lw, 0), true);
+                        ImGui::TextDisabled("%s (%d)", tr("Functions", "函数列表"), (int)pyResult_.functions.size());
+                        ImGui::Separator();
+                        for (int i = 0; i < (int)pyResult_.functions.size(); ++i) {
+                                bool sel = (i == pySelFnIdx_);
+                                if (ImGui::Selectable(pyResult_.functions[i].name.c_str(), sel) && !sel) {
+                                        pySelFnIdx_ = i;
+                                        pyFnArgBufs_.clear();
+                                        pyFnArgBufs_.resize(pyResult_.functions[i].params.size());
+                                        for (size_t j = 0; j < pyResult_.functions[i].params.size(); ++j) {
+                                                const auto &parm = pyResult_.functions[i].params[j];
+                                                if (!parm.defaultVal.empty())
+                                                        strncpy(pyFnArgBufs_[j].text,
+                                                                parm.defaultVal.c_str(),
+                                                                sizeof(ArgBuf::text) - 1);
+                                        }
+                                        pyLastResult_.clear();
+                                }
+                                // Drag to SequenceEditor
+                                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+                                        SdkDragPayload p;
+                                        p.panelWinId = winId_;
+                                        p.isPython   = true;
+                                        strncpy(p.pyName, pyResult_.functions[i].name.c_str(), sizeof(p.pyName) - 1);
+                                        ImGui::SetDragDropPayload("SDK_CALL", &p, sizeof(p));
+                                        ImGui::TextUnformatted(pyResult_.functions[i].name.c_str());
+                                        ImGui::EndDragDropSource();
+                                }
+                        }
+                        ImGui::EndChild();
+                        splitterV("##pyfnsplit", &lw, 80.0f, 500.0f);
+
+                        ImGui::BeginChild("##pyfncall", ImVec2(0, 0), false);
+                        if (pySelFnIdx_ < 0 || pySelFnIdx_ >= (int)pyResult_.functions.size()) {
+                                ImGui::TextDisabled("%s", tr("← Select a function", "← 选择左侧函数"));
+                        } else {
+                                const PyFuncDecl &fn = pyResult_.functions[pySelFnIdx_];
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
+                                ImGui::Text("def %s(...)", fn.name.c_str());
+                                ImGui::PopStyleColor();
+
+                                if (fn.params.empty()) {
+                                        ImGui::TextDisabled("  (%s)", tr("no parameters", "无参数"));
+                                } else {
+                                        for (size_t i = 0; i < fn.params.size(); ++i) {
+                                                char id[64];
+                                                snprintf(id, sizeof(id), "##pyfa%zu", i);
+                                                ImGui::SetNextItemWidth(260.0f);
+                                                if (i < pyFnArgBufs_.size())
+                                                        ImGui::InputText(id, pyFnArgBufs_[i].text, sizeof(ArgBuf::text));
+                                                ImGui::SameLine();
+                                                ImGui::TextDisabled("%s", fn.params[i].name.c_str());
+                                        }
+                                }
+
+                                ImGui::Spacing();
+                                ImGui::Separator();
+                                ImGui::Spacing();
+                                if (!runnerOk)
+                                        ImGui::BeginDisabled();
+                                if (ui::Button(tr("  CALL  ", "  调用  "), ui::BtnStyle::Success))
+                                        doCallPyFunc();
+                                if (!runnerOk) {
+                                        ImGui::EndDisabled();
+                                        ImGui::SameLine();
+                                        ImGui::TextDisabled("%s", tr("(Python not running)", "(Python 未运行)"));
+                                }
+
+                                if (!pyLastResult_.empty()) {
+                                        ImGui::Spacing();
+                                        ImGui::Text("%s", tr("Result:", "返回值:"));
+                                        ImGui::SameLine();
+                                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                                              pyLastResultOk_ ? ImVec4(0.3f, 1.f, 0.5f, 1.f)
+                                                                              : ImVec4(1.f, 0.4f, 0.4f, 1.f));
+                                        ImGui::TextUnformatted(pyLastResult_.c_str());
+                                        ImGui::PopStyleColor();
+                                }
+
+                                ImGui::Spacing();
+                                ImGui::Separator();
+                                ImGui::TextDisabled("%s", tr("History", "调用历史"));
+                                ImGui::BeginChild("##pyfhist", ImVec2(0, ImGui::GetContentRegionAvail().y), true);
+                                std::vector<HistEntry> snap;
+                                {
+                                        std::lock_guard<std::mutex> lk(histMtx_);
+                                        snap = history_;
+                                }
+                                for (int i = (int)snap.size() - 1; i >= 0; --i) {
+                                        const HistEntry &e  = snap[i];
+                                        uint64_t         ms = e.tsMs % 86400000ULL;
+                                        char             ts[24];
+                                        snprintf(ts,
+                                                 sizeof(ts),
+                                                 "[%02d:%02d:%02d.%03d] ",
+                                                 (int)(ms / 3600000),
+                                                 (int)(ms % 3600000 / 60000),
+                                                 (int)(ms % 60000 / 1000),
+                                                 (int)(ms % 1000));
+                                        ImGui::TextDisabled("%s", ts);
+                                        ImGui::SameLine(0, 0);
+                                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                                              e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f)
+                                                                   : ImVec4(1.f, 0.4f, 0.4f, 1.f));
+                                        ImGui::TextUnformatted(e.call.c_str());
+                                        ImGui::PopStyleColor();
+                                        ImGui::SameLine();
+                                        ImGui::TextDisabled(" → ");
+                                        ImGui::SameLine();
+                                        ImGui::PushStyleColor(
+                                            ImGuiCol_Text, e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
+                                        ImGui::TextUnformatted(e.result.c_str());
+                                        ImGui::PopStyleColor();
+                                }
+                                ImGui::EndChild();
+                        }
+                        ImGui::EndChild();
+                }
+                ImGui::EndTabItem();
+        }
+
+        // ── Classes sub-tab ───────────────────────────────────────────────────
+        if (ImGui::BeginTabItem(tr("Classes##pyc", "类##pyc"))) {
+                ImGui::Spacing();
+                if (pyResult_.classes.empty()) {
+                        ImGui::TextDisabled("%s", tr("No classes found.", "未找到类定义。"));
+                } else {
+                        float &lw = pySplitW_;
+                        ImGui::BeginChild("##pyclslist", ImVec2(lw, 0), true);
+                        ImGui::TextDisabled("%s (%d)", tr("Classes", "类列表"), (int)pyResult_.classes.size());
+                        ImGui::Separator();
+                        for (int ci = 0; ci < (int)pyResult_.classes.size(); ++ci) {
+                                const PyClassDecl &cls    = pyResult_.classes[ci];
+                                bool               selCls = (ci == pySelClsIdx_);
+                                char               lbl[128];
+                                snprintf(lbl, sizeof(lbl), "%s (%d)", cls.name.c_str(), (int)cls.methods.size());
+                                if (ImGui::Selectable(lbl, selCls) && !selCls) {
+                                        pySelClsIdx_  = ci;
+                                        pySelMethIdx_ = -1;
+                                        pyMethArgBufs_.clear();
+                                }
+                        }
+                        if (pySelClsIdx_ >= 0 && pySelClsIdx_ < (int)pyResult_.classes.size()) {
+                                const PyClassDecl &cls = pyResult_.classes[pySelClsIdx_];
+                                ImGui::Spacing();
+                                ImGui::Separator();
+                                ImGui::TextDisabled("%s (%d)", tr("Methods", "方法列表"), (int)cls.methods.size());
+                                ImGui::Separator();
+                                for (int mi = 0; mi < (int)cls.methods.size(); ++mi) {
+                                        bool selM = (mi == pySelMethIdx_);
+                                        char mlbl[256];
+                                        snprintf(mlbl, sizeof(mlbl), "def %s", cls.methods[mi].name.c_str());
+                                        if (ImGui::Selectable(mlbl, selM) && !selM) {
+                                                pySelMethIdx_ = mi;
+                                                pyMethArgBufs_.clear();
+                                                pyMethArgBufs_.resize(cls.methods[mi].params.size());
+                                                for (size_t j = 0; j < cls.methods[mi].params.size(); ++j) {
+                                                        const auto &parm = cls.methods[mi].params[j];
+                                                        if (!parm.defaultVal.empty())
+                                                                strncpy(pyMethArgBufs_[j].text,
+                                                                        parm.defaultVal.c_str(),
+                                                                        sizeof(ArgBuf::text) - 1);
+                                                }
+                                        }
+                                }
+                        }
+                        ImGui::EndChild();
+                        splitterV("##pyclssplit", &lw, 80.0f, 500.0f);
+
+                        ImGui::BeginChild("##pyclscall", ImVec2(0, 0), false);
+                        if (pySelClsIdx_ < 0 || pySelClsIdx_ >= (int)pyResult_.classes.size()) {
+                                ImGui::TextDisabled("%s", tr("← Select a class", "← 选择左侧类"));
+                                ImGui::EndChild();
+                                ImGui::EndTabItem();
+                                ImGui::EndTabBar();
+                                return;
+                        }
+                        const PyClassDecl &cls = pyResult_.classes[pySelClsIdx_];
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.7f, 0.3f, 1.f));
+                        ImGui::Text("class %s", cls.name.c_str());
+                        ImGui::PopStyleColor();
+
+                        // Object manager
+                        ImGui::Spacing();
+                        ImGui::Text("%s:", tr("Objects", "对象管理"));
+                        ImGui::SameLine();
+                        if (!runnerOk)
+                                ImGui::BeginDisabled();
+                        if (ImGui::Button(tr("+ New", "+ 新建")))
+                                doNewPyObject();
+                        if (!runnerOk)
+                                ImGui::EndDisabled();
+                        if (!pyObjects_.empty()) {
+                                ImGui::SameLine();
+                                bool canDel = (pySelObjIdx_ >= 0 && pySelObjIdx_ < (int)pyObjects_.size());
+                                if (!canDel)
+                                        ImGui::BeginDisabled();
+                                if (ImGui::Button(tr("Delete", "删除")))
+                                        doDeletePyObject(pySelObjIdx_);
+                                if (!canDel)
+                                        ImGui::EndDisabled();
+
+                                ImGui::BeginChild("##pyobjlist", ImVec2(0, 60.0f), true);
+                                for (int oi = 0; oi < (int)pyObjects_.size(); ++oi) {
+                                        bool sel = (oi == pySelObjIdx_);
+                                        char olbl[128];
+                                        snprintf(olbl,
+                                                 sizeof(olbl),
+                                                 "%s  [id=%d]",
+                                                 pyObjects_[oi].label.c_str(),
+                                                 pyObjects_[oi].pyId);
+                                        if (ImGui::Selectable(olbl, sel))
+                                                pySelObjIdx_ = oi;
+                                }
+                                ImGui::EndChild();
+                        }
+                        ImGui::Separator();
+
+                        if (pySelMethIdx_ < 0 || pySelMethIdx_ >= (int)cls.methods.size()) {
+                                ImGui::TextDisabled("%s", tr("← Select a method", "← 选择左侧方法"));
+                        } else {
+                                const PyFuncDecl &meth   = cls.methods[pySelMethIdx_];
+                                bool              isInit = (meth.name == "__init__");
+                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
+                                ImGui::Text("def %s.%s(...)", cls.name.c_str(), meth.name.c_str());
+                                ImGui::PopStyleColor();
+
+                                if (meth.params.empty()) {
+                                        ImGui::TextDisabled("  (%s)", tr("no parameters", "无参数"));
+                                } else {
+                                        for (size_t i = 0; i < meth.params.size(); ++i) {
+                                                char id[64];
+                                                snprintf(id, sizeof(id), "##pyma%zu", i);
+                                                ImGui::SetNextItemWidth(260.0f);
+                                                if (i < pyMethArgBufs_.size())
+                                                        ImGui::InputText(id, pyMethArgBufs_[i].text, sizeof(ArgBuf::text));
+                                                ImGui::SameLine();
+                                                ImGui::TextDisabled("%s", meth.params[i].name.c_str());
+                                        }
+                                }
+
+                                ImGui::Spacing();
+                                ImGui::Separator();
+                                ImGui::Spacing();
+                                bool canCall = runnerOk && (isInit || (!pyObjects_.empty() && pySelObjIdx_ >= 0));
+                                if (!canCall)
+                                        ImGui::BeginDisabled();
+                                if (ui::Button(isInit ? tr("  CREATE  ", "  创建  ") : tr("  CALL  ", "  调用  "),
+                                               ui::BtnStyle::Success))
+                                        doCallPyMeth();
+                                if (!canCall)
+                                        ImGui::EndDisabled();
+                                if (!canCall && runnerOk && !isInit && pyObjects_.empty()) {
+                                        ImGui::SameLine();
+                                        ImGui::TextDisabled("%s", tr("(create an object first)", "(请先创建对象)"));
+                                }
+
+                                ImGui::Spacing();
+                                ImGui::Separator();
+                                ImGui::TextDisabled("%s", tr("History", "调用历史"));
+                                ImGui::BeginChild("##pymhist", ImVec2(0, ImGui::GetContentRegionAvail().y), true);
+                                std::vector<HistEntry> snap;
+                                {
+                                        std::lock_guard<std::mutex> lk(histMtx_);
+                                        snap = history_;
+                                }
+                                for (int i = (int)snap.size() - 1; i >= 0; --i) {
+                                        const HistEntry &e  = snap[i];
+                                        uint64_t         ms = e.tsMs % 86400000ULL;
+                                        char             ts[24];
+                                        snprintf(ts,
+                                                 sizeof(ts),
+                                                 "[%02d:%02d:%02d.%03d] ",
+                                                 (int)(ms / 3600000),
+                                                 (int)(ms % 3600000 / 60000),
+                                                 (int)(ms % 60000 / 1000),
+                                                 (int)(ms % 1000));
+                                        ImGui::TextDisabled("%s", ts);
+                                        ImGui::SameLine(0, 0);
+                                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                                              e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f)
+                                                                   : ImVec4(1.f, 0.4f, 0.4f, 1.f));
+                                        ImGui::TextUnformatted(e.call.c_str());
+                                        ImGui::PopStyleColor();
+                                        ImGui::SameLine();
+                                        ImGui::TextDisabled(" → ");
+                                        ImGui::SameLine();
+                                        ImGui::PushStyleColor(
+                                            ImGuiCol_Text, e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
+                                        ImGui::TextUnformatted(e.result.c_str());
+                                        ImGui::PopStyleColor();
+                                }
+                                ImGui::EndChild();
+                        }
+                        ImGui::EndChild();
+                }
+                ImGui::EndTabItem();
+        }
+
+        ImGui::EndTabBar();
+}
+
 // ─── draw ──────────────────────────────────────────────────────────────────────
 
 void
@@ -989,58 +2008,15 @@ SdkPanel::draw()
                                         strncpy(headerPath_, f.c_str(), sizeof(headerPath_) - 1);
                                         headerPath_[sizeof(headerPath_) - 1] = '\0';
                                         doParseHeader();
+                                } else if (f.size() > 3 && f.substr(f.size() - 3) == ".py") {
+                                        strncpy(pyPath_, f.c_str(), sizeof(pyPath_) - 1);
+                                        pyPath_[sizeof(pyPath_) - 1] = '\0';
+                                        doLoadPy();
                                 }
                         }
                 }
                 pendingDropFiles_.clear();
         }
-
-        const float spacing = ImGui::GetStyle().ItemSpacing.x;
-
-        // ── DLL path row ──
-        ImGui::Text("%s", tr("DLL / SO / dylib:", "动态库路径:"));
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 160.0f - spacing * 2);
-        ImGui::InputText("##dllpath", dllPath_, sizeof(dllPath_));
-        ImGui::SameLine();
-        if (ImGui::Button(tr("Browse##dll", "浏览##dll"))) {
-                std::string p = nativeDlgOpen(tr("Select library", "选择动态库"),
-#if defined(_WIN32)
-                                              {{"DLL", {"dll"}}, {"All Files", {"*"}}});
-#elif defined(__APPLE__)
-                                              {{"dylib", {"dylib"}}, {"All Files", {"*"}}});
-#else
-                                              {{"Shared Library", {"so"}}, {"All Files", {"*"}}});
-#endif
-                if (!p.empty())
-                        strncpy(dllPath_, p.c_str(), sizeof(dllPath_) - 1);
-        }
-        ImGui::SameLine();
-        if (loader_.isLoaded()) {
-                if (ui::Button(tr("Unload", "卸载"), ui::BtnStyle::Danger)) {
-                        loader_.unload();
-                        setStatus(tr("Unloaded", "已卸载"), false);
-                }
-        } else {
-                if (ui::Button(tr("Load", "加载"), ui::BtnStyle::Success))
-                        doLoadDll();
-        }
-
-        // ── Header path row ──
-        ImGui::Text("%s", tr("Header file (.h):  ", "头文件 (.h):   "));
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - 160.0f - spacing * 2);
-        ImGui::InputText("##hdrpath", headerPath_, sizeof(headerPath_));
-        ImGui::SameLine();
-        if (ImGui::Button(tr("Browse##hdr", "浏览##hdr"))) {
-                std::string p = nativeDlgOpen(tr("Select header file", "选择头文件"),
-                                              {{"C/C++ Header", {"h", "hpp"}}, {"All Files", {"*"}}});
-                if (!p.empty())
-                        strncpy(headerPath_, p.c_str(), sizeof(headerPath_) - 1);
-        }
-        ImGui::SameLine();
-        if (ui::Button(tr("Parse", "解析"), ui::BtnStyle::Primary))
-                doParseHeader();
 
         // ── Status bar ──
         if (!statusMsg_.empty()) {
@@ -1054,20 +2030,84 @@ SdkPanel::draw()
         ImGui::Separator();
 
         // ── Tabs ──
-        bool hasCpp = !parseResult_.classes.empty();
-
         if (ImGui::BeginTabBar("##sdktabs")) {
-                if (ImGui::BeginTabItem(tr("C Functions", "C 函数"))) {
+                // ── C/C++ tab ────────────────────────────────────────────────
+                if (ImGui::BeginTabItem(tr("C/C++", "C/C++"))) {
                         ImGui::Spacing();
-                        drawCFunctionsTab();
+
+                        // DLL browse row
+                        if (ImGui::Button(tr("Browse DLL##dll", "浏览动态库##dll"))) {
+                                std::string p = nativeDlgOpen(tr("Select library", "选择动态库"),
+#if defined(_WIN32)
+                                                              {{"DLL", {"dll"}}, {"All Files", {"*"}}});
+#elif defined(__APPLE__)
+                                                              {{"dylib", {"dylib"}}, {"All Files", {"*"}}});
+#else
+                                                              {{"Shared Library", {"so"}}, {"All Files", {"*"}}});
+#endif
+                                if (!p.empty()) {
+                                        strncpy(dllPath_, p.c_str(), sizeof(dllPath_) - 1);
+                                        doLoadDll();
+                                }
+                        }
+                        if (loader_.isLoaded()) {
+                                ImGui::SameLine();
+                                if (ui::Button(tr("Unload", "卸载"), ui::BtnStyle::Danger)) {
+                                        loader_.unload();
+                                        setStatus(tr("Unloaded", "已卸载"), false);
+                                }
+                        }
+                        if (dllPath_[0]) {
+                                std::string dp(dllPath_);
+                                auto        sl = dp.find_last_of("/\\");
+                                ImGui::SameLine();
+                                ImGui::TextDisabled("— %s", (sl != std::string::npos ? dp.substr(sl + 1) : dp).c_str());
+                        }
+
+                        // Header browse row
+                        if (ImGui::Button(tr("Browse Header##hdr", "浏览头文件##hdr"))) {
+                                std::string p = nativeDlgOpen(tr("Select header file", "选择头文件"),
+                                                              {{"C/C++ Header", {"h", "hpp"}}, {"All Files", {"*"}}});
+                                if (!p.empty()) {
+                                        strncpy(headerPath_, p.c_str(), sizeof(headerPath_) - 1);
+                                        doParseHeader();
+                                }
+                        }
+                        if (headerPath_[0]) {
+                                std::string hp(headerPath_);
+                                auto        sl = hp.find_last_of("/\\");
+                                ImGui::SameLine();
+                                ImGui::TextDisabled("— %s", (sl != std::string::npos ? hp.substr(sl + 1) : hp).c_str());
+                        }
+
+                        ImGui::Spacing();
+                        ImGui::Separator();
+                        ImGui::Spacing();
+
+                        bool hasFn  = !parseResult_.functions.empty();
+                        bool hasCls = !parseResult_.classes.empty();
+                        if (!hasFn && !hasCls) {
+                                ImGui::TextDisabled(
+                                    "%s", tr("Browse a DLL and header file to begin.", "浏览动态库和头文件以开始使用。"));
+                        } else if (ImGui::BeginTabBar("##ccpptabs")) {
+                                if (hasFn && ImGui::BeginTabItem(tr("Functions", "C 函数"))) {
+                                        drawCFunctionsTab();
+                                        ImGui::EndTabItem();
+                                }
+                                if (hasCls && ImGui::BeginTabItem(tr("Classes", "C++ 类"))) {
+                                        drawCppClassesTab();
+                                        ImGui::EndTabItem();
+                                }
+                                ImGui::EndTabBar();
+                        }
+
                         ImGui::EndTabItem();
                 }
-                if (hasCpp) {
-                        if (ImGui::BeginTabItem(tr("C++ Classes", "C++ 类"))) {
-                                ImGui::Spacing();
-                                drawCppClassesTab();
-                                ImGui::EndTabItem();
-                        }
+                // ── Python tab ───────────────────────────────────────────────
+                if (ImGui::BeginTabItem(tr("Python", "Python"))) {
+                        ImGui::Spacing();
+                        drawPythonTab();
+                        ImGui::EndTabItem();
                 }
                 // Monitor-push toggle (right-aligned)
                 {
@@ -1771,6 +2811,29 @@ SdkPanel::getCFuncParamRawType(int fi, int pi) const
         return fn.params[pi].rawType;
 }
 
+const CStructDecl *
+SdkPanel::getParamStructDecl(bool isCFunc, int ci, int mi, int pi) const
+{
+        if (isCFunc) {
+                // mi is the function index (same convention as getCFuncParamRawType)
+                if (mi < 0 || mi >= (int)parseResult_.functions.size())
+                        return nullptr;
+                const CFuncDecl &fn = parseResult_.functions[mi];
+                if (pi < 0 || pi >= (int)fn.params.size())
+                        return nullptr;
+                return findParamStruct(fn.params[pi]);
+        }
+        if (ci < 0 || ci >= (int)parseResult_.classes.size())
+                return nullptr;
+        const CClassDecl &cls = parseResult_.classes[ci];
+        if (mi < 0 || mi >= (int)cls.methods.size())
+                return nullptr;
+        const CMethodDecl &m = cls.methods[mi];
+        if (pi < 0 || pi >= (int)m.params.size())
+                return nullptr;
+        return findParamStruct(m.params[pi]);
+}
+
 // ─── listObjects / newObject ─────────────────────────────────────────────────
 
 std::vector<SdkPanel::ObjInfo>
@@ -1812,6 +2875,9 @@ SdkPanel::directCall(int ci, int mi, int objIdx, const std::vector<std::string> 
         void *thisPtr = nullptr;
         if (!meth.isCtor && objIdx >= 0 && objIdx < (int)objects_.size())
                 thisPtr = objects_[objIdx].ptr;
+
+        if (!meth.isCtor && !meth.isStatic && !thisPtr)
+                return {false, "no object — create one first"};
 
         auto effArgs = args;
         effArgs.resize(meth.params.size());
@@ -1879,4 +2945,134 @@ SdkPanel::directCallC(int fi, const std::vector<std::string> &args)
                 pushToMonitor(fn.name, static_cast<float>(res.rawU64), tsSec);
 
         return {res.ok, disp};
+}
+
+// ─── directCallPy / Python info helpers ──────────────────────────────────────
+
+int
+SdkPanel::getPyFuncParamCount(const std::string &funcName) const
+{
+        for (const auto &fn : pyResult_.functions)
+                if (fn.name == funcName)
+                        return (int)fn.params.size();
+        return 0;
+}
+
+std::string
+SdkPanel::getPyFuncParamName(const std::string &funcName, int i) const
+{
+        for (const auto &fn : pyResult_.functions)
+                if (fn.name == funcName)
+                        return (i >= 0 && i < (int)fn.params.size()) ? fn.params[i].name : "";
+        return "";
+}
+
+std::string
+SdkPanel::getPyFuncLabel(const std::string &funcName) const
+{
+        return funcName;
+}
+
+SdkPanel::DirectCallResult
+SdkPanel::directCallPy(const std::string &funcName, const std::vector<std::string> &args)
+{
+        // Start runner on demand if not running.
+        if (!pyRunner_ || !pyRunner_->isAlive())
+                doStartPyRunner();
+        if (!pyRunner_ || !pyRunner_->isAlive())
+                return {false, "Python not running"};
+
+        const PyFuncDecl *fn = nullptr;
+        for (const auto &f : pyResult_.functions)
+                if (f.name == funcName) {
+                        fn = &f;
+                        break;
+                }
+        if (!fn)
+                return {false, "function not found: " + funcName};
+
+        cJSON *jargs = cJSON_CreateArray();
+        for (size_t i = 0; i < fn->params.size(); ++i)
+                cJSON_AddItemToArray(jargs, cJSON_CreateString(i < args.size() ? args[i].c_str() : ""));
+        cJSON *cmd = cJSON_CreateObject();
+        cJSON_AddStringToObject(cmd, "action", "call_func");
+        cJSON_AddStringToObject(cmd, "name", funcName.c_str());
+        cJSON_AddItemToObject(cmd, "args", jargs);
+        char *s  = cJSON_PrintUnformatted(cmd);
+        auto  rr = parsePyResp(pyRunner_->xact(s, 10000));
+        cJSON_free(s);
+        cJSON_Delete(cmd);
+
+        std::string result = rr.ok ? rr.result : rr.error;
+        std::string call   = funcName + "(";
+        for (size_t i = 0; i < fn->params.size(); ++i) {
+                if (i)
+                        call += ", ";
+                call += (i < args.size() ? args[i] : "");
+        }
+        call += ")";
+        pushHistory(call, result, rr.ok, sessionTimeSec());
+        return {rr.ok, result};
+}
+
+// ─── save / load ──────────────────────────────────────────────────────────────
+
+void
+SdkPanel::save(void *node, const std::string &baseDir) const
+{
+        cJSON *obj = static_cast<cJSON *>(node);
+        cJSON_AddNumberToObject(obj, "winId", winId_);
+
+        auto toRel = [&](const char *path) -> std::string {
+                if (!path || !path[0] || baseDir.empty())
+                        return path ? path : "";
+                std::error_code       ec;
+                std::filesystem::path rel = std::filesystem::relative(path, baseDir, ec);
+                if (ec || rel.empty())
+                        return path;
+                return rel.generic_string();
+        };
+
+        cJSON_AddStringToObject(obj, "dllPath", toRel(dllPath_).c_str());
+        cJSON_AddStringToObject(obj, "headerPath", toRel(headerPath_).c_str());
+        cJSON_AddStringToObject(obj, "pyPath", toRel(pyPath_).c_str());
+}
+
+void
+SdkPanel::load(const void *node, const std::string &baseDir)
+{
+        const cJSON *obj = static_cast<const cJSON *>(node);
+
+        if (const cJSON *w = cJSON_GetObjectItem(obj, "winId"); cJSON_IsNumber(w))
+                setWindowId(w->valueint);
+
+        auto toAbs = [&](const char *rel) -> std::string {
+                if (!rel || !rel[0])
+                        return "";
+                if (baseDir.empty())
+                        return rel;
+                std::filesystem::path p = std::filesystem::path(baseDir) / rel;
+                std::error_code       ec;
+                auto                  abs = std::filesystem::canonical(p, ec);
+                return ec ? p.generic_string() : abs.generic_string();
+        };
+
+        if (const cJSON *d = cJSON_GetObjectItem(obj, "dllPath"); cJSON_IsString(d) && d->valuestring[0]) {
+                std::string abs = toAbs(d->valuestring);
+                strncpy(dllPath_, abs.c_str(), sizeof(dllPath_) - 1);
+                dllPath_[sizeof(dllPath_) - 1] = '\0';
+                doLoadDll();
+        }
+        if (const cJSON *h = cJSON_GetObjectItem(obj, "headerPath"); cJSON_IsString(h) && h->valuestring[0]) {
+                std::string abs = toAbs(h->valuestring);
+                strncpy(headerPath_, abs.c_str(), sizeof(headerPath_) - 1);
+                headerPath_[sizeof(headerPath_) - 1] = '\0';
+                doParseHeader();
+        }
+        if (const cJSON *p = cJSON_GetObjectItem(obj, "pyPath"); cJSON_IsString(p) && p->valuestring[0]) {
+                std::string abs = toAbs(p->valuestring);
+                strncpy(pyPath_, abs.c_str(), sizeof(pyPath_) - 1);
+                pyPath_[sizeof(pyPath_) - 1] = '\0';
+                doLoadPy();
+        }
 }

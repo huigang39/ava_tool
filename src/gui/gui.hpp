@@ -13,6 +13,7 @@
 
 #include "core/updater.hpp"
 #include "gui/assembly_viewer.hpp"
+#include "gui/audio_fft.hpp"
 #include "gui/bode.hpp"
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
@@ -60,9 +61,8 @@ class Gui
         std::string currentSessionPath_   = "session.ava";
         bool        isModified_           = false;
         bool        showQuitModal_        = false;
-        bool        showElevationModal_   = false;
-        int         pendingElevationCore_ = -1;
         bool        wantsToQuit_          = false;
+        bool        skipAutoSave_         = false; // set when user explicitly chose "Don't Save"
         bool        isFirstSave_          = true;
         f32         saveToastAlpha_       = 0.0f;
 
@@ -103,6 +103,7 @@ class Gui
 
         bool           showCalculator_{false};
         Bode           bode_{};
+        AudioFft       audioFft_{};
         AssemblyViewer asmViewer_{};
         SequenceEditor seqEditor_{};
 

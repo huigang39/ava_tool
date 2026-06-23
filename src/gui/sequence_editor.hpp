@@ -35,24 +35,36 @@ struct SequenceAction {
         std::vector<std::pair<i64, std::string>> enumDefs;
 };
 
+// One entry in the sequence editor's execution log.
+struct SeqLogEntry {
+        std::string desc;  // e.g. "Write: target.voltage" or "SDK: Init" or "EXCEPTION"
+        std::string value; // e.g. "= 3.3" or "OK: 0" or "FAIL: timeout" or ex.what()
+        bool        ok{true};
+        uint64_t    tsMs{0}; // ms since midnight (wall-clock, for display)
+};
+
 // Payload for dragging a function/method out of an SDK Debug window.
 struct SdkDragPayload {
         int  panelWinId{-1};
         bool isCFunc{false};
+        bool isPython{false};
         int  classIdx{-1};
         int  methodIdx{-1};
         int  objIdx{0};
+        char pyName[128]{}; // Python function name (when isPython == true)
 };
 
 // SDK call step info.
 struct SdkStepInfo {
         int                      panelWinId{-1};
         bool                     isCFunc{false};
+        bool                     isPython{false};
         int                      classIdx{-1};
         int                      methodIdx{-1};
         int                      objIdx{0};
         std::vector<std::string> args;
         std::string              label;
+        std::string              pyFuncName; // Python function name (when isPython == true)
 };
 
 // Kept for backward compatibility: SdkCall is no longer a user-creatable step
@@ -67,7 +79,7 @@ enum class SeqOpKind { Write, Sdk };
 struct SeqOp {
         SeqOpKind      kind{SeqOpKind::Write};
         SequenceAction action{}; // valid when kind == Write
-        SdkStepInfo    sdk{};     // valid when kind == Sdk
+        SdkStepInfo    sdk{};    // valid when kind == Sdk
 };
 
 struct SequenceStep {
@@ -92,11 +104,22 @@ struct SequenceStep {
         bool                      expanded{true};
 };
 
+// Struct field descriptor for LOCAL struct variables created by the sequence editor.
+struct SeqStructField {
+        std::string name;
+        DataType    type{DataType::U32};
+        uint32_t    byteOffset{0};
+};
+
 class SequenceEditor
 {
       public:
         // Wired by Gui: read a LOCAL variable buffer for condition evaluation.
         std::function<void *(const std::string &)> onGetLocalBuf_;
+        // Wired by Gui: create a new LOCAL scalar variable in the variable manager.
+        std::function<void(const std::string &, DataType, size_t)> onAddLocalVar_;
+        // Wired by Gui: create a new LOCAL struct variable in the variable manager.
+        std::function<void(const std::string &, const std::vector<SeqStructField> &, size_t)> onAddLocalStructVar_;
 
         SequenceEditor();
         ~SequenceEditor();
@@ -130,16 +153,16 @@ class SequenceEditor
         std::shared_ptr<SdkPanel> findSdkPanel(int winId) const;
 
         // UI helpers
-        void          drawStepList();
-        void          drawStepDetail(SequenceStep &step);
-        void          drawBodySteps(std::vector<SequenceStep> &steps, int depth);
-        void          drawSdkStepDetail(SdkStepInfo &sdk, std::shared_ptr<SdkPanel> panel);
-        void          acceptSdkPayload(const void *data, int insertAfter);
+        void drawStepList();
+        void drawStepDetail(SequenceStep &step);
+        void drawBodySteps(std::vector<SequenceStep> &steps, int depth);
+        void drawSdkStepDetail(SdkStepInfo &sdk, std::shared_ptr<SdkPanel> panel);
+        void acceptSdkPayload(const void *data, int insertAfter);
         // Build an SDK op from a drag payload; false if the source panel is gone.
-        bool          makeSdkOp(const SdkDragPayload &pl, SeqOp &out);
+        bool makeSdkOp(const SdkDragPayload &pl, SeqOp &out);
         // Inside an active drag-drop target: consume any SDK/variable payload and
         // hand each resulting op to `sink`. Returns true if anything was added.
-        bool          acceptOpDrops(const std::function<void(SeqOp)> &sink);
+        bool          acceptOpDrops(const std::function<void(SeqOp)> &sink, bool noSdk = false);
         SequenceStep *selectedStepPtr();
 
         // Background execution
@@ -168,7 +191,8 @@ class SequenceEditor
         std::atomic<bool>        seqRunning_{false};
         std::atomic<bool>        seqStopReq_{false};
         std::atomic<bool>        seqDone_{false};
-        std::vector<std::string> seqLog_;
+        std::vector<SeqLogEntry> seqLog_;
+        float                    seqLogHeight_{120.0f};
 
         std::vector<std::weak_ptr<SdkPanel>> sdkPanels_;
 };

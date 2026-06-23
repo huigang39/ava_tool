@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -13,6 +14,28 @@
 #include "core/c_header_parser.hpp"
 #include "core/export_enum.hpp"
 #include "core/sdk_loader.hpp"
+
+// ─── Python parse result ──────────────────────────────────────────────────────
+
+struct PyParam {
+        std::string name;
+        std::string defaultVal;
+};
+
+struct PyFuncDecl {
+        std::string          name;
+        std::vector<PyParam> params;
+};
+
+struct PyClassDecl {
+        std::string             name;
+        std::vector<PyFuncDecl> methods;
+};
+
+struct PyParseResult {
+        std::vector<PyFuncDecl>  functions;
+        std::vector<PyClassDecl> classes;
+};
 
 // ─── Sequence step ────────────────────────────────────────────────────────────
 
@@ -95,6 +118,8 @@ class SdkPanel
         std::string getCFuncParamName(int fnIdx, int paramIdx) const;
         std::string getParamRawType(int classIdx, int methodIdx, int paramIdx) const;
         std::string getCFuncParamRawType(int fnIdx, int paramIdx) const;
+        // Returns the CStructDecl for the pointed-to type of a parameter, or nullptr.
+        const CStructDecl *getParamStructDecl(bool isCFunc, int classIdx, int methodIdx, int paramIdx) const;
 
         // Object list (for SequenceEditor object-selector dropdown).
         struct ObjInfo {
@@ -112,6 +137,19 @@ class SdkPanel
         };
         DirectCallResult directCall(int classIdx, int methodIdx, int objIdx, const std::vector<std::string> &args);
         DirectCallResult directCallC(int fnIdx, const std::vector<std::string> &args);
+        DirectCallResult directCallPy(const std::string &funcName, const std::vector<std::string> &args);
+
+        // Python info helpers — used by SequenceEditor to populate dragged steps.
+        int         getPyFuncParamCount(const std::string &funcName) const;
+        std::string getPyFuncParamName(const std::string &funcName, int paramIdx) const;
+        std::string getPyFuncLabel(const std::string &funcName) const;
+
+        // Session persistence — node is cJSON*, baseDir is the .ava file's directory.
+        void save(void *node, const std::string &baseDir) const;
+        void load(const void *node, const std::string &baseDir);
+
+        SdkPanel(); // defined in sdk_panel.cpp (PyRunner is incomplete in header)
+        ~SdkPanel();
 
         // Window identity — set once by Gui at creation time.
         void setWindowId(int id)
@@ -215,6 +253,38 @@ class SdkPanel
 
         void drawCFunctionsTab();
         void drawCppClassesTab();
+        void drawPythonTab();
+
+        // ── Python tab ───────────────────────────────────────────────────────────
+        char                pyPath_[512]{};
+        PyParseResult       pyResult_;
+        int                 pySelFnIdx_{-1};
+        int                 pySelClsIdx_{-1};
+        int                 pySelMethIdx_{-1};
+        int                 pySelObjIdx_{-1};
+        float               pySplitW_{220.0f};
+        std::vector<ArgBuf> pyFnArgBufs_;
+        std::vector<ArgBuf> pyMethArgBufs_;
+        std::string         pyLastResult_;
+        bool                pyLastResultOk_{false};
+
+        struct PyObjEntry {
+                int         pyId{-1};
+                std::string label;
+                std::string className;
+        };
+        std::vector<PyObjEntry> pyObjects_;
+
+        struct PyRunner; // defined in sdk_panel.cpp
+        std::unique_ptr<PyRunner> pyRunner_;
+
+        void doStartPyRunner();
+        void doLoadPy();
+        void doCallPyFunc();
+        void doNewPyObject();
+        void doNewPyObjectWithArgs(const std::vector<std::string> &args);
+        void doCallPyMeth();
+        void doDeletePyObject(int idx);
 
         // Sequence execution helpers (run inside seqThread_)
         struct SeqCtx {
