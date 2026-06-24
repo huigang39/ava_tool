@@ -284,6 +284,10 @@ class Variable
         void addLocalStructVar(const std::string &name, const std::vector<VarEntry::StructField> &fields, size_t totalSize);
         // Read one LOCAL struct field as float. Returns false if var/field not found.
         bool readLocalFieldAsFloat(const std::string &varName, const std::string &fieldName, float &out) const;
+        // Snapshot all LOCAL values as (channelName, value) pairs — "<var>" for a
+        // scalar and "<var>.<field>" for each manual-struct field. The GUI feeds
+        // these into matching scope channels each frame so LOCAL data plots live.
+        std::vector<std::pair<std::string, float>> collectLocalChannelValues() const;
 
         // Popup support: immediate members of a DWARF struct VarEntry.
         // Pass typeOff=0/baseAddr=0 to start from the top-level variable.

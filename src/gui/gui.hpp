@@ -58,13 +58,13 @@ class Gui
         mutable std::mutex mtxMonitors_{};
         VariableMapType    vars_{};
 
-        std::string currentSessionPath_   = "session.ava";
-        bool        isModified_           = false;
-        bool        showQuitModal_        = false;
-        bool        wantsToQuit_          = false;
-        bool        skipAutoSave_         = false; // set when user explicitly chose "Don't Save"
-        bool        isFirstSave_          = true;
-        f32         saveToastAlpha_       = 0.0f;
+        std::string currentSessionPath_ = "session.ava";
+        bool        isModified_         = false;
+        bool        showQuitModal_      = false;
+        bool        wantsToQuit_        = false;
+        bool        skipAutoSave_       = false; // set when user explicitly chose "Don't Save"
+        bool        isFirstSave_        = true;
+        f32         saveToastAlpha_     = 0.0f;
 
         void drawBar();
         void loadSession(const std::string &path = "");

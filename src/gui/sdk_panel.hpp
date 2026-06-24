@@ -215,8 +215,8 @@ class SdkPanel
 
         // ── monitor push ─────────────────────────────────────────────────────────
         // Channel name → latest value (for display in the history header)
+        // Always-on: every integer-returning call is pushed to the monitor.
         std::unordered_map<std::string, float> pinnedChannels_;
-        bool                                   monitorPushEnabled_{true};
 
         // ── sequence ──────────────────────────────────────────────────────────────
         std::vector<SdkSeqStep> seqSteps_;

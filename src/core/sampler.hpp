@@ -26,8 +26,14 @@ void fftThreadFunc(Gui *gui);
 //   0 = Low      : normal priority, no affinity, always Sleep(1ms)
 //   1 = Normal   : slightly elevated priority, no affinity, adaptive sleep
 //   2 = CPUBound : realtime priority + core pinning + spin-loop
-extern std::atomic<int>  g_samplerRunMode;   // default 1
+extern std::atomic<int>  g_samplerRunMode; // default 1
 extern std::atomic<bool> g_samplerRebind;
+
+// User-selected core for CPUBound mode.
+//   -1 : auto — pin to the highest available core (default)
+//   >=0: pin to this specific core (if available to the process)
+// Only consulted when g_samplerRunMode == 2. Set g_samplerRebind after changing.
+extern std::atomic<int> g_samplerCoreReq;
 
 // After setupThread() runs:
 //   >= 0 : sampler is pinned to this core (CPUBound mode)

@@ -41,9 +41,10 @@ extern std::atomic<bool> g_appRunning;
 extern std::atomic<bool> g_monitorPaused;
 extern std::atomic<bool> g_jlinkSamplingPaused;
 
-std::atomic<int>  g_samplerRunMode{1};   // 0=Low, 1=Normal, 2=CPUBound
+std::atomic<int>  g_samplerRunMode{1}; // 0=Low, 1=Normal, 2=CPUBound
 std::atomic<bool> g_samplerRebind{false};
 std::atomic<int>  g_samplerBoundCore{-1}; // -1=uninit, -2=no binding, >=0=core id
+std::atomic<int>  g_samplerCoreReq{-1};   // -1=auto (highest), >=0=user-picked core
 
 // ---------------------------------------------------------------------------
 // Apply the requested run mode to the calling (sampler) thread.
@@ -90,22 +91,35 @@ setupThread(int mode)
                 SetPriorityClass(hProc, ABOVE_NORMAL_PRIORITY_CLASS);
                 SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST);
 
+                // Note: pinning a thread of *our own* process needs no elevation;
+                // SetThreadAffinityMask / THREAD_PRIORITY_HIGHEST work for any user.
+                // (Only REALTIME_PRIORITY_CLASS would require admin, which we avoid.)
                 DWORD_PTR procMask = 0, sysMask = 0;
                 GetProcessAffinityMask(hProc, &procMask, &sysMask);
                 int       targetCore = -1;
                 DWORD_PTR targetMask = 0;
-                for (int b = 63; b >= 0; --b) {
-                        if (procMask & (1ull << b)) {
-                                targetCore = b;
-                                targetMask = (1ull << b);
-                                break;
+
+                const int reqCore = g_samplerCoreReq.load();
+                if (reqCore >= 0 && reqCore < 64 && (procMask & (1ull << reqCore))) {
+                        // User explicitly picked a core that this process may run on.
+                        targetCore = reqCore;
+                        targetMask = (1ull << reqCore);
+                } else {
+                        // Auto: pin to the highest available core.
+                        for (int b = 63; b >= 0; --b) {
+                                if (procMask & (1ull << b)) {
+                                        targetCore = b;
+                                        targetMask = (1ull << b);
+                                        break;
+                                }
                         }
                 }
                 if (targetMask)
                         SetThreadAffinityMask(hThread, targetMask);
                 g_samplerBoundCore.store(targetCore);
-                LOG_I("Sampler: CPUBound mode (HIGHEST priority, pinned to core %d, mask=0x%llx)",
+                LOG_I("Sampler: CPUBound mode (HIGHEST priority, pinned to core %d%s, mask=0x%llx)",
                       targetCore,
+                      reqCore >= 0 ? " [user]" : " [auto]",
                       (u64)targetMask);
         }
 
@@ -117,7 +131,8 @@ setupThread(int mode)
                 const int n = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
                 cpu_set_t cs;
                 CPU_ZERO(&cs);
-                for (int i = 0; i < n; ++i) CPU_SET(i, &cs);
+                for (int i = 0; i < n; ++i)
+                        CPU_SET(i, &cs);
                 pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
                 g_samplerBoundCore.store(-2);
                 LOG_I("Sampler: Low mode (SCHED_OTHER, no affinity)");
@@ -129,7 +144,8 @@ setupThread(int mode)
                 const int n = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
                 cpu_set_t cs;
                 CPU_ZERO(&cs);
-                for (int i = 0; i < n; ++i) CPU_SET(i, &cs);
+                for (int i = 0; i < n; ++i)
+                        CPU_SET(i, &cs);
                 pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
                 g_samplerBoundCore.store(-2);
                 LOG_I("Sampler: Normal mode (SCHED_OTHER, no affinity)");
@@ -142,16 +158,20 @@ setupThread(int mode)
                         sp.sched_priority = sched_get_priority_max(SCHED_RR);
                         pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
                 }
+                // Affinity itself needs no privileges; only SCHED_FIFO above does
+                // (handled with the SCHED_RR/SCHED_OTHER fallback when not permitted).
                 const int n    = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
-                const int core = (n > 1) ? (n - 1) : 0;
+                const int req  = g_samplerCoreReq.load();
+                const int core = (req >= 0 && req < n) ? req : ((n > 1) ? (n - 1) : 0);
                 cpu_set_t cs;
                 CPU_ZERO(&cs);
                 CPU_SET(core, &cs);
                 pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
                 g_samplerBoundCore.store(core);
-                LOG_I("Sampler: CPUBound mode (SCHED_FIFO prio=%d, pinned to core %d)",
+                LOG_I("Sampler: CPUBound mode (SCHED_FIFO prio=%d, pinned to core %d%s)",
                       sp.sched_priority,
-                      core);
+                      core,
+                      req >= 0 ? " [user]" : " [auto]");
         }
 
 #elif defined(__APPLE__)

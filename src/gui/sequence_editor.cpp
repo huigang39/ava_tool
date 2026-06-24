@@ -293,6 +293,20 @@ SequenceEditor::seqEvalCond(const SequenceStep &step)
         return true;
 }
 
+// Cap a free-spinning loop at ~1 kHz. Each While/For iteration checks its
+// condition via seqEvalCond() → onGetLocalBuf_(), which takes the GUI's
+// mtxMonitors_ lock; an unthrottled loop would acquire it at unbounded rate and
+// starve the render thread (which needs the same lock every frame), dragging
+// the GUI to a crawl. Iterations whose body already takes ≥1 ms are unaffected.
+static void
+throttleLoopIteration(std::chrono::steady_clock::time_point iterStart)
+{
+        const auto elapsed = std::chrono::steady_clock::now() - iterStart;
+        const auto floor   = std::chrono::milliseconds(1);
+        if (elapsed < floor)
+                std::this_thread::sleep_for(floor - elapsed);
+}
+
 SequenceEditor::SExecResult
 SequenceEditor::seqExecStep(const SequenceStep &step, SeqCtx &ctx)
 {
@@ -335,11 +349,13 @@ SequenceEditor::seqExecStep(const SequenceStep &step, SeqCtx &ctx)
 
                 case SeqStepKind::While: {
                         while (!ctx.editor->seqStopReq_.load() && ctx.editor->seqEvalCond(step)) {
-                                SExecResult r = seqExecSteps(step.body, ctx);
+                                const auto  iterStart = std::chrono::steady_clock::now();
+                                SExecResult r         = seqExecSteps(step.body, ctx);
                                 if (r == SExecResult::Stop)
                                         return SExecResult::Stop;
                                 if (r == SExecResult::Break)
                                         break;
+                                throttleLoopIteration(iterStart);
                         }
                         break;
                 }
@@ -1144,9 +1160,67 @@ SequenceEditor::acceptSdkPayload(const void *data, int stepIdx)
 // ─── drawStepList ─────────────────────────────────────────────────────────────
 
 void
+SequenceEditor::moveStep(int src, int dst)
+{
+        if (src == dst || src < 0 || dst < 0 || src >= (int)steps_.size() || dst >= (int)steps_.size())
+                return;
+        SequenceStep moved = std::move(steps_[src]);
+        steps_.erase(steps_.begin() + src);
+        // After erase, indices above src shift down by one.
+        if (dst > src)
+                --dst;
+        steps_.insert(steps_.begin() + dst, std::move(moved));
+        selectedStep_ = dst;
+        isModified_   = true;
+}
+
+void
+SequenceEditor::runSingleStep(int idx)
+{
+        if (seqRunning_.load())
+                return;
+        if (idx < 0 || idx >= (int)steps_.size())
+                return;
+
+        seqStopReq_.store(false);
+        seqDone_.store(false);
+        seqRunning_.store(true);
+        {
+                std::lock_guard<std::mutex> lk(seqMtx_);
+                seqLog_.clear();
+        }
+        if (seqThread_.joinable())
+                seqThread_.join();
+        seqThread_ = std::thread([this, idx]() {
+                LOG_I("[SeqEditor] single-step run: idx=%d", idx);
+                try {
+                        SeqCtx ctx{this};
+                        if (idx < (int)steps_.size())
+                                seqExecStep(steps_[idx], ctx);
+                } catch (const std::exception &ex) {
+                        LOG_E("[SeqEditor] single-step exception: %s", ex.what());
+                        SeqLogEntry le;
+                        le.tsMs  = nowStampMs();
+                        le.desc  = "EXCEPTION";
+                        le.value = ex.what();
+                        le.ok    = false;
+                        std::lock_guard<std::mutex> lk(seqMtx_);
+                        seqLog_.push_back(std::move(le));
+                } catch (...) {
+                        LOG_E("[SeqEditor] single-step unknown exception");
+                }
+                seqRunning_.store(false);
+                seqDone_.store(true);
+        });
+}
+
+void
 SequenceEditor::drawStepList()
 {
         bool running = seqRunning_.load();
+
+        // Deferred reorder: applied after the loop so we never mutate steps_ mid-iteration.
+        int moveSrc = -1, moveDst = -1;
 
         for (int i = 0; i < (int)steps_.size(); ++i) {
                 SequenceStep &step = steps_[i];
@@ -1224,23 +1298,53 @@ SequenceEditor::drawStepList()
                 }
                 ImGui::PopStyleColor();
 
-                // Drop target on step item: variables only (no SDK) on the left sidebar.
+                // Drag source: reorder this step by dragging it onto another.
+                if (!running && ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                        ImGui::SetDragDropPayload("SEQ_STEP_MOVE", &i, sizeof(i));
+                        ImGui::TextUnformatted(label);
+                        ImGui::EndDragDropSource();
+                }
+
+                // Drop target on step item: reorder (SEQ_STEP_MOVE), else variable/SDK op drops.
                 if (!running && ImGui::BeginDragDropTarget()) {
-                        SequenceStep &st  = steps_[i];
-                        bool          mod = false;
-                        if (st.kind == SeqStepKind::Action)
-                                mod = acceptOpDrops([&](SeqOp op) { st.ops.push_back(std::move(op)); }, true);
-                        else if (st.kind == SeqStepKind::If || st.kind == SeqStepKind::While || st.kind == SeqStepKind::For)
-                                mod = acceptOpDrops([&](SeqOp op) { appendOpToBody(st.body, std::move(op)); }, true);
-                        if (mod) {
-                                selectedStep_ = i;
-                                isModified_   = true;
+                        if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("SEQ_STEP_MOVE")) {
+                                if (mv->DataSize == (int)sizeof(int)) {
+                                        moveSrc = *static_cast<const int *>(mv->Data);
+                                        moveDst = i;
+                                }
+                        } else {
+                                SequenceStep &st  = steps_[i];
+                                bool          mod = false;
+                                if (st.kind == SeqStepKind::Action)
+                                        mod = acceptOpDrops([&](SeqOp op) { st.ops.push_back(std::move(op)); }, true);
+                                else if (st.kind == SeqStepKind::If || st.kind == SeqStepKind::While ||
+                                         st.kind == SeqStepKind::For)
+                                        mod = acceptOpDrops([&](SeqOp op) { appendOpToBody(st.body, std::move(op)); }, true);
+                                if (mod) {
+                                        selectedStep_ = i;
+                                        isModified_   = true;
+                                }
                         }
                         ImGui::EndDragDropTarget();
                 }
 
+                // Per-step single-run button (right-aligned overlay on the selectable).
+                if (!running) {
+                        ImGui::SameLine();
+                        float availW = ImGui::GetContentRegionAvail().x;
+                        if (availW > 28.0f)
+                                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + availW - 24.0f);
+                        if (ImGui::SmallButton("▶"))
+                                runSingleStep(i);
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", tr("Run this step only", "仅运行此步骤"));
+                }
+
                 ImGui::PopID();
         }
+
+        if (moveSrc >= 0)
+                moveStep(moveSrc, moveDst);
 }
 
 // ─── drawStepDetail ───────────────────────────────────────────────────────────

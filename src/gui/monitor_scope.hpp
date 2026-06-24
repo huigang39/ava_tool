@@ -130,6 +130,10 @@ class MonitorScope
                           const std::vector<std::string>  &allKeys,
                           const std::string               &displayLabel = {});
 
+        // Reorder channel `src` so it sits at `dst`'s display position, then
+        // renumber all channels' display order sequentially. Used by drag-reorder.
+        void reorderChannelTo(const std::string &src, const std::string &dst);
+
       public:
         static void shmInit(MonitorChannel &ch);
         explicit MonitorScope(std::string scopeName) : name_(std::move(scopeName))

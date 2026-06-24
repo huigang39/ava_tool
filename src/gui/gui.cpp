@@ -34,6 +34,7 @@
 #include "core/jlink_port.hpp"
 #include "core/mmap_vector.hpp"
 #include "core/sampler.hpp"
+#include "core/session_time.hpp"
 #include "gui/gui.hpp"
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
@@ -1058,19 +1059,49 @@ Gui::drawBar()
                                 };
                                 if (ImGui::MenuItem(tr("Low CPU Usage", "低占用模式"), nullptr, cur == 0))
                                         applyMode(0);
-                                ImGui::TextDisabled("%s",
-                                                    tr("  Sleep 1ms per iter, normal priority",
-                                                       "  每次迭代睡眠 1ms，普通优先级"));
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip(
+                                            "%s", tr("Sleep 1ms per iter, normal priority", "每次迭代睡眠 1ms，普通优先级"));
                                 if (ImGui::MenuItem(tr("Normal", "普通模式"), nullptr, cur == 1))
                                         applyMode(1);
-                                ImGui::TextDisabled("%s",
-                                                    tr("  Adaptive sleep, slightly elevated priority",
-                                                       "  自适应睡眠，稍高优先级"));
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip(
+                                            "%s", tr("Adaptive sleep, slightly elevated priority", "自适应睡眠，稍高优先级"));
                                 if (ImGui::MenuItem(tr("CPU-Bound (High Perf)", "CPU 绑定高占用模式"), nullptr, cur == 2))
                                         applyMode(2);
-                                ImGui::TextDisabled("%s",
-                                                    tr("  Spin-loop, highest priority, core pinned",
-                                                       "  自旋循环，最高优先级，绑定 CPU 核心"));
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s",
+                                                          tr("Spin-loop, highest priority, core pinned",
+                                                             "自旋循环，最高优先级，绑定 CPU 核心"));
+
+                                // Core selection — only meaningful in CPU-Bound mode.
+                                // Pinning our own thread needs no admin rights.
+                                ImGui::Separator();
+                                const unsigned hc       = std::thread::hardware_concurrency();
+                                const int      nCores   = hc > 0 ? static_cast<int>(hc) : 1;
+                                const int      reqCore  = g_samplerCoreReq.load();
+                                const bool     cpuBound = (cur == 2);
+                                if (ImGui::BeginMenu(tr("Bind to Core", "绑定 CPU 核心"), cpuBound)) {
+                                        auto pickCore = [&](int c) {
+                                                g_samplerCoreReq.store(c);
+                                                g_samplerRebind.store(true);
+                                        };
+                                        if (ImGui::MenuItem(
+                                                tr("Auto (highest core)", "自动（最高核心）"), nullptr, reqCore < 0))
+                                                pickCore(-1);
+                                        ImGui::Separator();
+                                        char lbl[32];
+                                        for (int c = 0; c < nCores; ++c) {
+                                                snprintf(lbl, sizeof(lbl), tr("Core %d", "核心 %d"), c);
+                                                if (ImGui::MenuItem(lbl, nullptr, reqCore == c))
+                                                        pickCore(c);
+                                        }
+                                        ImGui::EndMenu();
+                                }
+                                if (!cpuBound && ImGui::IsItemHovered())
+                                        ImGui::SetTooltip(
+                                            "%s",
+                                            tr("Switch to CPU-Bound mode to pin a core", "切换到 CPU 绑定模式后才能指定核心"));
                                 ImGui::EndMenu();
                         }
 
@@ -1352,6 +1383,37 @@ Gui::loop()
                                         }
                                         ++it;
                                 }
+                        }
+                }
+
+                // Feed LOCAL variable data into matching monitor scope channels.
+                // JLINK/SHM channels are sampled by the dedicated sampler thread, but
+                // LOCAL data lives only in each Variable's localBufs_ (written by the
+                // SDK/sequence panels). Resample it here each frame and push to any
+                // scope channel named "<var>" / "<var>.<field>" (device == LOCAL).
+                {
+                        std::unordered_map<std::string, float> localVals;
+                        for (auto &vw : vars_ | std::views::values)
+                                for (auto &[chName, val] : vw->collectLocalChannelValues())
+                                        localVals[chName] = val;
+
+                        if (!localVals.empty()) {
+                                const double    ts = sessionTimeSec();
+                                std::lock_guard lk(mtxMonitors_);
+                                for (auto &m : monitors_ | std::views::values)
+                                        for (auto &s : m->getScopes() | std::views::values)
+                                                for (auto &[cn, ch] : s->getChannels()) {
+                                                        if (ch->getDevice() != "LOCAL")
+                                                                continue;
+                                                        const std::string &key =
+                                                            ch->getSymbolName().empty() ? cn : ch->getSymbolName();
+                                                        auto it = localVals.find(key);
+                                                        if (it == localVals.end())
+                                                                continue;
+                                                        float v = it->second;
+                                                        ch->pushBatch(&v, &ts, 1);
+                                                        ch->publishSnapshot();
+                                                }
                         }
                 }
 

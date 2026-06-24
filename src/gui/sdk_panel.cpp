@@ -167,7 +167,7 @@ SdkPanel::doCallC()
 
         double tsSec = sessionTimeSec();
         pushHistory(callStr, fnLastResult_, res.ok, tsSec);
-        if (res.ok && ctypeIsInteger(fn.retType) && monitorPushEnabled_)
+        if (res.ok && ctypeIsInteger(fn.retType))
                 pushToMonitor(fn.name, static_cast<float>(res.rawU64), tsSec);
 }
 
@@ -238,7 +238,7 @@ SdkPanel::doCallMethod()
 
         double tsSec = sessionTimeSec();
         pushHistory(callStr, display, res.ok, tsSec);
-        if (res.ok && ctypeIsInteger(meth.retType) && monitorPushEnabled_) {
+        if (res.ok && ctypeIsInteger(meth.retType)) {
                 std::string chKey = cls.name + "::" + meth.name;
                 pushToMonitor(chKey, static_cast<float>(res.rawU64), tsSec);
         }
@@ -2109,17 +2109,6 @@ SdkPanel::draw()
                         drawPythonTab();
                         ImGui::EndTabItem();
                 }
-                // Monitor-push toggle (right-aligned)
-                {
-                        float avail = ImGui::GetContentRegionAvail().x;
-                        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - 180.0f);
-                        ImGui::PushStyleColor(
-                            ImGuiCol_Text, monitorPushEnabled_ ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(0.5f, 0.5f, 0.5f, 1.f));
-                        if (ImGui::SmallButton(monitorPushEnabled_ ? tr("■ Monitor Push ON", "■ 监视器推送 开")
-                                                                   : tr("□ Monitor Push OFF", "□ 监视器推送 关")))
-                                monitorPushEnabled_ = !monitorPushEnabled_;
-                        ImGui::PopStyleColor();
-                }
                 ImGui::EndTabBar();
         }
 
@@ -2254,7 +2243,7 @@ SdkPanel::execStep(const SdkSeqStep &step, SeqCtx &ctx)
                                                         callStr += args[i];
                                                 }
                                                 callStr += ")";
-                                                if (res.ok && ctypeIsInteger(meth.retType) && monitorPushEnabled_)
+                                                if (res.ok && ctypeIsInteger(meth.retType))
                                                         pushToMonitor(
                                                             cls.name + "::" + meth.name, static_cast<float>(res.rawU64), ts);
                                         }
@@ -2902,8 +2891,9 @@ SdkPanel::directCall(int ci, int mi, int objIdx, const std::vector<std::string> 
 
         std::string disp  = res.ok ? res.display : res.error;
         double      tsSec = sessionTimeSec();
-        pushHistory(cls.name + "::" + meth.name, disp, res.ok, tsSec);
-        if (res.ok && ctypeIsInteger(meth.retType) && monitorPushEnabled_)
+        // Sequence-editor calls keep their own log (seqLog_); don't mirror into the
+        // SDK panel's call history.
+        if (res.ok && ctypeIsInteger(meth.retType))
                 pushToMonitor(cls.name + "::" + meth.name, static_cast<float>(res.rawU64), tsSec);
 
         return {res.ok, disp};
@@ -2940,8 +2930,9 @@ SdkPanel::directCallC(int fi, const std::vector<std::string> &args)
 
         std::string disp  = res.ok ? res.display : res.error;
         double      tsSec = sessionTimeSec();
-        pushHistory(fn.name, disp, res.ok, tsSec);
-        if (res.ok && ctypeIsInteger(fn.retType) && monitorPushEnabled_)
+        // Sequence-editor calls keep their own log (seqLog_); don't mirror into the
+        // SDK panel's call history.
+        if (res.ok && ctypeIsInteger(fn.retType))
                 pushToMonitor(fn.name, static_cast<float>(res.rawU64), tsSec);
 
         return {res.ok, disp};
@@ -3011,7 +3002,8 @@ SdkPanel::directCallPy(const std::string &funcName, const std::vector<std::strin
                 call += (i < args.size() ? args[i] : "");
         }
         call += ")";
-        pushHistory(call, result, rr.ok, sessionTimeSec());
+        // Sequence-editor calls keep their own log (seqLog_); don't mirror into the
+        // SDK panel's call history.
         return {rr.ok, result};
 }
 

@@ -241,8 +241,8 @@ MonitorScope::menu()
         }
 
         // Right-aligned buttons: reorder (up/down), Delete Scope, Hide Scope, Pause/Resume
-        float arrowW = ImGui::GetFrameHeight(); // ArrowButton is square
-        float delBtnWidth = ImGui::CalcTextSize(tr("Delete Scope", "删除示波器")).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        float arrowW       = ImGui::GetFrameHeight(); // ArrowButton is square
+        float delBtnWidth  = ImGui::CalcTextSize(tr("Delete Scope", "删除示波器")).x + ImGui::GetStyle().FramePadding.x * 2.0f;
         float hideBtnWidth = std::max(ImGui::CalcTextSize(tr("Hide Scope", "隐藏示波器")).x,
                                       ImGui::CalcTextSize(tr("Show Scope", "显示示波器")).x) +
                              ImGui::GetStyle().FramePadding.x * 2.0f;
@@ -600,6 +600,24 @@ MonitorScope::drawTableRow(const std::string               &chName,
 
         // 1. Name (Selectable for Shift/Ctrl support)
         ImGui::TableNextColumn();
+
+        // Reorder grip — a dedicated drag handle so reordering doesn't clash with
+        // the row's existing "move to another scope" (DND_CHANNEL_MOVE) source.
+        ImGui::SmallButton("=##chgrip");
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                ImGui::SetDragDropPayload("CH_ROW_REORDER", chName.c_str(), chName.size() + 1);
+                ImGui::Text(tr("Reorder: %s", "调整顺序: %s"), chName.c_str());
+                ImGui::EndDragDropSource();
+        }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tr("Drag to reorder", "拖动以调整顺序"));
+        if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("CH_ROW_REORDER"))
+                        reorderChannelTo(std::string(static_cast<const char *>(mv->Data)), chName);
+                ImGui::EndDragDropTarget();
+        }
+        ImGui::SameLine();
+
         // Use alias when set; fall back to the trie display label (short segment).
         const bool  hasAlias = (ch->getLabel() != ch->getName());
         const char *label = hasAlias ? ch->getLabel().c_str() : (displayLabel.empty() ? chName.c_str() : displayLabel.c_str());
@@ -750,7 +768,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
         ImGui::TableNextColumn();
         const std::string &dev = ch->getDevice();
         if (dev == "LOCAL")
-                ImGui::Text("UDP");
+                ImGui::Text("LOCAL");
         else if (dev == "JLINK")
                 ImGui::Text("J-Link");
         else
@@ -1486,6 +1504,45 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
         ImGui::EndTable();
 }
 
+void
+MonitorScope::reorderChannelTo(const std::string &src, const std::string &dst)
+{
+        if (src == dst || chs_.find(src) == chs_.end() || chs_.find(dst) == chs_.end())
+                return;
+
+        // Current display order.
+        std::vector<std::string> keys;
+        keys.reserve(chs_.size());
+        for (auto &[k, _] : chs_)
+                keys.push_back(k);
+        std::sort(keys.begin(), keys.end(), [&](const std::string &a, const std::string &b) {
+                const i64 oa = chs_[a]->getOrder(), ob = chs_[b]->getOrder();
+                return oa != ob ? oa < ob : a < b;
+        });
+
+        int sidx = -1, didx = -1;
+        for (int i = 0; i < (int)keys.size(); ++i) {
+                if (keys[i] == src)
+                        sidx = i;
+                if (keys[i] == dst)
+                        didx = i;
+        }
+        if (sidx < 0 || didx < 0)
+                return;
+
+        std::string moved = keys[sidx];
+        keys.erase(keys.begin() + sidx);
+        if (didx > sidx)
+                --didx;
+        keys.insert(keys.begin() + didx, moved);
+
+        for (int i = 0; i < (int)keys.size(); ++i)
+                chs_[keys[i]]->setOrder(i);
+        nextChannelOrder_ = (i64)keys.size();
+        if (parent_)
+                parent_->setModified();
+}
+
 int
 MonitorScope::addChannel(const std::string &chName)
 {
@@ -1544,6 +1601,11 @@ MonitorScope::dropTarget()
                 if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("CHANNEL")) {
                         if (payload->DataSize == sizeof(ChannelDropPayload)) {
                                 auto *chPayload = static_cast<ChannelDropPayload *>(payload->Data);
+                                LOG_I("Scope[%s] drop CHANNEL name='%s' dev='%s' addr=0x%llx",
+                                      name_.c_str(),
+                                      chPayload->name,
+                                      chPayload->device,
+                                      (unsigned long long)chPayload->addr);
                                 if (addChannel(chPayload->name) == 0) {
                                         MonitorChannel *ch = findChannel(chPayload->name);
                                         if (ch) {
@@ -1583,6 +1645,11 @@ MonitorScope::dropTarget()
                 if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("STRUCT_CHANNEL")) {
                         if (payload->DataSize == sizeof(StructChannelPayload)) {
                                 auto *sp = static_cast<const StructChannelPayload *>(payload->Data);
+                                LOG_I("Scope[%s] drop STRUCT_CHANNEL root='%s' dev='%s' count=%d",
+                                      name_.c_str(),
+                                      sp->rootName,
+                                      sp->device,
+                                      (int)sp->count);
                                 for (int ei = 0; ei < sp->count; ++ei) {
                                         const auto &e = sp->entries[ei];
                                         if (addChannel(e.name) == 0) {

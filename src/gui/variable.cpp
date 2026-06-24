@@ -824,6 +824,12 @@ Variable::drawSymbolLeaf(
 void
 Variable::drawDataTreeLeaf(DataTree &node, const int indentLevel)
 {
+        // Unique per-node ID: template names repeat across sibling structs/arrays,
+        // and without this the TreeNodeEx IDs collide — ImGui then can't tell the
+        // rows apart, which silently breaks drag-and-drop / hover for the dupes.
+        // (drawSymbolLeaf and the watch table push IDs for the same reason.)
+        ImGui::PushID(static_cast<const void *>(&node));
+
         ImGui::TableNextRow();
         ImGui::TableSetColumnIndex(0);
 
@@ -872,6 +878,8 @@ Variable::drawDataTreeLeaf(DataTree &node, const int indentLevel)
                         drawDataTreeLeaf(child, indentLevel + 1);
                 ImGui::TreePop();
         }
+
+        ImGui::PopID();
 }
 
 static void
@@ -1225,12 +1233,36 @@ Variable::drawVariableList()
                         }
                 }
 
+                // Deferred reorder (drag grip): applied after the loop so we never
+                // mutate vars_ mid-iteration.
+                int varMoveSrc = -1, varMoveDst = -1;
+
                 for (int i = 0; i < (int)vars_.size(); ++i) {
                         auto      &v          = vars_[i];
                         const bool isSelected = v.selected;
                         ImGui::PushID(i);
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
+
+                        // Reorder grip — a dedicated drag handle so row reordering doesn't
+                        // clash with the row's existing "drag to scope" source.
+                        ImGui::SmallButton("=##rowgrip");
+                        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                                ImGui::SetDragDropPayload("VAR_ROW_MOVE", &i, sizeof(i));
+                                ImGui::TextUnformatted(v.name.c_str());
+                                ImGui::EndDragDropSource();
+                        }
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", tr("Drag to reorder", "拖动以调整顺序"));
+                        if (ImGui::BeginDragDropTarget()) {
+                                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("VAR_ROW_MOVE"))
+                                        if (mv->DataSize == (int)sizeof(int)) {
+                                                varMoveSrc = *static_cast<const int *>(mv->Data);
+                                                varMoveDst = i;
+                                        }
+                                ImGui::EndDragDropTarget();
+                        }
+                        ImGui::SameLine();
 
                         const dwarf::Type *t = nullptr;
                         {
@@ -1252,6 +1284,15 @@ Variable::drawVariableList()
                         if (isComplex)
                                 ImGui::SetNextItemOpen(wasOpenTop);
                         bool open = ImGui::TreeNodeEx(v.name.c_str(), nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
+                        // Accept reorder drops on the whole row (larger target than the grip).
+                        if (ImGui::BeginDragDropTarget()) {
+                                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("VAR_ROW_MOVE"))
+                                        if (mv->DataSize == (int)sizeof(int)) {
+                                                varMoveSrc = *static_cast<const int *>(mv->Data);
+                                                varMoveDst = i;
+                                        }
+                                ImGui::EndDragDropTarget();
+                        }
                         if (isComplex && open != wasOpenTop) {
                                 if (open)
                                         v.expandedMembers.insert(v.name);
@@ -1351,7 +1392,36 @@ Variable::drawVariableList()
                                                                            : (v.port == PortType::SHM ? "SHM" : "LOCAL"));
                                         if (v.port == PortType::SHM)
                                                 snprintf(sp.shmName, sizeof(sp.shmName), "%s", v.shm.name);
-                                        {
+                                        snprintf(sp.rootName, sizeof(sp.rootName), "%s", v.name.c_str());
+                                        sp.rootAddr    = v.addr;
+                                        sp.rootTypeOff = v.typeOff;
+                                        if (hasManualStruct) {
+                                                // Manual (LOCAL) struct: there is no DWARF type to walk —
+                                                // flatten directly from the user-defined fields so each
+                                                // member becomes a "<var>.<field>" scalar channel.
+                                                for (const auto &sf : v.structFields) {
+                                                        if (sp.count >= StructChannelPayload::kMaxEntries)
+                                                                break;
+                                                        auto &e = sp.entries[sp.count++];
+                                                        snprintf(e.name, sizeof(e.name), "%s.%s", v.name.c_str(), sf.name);
+                                                        e.addr     = v.addr + sf.byteOffset;
+                                                        snprintf(e.type, sizeof(e.type), "%s", Parser::dataTypeToStr(sf.type));
+                                                        e.writable = v.writable;
+                                                        e.numEnums = 0;
+                                                        auto eit   = v.memberEnumDefs.find(e.name);
+                                                        if (eit != v.memberEnumDefs.end() && !eit->second.empty()) {
+                                                                e.numEnums = (u8)std::min((int)eit->second.size(),
+                                                                                          StructChannelPayload::kMaxEnums);
+                                                                for (int k = 0; k < e.numEnums; ++k) {
+                                                                        snprintf(e.enums[k].name,
+                                                                                 sizeof(e.enums[k].name),
+                                                                                 "%s",
+                                                                                 eit->second[k].name.c_str());
+                                                                        e.enums[k].value = eit->second[k].value;
+                                                                }
+                                                        }
+                                                }
+                                        } else {
                                                 std::lock_guard lk(mtxElf_);
                                                 flattenForStructPayload(
                                                     dwarfInfo_, v.name, v.addr, v.typeOff, sp, &v.memberEnumDefs);
@@ -1466,6 +1536,19 @@ Variable::drawVariableList()
 
                         ImGui::PopID();
                 }
+
+                // Apply a deferred row reorder (drag grip). Move the dragged entry so
+                // it lands at the drop row's position.
+                if (varMoveSrc >= 0 && varMoveDst >= 0 && varMoveSrc != varMoveDst && varMoveSrc < (int)vars_.size() &&
+                    varMoveDst < (int)vars_.size()) {
+                        VarEntry moved = std::move(vars_[varMoveSrc]);
+                        vars_.erase(vars_.begin() + varMoveSrc);
+                        int dst = varMoveDst > varMoveSrc ? varMoveDst - 1 : varMoveDst;
+                        vars_.insert(vars_.begin() + dst, std::move(moved));
+                        lastSelectedIndex_ = dst;
+                        isModified_        = true;
+                }
+
                 ImGui::EndTable();
         }
 
@@ -3477,42 +3560,12 @@ Variable::refreshDwarfMember(const std::string &memberPath)
         memberValueCache_[memberPath] = ok ? decodeValue(buf, dt, 0, 0) : "ERR";
 }
 
-bool
-Variable::readLocalFieldAsFloat(const std::string &varName, const std::string &fieldName, float &out) const
+// Decode `fsz` bytes at `tmp` as the given scalar type into a float.
+// Returns false for non-scalar/unsupported types.
+static bool
+decodeLocalScalar(const uint8_t *tmp, DataType type, float &out)
 {
-        const VarEntry *ve = nullptr;
-        for (const auto &v : vars_)
-                if (v.name == varName) {
-                        ve = &v;
-                        break;
-                }
-        if (!ve || ve->structFields.empty())
-                return false;
-
-        const VarEntry::StructField *sf = nullptr;
-        for (const auto &f : ve->structFields)
-                if (fieldName == f.name) {
-                        sf = &f;
-                        break;
-                }
-        if (!sf)
-                return false;
-
-        u32 fsz = Parser::typeBytes(sf->type);
-        if (fsz == 0)
-                return false;
-
-        std::lock_guard<std::mutex> lk(mtxLocal_);
-        auto                        it = localBufs_.find(varName);
-        if (it == localBufs_.end())
-                return false;
-        const auto &buf = it->second;
-        if (sf->byteOffset + fsz > (u32)buf.size())
-                return false;
-
-        uint8_t tmp[8]{};
-        std::memcpy(tmp, buf.data() + sf->byteOffset, fsz);
-        switch (sf->type) {
+        switch (type) {
                 case DataType::F32: {
                         float v;
                         std::memcpy(&v, tmp, 4);
@@ -3570,4 +3623,84 @@ Variable::readLocalFieldAsFloat(const std::string &varName, const std::string &f
                 default:
                         return false;
         }
+}
+
+// Snapshot all LOCAL variable values as (channelName, value) pairs. Channel
+// names match what the watch-list drag produces: "<var>" for a scalar LOCAL
+// variable and "<var>.<field>" for each field of a manual struct. The GUI feeds
+// these into matching monitor scope channels each frame.
+std::vector<std::pair<std::string, float>>
+Variable::collectLocalChannelValues() const
+{
+        std::vector<std::pair<std::string, float>> outVals;
+        std::lock_guard<std::mutex>                lk(mtxLocal_);
+        for (const auto &v : vars_) {
+                if (v.port != PortType::LOCAL && v.port != PortType::MANUAL)
+                        continue;
+                auto it = localBufs_.find(v.name);
+                if (it == localBufs_.end() || it->second.empty())
+                        continue;
+                const auto &buf = it->second;
+
+                if (!v.structFields.empty()) {
+                        for (const auto &sf : v.structFields) {
+                                u32 fsz = Parser::typeBytes(sf.type);
+                                if (fsz == 0 || sf.byteOffset + fsz > (u32)buf.size())
+                                        continue;
+                                uint8_t tmp[8]{};
+                                std::memcpy(tmp, buf.data() + sf.byteOffset, fsz);
+                                float val;
+                                if (decodeLocalScalar(tmp, sf.type, val))
+                                        outVals.emplace_back(v.name + "." + sf.name, val);
+                        }
+                } else {
+                        u32 sz = Parser::typeBytes(v.type);
+                        if (sz == 0 || sz > buf.size())
+                                continue;
+                        uint8_t tmp[8]{};
+                        std::memcpy(tmp, buf.data(), sz);
+                        float val;
+                        if (decodeLocalScalar(tmp, v.type, val))
+                                outVals.emplace_back(v.name, val);
+                }
+        }
+        return outVals;
+}
+
+bool
+Variable::readLocalFieldAsFloat(const std::string &varName, const std::string &fieldName, float &out) const
+{
+        const VarEntry *ve = nullptr;
+        for (const auto &v : vars_)
+                if (v.name == varName) {
+                        ve = &v;
+                        break;
+                }
+        if (!ve || ve->structFields.empty())
+                return false;
+
+        const VarEntry::StructField *sf = nullptr;
+        for (const auto &f : ve->structFields)
+                if (fieldName == f.name) {
+                        sf = &f;
+                        break;
+                }
+        if (!sf)
+                return false;
+
+        u32 fsz = Parser::typeBytes(sf->type);
+        if (fsz == 0)
+                return false;
+
+        std::lock_guard<std::mutex> lk(mtxLocal_);
+        auto                        it = localBufs_.find(varName);
+        if (it == localBufs_.end())
+                return false;
+        const auto &buf = it->second;
+        if (sf->byteOffset + fsz > (u32)buf.size())
+                return false;
+
+        uint8_t tmp[8]{};
+        std::memcpy(tmp, buf.data() + sf->byteOffset, fsz);
+        return decodeLocalScalar(tmp, sf->type, out);
 }

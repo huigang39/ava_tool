@@ -164,6 +164,11 @@ class SequenceEditor
         // hand each resulting op to `sink`. Returns true if anything was added.
         bool          acceptOpDrops(const std::function<void(SeqOp)> &sink, bool noSdk = false);
         SequenceStep *selectedStepPtr();
+        // Run a single top-level step (by index) in the background, independent of
+        // the full-sequence run. No-op if a run is already in progress.
+        void runSingleStep(int idx);
+        // Reorder a top-level step from `src` to `dst` (drag-and-drop).
+        void moveStep(int src, int dst);
 
         // Background execution
         struct SeqCtx {
