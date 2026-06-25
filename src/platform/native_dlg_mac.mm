@@ -54,3 +54,9 @@ nativeDlgSave(const std::string &title, const std::vector<NativeDlgFilter> &filt
         return ([panel runModal] == NSModalResponseOK) ? std::string(panel.URL.path.UTF8String) : "";
     }
 }
+
+FILE *
+nativeFopen(const std::string &utf8Path, const char *mode)
+{
+    return fopen(utf8Path.c_str(), mode);
+}

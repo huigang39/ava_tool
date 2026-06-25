@@ -339,6 +339,7 @@ Gui::saveSession(const std::string &path)
         cJSON_AddStringToObject(jlink, "device", JLinkPort::instance().deviceName().c_str());
         cJSON_AddNumberToObject(jlink, "speedKHz", JLinkPort::instance().speed());
         cJSON_AddNumberToObject(jlink, "hssPeriodUs", JLinkPort::instance().hssPeriodUs());
+        cJSON_AddNumberToObject(jlink, "maxHssHz", g_maxHssHz.load(std::memory_order_relaxed));
         cJSON_AddItemToObject(root, "jlink", jlink);
 
         cJSON_AddBoolToObject(root, "showCalculator", showCalculator_);
@@ -605,6 +606,8 @@ Gui::loadSession(const std::string &path)
                         JLinkPort::instance().setSpeed(spd->valueint);
                 if (const cJSON *p = cJSON_GetObjectItem(jlink, "hssPeriodUs"); cJSON_IsNumber(p))
                         JLinkPort::instance().hssPeriodUs() = p->valueint;
+                if (const cJSON *hz = cJSON_GetObjectItem(jlink, "maxHssHz"); cJSON_IsNumber(hz))
+                        g_maxHssHz.store(hz->valueint, std::memory_order_relaxed);
         }
 
         if (const cJSON *sc = cJSON_GetObjectItem(root, "showCalculator")) {
@@ -1018,7 +1021,8 @@ Gui::drawBar()
                                         monitorName = "变量监视器_" + std::to_string(idx++);
                                 } while (monitors_.count(monitorName));
                                 monitors_[monitorName] = std::make_shared<Monitor>(monitorName);
-                                isModified_            = true;
+                                monitors_[monitorName]->setTitle("变量监视器 [" + std::to_string(idx - 1) + "]");
+                                isModified_ = true;
                                 LOG_I("Add Variable Monitor: %s", monitorName.c_str());
                         }
                         if (ImGui::MenuItem(tr("Add Variable Manager", "添加变量管理器"))) {
@@ -1028,7 +1032,8 @@ Gui::drawBar()
                                         varName = "变量管理器_" + std::to_string(idx++);
                                 } while (vars_.count(varName));
                                 vars_[varName] = std::make_shared<Variable>(varName);
-                                isModified_    = true;
+                                vars_[varName]->setTitle("变量管理器 [" + std::to_string(idx - 1) + "]");
+                                isModified_ = true;
                                 LOG_I("Add Variable Manager Window: %s", varName.c_str());
                         }
                         if (ImGui::MenuItem(tr("Add SDK Caller", "添加 SDK 调用器")))
@@ -1176,16 +1181,44 @@ Gui::drawBar()
                 ImGui::SameLine();
                 const bool jlinkPaused = g_jlinkSamplingPaused.load();
                 if (jlinkPaused) {
-                        if (ui::SmallButton(tr("RESUME JLINK", "恢复 JLink 采样"), ui::BtnStyle::Success))
+                        if (ui::SmallButton(tr("RESUME J-Link", "恢复 J-Link 采样"), ui::BtnStyle::Success))
                                 g_jlinkSamplingPaused.store(false);
                 } else {
-                        if (ui::SmallButton(tr("PAUSE JLINK", "暂停 JLink 采样"), ui::BtnStyle::Warning))
+                        if (ui::SmallButton(tr("PAUSE J-Link", "暂停 J-Link 采样"), ui::BtnStyle::Warning))
                                 g_jlinkSamplingPaused.store(true);
                 }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s",
                                           tr("Pause/resume all J-Link sampling (acquisition stops; display pause is separate)",
                                              "暂停/恢复所有 J-Link 采样（停止采集；与显示暂停相互独立）"));
+
+                // HSS global sample rate — shared by all monitors in HSS mode.
+                ImGui::SameLine();
+                {
+                        int hssHz = g_maxHssHz.load(std::memory_order_relaxed);
+                        ImGui::SetNextItemWidth(100);
+                        if (ImGui::SliderInt("##HssHz", &hssHz, 1, 50000, "%d Hz", ImGuiSliderFlags_Logarithmic))
+                                g_maxHssHz.store(hssHz, std::memory_order_relaxed);
+                        if (ImGui::IsItemDeactivatedAfterEdit())
+                                JLinkPort::instance().reqRestart();
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s",
+                                                  tr("HSS sample rate (Hz) — applies to all J-Link monitors in HSS mode",
+                                                     "HSS 采样率 (Hz) — 对所有处于 HSS 模式的监视器生效"));
+                }
+                ImGui::SameLine();
+                {
+                        static f32 s_smoothHssHz = 0.0f;
+                        const f32  rawHz         = Monitor::getGlobalHssHz();
+                        if (rawHz > 0.1f)
+                                s_smoothHssHz = s_smoothHssHz * 0.85f + rawHz * 0.15f;
+                        else
+                                s_smoothHssHz = 0.0f;
+                        if (s_smoothHssHz > 0.1f)
+                                ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "%.0f Hz", s_smoothHssHz);
+                        else
+                                ImGui::TextDisabled("-- Hz");
+                }
 
                 // Total points currently in memory (across all channels)
                 u64 totalPts = 0;
@@ -2778,6 +2811,30 @@ Gui::newSdkPanel()
                                 }
                         }
                         return nullptr;
+                };
+        }
+        if (!seqEditor_.onGetLocalVarDataType_) {
+                seqEditor_.onGetLocalVarDataType_ = [this](const std::string &varName) -> DataType {
+                        std::lock_guard<std::mutex> lk(mtxMonitors_);
+                        for (auto &[_, vw] : vars_) {
+                                for (const auto &ve : vw->vars_) {
+                                        if (ve.port == PortType::LOCAL && ve.name == varName)
+                                                return ve.type;
+                                }
+                        }
+                        return DataType::I64;
+                };
+        }
+        if (!seqEditor_.onLocalVarWritten_) {
+                seqEditor_.onLocalVarWritten_ = [this](const std::string &varName) {
+                        for (auto &[_, vw] : vars_) {
+                                for (const auto &ve : vw->vars_) {
+                                        if (ve.port == PortType::LOCAL && ve.name == varName) {
+                                                vw->notifyLocalWrite(varName);
+                                                return;
+                                        }
+                                }
+                        }
                 };
         }
         // Wire sequence editor LOCAL variable creation (for "→ Create output vars" button).

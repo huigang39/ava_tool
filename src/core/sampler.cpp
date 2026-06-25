@@ -2,6 +2,7 @@
  * @file  sampler.cpp
  * @brief Sampler thread implementation — HSS / POLL / SHM / Wave processing.
  */
+#include <algorithm>
 #include <cstring>
 #include <ranges>
 #include <unordered_map>
@@ -433,10 +434,21 @@ threadFunc(Gui *gui)
                                                         }
                                                 }
                                         }
-                                        if (hasHss && monitor->maxSampleHz_ > maxHssHz) {
-                                                maxHssHz = monitor->maxSampleHz_;
+                                        if (hasHss) {
+                                                int gh = g_maxHssHz.load(std::memory_order_relaxed);
+                                                if (gh > maxHssHz)
+                                                        maxHssHz = gh;
                                         }
                                 }
+                                // Sort by address so block order is stable regardless of
+                                // unordered_map iteration order (which can change after
+                                // channel insertions trigger a rehash). Without this, adding
+                                // a LOCAL channel reshuffles JLINK entries, producing a
+                                // spurious `blocks != lastBlocks` → unnecessary HSS restart
+                                // and data gap.
+                                std::sort(tempChs.begin(), tempChs.end(), [](const TempCh &a, const TempCh &b) {
+                                        return a.addr < b.addr;
+                                });
                                 lastRefreshUs = iterStartUs;
                         } else {
                                 loopDiag.refreshTryFail++;

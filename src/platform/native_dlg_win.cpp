@@ -58,6 +58,7 @@ nativeDlgOpen(const std::string &title, const std::vector<NativeDlgFilter> &filt
         std::wstring  wTitle        = toWide(title);
         OPENFILENAMEW ofn           = {};
         ofn.lStructSize             = sizeof(ofn);
+        ofn.hwndOwner               = GetActiveWindow();
         ofn.lpstrFilter             = filter.data();
         ofn.lpstrFile               = buf;
         ofn.nMaxFile                = MAX_PATH;
@@ -85,6 +86,7 @@ nativeDlgSave(const std::string                  &title,
         std::wstring  wTitle = toWide(title);
         OPENFILENAMEW ofn    = {};
         ofn.lStructSize      = sizeof(ofn);
+        ofn.hwndOwner        = GetActiveWindow();
         ofn.lpstrFilter      = filter.data();
         ofn.lpstrFile        = buf;
         ofn.nMaxFile         = MAX_PATH;
@@ -123,4 +125,14 @@ nativeDlgPickDir(const std::string &title)
                 CoUninitialize();
         }
         return ret;
+}
+
+FILE *
+nativeFopen(const std::string &utf8Path, const char *mode)
+{
+        std::wstring wPath = toWide(utf8Path);
+        std::wstring wMode = toWide(mode);
+        FILE        *f     = nullptr;
+        _wfopen_s(&f, wPath.c_str(), wMode.c_str());
+        return f;
 }

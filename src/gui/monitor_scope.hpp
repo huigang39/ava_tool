@@ -53,7 +53,7 @@ class MonitorScope
         std::string           label_{}; // User-facing alias; falls back to name_ when empty
         char                  renameBuf_[64]{};
         ChannelMapType        chs_{};
-        DrawEnum              e_draw{};
+        DrawEnum              e_draw{DrawEnum::PLOT};
         f32                   height_{200.0f};
         bool                  showFft_{false};
         bool                  fftBars_{false};      // FFT render style: false = line, true = bar chart
@@ -82,8 +82,9 @@ class MonitorScope
         // matching CSV column order) instead of hash order.
         i64 nextChannelOrder_{0};
         // Display order of this scope within its Monitor (user-reorderable).
-        i64 order_{0};
-        int moveDir_{0}; // pending reorder request (-1 up, +1 down), consumed by Monitor
+        i64         order_{0};
+        int         moveDir_{0};      // pending reorder request (-1 up, +1 down), consumed by Monitor
+        std::string pendingSwapWith_; // drag-drop swap target scope name, consumed by Monitor
 
         bool pendingAxisReset_{false};
         struct Peak {
@@ -190,6 +191,15 @@ class MonitorScope
                 int d    = moveDir_;
                 moveDir_ = 0;
                 return d;
+        }
+
+        // Drag-drop swap: set by a drop event in the scope's menu bar, consumed by Monitor.
+        void        requestSwap(const std::string &name) { pendingSwapWith_ = name; }
+        std::string consumeSwap()
+        {
+                std::string s;
+                s.swap(pendingSwapWith_);
+                return s;
         }
 
         // Purge channels marked for deletion (called by sampler at safe point).

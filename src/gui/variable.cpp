@@ -965,14 +965,6 @@ flattenForStructPayload(const dwarf::Info                                       
 void
 Variable::drawSymbolBrowser()
 {
-        ImGui::SeparatorText(tr("AXF/ELF Symbol Parsing", "AXF/ELF符号解析"));
-        if (!elfPath_.empty()) {
-                std::error_code ec;
-                std::string     absPath = std::filesystem::absolute(elfPath_, ec).string();
-                if (ec || absPath.empty())
-                        absPath = elfPath_;
-                ImGui::TextWrapped("%s: %s", tr("File Path", "文件路径"), absPath.c_str());
-        }
         TutorialGuide::instance().mark("variable_browser");
         if (isElfLoading_) {
                 ImGui::Text("%s", tr("Loading symbols...", "正在加载符号..."));
@@ -1246,7 +1238,21 @@ Variable::drawVariableList()
 
                         // Reorder grip — a dedicated drag handle so row reordering doesn't
                         // clash with the row's existing "drag to scope" source.
-                        ImGui::SmallButton("=##rowgrip");
+                        if (ui::SmallButton("=##rowgrip", v.selected ? ui::BtnStyle::Primary : ui::BtnStyle::Neutral)) {
+                                if (ImGui::GetIO().KeyCtrl) {
+                                        v.selected = !v.selected;
+                                } else if (ImGui::GetIO().KeyShift && lastSelectedIndex_ != -1) {
+                                        int start = std::min(lastSelectedIndex_, i);
+                                        int end   = std::max(lastSelectedIndex_, i);
+                                        for (int j = start; j <= end; ++j)
+                                                vars_[j].selected = true;
+                                } else {
+                                        for (auto &var : vars_)
+                                                var.selected = false;
+                                        v.selected = true;
+                                }
+                                lastSelectedIndex_ = i;
+                        }
                         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
                                 ImGui::SetDragDropPayload("VAR_ROW_MOVE", &i, sizeof(i));
                                 ImGui::TextUnformatted(v.name.c_str());
@@ -1262,6 +1268,7 @@ Variable::drawVariableList()
                                         }
                                 ImGui::EndDragDropTarget();
                         }
+                        ImGui::OpenPopupOnItemClick("##var_row_ctx", ImGuiPopupFlags_MouseButtonRight);
                         ImGui::SameLine();
 
                         const dwarf::Type *t = nullptr;
@@ -1274,16 +1281,78 @@ Variable::drawVariableList()
                             hasManualStruct || (t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
                                                       t->kind == dwarf::TypeKind::ARRAY));
 
+                        bool pendingDelete   = false;
+                        bool pendingEnumEdit = false;
+                        if (ImGui::BeginPopup("##var_row_ctx")) {
+                                // Auto-select on right-click when nothing is selected.
+                                if (!v.selected) {
+                                        for (auto &var : vars_)
+                                                var.selected = false;
+                                        v.selected = true;
+                                }
+                                if (ImGui::MenuItem(tr("Delete Selected", "删除选中项"))) {
+                                        pendingDelete = true;
+                                }
+                                if (ImGui::MenuItem(tr("Edit Properties...", "编辑属性..."))) {
+                                        editPropIdx_ = i;
+                                        snprintf(editPropBuf_.name, sizeof(editPropBuf_.name), "%s", v.name.c_str());
+                                        snprintf(editPropBuf_.addrBuf,
+                                                 sizeof(editPropBuf_.addrBuf),
+                                                 "%llX",
+                                                 (unsigned long long)v.addr);
+                                        editPropBuf_.type         = v.type;
+                                        editPropBuf_.port         = v.port;
+                                        editPropBuf_.writable     = v.writable;
+                                        editPropBuf_.structMode   = !v.structFields.empty();
+                                        editPropBuf_.structFields = v.structFields;
+                                        if (v.port == PortType::SHM) {
+                                                snprintf(editPropBuf_.shmName, sizeof(editPropBuf_.shmName), "%s", v.shm.name);
+                                        }
+                                }
+                                const bool isEnumType = (t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty();
+                                if (!isComplex && isEnumType &&
+                                    ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
+                                        pendingEnumEdit = true;
+                                }
+                                if (isComplex && !v.hiddenMembers.empty()) {
+                                        char restoreLabel[64];
+                                        snprintf(restoreLabel,
+                                                 sizeof(restoreLabel),
+                                                 "Restore hidden (%d)",
+                                                 (int)v.hiddenMembers.size());
+                                        if (ImGui::MenuItem(restoreLabel)) {
+                                                v.hiddenMembers.clear();
+                                                isModified_ = true;
+                                        }
+                                }
+                                ImGui::EndPopup();
+                        }
+
+                        // Popup is handled before TreeNodeEx so the ID stack matches
+                        // OpenPopupOnItemClick (expanded structs push to the ID stack).
+                        if (pendingDelete) {
+                                ImGui::PopID();
+                                for (int j = (int)vars_.size() - 1; j >= 0; --j)
+                                        if (vars_[j].selected)
+                                                vars_.erase(vars_.begin() + j);
+                                isModified_        = true;
+                                lastSelectedIndex_ = -1;
+                                break;
+                        }
+                        if (pendingEnumEdit)
+                                enumEditIdx_ = i;
+
                         ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_OpenOnArrow;
-                        if (isSelected)
-                                nodeFlags |= ImGuiTreeNodeFlags_Selected;
                         if (!isComplex)
                                 nodeFlags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
 
                         const bool wasOpenTop = isComplex && v.expandedMembers.count(v.name) > 0;
                         if (isComplex)
                                 ImGui::SetNextItemOpen(wasOpenTop);
+                        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+                        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
                         bool open = ImGui::TreeNodeEx(v.name.c_str(), nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
+                        ImGui::PopStyleColor(2);
                         // Accept reorder drops on the whole row (larger target than the grip).
                         if (ImGui::BeginDragDropTarget()) {
                                 if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("VAR_ROW_MOVE"))
@@ -1318,69 +1387,6 @@ Variable::drawVariableList()
                                 lastSelectedIndex_ = i;
                         }
 
-                        bool pendingDelete   = false;
-                        bool pendingEnumEdit = false;
-                        if (ImGui::BeginPopupContextItem()) {
-                                // Auto-select on right-click when nothing is selected.
-                                if (!v.selected) {
-                                        for (auto &var : vars_)
-                                                var.selected = false;
-                                        v.selected = true;
-                                }
-                                if (ImGui::MenuItem(tr("Delete Selected", "删除选中项"))) {
-                                        pendingDelete = true;
-                                }
-                                if (ImGui::MenuItem(tr("Edit Properties...", "编辑属性..."))) {
-                                        editPropIdx_ = i;
-                                        // Populate edit buffers from current var
-                                        snprintf(editPropBuf_.name, sizeof(editPropBuf_.name), "%s", v.name.c_str());
-                                        snprintf(editPropBuf_.addrBuf,
-                                                 sizeof(editPropBuf_.addrBuf),
-                                                 "%llX",
-                                                 (unsigned long long)v.addr);
-                                        editPropBuf_.type         = v.type;
-                                        editPropBuf_.port         = v.port;
-                                        editPropBuf_.writable     = v.writable;
-                                        editPropBuf_.structMode   = !v.structFields.empty();
-                                        editPropBuf_.structFields = v.structFields;
-                                        if (v.port == PortType::SHM) {
-                                                snprintf(editPropBuf_.shmName, sizeof(editPropBuf_.shmName), "%s", v.shm.name);
-                                        }
-                                }
-                                const bool isEnumType = (t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty();
-                                if (!isComplex && isEnumType &&
-                                    ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
-                                        pendingEnumEdit = true;
-                                }
-                                if (isComplex && !v.hiddenMembers.empty()) {
-                                        char restoreLabel[64];
-                                        snprintf(restoreLabel,
-                                                 sizeof(restoreLabel),
-                                                 "Restore hidden (%d)",
-                                                 (int)v.hiddenMembers.size());
-                                        if (ImGui::MenuItem(restoreLabel)) {
-                                                v.hiddenMembers.clear();
-                                                isModified_ = true;
-                                        }
-                                }
-                                ImGui::EndPopup();
-                        }
-
-                        if (pendingDelete) {
-                                if (open && isComplex)
-                                        ImGui::TreePop();
-                                ImGui::PopID();
-                                // Erase all selected entries back-to-front to keep indices valid.
-                                for (int j = (int)vars_.size() - 1; j >= 0; --j)
-                                        if (vars_[j].selected)
-                                                vars_.erase(vars_.begin() + j);
-                                isModified_        = true;
-                                lastSelectedIndex_ = -1;
-                                break;
-                        }
-                        if (pendingEnumEdit)
-                                enumEditIdx_ = i;
-
                         if (ImGui::BeginDragDropSource()) {
                                 if (isComplex) {
                                         StructChannelPayload sp{};
@@ -1404,7 +1410,7 @@ Variable::drawVariableList()
                                                                 break;
                                                         auto &e = sp.entries[sp.count++];
                                                         snprintf(e.name, sizeof(e.name), "%s.%s", v.name.c_str(), sf.name);
-                                                        e.addr     = v.addr + sf.byteOffset;
+                                                        e.addr = v.addr + sf.byteOffset;
                                                         snprintf(e.type, sizeof(e.type), "%s", Parser::dataTypeToStr(sf.type));
                                                         e.writable = v.writable;
                                                         e.numEnums = 0;
@@ -2759,31 +2765,51 @@ Variable::draw()
                                        !binPath_.empty() || !cfgPath_.empty() || !dataTree_.children.empty();
 
         if (showSymbolBrowser) {
-                f32 availY       = ImGui::GetContentRegionAvail().y;
-                f32 splitterSize = 8.0f;
-                f32 topHeight    = watchListHeight_;
-                f32 bottomHeight = availY - topHeight - splitterSize;
-                if (bottomHeight < 100.0f) {
-                        bottomHeight = 100.0f;
-                        topHeight    = availY - bottomHeight - splitterSize;
-                }
+                constexpr f32 kStripH = 22.0f; // header strip height
+                constexpr f32 kSplitH = 6.0f;  // draggable splitter height
+                f32           availY  = ImGui::GetContentRegionAvail().y;
 
-                if (ImGui::BeginChild("TopSection", ImVec2(0, topHeight), false)) {
+                // Watch list takes all space except bottom strip (and symbol browser when expanded)
+                f32 topH = symBrowserCollapsed_
+                               ? availY - kStripH
+                               : std::max(60.0f, std::min(watchListHeight_, availY - kStripH - kSplitH - 60.0f));
+
+                if (ImGui::BeginChild("TopSection", ImVec2(0, topH), false)) {
                         drawVariableList();
                 }
                 ImGui::EndChild();
 
-                ImGui::Button("##Splitter", ImVec2(-1, splitterSize));
-                if (ImGui::IsItemActive()) {
-                        watchListHeight_ += ImGui::GetIO().MouseDelta.y;
+                if (!symBrowserCollapsed_) {
+                        // Thin draggable splitter line
+                        ImVec2 splitPos = ImGui::GetCursorScreenPos();
+                        float  w        = ImGui::GetContentRegionAvail().x;
+                        ImGui::InvisibleButton("##symSplit", ImVec2(w, kSplitH));
+                        if (ImGui::IsItemActive())
+                                watchListHeight_ = std::max(60.0f, watchListHeight_ + ImGui::GetIO().MouseDelta.y);
+                        ImU32 lineCol = ImGui::IsItemHovered() || ImGui::IsItemActive()
+                                            ? ImGui::GetColorU32(ImGuiCol_SeparatorActive)
+                                            : ImGui::GetColorU32(ImGuiCol_Separator);
+                        ImGui::GetWindowDrawList()->AddLine(ImVec2(splitPos.x, splitPos.y + kSplitH * 0.5f),
+                                                            ImVec2(splitPos.x + w, splitPos.y + kSplitH * 0.5f),
+                                                            lineCol,
+                                                            1.0f);
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
                 }
-                if (ImGui::IsItemHovered())
-                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
 
-                if (ImGui::BeginChild("BottomSection", ImVec2(0, 0), false)) {
-                        drawSymbolBrowser();
+                // Header strip: collapse/expand arrow + label
+                ImGui::AlignTextToFramePadding();
+                if (ImGui::ArrowButton("##symhdr", symBrowserCollapsed_ ? ImGuiDir_Right : ImGuiDir_Down))
+                        symBrowserCollapsed_ = !symBrowserCollapsed_;
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", tr("Symbol Browser", "符号浏览器"));
+
+                if (!symBrowserCollapsed_) {
+                        if (ImGui::BeginChild("BottomSection", ImVec2(0, 0), false)) {
+                                drawSymbolBrowser();
+                        }
+                        ImGui::EndChild();
                 }
-                ImGui::EndChild();
         } else {
                 // No symbol source yet — the watch list uses the full window.
                 drawVariableList();
@@ -2828,7 +2854,7 @@ Variable::updateDisplay()
         // "VisibleTitle###name_": the visible label tracks the user-editable title
         // while the trailing id keeps the ImGui window id (and dock layout) stable.
         const std::string winLabel = getTitle() + "###" + name_;
-        if (ImGui::Begin(winLabel.c_str(), &open_)) {
+        if (ImGui::Begin(winLabel.c_str(), &open_, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
                 // Double-click the title bar (or dock tab) to rename this window.
                 ImGuiWindow *win       = ImGui::GetCurrentWindow();
                 ImRect       titleRect = win->DockIsActive ? win->DC.DockTabItemRect : win->TitleBarRect();

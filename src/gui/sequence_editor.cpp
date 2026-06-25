@@ -21,12 +21,9 @@
 static uint64_t
 nowStampMs()
 {
-        auto        now   = std::chrono::system_clock::now();
-        std::time_t t     = std::chrono::system_clock::to_time_t(now);
-        struct tm   tmBuf = {};
-        localtime_s(&tmBuf, &t);
-        auto ms_frac = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-        return (uint64_t)(tmBuf.tm_hour * 3600000 + tmBuf.tm_min * 60000 + tmBuf.tm_sec * 1000 + ms_frac.count());
+        return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
 }
 
 static const char *
@@ -56,17 +53,17 @@ kindLabelCn(SeqStepKind k)
 {
         switch (k) {
                 case SeqStepKind::Action:
-                        return "do";
+                        return "执行";
                 case SeqStepKind::Sleep:
-                        return "delay";
+                        return "延时";
                 case SeqStepKind::If:
-                        return "if";
+                        return "判断";
                 case SeqStepKind::While:
                         return "循环";
                 case SeqStepKind::For:
-                        return "For";
+                        return "计数";
                 case SeqStepKind::Break:
-                        return "Break";
+                        return "退出";
                 case SeqStepKind::SdkCall:
                         return "SDK";
         }
@@ -226,9 +223,32 @@ SequenceEditor::execSdkOp(const SdkStepInfo &sdk)
                 seqLog_.push_back(std::move(e));
                 return;
         }
+        auto writeResultVar = [&](bool ok, const SdkPanel::DirectCallResult &r) {
+                if (ok && sdk.resultVar[0] != '\0' && onGetLocalBuf_) {
+                        void *buf = onGetLocalBuf_(sdk.resultVar);
+                        if (buf) {
+                                DataType dt = DataType::I64;
+                                if (onGetLocalVarDataType_)
+                                        dt = onGetLocalVarDataType_(sdk.resultVar);
+                                if (dt == DataType::F64) {
+                                        double v = sdk.isPython ? r.rawDouble : *reinterpret_cast<const double *>(&r.rawValue);
+                                        std::memcpy(buf, &v, sizeof(double));
+                                } else if (dt == DataType::F32) {
+                                        float v = sdk.isPython ? static_cast<float>(r.rawDouble)
+                                                               : *reinterpret_cast<const float *>(&r.rawValue);
+                                        std::memcpy(buf, &v, sizeof(float));
+                                } else {
+                                        std::memcpy(buf, &r.rawValue, sizeof(int64_t));
+                                }
+                                if (onLocalVarWritten_)
+                                        onLocalVarWritten_(sdk.resultVar);
+                        }
+                }
+        };
         if (sdk.isPython) {
                 auto r = panel->directCallPy(sdk.pyFuncName, sdk.args);
                 LOG_I("[SeqEditor] SdkOp Py result ok=%d: %s", (int)r.ok, r.text.c_str());
+                writeResultVar(r.ok, r);
                 SeqLogEntry e;
                 e.tsMs  = nowStampMs();
                 e.desc  = "SDK: " + sdk.label;
@@ -241,6 +261,7 @@ SequenceEditor::execSdkOp(const SdkStepInfo &sdk)
         } else if (sdk.isCFunc) {
                 auto r = panel->directCallC(sdk.methodIdx, sdk.args);
                 LOG_I("[SeqEditor] SdkOp C result ok=%d: %s", (int)r.ok, r.text.c_str());
+                writeResultVar(r.ok, r);
                 SeqLogEntry e;
                 e.tsMs  = nowStampMs();
                 e.desc  = "SDK: " + sdk.label;
@@ -253,6 +274,7 @@ SequenceEditor::execSdkOp(const SdkStepInfo &sdk)
         } else {
                 auto r = panel->directCall(sdk.classIdx, sdk.methodIdx, sdk.objIdx, sdk.args);
                 LOG_I("[SeqEditor] SdkOp C++ result ok=%d: %s", (int)r.ok, r.text.c_str());
+                writeResultVar(r.ok, r);
                 SeqLogEntry e;
                 e.tsMs  = nowStampMs();
                 e.desc  = "SDK: " + sdk.label;
@@ -535,19 +557,19 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
         bool topLevel = (depth == 0);
         if (topLevel) {
                 static ImGuiTableFlags tblFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                                  ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY;
-                if (!ImGui::BeginTable("##bodytbl", 4, tblFlags))
+                                                  ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY |
+                                                  ImGuiTableFlags_Resizable;
+                if (!ImGui::BeginTable("##bodytbl", 3, tblFlags))
                         return;
                 ImGui::TableSetupScrollFreeze(0, 1);
-                ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 28.0f);
+                ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 70.0f);
                 ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch, 0.35f);
                 ImGui::TableSetupColumn(tr("Value / Args", "值/参数"), ImGuiTableColumnFlags_WidthStretch, 0.65f);
-                ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 32.0f);
                 ImGui::TableHeadersRow();
         }
 
         float indent       = depth * 14.0f;
-        int   stepToDelete = -1;
+        int   stepToDelete = -1, stepMoveSrc = -1, stepMoveDst = -1;
 
         for (int i = 0; i < (int)steps.size(); ++i) {
                 SequenceStep &s = steps[i];
@@ -555,7 +577,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
 
                 if (s.kind == SeqStepKind::Action) {
                         // ── Render ops directly as table rows (same format as "do" detail) ──
-                        int opToDelete = -1;
+                        int opToDelete = -1, opMoveSrc = -1, opMoveDst = -1;
                         for (int j = 0; j < (int)s.ops.size(); ++j) {
                                 ImGui::PushID(j + 20000);
                                 SeqOp &op = s.ops[j];
@@ -567,6 +589,26 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                         ImGui::TableSetColumnIndex(0);
                                         if (indent > 0.0f)
                                                 ImGui::Indent(indent);
+                                        ImGui::SmallButton("=##og");
+                                        if (ImGui::BeginDragDropSource()) {
+                                                ImGui::SetDragDropPayload("BODYOP_MOVE", &j, sizeof(int));
+                                                ImGui::Text("%d", j + 1);
+                                                ImGui::EndDragDropSource();
+                                        }
+                                        if (ImGui::BeginDragDropTarget()) {
+                                                if (const ImGuiPayload *pl = ImGui::AcceptDragDropPayload("BODYOP_MOVE")) {
+                                                        opMoveSrc = *(const int *)pl->Data;
+                                                        opMoveDst = j;
+                                                }
+                                                ImGui::EndDragDropTarget();
+                                        }
+                                        ImGui::OpenPopupOnItemClick("##opdelmenu", ImGuiPopupFlags_MouseButtonRight);
+                                        if (ImGui::BeginPopup("##opdelmenu")) {
+                                                if (ImGui::MenuItem(tr("Delete", "删除")))
+                                                        opToDelete = j;
+                                                ImGui::EndPopup();
+                                        }
+                                        ImGui::SameLine();
                                         ImGui::Text("%d", j + 1);
                                         if (indent > 0.0f)
                                                 ImGui::Unindent(indent);
@@ -607,10 +649,6 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                 }
                                         }
 
-                                        ImGui::TableSetColumnIndex(3);
-                                        if (ui::Button(tr("X", "X"), ui::BtnStyle::Danger, ImVec2(-FLT_MIN, 0)))
-                                                opToDelete = j;
-
                                 } else {
                                         // SDK op
                                         auto panel   = findSdkPanel(op.sdk.panelWinId);
@@ -630,17 +668,33 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                         ImGui::TableSetColumnIndex(0);
                                         if (indent > 0.0f)
                                                 ImGui::Indent(indent);
+                                        ImGui::SmallButton("=##og");
+                                        if (ImGui::BeginDragDropSource()) {
+                                                ImGui::SetDragDropPayload("BODYOP_MOVE", &j, sizeof(int));
+                                                ImGui::Text("%d", j + 1);
+                                                ImGui::EndDragDropSource();
+                                        }
+                                        if (ImGui::BeginDragDropTarget()) {
+                                                if (const ImGuiPayload *pl = ImGui::AcceptDragDropPayload("BODYOP_MOVE")) {
+                                                        opMoveSrc = *(const int *)pl->Data;
+                                                        opMoveDst = j;
+                                                }
+                                                ImGui::EndDragDropTarget();
+                                        }
+                                        ImGui::OpenPopupOnItemClick("##opdelmenu", ImGuiPopupFlags_MouseButtonRight);
+                                        if (ImGui::BeginPopup("##opdelmenu")) {
+                                                if (ImGui::MenuItem(tr("Delete", "删除")))
+                                                        opToDelete = j;
+                                                ImGui::EndPopup();
+                                        }
+                                        ImGui::SameLine();
                                         ImGui::Text("%d", j + 1);
                                         if (indent > 0.0f)
                                                 ImGui::Unindent(indent);
 
                                         ImGui::TableSetColumnIndex(1);
                                         bool open = ImGui::TreeNodeEx(
-                                            "##sdkn", ImGuiTreeNodeFlags_DefaultOpen, "[SDK] %s", op.sdk.label.c_str());
-
-                                        ImGui::TableSetColumnIndex(3);
-                                        if (ui::Button(tr("X", "X"), ui::BtnStyle::Danger, ImVec2(-FLT_MIN, 0)))
-                                                opToDelete = j;
+                                            "##sdkn", ImGuiTreeNodeFlags_DefaultOpen, "%s", op.sdk.label.c_str());
 
                                         if (open) {
                                                 if (!panel) {
@@ -654,20 +708,33 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                 } else {
                                                         if (!op.sdk.isCFunc && !op.sdk.isPython) {
                                                                 auto        objs = panel->listObjects(op.sdk.classIdx);
-                                                                const char *cur  = tr("(none)", "(无对象)");
+                                                                const char *cur  = tr("(none)", "(无)");
                                                                 for (const auto &o : objs)
                                                                         if (o.idx == op.sdk.objIdx) {
                                                                                 cur = o.label.c_str();
                                                                                 break;
                                                                         }
                                                                 ImGui::TableNextRow();
+                                                                ImGui::TableSetColumnIndex(0);
+                                                                {
+                                                                        std::string cn = panel->getClassName(op.sdk.classIdx);
+                                                                        ImGui::TextUnformatted(cn.empty() ? "?" : cn.c_str());
+                                                                }
                                                                 ImGui::TableSetColumnIndex(1);
                                                                 ImGui::Indent(indent + 16.0f);
-                                                                ImGui::TextDisabled(tr("Object:", "对象:"));
+                                                                ImGui::TextUnformatted(tr("Object", "对象"));
                                                                 ImGui::Unindent(indent + 16.0f);
                                                                 ImGui::TableSetColumnIndex(2);
-                                                                ImGui::SetNextItemWidth(-50.0f);
+                                                                ImGui::SetNextItemWidth(-FLT_MIN);
                                                                 if (ImGui::BeginCombo("##objsel", cur)) {
+                                                                        if (ImGui::Selectable(
+                                                                                tr("[+ New Object]", "[+ 新建对象]"), false)) {
+                                                                                int ni = panel->newObject(op.sdk.classIdx);
+                                                                                if (ni >= 0) {
+                                                                                        op.sdk.objIdx = ni;
+                                                                                        isModified_   = true;
+                                                                                }
+                                                                        }
                                                                         for (const auto &o : objs) {
                                                                                 bool sel = (o.idx == op.sdk.objIdx);
                                                                                 char cl[128];
@@ -685,14 +752,6 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                                         }
                                                                         ImGui::EndCombo();
                                                                 }
-                                                                ImGui::SameLine();
-                                                                if (ImGui::SmallButton(tr("New##newobj", "新建##newobj"))) {
-                                                                        int ni = panel->newObject(op.sdk.classIdx);
-                                                                        if (ni >= 0) {
-                                                                                op.sdk.objIdx = ni;
-                                                                                isModified_   = true;
-                                                                        }
-                                                                }
                                                         }
                                                         std::vector<std::string> localVars;
                                                         if (panel->onListLocalVars_)
@@ -700,7 +759,9 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                         for (int p = 0; p < nParams; ++p) {
                                                                 ImGui::PushID(p);
                                                                 std::string pname =
-                                                                    op.sdk.isCFunc
+                                                                    op.sdk.isPython
+                                                                        ? panel->getPyFuncParamName(op.sdk.pyFuncName, p)
+                                                                    : op.sdk.isCFunc
                                                                         ? panel->getCFuncParamName(op.sdk.methodIdx, p)
                                                                         : panel->getParamName(
                                                                               op.sdk.classIdx, op.sdk.methodIdx, p);
@@ -715,129 +776,208 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                                         : panel->isParamPtrOrRef(
                                                                               op.sdk.classIdx, op.sdk.methodIdx, p);
                                                                 ImGui::TableNextRow();
+                                                                ImGui::TableSetColumnIndex(0);
+                                                                ImGui::TextUnformatted(ptype.empty() ? "?" : ptype.c_str());
                                                                 ImGui::TableSetColumnIndex(1);
                                                                 ImGui::Indent(indent + 16.0f);
                                                                 if (!pname.empty())
                                                                         ImGui::TextUnformatted(pname.c_str());
                                                                 else
                                                                         ImGui::Text(tr("Arg %d", "参数%d"), p);
-                                                                if (!ptype.empty() && ImGui::IsItemHovered())
-                                                                        ImGui::SetTooltip("%s", ptype.c_str());
                                                                 ImGui::Unindent(indent + 16.0f);
                                                                 ImGui::TableSetColumnIndex(2);
                                                                 char argBuf[512]{};
                                                                 strncpy(argBuf, op.sdk.args[p].c_str(), sizeof(argBuf) - 1);
-                                                                float inputW =
-                                                                    (isPtr && !localVars.empty()) ? -50.0f : -FLT_MIN;
-                                                                ImGui::SetNextItemWidth(inputW);
-                                                                if (ImGui::InputText("##arg", argBuf, sizeof(argBuf))) {
-                                                                        op.sdk.args[p] = argBuf;
-                                                                        isModified_    = true;
-                                                                }
-                                                                if (!ptype.empty() && ImGui::IsItemHovered())
-                                                                        ImGui::SetTooltip("%s", ptype.c_str());
-                                                                if (isPtr && !localVars.empty()) {
-                                                                        ImGui::SameLine();
-                                                                        char btnId[16];
-                                                                        snprintf(btnId, sizeof(btnId), "v##p%d", p);
-                                                                        if (ImGui::Button(btnId)) {
-                                                                                char pid[32];
-                                                                                snprintf(pid, sizeof(pid), "##vp%d", p);
-                                                                                ImGui::OpenPopup(pid);
+                                                                bool             hasPicker = !localVars.empty();
+                                                                bool             hasCreate = (bool)onAddLocalVar_;
+                                                                float            inputW    = (hasPicker && hasCreate)   ? -82.0f
+                                                                                             : (hasPicker || hasCreate) ? -35.0f
+                                                                                                                        : -FLT_MIN;
+                                                                const CEnumDecl *ed =
+                                                                    (!op.sdk.isPython)
+                                                                        ? panel->getParamEnumDecl(op.sdk.isCFunc,
+                                                                                                  op.sdk.classIdx,
+                                                                                                  op.sdk.methodIdx,
+                                                                                                  p)
+                                                                        : nullptr;
+                                                                if (ed && !ed->values.empty()) {
+                                                                        int64_t curVal =
+                                                                            op.sdk.args[p].empty()
+                                                                                ? 0
+                                                                                : strtoll(op.sdk.args[p].c_str(), nullptr, 0);
+                                                                        const char *preview = ed->values[0].name.c_str();
+                                                                        int         curIdx  = 0;
+                                                                        for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
+                                                                                if (ed->values[ei].value == curVal) {
+                                                                                        preview = ed->values[ei].name.c_str();
+                                                                                        curIdx  = ei;
+                                                                                        break;
+                                                                                }
                                                                         }
-                                                                        char pid[32];
-                                                                        snprintf(pid, sizeof(pid), "##vp%d", p);
-                                                                        if (ImGui::BeginPopup(pid)) {
-                                                                                for (const auto &vn : localVars)
-                                                                                        if (ImGui::Selectable(vn.c_str())) {
-                                                                                                op.sdk.args[p] = "&" + vn;
+                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                                                        char cmId[16];
+                                                                        snprintf(cmId, sizeof(cmId), "##ec%d", p);
+                                                                        if (ImGui::BeginCombo(cmId, preview)) {
+                                                                                for (int ei = 0; ei < (int)ed->values.size();
+                                                                                     ++ei) {
+                                                                                        bool sel2 = (ei == curIdx);
+                                                                                        char evLbl[128];
+                                                                                        snprintf(
+                                                                                            evLbl,
+                                                                                            sizeof(evLbl),
+                                                                                            "%s (%lld)",
+                                                                                            ed->values[ei].name.c_str(),
+                                                                                            (long long)ed->values[ei].value);
+                                                                                        if (ImGui::Selectable(evLbl, sel2)) {
+                                                                                                char numBuf[32];
+                                                                                                snprintf(
+                                                                                                    numBuf,
+                                                                                                    sizeof(numBuf),
+                                                                                                    "%lld",
+                                                                                                    (long long)ed->values[ei]
+                                                                                                        .value);
+                                                                                                op.sdk.args[p] = numBuf;
                                                                                                 isModified_    = true;
                                                                                         }
-                                                                                ImGui::EndPopup();
+                                                                                        if (sel2)
+                                                                                                ImGui::SetItemDefaultFocus();
+                                                                                }
+                                                                                ImGui::EndCombo();
                                                                         }
-                                                                }
-                                                                ImGui::PopID();
-                                                        }
-                                                        // "Create output vars" button for body-step SDK ops
-                                                        if (onAddLocalVar_) {
-                                                                bool anyPtr = false;
-                                                                for (int p = 0; p < nParams && !anyPtr; ++p) {
-                                                                        anyPtr =
-                                                                            op.sdk.isCFunc
-                                                                                ? panel->isCFuncParamPtrOrRef(op.sdk.methodIdx,
-                                                                                                              p)
-                                                                                : panel->isParamPtrOrRef(
-                                                                                      op.sdk.classIdx, op.sdk.methodIdx, p);
-                                                                }
-                                                                if (anyPtr) {
-                                                                        ImGui::TableNextRow();
-                                                                        ImGui::TableSetColumnIndex(1);
-                                                                        ImGui::Indent(indent + 16.0f);
-                                                                        if (ImGui::SmallButton(
-                                                                                tr("→ Create output vars", "→ 创建输出变量"))) {
-                                                                                for (int p = 0; p < nParams; ++p) {
-                                                                                        bool ip =
-                                                                                            op.sdk.isCFunc
-                                                                                                ? panel->isCFuncParamPtrOrRef(
-                                                                                                      op.sdk.methodIdx, p)
-                                                                                                : panel->isParamPtrOrRef(
-                                                                                                      op.sdk.classIdx,
-                                                                                                      op.sdk.methodIdx,
-                                                                                                      p);
-                                                                                        if (!ip)
-                                                                                                continue;
+                                                                } else {
+                                                                        ImGui::SetNextItemWidth(inputW);
+                                                                        if (ImGui::InputText("##arg", argBuf, sizeof(argBuf))) {
+                                                                                op.sdk.args[p] = argBuf;
+                                                                                isModified_    = true;
+                                                                        }
+                                                                        if (!ptype.empty() && ImGui::IsItemHovered())
+                                                                                ImGui::SetTooltip("%s", ptype.c_str());
+                                                                        if (hasCreate) {
+                                                                                ImGui::SameLine();
+                                                                                char cbtn[16];
+                                                                                snprintf(cbtn, sizeof(cbtn), "+##c%d", p);
+                                                                                if (ImGui::SmallButton(cbtn)) {
                                                                                         std::string pn =
-                                                                                            op.sdk.isCFunc
-                                                                                                ? panel->getCFuncParamName(
-                                                                                                      op.sdk.methodIdx, p)
-                                                                                                : panel->getParamName(
-                                                                                                      op.sdk.classIdx,
-                                                                                                      op.sdk.methodIdx,
-                                                                                                      p);
-                                                                                        std::string pt =
-                                                                                            op.sdk.isCFunc
-                                                                                                ? panel->getCFuncParamRawType(
-                                                                                                      op.sdk.methodIdx, p)
-                                                                                                : panel->getParamRawType(
-                                                                                                      op.sdk.classIdx,
-                                                                                                      op.sdk.methodIdx,
-                                                                                                      p);
-                                                                                        if (pn.empty())
-                                                                                                pn = "arg" + std::to_string(p);
+                                                                                            pname.empty()
+                                                                                                ? "arg" + std::to_string(p)
+                                                                                                : pname;
+                                                                                        DataType dt = ptrTypeFromRaw(ptype);
+                                                                                        size_t   sz = Parser::typeBytes(dt);
+                                                                                        if (sz == 0)
+                                                                                                sz = 4;
                                                                                         const CStructDecl *sd =
                                                                                             panel->getParamStructDecl(
                                                                                                 op.sdk.isCFunc,
                                                                                                 op.sdk.classIdx,
                                                                                                 op.sdk.methodIdx,
                                                                                                 p);
-                                                                                        if (sd && onAddLocalStructVar_) {
+                                                                                        if (sd && onAddLocalStructVar_)
                                                                                                 onAddLocalStructVar_(
                                                                                                     pn,
                                                                                                     structDeclToFields(*sd),
                                                                                                     sd->totalSize);
-                                                                                        } else if (onAddLocalVar_) {
-                                                                                                DataType dt =
-                                                                                                    ptrTypeFromRaw(pt);
-                                                                                                size_t sz =
-                                                                                                    Parser::typeBytes(dt);
-                                                                                                if (sz == 0)
-                                                                                                        sz = 4;
+                                                                                        else
                                                                                                 onAddLocalVar_(pn, dt, sz);
-                                                                                        }
-                                                                                        if (op.sdk.args[p].empty()) {
+                                                                                        if (isPtr)
                                                                                                 op.sdk.args[p] = "&" + pn;
-                                                                                                isModified_    = true;
-                                                                                        }
+                                                                                        isModified_ = true;
                                                                                 }
+                                                                                if (ImGui::IsItemHovered())
+                                                                                        ImGui::SetTooltip(
+                                                                                            "%s",
+                                                                                            tr("Create LOCAL variable",
+                                                                                               "创建 LOCAL 变量"));
+                                                                        }
+                                                                        if (hasPicker) {
+                                                                                ImGui::SameLine();
+                                                                                char btnId[16];
+                                                                                snprintf(btnId, sizeof(btnId), "v##p%d", p);
+                                                                                if (ImGui::Button(btnId)) {
+                                                                                        char pid[32];
+                                                                                        snprintf(pid, sizeof(pid), "##vp%d", p);
+                                                                                        ImGui::OpenPopup(pid);
+                                                                                }
+                                                                                char pid[32];
+                                                                                snprintf(pid, sizeof(pid), "##vp%d", p);
+                                                                                if (ImGui::BeginPopup(pid)) {
+                                                                                        for (const auto &vn : localVars)
+                                                                                                if (ImGui::Selectable(
+                                                                                                        vn.c_str())) {
+                                                                                                        op.sdk.args[p] =
+                                                                                                            isPtr ? "&" + vn
+                                                                                                                  : vn;
+                                                                                                        isModified_ = true;
+                                                                                                }
+                                                                                        ImGui::EndPopup();
+                                                                                }
+                                                                        }
+                                                                }
+                                                                ImGui::PopID();
+                                                        }
+                                                        // Return value → LOCAL variable row
+                                                        {
+                                                                std::string retT = panel->getCallReturnType(op.sdk.isCFunc,
+                                                                                                            op.sdk.isPython,
+                                                                                                            op.sdk.classIdx,
+                                                                                                            op.sdk.methodIdx,
+                                                                                                            op.sdk.pyFuncName);
+                                                                ImGui::TableNextRow();
+                                                                ImGui::TableSetColumnIndex(0);
+                                                                ImGui::TextUnformatted(retT.empty() ? "?" : retT.c_str());
+                                                                ImGui::TableSetColumnIndex(1);
+                                                                ImGui::Indent(indent + 16.0f);
+                                                                ImGui::TextUnformatted(tr("return", "返回值"));
+                                                                ImGui::Unindent(indent + 16.0f);
+                                                                ImGui::TableSetColumnIndex(2);
+                                                                char rvBuf[32]{};
+                                                                strncpy(rvBuf, op.sdk.resultVar, sizeof(rvBuf) - 1);
+                                                                bool  rvHasPicker = !localVars.empty();
+                                                                bool  rvHasCreate = (bool)onAddLocalVar_;
+                                                                float rvW         = (rvHasPicker && rvHasCreate)   ? -82.0f
+                                                                                    : (rvHasPicker || rvHasCreate) ? -35.0f
+                                                                                                                   : -FLT_MIN;
+                                                                ImGui::SetNextItemWidth(rvW);
+                                                                if (ImGui::InputText("##rv", rvBuf, sizeof(rvBuf))) {
+                                                                        strncpy(op.sdk.resultVar,
+                                                                                rvBuf,
+                                                                                sizeof(op.sdk.resultVar) - 1);
+                                                                        isModified_ = true;
+                                                                }
+                                                                if (rvHasCreate) {
+                                                                        ImGui::SameLine();
+                                                                        if (ImGui::SmallButton("+##rvc")) {
+                                                                                std::string vn = (op.sdk.resultVar[0] != '\0')
+                                                                                                     ? op.sdk.resultVar
+                                                                                                     : "result";
+                                                                                onAddLocalVar_(
+                                                                                    vn, DataType::I64, sizeof(int64_t));
+                                                                                strncpy(op.sdk.resultVar,
+                                                                                        vn.c_str(),
+                                                                                        sizeof(op.sdk.resultVar) - 1);
+                                                                                isModified_ = true;
                                                                         }
                                                                         if (ImGui::IsItemHovered())
                                                                                 ImGui::SetTooltip(
                                                                                     "%s",
-                                                                                    tr("Create pointer params as LOCAL "
-                                                                                       "variables in Variable Manager",
-                                                                                       "将指针参数新建为变量管理器中的LOCAL变量"
-                                                                                       "，并自动填入参数"));
-                                                                        ImGui::Unindent(indent + 16.0f);
+                                                                                    tr("Create LOCAL variable for return value",
+                                                                                       "为返回值创建 LOCAL 变量"));
+                                                                }
+                                                                if (rvHasPicker) {
+                                                                        ImGui::SameLine();
+                                                                        if (ImGui::Button("v##rvpick"))
+                                                                                ImGui::OpenPopup("##rvpop");
+                                                                        if (ImGui::BeginPopup("##rvpop")) {
+                                                                                for (const auto &vn : localVars)
+                                                                                        if (ImGui::Selectable(vn.c_str())) {
+                                                                                                strncpy(
+                                                                                                    op.sdk.resultVar,
+                                                                                                    vn.c_str(),
+                                                                                                    sizeof(op.sdk.resultVar) -
+                                                                                                        1);
+                                                                                                isModified_ = true;
+                                                                                        }
+                                                                                ImGui::EndPopup();
+                                                                        }
                                                                 }
                                                         }
                                                 }
@@ -852,25 +992,62 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                         stepToDelete = i;
                                 isModified_ = true;
                         }
+                        if (opMoveSrc >= 0 && opMoveDst >= 0 && opMoveSrc != opMoveDst) {
+                                auto moved = s.ops[opMoveSrc];
+                                s.ops.erase(s.ops.begin() + opMoveSrc);
+                                if (opMoveDst > opMoveSrc)
+                                        opMoveDst--;
+                                s.ops.insert(s.ops.begin() + opMoveDst, moved);
+                                isModified_ = true;
+                        }
 
                 } else {
-                        // ── Control flow step: single colored badge row ───────────────
+                        // ── Control flow step: same 4-column layout as "do" ops ──────
                         ImGui::TableNextRow();
+
+                        ImVec4 badgeCol = (s.kind == SeqStepKind::Sleep)   ? ImVec4(0.6f, 0.8f, 1.0f, 1.0f)
+                                          : (s.kind == SeqStepKind::Break) ? ImVec4(1.0f, 0.5f, 0.5f, 1.0f)
+                                                                           : ImVec4(1.0f, 0.85f, 0.4f, 1.0f);
 
                         ImGui::TableSetColumnIndex(0);
                         if (indent > 0.0f)
                                 ImGui::Indent(indent);
-                        ImVec4 badgeCol = (s.kind == SeqStepKind::Sleep)   ? ImVec4(0.6f, 0.8f, 1.0f, 1.0f)
-                                          : (s.kind == SeqStepKind::Break) ? ImVec4(1.0f, 0.5f, 0.5f, 1.0f)
-                                                                           : ImVec4(1.0f, 0.85f, 0.4f, 1.0f);
-                        ImGui::TextColored(badgeCol, "%s", tr(kindLabel(s.kind), kindLabelCn(s.kind)));
+                        ImGui::SmallButton("=##sg");
+                        if (ImGui::BeginDragDropSource()) {
+                                ImGui::SetDragDropPayload("BODYSTEP_MOVE", &i, sizeof(int));
+                                ImGui::Text("%d", i + 1);
+                                ImGui::EndDragDropSource();
+                        }
+                        if (ImGui::BeginDragDropTarget()) {
+                                if (const ImGuiPayload *pl = ImGui::AcceptDragDropPayload("BODYSTEP_MOVE")) {
+                                        stepMoveSrc = *(const int *)pl->Data;
+                                        stepMoveDst = i;
+                                }
+                                ImGui::EndDragDropTarget();
+                        }
+                        ImGui::OpenPopupOnItemClick("##stepdelmenu", ImGuiPopupFlags_MouseButtonRight);
+                        if (ImGui::BeginPopup("##stepdelmenu")) {
+                                if (ImGui::MenuItem(tr("Delete", "删除")))
+                                        stepToDelete = i;
+                                ImGui::EndPopup();
+                        }
+                        ImGui::SameLine();
+                        ImGui::TextColored(badgeCol, "%d", i + 1);
                         if (indent > 0.0f)
                                 ImGui::Unindent(indent);
 
                         ImGui::TableSetColumnIndex(1);
+                        ImGui::AlignTextToFramePadding();
+                        if (indent > 0.0f)
+                                ImGui::Indent(indent);
+                        ImGui::TextColored(badgeCol, "%s", tr(kindLabel(s.kind), kindLabelCn(s.kind)));
+                        if (indent > 0.0f)
+                                ImGui::Unindent(indent);
+
+                        ImGui::TableSetColumnIndex(2);
                         switch (s.kind) {
                                 case SeqStepKind::Sleep:
-                                        ImGui::SetNextItemWidth(60.0f);
+                                        ImGui::SetNextItemWidth(50.0f);
                                         if (ImGui::InputInt("##ms", &s.sleepMs, 0))
                                                 isModified_ = true;
                                         ImGui::SameLine();
@@ -878,7 +1055,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                         break;
                                 case SeqStepKind::If:
                                 case SeqStepKind::While: {
-                                        ImGui::SetNextItemWidth(72.0f);
+                                        ImGui::SetNextItemWidth(60.0f);
                                         if (ImGui::InputText("##cv", s.condVar, sizeof(s.condVar)))
                                                 isModified_ = true;
                                         ImGui::SameLine();
@@ -888,14 +1065,14 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                         opi = oi;
                                                         break;
                                                 }
-                                        ImGui::SetNextItemWidth(46.0f);
+                                        ImGui::SetNextItemWidth(40.0f);
                                         if (ImGui::Combo("##op", &opi, condOps, 6)) {
                                                 strncpy(s.condOp, condOps[opi], sizeof(s.condOp) - 1);
                                                 isModified_ = true;
                                         }
                                         ImGui::SameLine();
                                         int64_t cv = s.condVal;
-                                        ImGui::SetNextItemWidth(52.0f);
+                                        ImGui::SetNextItemWidth(44.0f);
                                         if (ImGui::InputScalar("##cv2", ImGuiDataType_S64, &cv)) {
                                                 s.condVal   = cv;
                                                 isModified_ = true;
@@ -903,14 +1080,14 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                         break;
                                 }
                                 case SeqStepKind::For: {
-                                        ImGui::SetNextItemWidth(40.0f);
+                                        ImGui::SetNextItemWidth(32.0f);
                                         if (ImGui::InputText("##fv", s.forVar, sizeof(s.forVar)))
                                                 isModified_ = true;
                                         ImGui::SameLine();
                                         ImGui::TextDisabled("=");
                                         int64_t ff = s.forFrom, ft = s.forTo, fs = s.forStep;
                                         ImGui::SameLine();
-                                        ImGui::SetNextItemWidth(44.0f);
+                                        ImGui::SetNextItemWidth(36.0f);
                                         if (ImGui::InputScalar("##ff", ImGuiDataType_S64, &ff)) {
                                                 s.forFrom   = ff;
                                                 isModified_ = true;
@@ -918,7 +1095,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                         ImGui::SameLine();
                                         ImGui::TextDisabled("..");
                                         ImGui::SameLine();
-                                        ImGui::SetNextItemWidth(44.0f);
+                                        ImGui::SetNextItemWidth(36.0f);
                                         if (ImGui::InputScalar("##ft", ImGuiDataType_S64, &ft)) {
                                                 s.forTo     = ft;
                                                 isModified_ = true;
@@ -926,7 +1103,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                         ImGui::SameLine();
                                         ImGui::TextDisabled("+");
                                         ImGui::SameLine();
-                                        ImGui::SetNextItemWidth(36.0f);
+                                        ImGui::SetNextItemWidth(28.0f);
                                         if (ImGui::InputScalar("##fs", ImGuiDataType_S64, &fs)) {
                                                 s.forStep   = fs;
                                                 isModified_ = true;
@@ -940,50 +1117,32 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                         break;
                         }
 
-                        ImGui::TableSetColumnIndex(3);
-                        if (ImGui::SmallButton("X"))
-                                stepToDelete = i;
-
                         // ── Nested body for compound steps ────────────────────────────
                         if (depth < 4 &&
                             (s.kind == SeqStepKind::If || s.kind == SeqStepKind::While || s.kind == SeqStepKind::For)) {
                                 drawBodySteps(s.body, depth + 1);
 
                                 float subIndent = (depth + 1) * 14.0f;
-                                ImGui::TableNextRow();
-                                ImGui::TableSetColumnIndex(0);
-                                ImGui::Indent(subIndent);
-                                if (ImGui::SmallButton(tr("+##bb", "+##bb"))) {
-                                        s.body.push_back(SequenceStep{});
-                                        isModified_ = true;
-                                }
                                 if (s.kind == SeqStepKind::If) {
-                                        ImGui::SameLine();
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::Indent(subIndent);
                                         bool he = s.hasElse;
-                                        if (ImGui::Checkbox(tr("else", "else"), &he)) {
+                                        if (ImGui::Checkbox(tr("else", "否则"), &he)) {
                                                 s.hasElse   = he;
                                                 isModified_ = true;
                                         }
+                                        ImGui::Unindent(subIndent);
                                 }
-                                ImGui::Unindent(subIndent);
 
                                 if (s.kind == SeqStepKind::If && s.hasElse) {
                                         ImGui::TableNextRow();
-                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::TableSetColumnIndex(1);
                                         ImGui::Indent(subIndent);
-                                        ImGui::TextDisabled("else:");
+                                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "%s", tr("else:", "否则:"));
                                         ImGui::Unindent(subIndent);
 
                                         drawBodySteps(s.elseBody, depth + 1);
-
-                                        ImGui::TableNextRow();
-                                        ImGui::TableSetColumnIndex(0);
-                                        ImGui::Indent(subIndent);
-                                        if (ImGui::SmallButton(tr("+##be", "+##be"))) {
-                                                s.elseBody.push_back(SequenceStep{});
-                                                isModified_ = true;
-                                        }
-                                        ImGui::Unindent(subIndent);
                                 }
                         }
                 }
@@ -993,6 +1152,14 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
 
         if (stepToDelete >= 0) {
                 steps.erase(steps.begin() + stepToDelete);
+                isModified_ = true;
+        }
+        if (stepMoveSrc >= 0 && stepMoveDst >= 0 && stepMoveSrc != stepMoveDst) {
+                auto moved = steps[stepMoveSrc];
+                steps.erase(steps.begin() + stepMoveSrc);
+                if (stepMoveDst > stepMoveSrc)
+                        stepMoveDst--;
+                steps.insert(steps.begin() + stepMoveDst, moved);
                 isModified_ = true;
         }
 
@@ -1334,7 +1501,7 @@ SequenceEditor::drawStepList()
                         float availW = ImGui::GetContentRegionAvail().x;
                         if (availW > 28.0f)
                                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + availW - 24.0f);
-                        if (ImGui::SmallButton("▶"))
+                        if (ImGui::SmallButton(">##run"))
                                 runSingleStep(i);
                         if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("%s", tr("Run this step only", "仅运行此步骤"));
@@ -1378,7 +1545,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
         // ── Kind selector ──
         {
                 static const char *kinds[]   = {"do", "delay", "if", "While", "For", "Break"};
-                static const char *kindsCn[] = {"do", "delay", "if", "循环", "For", "Break"};
+                static const char *kindsCn[] = {"执行", "延时", "判断", "循环", "计数", "退出"};
                 int                ki        = (int)step.kind;
                 ImGui::SetNextItemWidth(100.0f);
                 if (ImGui::Combo(tr("Kind", "类型"), &ki, g_lang == Lang::ZH ? kindsCn : kinds, 6)) {
@@ -1396,17 +1563,18 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                         ImGui::Text("%s", tr("Actions (drag variables / SDK functions):", "动作（拖入变量 / SDK 函数）："));
                         if (ImGui::BeginChild("OpList", ImVec2(0, 0), true)) {
                                 static ImGuiTableFlags opTblFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                                                                    ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY;
-                                if (ImGui::BeginTable("##optbl", 4, opTblFlags)) {
+                                                                    ImGuiTableFlags_SizingStretchProp |
+                                                                    ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable;
+                                if (ImGui::BeginTable("##optbl", 3, opTblFlags)) {
                                         ImGui::TableSetupScrollFreeze(0, 1);
-                                        ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 28.0f);
+                                        ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 70.0f);
                                         ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch, 0.35f);
                                         ImGui::TableSetupColumn(
                                             tr("Value / Args", "值/参数"), ImGuiTableColumnFlags_WidthStretch, 0.65f);
-                                        ImGui::TableSetupColumn("##del", ImGuiTableColumnFlags_WidthFixed, 32.0f);
                                         ImGui::TableHeadersRow();
 
-                                        int toDelete = -1;
+                                        int toDelete  = -1;
+                                        int opMoveSrc = -1, opMoveDst = -1;
                                         for (int i = 0; i < (int)step.ops.size(); ++i) {
                                                 ImGui::PushID(i);
                                                 SeqOp &op = step.ops[i];
@@ -1416,6 +1584,32 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                         ImGui::TableNextRow();
 
                                                         ImGui::TableSetColumnIndex(0);
+                                                        ImGui::SmallButton("=##opgrip");
+                                                        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                                                                ImGui::SetDragDropPayload("OP_ROW_MOVE", &i, sizeof(i));
+                                                                ImGui::TextUnformatted(a.name.c_str());
+                                                                ImGui::EndDragDropSource();
+                                                        }
+                                                        if (ImGui::IsItemHovered())
+                                                                ImGui::SetTooltip("%s",
+                                                                                  tr("Drag to reorder", "拖动以调整顺序"));
+                                                        if (ImGui::BeginDragDropTarget()) {
+                                                                if (const ImGuiPayload *mv =
+                                                                        ImGui::AcceptDragDropPayload("OP_ROW_MOVE"))
+                                                                        if (mv->DataSize == (int)sizeof(int)) {
+                                                                                opMoveSrc = *static_cast<const int *>(mv->Data);
+                                                                                opMoveDst = i;
+                                                                        }
+                                                                ImGui::EndDragDropTarget();
+                                                        }
+                                                        ImGui::OpenPopupOnItemClick("##op_ctx",
+                                                                                    ImGuiPopupFlags_MouseButtonRight);
+                                                        if (ImGui::BeginPopup("##op_ctx")) {
+                                                                if (ImGui::MenuItem(tr("Delete", "删除")))
+                                                                        toDelete = i;
+                                                                ImGui::EndPopup();
+                                                        }
+                                                        ImGui::SameLine();
                                                         ImGui::Text("%d", i + 1);
 
                                                         ImGui::TableSetColumnIndex(1);
@@ -1455,10 +1649,6 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                 }
                                                         }
 
-                                                        ImGui::TableSetColumnIndex(3);
-                                                        if (ui::Button(tr("X", "X"), ui::BtnStyle::Danger, ImVec2(-FLT_MIN, 0)))
-                                                                toDelete = i;
-
                                                 } else {
                                                         // SDK call op
                                                         auto panel   = findSdkPanel(op.sdk.panelWinId);
@@ -1477,17 +1667,39 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                         ImGui::TableNextRow();
 
                                                         ImGui::TableSetColumnIndex(0);
+                                                        ImGui::SmallButton("=##opgrip");
+                                                        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                                                                ImGui::SetDragDropPayload("OP_ROW_MOVE", &i, sizeof(i));
+                                                                ImGui::TextUnformatted(op.sdk.label.c_str());
+                                                                ImGui::EndDragDropSource();
+                                                        }
+                                                        if (ImGui::IsItemHovered())
+                                                                ImGui::SetTooltip("%s",
+                                                                                  tr("Drag to reorder", "拖动以调整顺序"));
+                                                        if (ImGui::BeginDragDropTarget()) {
+                                                                if (const ImGuiPayload *mv =
+                                                                        ImGui::AcceptDragDropPayload("OP_ROW_MOVE"))
+                                                                        if (mv->DataSize == (int)sizeof(int)) {
+                                                                                opMoveSrc = *static_cast<const int *>(mv->Data);
+                                                                                opMoveDst = i;
+                                                                        }
+                                                                ImGui::EndDragDropTarget();
+                                                        }
+                                                        ImGui::OpenPopupOnItemClick("##op_ctx",
+                                                                                    ImGuiPopupFlags_MouseButtonRight);
+                                                        if (ImGui::BeginPopup("##op_ctx")) {
+                                                                if (ImGui::MenuItem(tr("Delete", "删除")))
+                                                                        toDelete = i;
+                                                                ImGui::EndPopup();
+                                                        }
+                                                        ImGui::SameLine();
                                                         ImGui::Text("%d", i + 1);
 
                                                         ImGui::TableSetColumnIndex(1);
                                                         bool open = ImGui::TreeNodeEx("##sdkn",
                                                                                       ImGuiTreeNodeFlags_DefaultOpen,
-                                                                                      "[SDK] %s",
+                                                                                      "%s",
                                                                                       op.sdk.label.c_str());
-
-                                                        ImGui::TableSetColumnIndex(3);
-                                                        if (ui::Button(tr("X", "X"), ui::BtnStyle::Danger, ImVec2(-FLT_MIN, 0)))
-                                                                toDelete = i;
 
                                                         if (open) {
                                                                 if (!panel) {
@@ -1502,7 +1714,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                         // Object selector for C++ methods
                                                                         if (!op.sdk.isCFunc && !op.sdk.isPython) {
                                                                                 auto objs = panel->listObjects(op.sdk.classIdx);
-                                                                                const char *curLabel = tr("(none)", "(无对象)");
+                                                                                const char *curLabel = tr("(none)", "(无)");
                                                                                 for (const auto &o : objs)
                                                                                         if (o.idx == op.sdk.objIdx) {
                                                                                                 curLabel = o.label.c_str();
@@ -1510,14 +1722,32 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                         }
 
                                                                                 ImGui::TableNextRow();
+                                                                                ImGui::TableSetColumnIndex(0);
+                                                                                {
+                                                                                        std::string cn = panel->getClassName(
+                                                                                            op.sdk.classIdx);
+                                                                                        ImGui::TextUnformatted(
+                                                                                            cn.empty() ? "?" : cn.c_str());
+                                                                                }
                                                                                 ImGui::TableSetColumnIndex(1);
                                                                                 ImGui::Indent(16.0f);
-                                                                                ImGui::TextDisabled(tr("Object:", "对象:"));
+                                                                                ImGui::TextUnformatted(tr("Object", "对象"));
                                                                                 ImGui::Unindent(16.0f);
 
                                                                                 ImGui::TableSetColumnIndex(2);
-                                                                                ImGui::SetNextItemWidth(-50.0f);
+                                                                                ImGui::SetNextItemWidth(-FLT_MIN);
                                                                                 if (ImGui::BeginCombo("##objsel", curLabel)) {
+                                                                                        if (ImGui::Selectable(
+                                                                                                tr("[+ New Object]",
+                                                                                                   "[+ 新建对象]"),
+                                                                                                false)) {
+                                                                                                int ni = panel->newObject(
+                                                                                                    op.sdk.classIdx);
+                                                                                                if (ni >= 0) {
+                                                                                                        op.sdk.objIdx = ni;
+                                                                                                        isModified_   = true;
+                                                                                                }
+                                                                                        }
                                                                                         for (const auto &o : objs) {
                                                                                                 bool sel =
                                                                                                     (o.idx == op.sdk.objIdx);
@@ -1538,16 +1768,6 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                         }
                                                                                         ImGui::EndCombo();
                                                                                 }
-                                                                                ImGui::SameLine();
-                                                                                if (ImGui::SmallButton(
-                                                                                        tr("New##newobj", "新建##newobj"))) {
-                                                                                        int ni =
-                                                                                            panel->newObject(op.sdk.classIdx);
-                                                                                        if (ni >= 0) {
-                                                                                                op.sdk.objIdx = ni;
-                                                                                                isModified_   = true;
-                                                                                        }
-                                                                                }
                                                                         }
 
                                                                         // Arg rows
@@ -1558,7 +1778,9 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                         for (int p = 0; p < nParams; ++p) {
                                                                                 ImGui::PushID(p);
                                                                                 std::string pname =
-                                                                                    op.sdk.isCFunc
+                                                                                    op.sdk.isPython ? panel->getPyFuncParamName(
+                                                                                                          op.sdk.pyFuncName, p)
+                                                                                    : op.sdk.isCFunc
                                                                                         ? panel->getCFuncParamName(
                                                                                               op.sdk.methodIdx, p)
                                                                                         : panel->getParamName(op.sdk.classIdx,
@@ -1582,14 +1804,15 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
 
                                                                                 ImGui::TableNextRow();
 
+                                                                                ImGui::TableSetColumnIndex(0);
+                                                                                ImGui::TextUnformatted(
+                                                                                    ptype.empty() ? "?" : ptype.c_str());
                                                                                 ImGui::TableSetColumnIndex(1);
                                                                                 ImGui::Indent(16.0f);
                                                                                 if (!pname.empty())
                                                                                         ImGui::TextUnformatted(pname.c_str());
                                                                                 else
                                                                                         ImGui::Text(tr("Arg %d", "参数%d"), p);
-                                                                                if (!ptype.empty() && ImGui::IsItemHovered())
-                                                                                        ImGui::SetTooltip("%s", ptype.c_str());
                                                                                 ImGui::Unindent(16.0f);
 
                                                                                 ImGui::TableSetColumnIndex(2);
@@ -1597,120 +1820,123 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                 strncpy(argBuf,
                                                                                         op.sdk.args[p].c_str(),
                                                                                         sizeof(argBuf) - 1);
-                                                                                float inputW = (isPtr && !localVars.empty())
-                                                                                                   ? -50.0f
-                                                                                                   : -FLT_MIN;
-                                                                                ImGui::SetNextItemWidth(inputW);
-                                                                                if (ImGui::InputText(
-                                                                                        "##arg", argBuf, sizeof(argBuf))) {
-                                                                                        op.sdk.args[p] = argBuf;
-                                                                                        isModified_    = true;
-                                                                                }
-                                                                                if (!ptype.empty() && ImGui::IsItemHovered())
-                                                                                        ImGui::SetTooltip("%s", ptype.c_str());
-                                                                                if (isPtr && !localVars.empty()) {
-                                                                                        ImGui::SameLine();
-                                                                                        char btnId[16];
-                                                                                        snprintf(
-                                                                                            btnId, sizeof(btnId), "v##p%d", p);
-                                                                                        if (ImGui::Button(btnId)) {
-                                                                                                char popupId[32];
-                                                                                                snprintf(popupId,
-                                                                                                         sizeof(popupId),
-                                                                                                         "##vp%d",
-                                                                                                         p);
-                                                                                                ImGui::OpenPopup(popupId);
+                                                                                bool  hasPicker2 = isPtr && !localVars.empty();
+                                                                                bool  hasCreate2 = (bool)onAddLocalVar_;
+                                                                                float inputW =
+                                                                                    (hasPicker2 && hasCreate2)   ? -82.0f
+                                                                                    : (hasPicker2 || hasCreate2) ? -35.0f
+                                                                                                                 : -FLT_MIN;
+                                                                                const CEnumDecl *ed2 =
+                                                                                    (!op.sdk.isPython)
+                                                                                        ? panel->getParamEnumDecl(
+                                                                                              op.sdk.isCFunc,
+                                                                                              op.sdk.classIdx,
+                                                                                              op.sdk.methodIdx,
+                                                                                              p)
+                                                                                        : nullptr;
+                                                                                if (ed2 && !ed2->values.empty()) {
+                                                                                        int64_t curVal2 =
+                                                                                            op.sdk.args[p].empty()
+                                                                                                ? 0
+                                                                                                : strtoll(
+                                                                                                      op.sdk.args[p].c_str(),
+                                                                                                      nullptr,
+                                                                                                      0);
+                                                                                        const char *preview2 =
+                                                                                            ed2->values[0].name.c_str();
+                                                                                        int curIdx2 = 0;
+                                                                                        for (int ei = 0;
+                                                                                             ei < (int)ed2->values.size();
+                                                                                             ++ei) {
+                                                                                                if (ed2->values[ei].value ==
+                                                                                                    curVal2) {
+                                                                                                        preview2 =
+                                                                                                            ed2->values[ei]
+                                                                                                                .name.c_str();
+                                                                                                        curIdx2 = ei;
+                                                                                                        break;
+                                                                                                }
                                                                                         }
-                                                                                        char popupId[32];
-                                                                                        snprintf(popupId,
-                                                                                                 sizeof(popupId),
-                                                                                                 "##vp%d",
-                                                                                                 p);
-                                                                                        if (ImGui::BeginPopup(popupId)) {
-                                                                                                for (const auto &vn : localVars)
+                                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                                                                        char cmId2[16];
+                                                                                        snprintf(
+                                                                                            cmId2, sizeof(cmId2), "##ec%d", p);
+                                                                                        if (ImGui::BeginCombo(cmId2,
+                                                                                                              preview2)) {
+                                                                                                for (int ei = 0;
+                                                                                                     ei <
+                                                                                                     (int)ed2->values.size();
+                                                                                                     ++ei) {
+                                                                                                        bool sel2 =
+                                                                                                            (ei == curIdx2);
+                                                                                                        char evLbl[128];
+                                                                                                        snprintf(
+                                                                                                            evLbl,
+                                                                                                            sizeof(evLbl),
+                                                                                                            "%s (%lld)",
+                                                                                                            ed2->values[ei]
+                                                                                                                .name.c_str(),
+                                                                                                            (long long)ed2
+                                                                                                                ->values[ei]
+                                                                                                                .value);
                                                                                                         if (ImGui::Selectable(
-                                                                                                                vn.c_str())) {
+                                                                                                                evLbl, sel2)) {
+                                                                                                                char numBuf[32];
+                                                                                                                snprintf(
+                                                                                                                    numBuf,
+                                                                                                                    sizeof(
+                                                                                                                        numBuf),
+                                                                                                                    "%lld",
+                                                                                                                    (long long)ed2
+                                                                                                                        ->values
+                                                                                                                            [ei]
+                                                                                                                        .value);
                                                                                                                 op.sdk.args[p] =
-                                                                                                                    "&" + vn;
+                                                                                                                    numBuf;
                                                                                                                 isModified_ =
                                                                                                                     true;
                                                                                                         }
-                                                                                                ImGui::EndPopup();
+                                                                                                        if (sel2)
+                                                                                                                ImGui::
+                                                                                                                    SetItemDefaultFocus();
+                                                                                                }
+                                                                                                ImGui::EndCombo();
                                                                                         }
-                                                                                }
-                                                                                ImGui::PopID();
-                                                                        }
-                                                                        // "Create output vars" button: one click
-                                                                        // creates LOCAL vars for all ptr/ref params
-                                                                        if (onAddLocalVar_) {
-                                                                                bool anyPtr = false;
-                                                                                for (int p = 0; p < nParams; ++p) {
-                                                                                        bool ip =
-                                                                                            op.sdk.isCFunc
-                                                                                                ? panel->isCFuncParamPtrOrRef(
-                                                                                                      op.sdk.methodIdx, p)
-                                                                                                : panel->isParamPtrOrRef(
-                                                                                                      op.sdk.classIdx,
-                                                                                                      op.sdk.methodIdx,
-                                                                                                      p);
-                                                                                        if (ip) {
-                                                                                                anyPtr = true;
-                                                                                                break;
+                                                                                } else {
+                                                                                        ImGui::SetNextItemWidth(inputW);
+                                                                                        if (ImGui::InputText("##arg",
+                                                                                                             argBuf,
+                                                                                                             sizeof(argBuf))) {
+                                                                                                op.sdk.args[p] = argBuf;
+                                                                                                isModified_    = true;
                                                                                         }
-                                                                                }
-                                                                                if (anyPtr) {
-                                                                                        ImGui::TableNextRow();
-                                                                                        ImGui::TableSetColumnIndex(1);
-                                                                                        ImGui::Indent(16.0f);
-                                                                                        if (ImGui::SmallButton(
-                                                                                                tr("→ Create output vars",
-                                                                                                   "→ 创建输出变量"))) {
-                                                                                                for (int p = 0; p < nParams;
-                                                                                                     ++p) {
-                                                                                                        bool ip =
-                                                                                                            op.sdk.isCFunc
-                                                                                                                ? panel->isCFuncParamPtrOrRef(
-                                                                                                                      op.sdk
-                                                                                                                          .methodIdx,
-                                                                                                                      p)
-                                                                                                                : panel->isParamPtrOrRef(
-                                                                                                                      op.sdk
-                                                                                                                          .classIdx,
-                                                                                                                      op.sdk
-                                                                                                                          .methodIdx,
-                                                                                                                      p);
-                                                                                                        if (!ip)
-                                                                                                                continue;
+                                                                                        if (!ptype.empty() &&
+                                                                                            ImGui::IsItemHovered())
+                                                                                                ImGui::SetTooltip(
+                                                                                                    "%s", ptype.c_str());
+                                                                                        if (hasCreate2) {
+                                                                                                ImGui::SameLine();
+                                                                                                char cbtn[16];
+                                                                                                snprintf(cbtn,
+                                                                                                         sizeof(cbtn),
+                                                                                                         "+##c%d",
+                                                                                                         p);
+                                                                                                if (ImGui::SmallButton(cbtn)) {
                                                                                                         std::string pn =
-                                                                                                            op.sdk.isCFunc
-                                                                                                                ? panel->getCFuncParamName(
-                                                                                                                      op.sdk
-                                                                                                                          .methodIdx,
-                                                                                                                      p)
-                                                                                                                : panel->getParamName(
-                                                                                                                      op.sdk
-                                                                                                                          .classIdx,
-                                                                                                                      op.sdk
-                                                                                                                          .methodIdx,
-                                                                                                                      p);
-                                                                                                        std::string pt =
-                                                                                                            op.sdk.isCFunc
-                                                                                                                ? panel->getCFuncParamRawType(
-                                                                                                                      op.sdk
-                                                                                                                          .methodIdx,
-                                                                                                                      p)
-                                                                                                                : panel->getParamRawType(
-                                                                                                                      op.sdk
-                                                                                                                          .classIdx,
-                                                                                                                      op.sdk
-                                                                                                                          .methodIdx,
-                                                                                                                      p);
-                                                                                                        if (pn.empty())
-                                                                                                                pn =
-                                                                                                                    "arg" +
-                                                                                                                    std::
-                                                                                                                        to_string(
-                                                                                                                            p);
+                                                                                                            pname.empty()
+                                                                                                                ? "arg" +
+                                                                                                                      std::
+                                                                                                                          to_string(
+                                                                                                                              p)
+                                                                                                                : pname;
+                                                                                                        DataType dt =
+                                                                                                            ptrTypeFromRaw(
+                                                                                                                ptype);
+                                                                                                        size_t sz =
+                                                                                                            Parser::typeBytes(
+                                                                                                                dt);
+                                                                                                        if (sz == 0)
+                                                                                                                sz = 4;
                                                                                                         const CStructDecl *sd =
                                                                                                             panel->getParamStructDecl(
                                                                                                                 op.sdk.isCFunc,
@@ -1719,44 +1945,150 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                                                     .methodIdx,
                                                                                                                 p);
                                                                                                         if (sd &&
-                                                                                                            onAddLocalStructVar_) {
+                                                                                                            onAddLocalStructVar_)
                                                                                                                 onAddLocalStructVar_(
                                                                                                                     pn,
                                                                                                                     structDeclToFields(
                                                                                                                         *sd),
                                                                                                                     sd->totalSize);
-                                                                                                        } else {
-                                                                                                                DataType dt =
-                                                                                                                    ptrTypeFromRaw(
-                                                                                                                        pt);
-                                                                                                                size_t sz =
-                                                                                                                    Parser::
-                                                                                                                        typeBytes(
-                                                                                                                            dt);
-                                                                                                                if (sz == 0)
-                                                                                                                        sz = 4;
+                                                                                                        else
                                                                                                                 onAddLocalVar_(
                                                                                                                     pn, dt, sz);
-                                                                                                        }
-                                                                                                        if (op.sdk.args[p]
-                                                                                                                .empty()) {
+                                                                                                        if (isPtr)
                                                                                                                 op.sdk.args[p] =
                                                                                                                     "&" + pn;
-                                                                                                                isModified_ =
-                                                                                                                    true;
-                                                                                                        }
+                                                                                                        isModified_ = true;
                                                                                                 }
+                                                                                                if (ImGui::IsItemHovered())
+                                                                                                        ImGui::SetTooltip(
+                                                                                                            "%s",
+                                                                                                            tr("Create LOCAL "
+                                                                                                               "variable",
+                                                                                                               "创建 LOCAL "
+                                                                                                               "变量"));
+                                                                                        }
+                                                                                        if (hasPicker2) {
+                                                                                                ImGui::SameLine();
+                                                                                                char btnId[16];
+                                                                                                snprintf(btnId,
+                                                                                                         sizeof(btnId),
+                                                                                                         "v##p%d",
+                                                                                                         p);
+                                                                                                if (ImGui::Button(btnId)) {
+                                                                                                        char popupId[32];
+                                                                                                        snprintf(
+                                                                                                            popupId,
+                                                                                                            sizeof(popupId),
+                                                                                                            "##vp%d",
+                                                                                                            p);
+                                                                                                        ImGui::OpenPopup(
+                                                                                                            popupId);
+                                                                                                }
+                                                                                                char popupId[32];
+                                                                                                snprintf(popupId,
+                                                                                                         sizeof(popupId),
+                                                                                                         "##vp%d",
+                                                                                                         p);
+                                                                                                if (ImGui::BeginPopup(
+                                                                                                        popupId)) {
+                                                                                                        for (const auto &vn :
+                                                                                                             localVars)
+                                                                                                                if (ImGui::Selectable(
+                                                                                                                        vn.c_str())) {
+                                                                                                                        op.sdk.args
+                                                                                                                            [p] =
+                                                                                                                            "&" +
+                                                                                                                            vn;
+                                                                                                                        isModified_ =
+                                                                                                                            true;
+                                                                                                                }
+                                                                                                        ImGui::EndPopup();
+                                                                                                }
+                                                                                        }
+                                                                                }
+                                                                                ImGui::PopID();
+                                                                        }
+                                                                        // Return value → LOCAL variable row
+                                                                        {
+                                                                                std::string retT2 =
+                                                                                    panel->getCallReturnType(op.sdk.isCFunc,
+                                                                                                             op.sdk.isPython,
+                                                                                                             op.sdk.classIdx,
+                                                                                                             op.sdk.methodIdx,
+                                                                                                             op.sdk.pyFuncName);
+                                                                                ImGui::TableNextRow();
+                                                                                ImGui::TableSetColumnIndex(0);
+                                                                                ImGui::TextUnformatted(
+                                                                                    retT2.empty() ? "?" : retT2.c_str());
+                                                                                ImGui::TableSetColumnIndex(1);
+                                                                                ImGui::Indent(16.0f);
+                                                                                ImGui::TextUnformatted(tr("return", "返回值"));
+                                                                                ImGui::Unindent(16.0f);
+                                                                                ImGui::TableSetColumnIndex(2);
+                                                                                char rvBuf[32]{};
+                                                                                strncpy(
+                                                                                    rvBuf, op.sdk.resultVar, sizeof(rvBuf) - 1);
+                                                                                bool  rv2HasPicker = !localVars.empty();
+                                                                                bool  rv2HasCreate = (bool)onAddLocalVar_;
+                                                                                float rvW =
+                                                                                    (rv2HasPicker && rv2HasCreate)   ? -82.0f
+                                                                                    : (rv2HasPicker || rv2HasCreate) ? -35.0f
+                                                                                                                     : -FLT_MIN;
+                                                                                ImGui::SetNextItemWidth(rvW);
+                                                                                if (ImGui::InputText(
+                                                                                        "##rv2", rvBuf, sizeof(rvBuf))) {
+                                                                                        strncpy(op.sdk.resultVar,
+                                                                                                rvBuf,
+                                                                                                sizeof(op.sdk.resultVar) - 1);
+                                                                                        isModified_ = true;
+                                                                                }
+                                                                                if (rv2HasCreate) {
+                                                                                        ImGui::SameLine();
+                                                                                        if (ImGui::SmallButton("+##rv2c")) {
+                                                                                                std::string vn =
+                                                                                                    (op.sdk.resultVar[0] !=
+                                                                                                     '\0')
+                                                                                                        ? op.sdk.resultVar
+                                                                                                        : "result";
+                                                                                                onAddLocalVar_(vn,
+                                                                                                               DataType::I64,
+                                                                                                               sizeof(int64_t));
+                                                                                                strncpy(
+                                                                                                    op.sdk.resultVar,
+                                                                                                    vn.c_str(),
+                                                                                                    sizeof(op.sdk.resultVar) -
+                                                                                                        1);
+                                                                                                isModified_ = true;
                                                                                         }
                                                                                         if (ImGui::IsItemHovered())
                                                                                                 ImGui::SetTooltip(
                                                                                                     "%s",
-                                                                                                    tr("Create pointer params "
-                                                                                                       "as LOCAL variables in "
-                                                                                                       "Variable Manager",
-                                                                                                       "将指针参数新建为变量管"
-                                                                                                       "理器中的LOCAL变量，并自"
-                                                                                                       "动填入参数"));
-                                                                                        ImGui::Unindent(16.0f);
+                                                                                                    tr("Create LOCAL variable "
+                                                                                                       "for return value",
+                                                                                                       "为返回值创建 LOCAL "
+                                                                                                       "变量"));
+                                                                                }
+                                                                                if (rv2HasPicker) {
+                                                                                        ImGui::SameLine();
+                                                                                        if (ImGui::Button("v##rv2pick"))
+                                                                                                ImGui::OpenPopup("##rv2pop");
+                                                                                        if (ImGui::BeginPopup("##rv2pop")) {
+                                                                                                for (const auto &vn : localVars)
+                                                                                                        if (ImGui::Selectable(
+                                                                                                                vn.c_str())) {
+                                                                                                                strncpy(
+                                                                                                                    op.sdk
+                                                                                                                        .resultVar,
+                                                                                                                    vn.c_str(),
+                                                                                                                    sizeof(
+                                                                                                                        op.sdk
+                                                                                                                            .resultVar) -
+                                                                                                                        1);
+                                                                                                                isModified_ =
+                                                                                                                    true;
+                                                                                                        }
+                                                                                                ImGui::EndPopup();
+                                                                                        }
                                                                                 }
                                                                         }
                                                                 }
@@ -1774,6 +2106,15 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                     tr("Drag variables or SDK functions here.", "把变量或 SDK 函数拖到这里。"));
                                         }
 
+                                        if (opMoveSrc >= 0 && opMoveSrc != opMoveDst && opMoveSrc < (int)step.ops.size() &&
+                                            opMoveDst < (int)step.ops.size()) {
+                                                SeqOp moved = std::move(step.ops[opMoveSrc]);
+                                                step.ops.erase(step.ops.begin() + opMoveSrc);
+                                                if (opMoveDst > opMoveSrc)
+                                                        --opMoveDst;
+                                                step.ops.insert(step.ops.begin() + opMoveDst, std::move(moved));
+                                                isModified_ = true;
+                                        }
                                         if (toDelete >= 0) {
                                                 step.ops.erase(step.ops.begin() + toDelete);
                                                 isModified_ = true;
@@ -1841,7 +2182,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
 
                         // ── Body ──
                         ImGui::Text("%s", tr("Body:", "动作："));
-                        if (ImGui::BeginChild("BodyList", ImVec2(0, step.hasElse ? -160.0f : -60.0f), true)) {
+                        if (ImGui::BeginChild("BodyList", ImVec2(0, step.hasElse ? -160.0f : 0.0f), true)) {
                                 drawBodySteps(step.body, 0);
                         }
                         ImGui::EndChild();
@@ -1850,10 +2191,6 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                 if (acceptOpDrops([&](SeqOp op) { appendOpToBody(step.body, std::move(op)); }))
                                         isModified_ = true;
                                 ImGui::EndDragDropTarget();
-                        }
-                        if (ImGui::Button(tr("+ Add Body Step", "+ 添加步骤"))) {
-                                step.body.push_back(SequenceStep{});
-                                isModified_ = true;
                         }
 
                         if (step.kind == SeqStepKind::If && step.hasElse) {
@@ -1898,7 +2235,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                         }
                         ImGui::Spacing();
                         ImGui::Text("%s", tr("Body:", "动作："));
-                        if (ImGui::BeginChild("ForBody", ImVec2(0, -60.0f), true)) {
+                        if (ImGui::BeginChild("ForBody", ImVec2(0, 0.0f), true)) {
                                 drawBodySteps(step.body, 0);
                         }
                         ImGui::EndChild();
@@ -1906,10 +2243,6 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                 if (acceptOpDrops([&](SeqOp op) { appendOpToBody(step.body, std::move(op)); }))
                                         isModified_ = true;
                                 ImGui::EndDragDropTarget();
-                        }
-                        if (ImGui::Button(tr("+ Add Body Step", "+ 添加步骤"))) {
-                                step.body.push_back(SequenceStep{});
-                                isModified_ = true;
                         }
                         break;
                 }
@@ -1942,7 +2275,9 @@ SequenceEditor::draw()
         }
 
         ImGui::SetNextWindowSize(ImVec2(700, 500), ImGuiCond_FirstUseEver);
-        if (!ImGui::Begin(tr("Sequence Editor###SeqEditor", "序列编辑器###SeqEditor"), &show_)) {
+        if (!ImGui::Begin(tr("Sequence Editor###SeqEditor", "序列编辑器###SeqEditor"),
+                          &show_,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
                 if (seqRunning_.load())
                         seqStopReq_.store(true);
                 ImGui::End();
@@ -2046,7 +2381,7 @@ SequenceEditor::draw()
 
         // ── Add Step buttons ──────────────────────────────────────────────────
         if (!running) {
-                if (ImGui::Button(tr("+ do", "+ do"))) {
+                if (ImGui::Button(tr("+ do", "+ 执行"))) {
                         SequenceStep s;
                         s.kind    = SeqStepKind::Action;
                         s.delayMs = 0;
@@ -2055,7 +2390,7 @@ SequenceEditor::draw()
                         isModified_   = true;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button(tr("+ delay", "+ delay"))) {
+                if (ImGui::Button(tr("+ delay", "+ 延时"))) {
                         SequenceStep s;
                         s.kind = SeqStepKind::Sleep;
                         steps_.push_back(s);
@@ -2063,7 +2398,7 @@ SequenceEditor::draw()
                         isModified_   = true;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button(tr("+ if", "+ if"))) {
+                if (ImGui::Button(tr("+ if", "+ 判断"))) {
                         SequenceStep s;
                         s.kind = SeqStepKind::If;
                         steps_.push_back(s);
@@ -2071,7 +2406,7 @@ SequenceEditor::draw()
                         isModified_   = true;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button(tr("+ While", "+ While"))) {
+                if (ImGui::Button(tr("+ while", "+ 循环"))) {
                         SequenceStep s;
                         s.kind = SeqStepKind::While;
                         steps_.push_back(s);
@@ -2079,7 +2414,7 @@ SequenceEditor::draw()
                         isModified_   = true;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button(tr("+ For", "+ For"))) {
+                if (ImGui::Button(tr("+ for", "+ 计数"))) {
                         SequenceStep s;
                         s.kind = SeqStepKind::For;
                         steps_.push_back(s);
@@ -2087,7 +2422,7 @@ SequenceEditor::draw()
                         isModified_   = true;
                 }
                 ImGui::SameLine();
-                if (ImGui::Button(tr("+ Break", "+ Break"))) {
+                if (ImGui::Button(tr("+ break", "+ 退出"))) {
                         SequenceStep s;
                         s.kind = SeqStepKind::Break;
                         steps_.push_back(s);
@@ -2109,8 +2444,11 @@ SequenceEditor::draw()
         // windows still fill remaining *window* space and won't respond to the
         // table height.  Wrap in BeginChild instead — it enforces explicit height.
         static ImGuiTableFlags splitFlags = ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV;
-        const float            logReserve = 6.0f + 20.0f + seqLogHeight_; // splitter + label row + log
-        const float            topH       = std::max(80.0f, ImGui::GetContentRegionAvail().y - logReserve);
+        const float            is         = ImGui::GetStyle().ItemSpacing.y;
+        const float            logHeaderH = ImGui::GetFrameHeightWithSpacing(); // dynamic: frame + ItemSpacing
+        const float            logReserve = seqLogCollapsed_ ? logHeaderH : (6.0f + is + logHeaderH + seqLogHeight_ + is);
+        // Subtract one extra ItemSpacing for what EndChild appends after SeqTopPane
+        const float topH = std::max(80.0f, ImGui::GetContentRegionAvail().y - is - logReserve);
         if (ImGui::BeginChild("SeqTopPane", ImVec2(0, topH), false, ImGuiWindowFlags_NoScrollbar)) {
                 if (ImGui::BeginTable("SplitView", 2, splitFlags)) {
                         ImGui::TableSetupColumn("Left", ImGuiTableColumnFlags_WidthFixed, 220.0f);
@@ -2160,23 +2498,26 @@ SequenceEditor::draw()
         }
         ImGui::EndChild();
 
-        // ── Log splitter handle ────────────────────────────────────────────────
-        {
-                ImVec2 splitterPos = ImGui::GetCursorScreenPos();
-                float  w           = ImGui::GetContentRegionAvail().x;
+        // ── Log splitter handle (only when log is expanded) ───────────────────
+        if (!seqLogCollapsed_) {
+                ImVec2 splitPos = ImGui::GetCursorScreenPos();
+                float  w        = ImGui::GetContentRegionAvail().x;
                 ImGui::InvisibleButton("##logSplit", ImVec2(w, 6.0f));
                 if (ImGui::IsItemActive())
                         seqLogHeight_ = std::max(40.0f, seqLogHeight_ - ImGui::GetIO().MouseDelta.y);
                 ImU32 col = ImGui::IsItemHovered() || ImGui::IsItemActive() ? ImGui::GetColorU32(ImGuiCol_SeparatorActive)
                                                                             : ImGui::GetColorU32(ImGuiCol_Separator);
                 ImGui::GetWindowDrawList()->AddLine(
-                    ImVec2(splitterPos.x, splitterPos.y + 3.0f), ImVec2(splitterPos.x + w, splitterPos.y + 3.0f), col, 2.0f);
+                    ImVec2(splitPos.x, splitPos.y + 3.0f), ImVec2(splitPos.x + w, splitPos.y + 3.0f), col, 1.0f);
                 if (ImGui::IsItemHovered())
                         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
         }
 
-        // ── Log ───────────────────────────────────────────────────────────────
+        // ── Log header: collapse arrow + label + clear ────────────────────────
         ImGui::AlignTextToFramePadding();
+        if (ImGui::ArrowButton("##logcol", seqLogCollapsed_ ? ImGuiDir_Right : ImGuiDir_Down))
+                seqLogCollapsed_ = !seqLogCollapsed_;
+        ImGui::SameLine();
         ImGui::TextUnformatted(tr("Log", "日志"));
         ImGui::SameLine();
         if (ImGui::SmallButton(tr("Clear##logclear", "清空##logclear"))) {
@@ -2184,42 +2525,62 @@ SequenceEditor::draw()
                 seqLog_.clear();
         }
 
-        std::vector<SeqLogEntry> logSnapshot;
-        {
-                std::lock_guard<std::mutex> lk(seqMtx_);
-                logSnapshot = seqLog_;
-        }
-
-        if (ImGui::BeginChild("SeqLog", ImVec2(0, seqLogHeight_), true, ImGuiWindowFlags_HorizontalScrollbar)) {
-                for (int i = (int)logSnapshot.size() - 1; i >= 0; --i) {
-                        const SeqLogEntry &e  = logSnapshot[i];
-                        uint64_t           ms = e.tsMs;
-                        char               ts[24];
-                        snprintf(ts,
-                                 sizeof(ts),
-                                 "[%02d:%02d:%02d.%03d] ",
-                                 (int)(ms / 3600000),
-                                 (int)((ms % 3600000) / 60000),
-                                 (int)((ms % 60000) / 1000),
-                                 (int)(ms % 1000));
-                        ImGui::TextDisabled("%s", ts);
-                        ImGui::SameLine(0, 0);
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                              e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f));
-                        ImGui::TextUnformatted(e.desc.c_str());
-                        ImGui::PopStyleColor();
-                        if (!e.value.empty()) {
-                                ImGui::SameLine();
-                                ImGui::TextDisabled(" \xe2\x86\x92 ");
-                                ImGui::SameLine();
-                                ImGui::PushStyleColor(ImGuiCol_Text,
-                                                      e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
-                                ImGui::TextUnformatted(e.value.c_str());
-                                ImGui::PopStyleColor();
-                        }
+        // ── Log content (hidden when collapsed) ───────────────────────────────
+        if (!seqLogCollapsed_) {
+                std::vector<SeqLogEntry> logSnapshot;
+                {
+                        std::lock_guard<std::mutex> lk(seqMtx_);
+                        // Trim in-place to keep memory bounded, then snapshot
+                        if ((int)seqLog_.size() > kMaxLogEntries)
+                                seqLog_.erase(seqLog_.begin(), seqLog_.begin() + ((int)seqLog_.size() - kMaxLogEntries));
+                        logSnapshot = seqLog_;
                 }
+
+                if (ImGui::BeginChild("SeqLog", ImVec2(0, seqLogHeight_), true, ImGuiWindowFlags_HorizontalScrollbar)) {
+                        // Render newest-first using a clipper so only visible rows cost anything.
+                        ImGuiListClipper clipper;
+                        clipper.Begin((int)logSnapshot.size());
+                        while (clipper.Step()) {
+                                for (int ci = clipper.DisplayStart; ci < clipper.DisplayEnd; ++ci) {
+                                        // Reverse: ci=0 → last entry (newest)
+                                        const SeqLogEntry &e = logSnapshot[(int)logSnapshot.size() - 1 - ci];
+                                        {
+                                                std::time_t t   = (std::time_t)(e.tsMs / 1000);
+                                                struct tm   tm_ = {};
+                                                localtime_s(&tm_, &t);
+                                                char ts[32];
+                                                snprintf(ts,
+                                                         sizeof(ts),
+                                                         "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                                                         tm_.tm_year + 1900,
+                                                         tm_.tm_mon + 1,
+                                                         tm_.tm_mday,
+                                                         tm_.tm_hour,
+                                                         tm_.tm_min,
+                                                         tm_.tm_sec,
+                                                         (int)(e.tsMs % 1000));
+                                                ImGui::TextDisabled("%s", ts);
+                                                ImGui::SameLine(0, 0);
+                                        }
+                                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                                              e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f)
+                                                                   : ImVec4(1.f, 0.4f, 0.4f, 1.f));
+                                        ImGui::TextUnformatted(e.desc.c_str());
+                                        ImGui::PopStyleColor();
+                                        if (!e.value.empty()) {
+                                                ImGui::SameLine();
+                                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                                                      e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f)
+                                                                           : ImVec4(1.f, 0.5f, 0.3f, 1.f));
+                                                ImGui::TextUnformatted(e.value.c_str());
+                                                ImGui::PopStyleColor();
+                                        }
+                                }
+                        }
+                        clipper.End();
+                }
+                ImGui::EndChild();
         }
-        ImGui::EndChild();
 
         ImGui::End();
 }
@@ -2277,6 +2638,7 @@ saveOp(const SeqOp &op)
                 cJSON_AddNumberToObject(obj, "sdkObjIdx", op.sdk.objIdx);
                 cJSON_AddStringToObject(obj, "sdkLabel", op.sdk.label.c_str());
                 cJSON_AddStringToObject(obj, "sdkPyFuncName", op.sdk.pyFuncName.c_str());
+                cJSON_AddStringToObject(obj, "sdkResultVar", op.sdk.resultVar);
                 cJSON *argsArr = cJSON_CreateArray();
                 for (const auto &a : op.sdk.args)
                         cJSON_AddItemToArray(argsArr, cJSON_CreateString(a.c_str()));
@@ -2423,6 +2785,8 @@ loadStep(const cJSON *obj)
                         for (const cJSON *a = aa->child; a; a = a->next)
                                 if (cJSON_IsString(a))
                                         sdk.args.push_back(a->valuestring);
+                if (const cJSON *rv = cJSON_GetObjectItem(o, "sdkResultVar"); cJSON_IsString(rv))
+                        strncpy(sdk.resultVar, rv->valuestring, sizeof(sdk.resultVar) - 1);
                 return sdk;
         };
 
@@ -2573,7 +2937,7 @@ SequenceEditor::drawSdkStepDetail(SdkStepInfo &sdk, std::shared_ptr<SdkPanel> pa
         if (!sdk.isCFunc) {
                 auto objs = panel->listObjects(sdk.classIdx);
 
-                const char *curLabel = tr("(none)", "(无对象)");
+                const char *curLabel = tr("(none)", "(无)");
                 for (const auto &o : objs)
                         if (o.idx == sdk.objIdx) {
                                 curLabel = o.label.c_str();
@@ -2633,9 +2997,12 @@ SequenceEditor::drawSdkStepDetail(SdkStepInfo &sdk, std::shared_ptr<SdkPanel> pa
                 else
                         snprintf(argLabel, sizeof(argLabel), tr("Arg %d##p%d", "参数 %d##p%d"), i, i);
 
-                // Cap input width to avoid overflow on wide panels
-                float availW = ImGui::GetContentRegionAvail().x;
-                float inputW = availW - (isPtr ? 55.0f : 8.0f);
+                // Cap input width — account for create (+) and picker (v) buttons
+                bool  dsdkHasPicker = isPtr && !localVars.empty();
+                bool  dsdkHasCreate = (bool)onAddLocalVar_;
+                float availW        = ImGui::GetContentRegionAvail().x;
+                float btnRoom = (dsdkHasPicker && dsdkHasCreate) ? 80.0f : (dsdkHasPicker || dsdkHasCreate) ? 35.0f : 8.0f;
+                float inputW  = availW - btnRoom;
                 if (inputW > 200.0f)
                         inputW = 200.0f;
                 if (inputW < 80.0f)
@@ -2648,7 +3015,29 @@ SequenceEditor::drawSdkStepDetail(SdkStepInfo &sdk, std::shared_ptr<SdkPanel> pa
                 if (!ptype.empty() && ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", ptype.c_str());
 
-                if (isPtr && !localVars.empty()) {
+                if (dsdkHasCreate) {
+                        ImGui::SameLine();
+                        char cbtn[16];
+                        snprintf(cbtn, sizeof(cbtn), "+##dc%d", i);
+                        if (ImGui::SmallButton(cbtn)) {
+                                std::string pn = pname.empty() ? "arg" + std::to_string(i) : pname;
+                                DataType    dt = ptrTypeFromRaw(ptype);
+                                size_t      sz = Parser::typeBytes(dt);
+                                if (sz == 0)
+                                        sz = 4;
+                                const CStructDecl *sd = panel->getParamStructDecl(sdk.isCFunc, sdk.classIdx, sdk.methodIdx, i);
+                                if (sd && onAddLocalStructVar_)
+                                        onAddLocalStructVar_(pn, structDeclToFields(*sd), sd->totalSize);
+                                else
+                                        onAddLocalVar_(pn, dt, sz);
+                                if (isPtr)
+                                        sdk.args[i] = "&" + pn;
+                                isModified_ = true;
+                        }
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", tr("Create LOCAL variable", "创建 LOCAL 变量"));
+                }
+                if (dsdkHasPicker) {
                         ImGui::SameLine();
                         char btnId[16];
                         snprintf(btnId, sizeof(btnId), "v##p%d", i);
@@ -2670,5 +3059,44 @@ SequenceEditor::drawSdkStepDetail(SdkStepInfo &sdk, std::shared_ptr<SdkPanel> pa
                         }
                 }
                 ImGui::PopID();
+        }
+
+        // Return value → LOCAL variable
+        ImGui::Spacing();
+        ImGui::TextDisabled(tr("return", "返回值"));
+        ImGui::SameLine();
+        char rvBuf[32]{};
+        strncpy(rvBuf, sdk.resultVar, sizeof(rvBuf) - 1);
+        bool  dsdkRvHasPicker = !localVars.empty();
+        bool  dsdkRvHasCreate = (bool)onAddLocalVar_;
+        float rvW = (dsdkRvHasPicker && dsdkRvHasCreate) ? -82.0f : (dsdkRvHasPicker || dsdkRvHasCreate) ? -38.0f : -FLT_MIN;
+        ImGui::SetNextItemWidth(rvW);
+        if (ImGui::InputText("##dsdkrv", rvBuf, sizeof(rvBuf))) {
+                strncpy(sdk.resultVar, rvBuf, sizeof(sdk.resultVar) - 1);
+                isModified_ = true;
+        }
+        if (dsdkRvHasCreate) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("+##dsdkrvc")) {
+                        std::string vn = (sdk.resultVar[0] != '\0') ? sdk.resultVar : "result";
+                        onAddLocalVar_(vn, DataType::I64, sizeof(int64_t));
+                        strncpy(sdk.resultVar, vn.c_str(), sizeof(sdk.resultVar) - 1);
+                        isModified_ = true;
+                }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Create LOCAL variable for return value", "为返回值创建 LOCAL 变量"));
+        }
+        if (dsdkRvHasPicker) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("v##dsdkrvpick"))
+                        ImGui::OpenPopup("##dsdkrvpop");
+                if (ImGui::BeginPopup("##dsdkrvpop")) {
+                        for (const auto &vn : localVars)
+                                if (ImGui::Selectable(vn.c_str())) {
+                                        strncpy(sdk.resultVar, vn.c_str(), sizeof(sdk.resultVar) - 1);
+                                        isModified_ = true;
+                                }
+                        ImGui::EndPopup();
+                }
         }
 }

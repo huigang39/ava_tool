@@ -25,6 +25,7 @@
 
 std::atomic<bool> g_monitorPaused{false};
 std::atomic<bool> g_jlinkSamplingPaused{false};
+std::atomic<int>  g_maxHssHz{1000};
 
 std::vector<Monitor *> Monitor::sInstances_;
 std::mutex             Monitor::sMtxInstances_;
@@ -62,6 +63,22 @@ humanSize(u64 bytes)
 void
 MonitorScope::menu()
 {
+        // Drag-reorder grip — placed left of the scope label.
+        ui::SmallButton("=##scopegrip", ui::BtnStyle::Neutral);
+        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                ImGui::SetDragDropPayload("SCOPE_REORDER", name_.c_str(), name_.size() + 1);
+                ImGui::TextUnformatted(name_.c_str());
+                ImGui::EndDragDropSource();
+        }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tr("Drag to reorder scope", "拖动以调整示波器顺序"));
+        if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload *p = ImGui::AcceptDragDropPayload("SCOPE_REORDER"))
+                        requestSwap(std::string(static_cast<const char *>(p->Data)));
+                ImGui::EndDragDropTarget();
+        }
+        ImGui::SameLine();
+
         // Scope label (double-click to rename)
         {
                 const std::string &displayLabel = getLabel();
@@ -240,37 +257,23 @@ MonitorScope::menu()
                 }
         }
 
-        // Right-aligned buttons: reorder (up/down), Delete Scope, Hide Scope, Pause/Resume
-        float arrowW       = ImGui::GetFrameHeight(); // ArrowButton is square
-        float delBtnWidth  = ImGui::CalcTextSize(tr("Delete Scope", "删除示波器")).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        // Right-aligned buttons: Delete Scope, Hide Scope, Pause/Resume
+        float delBtnWidth = ImGui::CalcTextSize(tr("Delete Scope", "删除示波器")).x + ImGui::GetStyle().FramePadding.x * 2.0f;
         float hideBtnWidth = std::max(ImGui::CalcTextSize(tr("Hide Scope", "隐藏示波器")).x,
                                       ImGui::CalcTextSize(tr("Show Scope", "显示示波器")).x) +
                              ImGui::GetStyle().FramePadding.x * 2.0f;
-        float pauseBtnWidth =
-            std::max(ImGui::CalcTextSize(tr("Pause", "暂停")).x, ImGui::CalcTextSize(tr("Resume", "继续")).x) +
-            ImGui::GetStyle().FramePadding.x * 2.0f;
-        float spacing = ImGui::GetStyle().ItemSpacing.x;
-        float totalRightWidth =
-            arrowW + spacing + arrowW + spacing + delBtnWidth + spacing + hideBtnWidth + spacing + pauseBtnWidth;
-        float availWidth = ImGui::GetContentRegionAvail().x;
+        float pauseBtnWidth = std::max(ImGui::CalcTextSize(tr("Pause J-Link Sampling", "暂停J-Link采样")).x,
+                                       ImGui::CalcTextSize(tr("Resume J-Link", "继续J-Link")).x) +
+                              ImGui::GetStyle().FramePadding.x * 2.0f;
+        float spacing         = ImGui::GetStyle().ItemSpacing.x;
+        float totalRightWidth = delBtnWidth + spacing + hideBtnWidth + spacing + pauseBtnWidth;
+        float availWidth      = ImGui::GetContentRegionAvail().x;
 
         if (availWidth > totalRightWidth) {
                 ImGui::SameLine(ImGui::GetCursorPosX() + availWidth - totalRightWidth);
         } else {
                 ImGui::SameLine();
         }
-
-        // Reorder this scope within the monitor (consumed by Monitor::updateDisplay).
-        if (ImGui::ArrowButton("##scopeUp", ImGuiDir_Up))
-                requestMove(-1);
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", tr("Move scope up", "上移示波器"));
-        ImGui::SameLine();
-        if (ImGui::ArrowButton("##scopeDown", ImGuiDir_Down))
-                requestMove(+1);
-        if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", tr("Move scope down", "下移示波器"));
-        ImGui::SameLine();
 
         // Delete = destructive → red.
         if (ui::Button(tr("Delete Scope", "删除示波器"), ui::BtnStyle::Danger)) {
@@ -290,10 +293,10 @@ MonitorScope::menu()
         // Resume = go (green); Pause = caution (amber).
         ImGui::SameLine();
         if (paused_) {
-                if (ui::Button(tr("Resume", "继续"), ui::BtnStyle::Success))
+                if (ui::Button(tr("Resume J-Link", "继续J-Link"), ui::BtnStyle::Success))
                         paused_ = false;
         } else {
-                if (ui::Button(tr("Pause", "暂停"), ui::BtnStyle::Warning))
+                if (ui::Button(tr("Pause J-Link Sampling", "暂停J-Link采样"), ui::BtnStyle::Warning))
                         paused_ = true;
         }
 
@@ -622,6 +625,9 @@ MonitorScope::drawTableRow(const std::string               &chName,
         const bool  hasAlias = (ch->getLabel() != ch->getName());
         const char *label = hasAlias ? ch->getLabel().c_str() : (displayLabel.empty() ? chName.c_str() : displayLabel.c_str());
         bool        isSelected = ch->selected_;
+        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
         if (ImGui::Selectable(label, isSelected, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
                 selectedGroupPaths_.clear();
                 if (ImGui::GetIO().KeyCtrl) {
@@ -644,6 +650,7 @@ MonitorScope::drawTableRow(const std::string               &chName,
                 }
                 lastSelectedIndex_ = idx;
         }
+        ImGui::PopStyleColor(3);
 
         if (ImGui::BeginPopupContextItem()) {
                 // Right-click implies selection — auto-select this row so Delete works
@@ -776,27 +783,33 @@ MonitorScope::drawTableRow(const std::string               &chName,
 
         // 6. Wave Control
         ImGui::TableNextColumn();
-        f32 availX  = ImGui::GetContentRegionAvail().x;
-        f32 spacing = ImGui::GetStyle().ItemSpacing.x;
-        f32 btnW    = (availX - spacing) * 0.65f;
-        f32 cfgW    = (availX - spacing) * 0.35f;
-
-        if (ch->waveEnable_) {
-                // Wave generator active → green; inactive → muted grey.
-                if (ui::Button("ON", ui::BtnStyle::Success, ImVec2(btnW, 0)))
-                        ch->waveEnable_ = false;
-        } else {
-                if (ui::Button("OFF", ui::BtnStyle::Muted, ImVec2(btnW, 0)))
-                        ch->waveEnable_ = true;
+        {
+                f32 availX = ImGui::GetContentRegionAvail().x;
+                // Tint the "..." button green while the wave is active.
+                if (ch->waveEnable_)
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.55f, 0.15f, 1.0f));
+                if (ImGui::Button("...", ImVec2(availX, 0)))
+                        ImGui::OpenPopup("WaveCfg");
+                if (ch->waveEnable_)
+                        ImGui::PopStyleColor();
         }
-        ImGui::SameLine();
-        if (ImGui::Button("..", ImVec2(cfgW, 0)))
-                ImGui::OpenPopup("WaveCfg");
 
         if (ImGui::BeginPopup("WaveCfg")) {
                 // Read current values from atomic shadow fields
                 auto &pending = ch->waveCfgPending_;
                 ImGui::Text(tr("Wave Generator: %s", "波形发生器: %s"), chName.c_str());
+                ImGui::Separator();
+
+                // ON / OFF toggle at the top of the popup
+                if (ch->waveEnable_) {
+                        if (ui::Button(
+                                tr("ON  (click to disable)", "ON（点击关闭）"), ui::BtnStyle::Success, ImVec2(-FLT_MIN, 0)))
+                                ch->waveEnable_ = false;
+                } else {
+                        if (ui::Button(
+                                tr("OFF (click to enable)", "OFF（点击开启）"), ui::BtnStyle::Muted, ImVec2(-FLT_MIN, 0)))
+                                ch->waveEnable_ = true;
+                }
                 ImGui::Separator();
 
                 const char *types[]     = {tr("Sine", "正弦"), tr("Square", "方波"), tr("Triangle", "三角")};
@@ -1377,6 +1390,13 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 ImGui::SameLine();
                                 if (ImGui::SmallButton(tr("Reset##biasrst", "重置##biasrst")))
                                         ch->getBias() = 0.0f;
+                                ImGui::SameLine();
+                                if (ImGui::SmallButton(tr("Zero##biaszero", "置零##biaszero")))
+                                        ch->getBias() -= ch->getDispVal();
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s",
+                                                          tr("Set bias so the current reading displays as 0",
+                                                             "将偏置设为当前显示值的相反数，使当前读数归零"));
                                 if (ui::Button(tr("Delete Channel", "删除通道"), ui::BtnStyle::Danger))
                                         ch->markPendingDelete();
 
@@ -1791,7 +1811,7 @@ Monitor::updateDisplay()
         // "VisibleTitle###name_": the visible label tracks the user-editable title
         // while the trailing id keeps the ImGui window id (and dock layout) stable.
         const std::string winLabel = getTitle() + "###" + name_;
-        if (ImGui::Begin(winLabel.c_str(), &open)) {
+        if (ImGui::Begin(winLabel.c_str(), &open, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
                 if (!open)
                         markPendingDelete();
 
@@ -1862,18 +1882,18 @@ Monitor::updateDisplay()
                 }
                 TutorialGuide::instance().mark("monitor_window");
 
-                // Master pause for every scope's acquisition in this monitor.
+                // Master pause for J-Link acquisition in this monitor.
                 const bool  monSampPaused = isSamplingPaused();
                 const char *pauseAllLabel =
-                    monSampPaused ? tr("Resume All Scopes", "恢复全部采样") : tr("Pause All Scopes", "暂停全部采样");
+                    monSampPaused ? tr("Resume All J-Link", "恢复J-Link采样") : tr("Pause All J-Link", "暂停J-Link采样");
                 tbFlow(tbBtnW(pauseAllLabel));
                 // Resume = go (green); Pause = caution (amber).
                 if (ui::Button(pauseAllLabel, monSampPaused ? ui::BtnStyle::Success : ui::BtnStyle::Warning))
                         setSamplingPaused(!monSampPaused);
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s",
-                                          tr("Pause/resume acquisition for all scopes in this monitor",
-                                             "暂停/恢复此监视器内所有示波器的采样"));
+                                          tr("Pause/resume J-Link acquisition for all scopes in this monitor",
+                                             "暂停/恢复此监视器内所有示波器的J-Link采样"));
 
                 tbFlow(tbBtnW(tr("Clear Data", "清空数据")));
                 // Clear Data = caution / reversible-by-resampling → amber.
@@ -1965,7 +1985,7 @@ Monitor::updateDisplay()
 
                                 std::string monName = name_;
                                 std::thread([snapshot, state, fullpath, maxLen, monName]() {
-                                        FILE *f = fopen(fullpath.c_str(), "w");
+                                        FILE *f = nativeFopen(fullpath, "w");
                                         if (!f) {
                                                 LOG_E("Monitor[%s] failed to open %s for export",
                                                       monName.c_str(),
@@ -2031,7 +2051,7 @@ Monitor::updateDisplay()
                 tbFlow(120);
                 ImGui::SetNextItemWidth(120);
                 f32 h = historySeconds_;
-                if (ImGui::SliderFloat("##History", &h, 0.1f, 3600.0f, "%.1f s", ImGuiSliderFlags_Logarithmic))
+                if (ImGui::SliderFloat("##History", &h, 0.0f, 3600.0f, "%.1f s", ImGuiSliderFlags_Logarithmic))
                         historySeconds_ = h;
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("History(s)", "历史时长(秒)"));
@@ -2048,25 +2068,27 @@ Monitor::updateDisplay()
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("Max Pts", "最大显示点数"));
 
-                tbFlow(120);
-                ImGui::SetNextItemWidth(120);
-                ImGui::SliderInt("##MaxHz", &maxSampleHz_, 1, 50000, "%d Hz", ImGuiSliderFlags_Logarithmic);
-                // Restart HSS only on release (matches the J-Link slider) so dragging
-                // doesn't spam restarts every frame.
-                if (ImGui::IsItemDeactivatedAfterEdit())
-                        JLinkPort::instance().reqRestart();
-                if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("%s",
-                                          tr("Target sample rate (Hz). HSS mode on J-Link Pro/Ultra+ can reach several "
-                                             "kHz to tens of kHz; POLL mode is limited by USB latency (~1-2kHz).",
-                                             "目标采样率 (Hz)。J-Link Pro/Ultra+ 的 HSS 模式可达数 kHz 至数十 kHz；"
-                                             "POLL 模式受 USB 延迟限制（约 1-2kHz）。"));
+                // POLL-mode sample rate: only shown when this monitor is in POLL mode.
+                // HSS rate is global and lives in the app top bar.
+                if (samplingMode_ == SamplingMode::POLL) {
+                        tbFlow(120);
+                        ImGui::SetNextItemWidth(120);
+                        ImGui::SliderInt("##MaxHz", &maxSampleHz_, 1, 50000, "%d Hz", ImGuiSliderFlags_Logarithmic);
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s",
+                                                  tr("POLL sample rate (Hz). Limited by USB latency (~1-2 kHz).",
+                                                     "POLL 采样率 (Hz)，受 USB 延迟限制（约 1-2 kHz）。"));
 
-                tbFlow(ImGui::CalcTextSize(actualHz_ > 0.1f ? "0000 Hz" : "-- Hz").x);
-                if (actualHz_ > 0.1f) {
-                        ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "%.0f Hz", actualHz_);
-                } else {
-                        ImGui::TextDisabled("-- Hz");
+                        // EMA-smoothed actual rate — reserve fixed width to prevent button jumping.
+                        if (actualHz_ > 0.1f)
+                                displayHz_ = displayHz_ * 0.85f + actualHz_ * 0.15f;
+                        else
+                                displayHz_ = 0.0f;
+                        tbFlow(ImGui::CalcTextSize("0000 Hz").x);
+                        if (displayHz_ > 0.1f)
+                                ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "%.0f Hz", displayHz_);
+                        else
+                                ImGui::TextDisabled("-- Hz");
                 }
 
                 // Mode control group (Sampling Mode + View Mode). Right-align it when there's
@@ -2142,15 +2164,26 @@ Monitor::updateDisplay()
                         }
                 }
 
+                // Helper: compute the equal scope height that fills avail.y exactly.
+                // ImGui adds ItemSpacing.y after every EndChild and InvisibleButton, so
+                // N scopes + (N-1) splitters = (2N-1) items each contributing ItemSpacing.y.
+                auto computeEqualHeight = [&](f32 totalY) -> f32 {
+                        const auto N = keys.size();
+                        if (N == 0)
+                                return totalY;
+                        const f32 is   = ImGui::GetStyle().ItemSpacing.y;
+                        f32       splH = static_cast<f32>(N - 1) * 8.0f;
+                        f32       isH  = static_cast<f32>(2 * N - 1) * is;
+                        return std::max(10.0f, (totalY - splH - isH) / static_cast<f32>(N));
+                };
+
                 if (keys.size() == 1) {
-                        // Force fill if only one scope
-                        scopes_[keys[0]]->getHeight() = avail.y;
+                        // Single scope: fill all minus the one ItemSpacing ImGui appends after it
+                        const f32 is                  = ImGui::GetStyle().ItemSpacing.y;
+                        scopes_[keys[0]]->getHeight() = std::max(10.0f, avail.y - is);
                 } else if (needsLayout_ || (!anyManual && std::abs(avail.y - lastAvailY_) > 1.0f)) {
                         // Distribute equally if no manual overrides OR window resized while in auto mode
-                        f32 totalSplitterHeight = static_cast<f32>(keys.size() - 1) * 8.0f;
-                        f32 equalHeight         = (avail.y - totalSplitterHeight) / static_cast<f32>(keys.size());
-                        if (equalHeight < 40.0f)
-                                equalHeight = 40.0f;
+                        f32 equalHeight = computeEqualHeight(avail.y);
                         for (auto &key : keys) {
                                 scopes_[key]->getHeight() = equalHeight;
                         }
@@ -2213,43 +2246,59 @@ Monitor::updateDisplay()
                 }
                 wasPaused_ = isPaused;
 
-                for (size_t i = 0; i < keys.size(); ++i) {
-                        auto &scope = scopes_[keys[i]];
+                // Scrollable scope area: outer window has NoScrollbar so avail.y is stable;
+                // this inner child can scroll when the user manually enlarges a scope.
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+                if (ImGui::BeginChild("##scope_area", ImVec2(avail.x, avail.y), false)) {
+                        ImGui::PopStyleVar();
+                        const float innerW = ImGui::GetContentRegionAvail().x;
+                        for (size_t i = 0; i < keys.size(); ++i) {
+                                auto &scope = scopes_[keys[i]];
 
-                        float childHeight =
-                            scope->isHidden() ? (ImGui::GetFrameHeightWithSpacing() + 15.0f) : scope->getHeight();
-                        if (ImGui::BeginChild(keys[i].c_str(), ImVec2(avail.x, childHeight), true)) {
-                                scope->menu();
+                                float childHeight =
+                                    scope->isHidden() ? (ImGui::GetFrameHeightWithSpacing() + 15.0f) : scope->getHeight();
+                                if (ImGui::BeginChild(keys[i].c_str(), ImVec2(innerW, childHeight), true)) {
+                                        scope->menu();
 
-                                if (!scope->isHidden()) {
-                                        if (scope->isFftEnabled()) {
-                                                scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, fftViewMode_);
-                                        } else {
-                                                scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, viewMode_);
+                                        if (!scope->isHidden()) {
+                                                if (scope->isFftEnabled()) {
+                                                        scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, fftViewMode_);
+                                                } else {
+                                                        scope->draw(&linkXMin_, &linkXMax_, maxDisplayPoints_, viewMode_);
+                                                }
                                         }
+                                        scope->dropTarget();
                                 }
-                                scope->dropTarget();
-                        }
-                        ImGui::EndChild();
+                                ImGui::EndChild();
 
-                        ImGui::PushID(static_cast<i32>(i));
-                        ImGui::InvisibleButton("##splitter", ImVec2(-1, 8.0f));
-                        if (ImGui::IsItemActive()) {
-                                scope->getHeight() += ImGui::GetIO().MouseDelta.y;
-                                if (scope->getHeight() < 40.0f)
-                                        scope->getHeight() = 40.0f;
-                                scope->setManual(true); // User touched the splitter, mark as manual
-                        }
-                        if (ImGui::IsItemHovered()) {
-                                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-                                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                                        needsLayout_ = true;
-                                        for (auto &pair : scopes_)
-                                                pair.second->setManual(false);
+                                if (i + 1 < keys.size()) {
+                                        ImGui::PushID(static_cast<i32>(i));
+                                        ImGui::InvisibleButton("##splitter", ImVec2(-1, 8.0f));
+                                        if (ImGui::IsItemActive()) {
+                                                scope->getHeight() += ImGui::GetIO().MouseDelta.y;
+                                                if (scope->getHeight() < 40.0f)
+                                                        scope->getHeight() = 40.0f;
+                                                scope->setManual(true);
+                                        }
+                                        if (ImGui::IsItemHovered()) {
+                                                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+                                                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                                                        const f32 eqH = computeEqualHeight(avail.y);
+                                                        for (auto &[k, sc] : scopes_) {
+                                                                sc->getHeight() = eqH;
+                                                                sc->setManual(false);
+                                                        }
+                                                        needsLayout_ = false;
+                                                        ImGui::SetScrollY(0.0f); // reset inner child scroll
+                                                }
+                                        }
+                                        ImGui::PopID();
                                 }
                         }
-                        ImGui::PopID();
+                } else {
+                        ImGui::PopStyleVar();
                 }
+                ImGui::EndChild();
 
                 // Apply a pending reorder request: swap this scope's display order with
                 // its neighbour in the current order. `keys` is sorted by order above, so
@@ -2264,6 +2313,22 @@ Monitor::updateDisplay()
                                 const i64 oj = scopes_[keys[j]]->getOrder();
                                 scopes_[keys[i]]->setOrder(oj);
                                 scopes_[keys[j]]->setOrder(oi);
+                                setModified();
+                        }
+                        break;
+                }
+
+                // Apply drag-drop reorder: swap two scopes' display orders by name.
+                for (auto &[scopeName, scope] : scopes_) {
+                        std::string swapWith = scope->consumeSwap();
+                        if (swapWith.empty() || swapWith == scopeName)
+                                continue;
+                        auto it = scopes_.find(swapWith);
+                        if (it != scopes_.end() && it->second) {
+                                const i64 oi = scope->getOrder();
+                                const i64 oj = it->second->getOrder();
+                                scope->setOrder(oj);
+                                it->second->setOrder(oi);
                                 setModified();
                         }
                         break;

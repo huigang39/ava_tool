@@ -128,7 +128,8 @@ class Variable
         // For JSON/BIN tree display
         DataTree dataTree_;
 
-        f32 watchListHeight_ = 300.0f;
+        f32  watchListHeight_     = 300.0f;
+        bool symBrowserCollapsed_ = false;
 
         u64 lastUpdateTs_{0};
         u32 updateIntervalMs_{200};

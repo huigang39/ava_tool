@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -22,6 +23,7 @@
 #include "gui/i18n.hpp"
 #include "gui/ui_theme.hpp"
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "platform/native_dlg.hpp"
 #include "timeops.h"
 
@@ -79,6 +81,9 @@ SdkPanel::doParseHeader()
         fnArgBufs_.clear();
         methArgBufs_.clear();
         structBufs_.clear();
+        fnArgBufsCache_.clear();
+        methArgBufsCache_.clear();
+        structBufsCache_.clear();
         fnLastResult_.clear();
 
         int  totalFn  = (int)parseResult_.functions.size();
@@ -93,6 +98,10 @@ SdkPanel::doParseHeader()
 void
 SdkPanel::selectFn(int idx)
 {
+        // Save current args before switching
+        if (selectedFnIdx_ >= 0 && selectedFnIdx_ < (int)parseResult_.functions.size())
+                fnArgBufsCache_[selectedFnIdx_] = fnArgBufs_;
+
         selectedFnIdx_ = idx;
         fnLastResult_.clear();
         fnLastResultOk_ = false;
@@ -101,36 +110,74 @@ SdkPanel::selectFn(int idx)
                 return;
         }
         const CFuncDecl &fn = parseResult_.functions[idx];
-        fnArgBufs_.resize(fn.params.size());
-        for (auto &b : fnArgBufs_)
-                b = {};
+        auto             it = fnArgBufsCache_.find(idx);
+        if (it != fnArgBufsCache_.end() && it->second.size() == fn.params.size()) {
+                fnArgBufs_ = it->second;
+        } else {
+                fnArgBufs_.resize(fn.params.size());
+                for (auto &b : fnArgBufs_)
+                        b = {};
+        }
 }
 
 void
 SdkPanel::selectMethod(int classIdx, int methodIdx)
 {
+        // Save current args before switching
+        if (selectedClassIdx_ >= 0 && selectedMethodIdx_ >= 0) {
+                int key                = selectedClassIdx_ * 10000 + selectedMethodIdx_;
+                methArgBufsCache_[key] = methArgBufs_;
+                structBufsCache_[key]  = structBufs_;
+        }
+
         selectedClassIdx_  = classIdx;
         selectedMethodIdx_ = methodIdx;
-        methArgBufs_.clear();
-        structBufs_.clear();
 
-        if (classIdx < 0 || classIdx >= (int)parseResult_.classes.size())
+        if (classIdx < 0 || classIdx >= (int)parseResult_.classes.size()) {
+                methArgBufs_.clear();
+                structBufs_.clear();
                 return;
+        }
         const CClassDecl &cls = parseResult_.classes[classIdx];
-        if (methodIdx < 0 || methodIdx >= (int)cls.methods.size())
+        if (methodIdx < 0 || methodIdx >= (int)cls.methods.size()) {
+                methArgBufs_.clear();
+                structBufs_.clear();
                 return;
+        }
 
         const CMethodDecl &meth = cls.methods[methodIdx];
-        methArgBufs_.resize(meth.params.size());
-        structBufs_.resize(meth.params.size());
+        int                key  = classIdx * 10000 + methodIdx;
 
-        for (size_t i = 0; i < meth.params.size(); ++i) {
-                methArgBufs_[i]       = {};
-                structBufs_[i]        = {};
-                const CStructDecl *sd = findParamStruct(meth.params[i]);
-                if (sd && sd->isPOD && sd->totalSize > 0) {
-                        structBufs_[i].decl = sd;
-                        structBufs_[i].data.assign(sd->totalSize, 0);
+        auto ita = methArgBufsCache_.find(key);
+        if (ita != methArgBufsCache_.end() && ita->second.size() == meth.params.size()) {
+                methArgBufs_ = ita->second;
+                auto its     = structBufsCache_.find(key);
+                if (its != structBufsCache_.end() && its->second.size() == meth.params.size())
+                        structBufs_ = its->second;
+                else {
+                        structBufs_.resize(meth.params.size());
+                        for (size_t i = 0; i < meth.params.size(); ++i) {
+                                if (!structBufs_[i].decl) {
+                                        const CStructDecl *sd = findParamStruct(meth.params[i]);
+                                        if (sd && sd->isPOD && sd->totalSize > 0) {
+                                                structBufs_[i].decl = sd;
+                                                if (structBufs_[i].data.empty())
+                                                        structBufs_[i].data.assign(sd->totalSize, 0);
+                                        }
+                                }
+                        }
+                }
+        } else {
+                methArgBufs_.resize(meth.params.size());
+                structBufs_.resize(meth.params.size());
+                for (size_t i = 0; i < meth.params.size(); ++i) {
+                        methArgBufs_[i]       = {};
+                        structBufs_[i]        = {};
+                        const CStructDecl *sd = findParamStruct(meth.params[i]);
+                        if (sd && sd->isPOD && sd->totalSize > 0) {
+                                structBufs_[i].decl = sd;
+                                structBufs_[i].data.assign(sd->totalSize, 0);
+                        }
                 }
         }
 }
@@ -169,6 +216,16 @@ SdkPanel::doCallC()
         pushHistory(callStr, fnLastResult_, res.ok, tsSec);
         if (res.ok && ctypeIsInteger(fn.retType))
                 pushToMonitor(fn.name, static_cast<float>(res.rawU64), tsSec);
+
+        if (res.ok && fnResultVar_[0] != '\0' && onGetVarBuf_) {
+                void *buf = onGetVarBuf_(fnResultVar_);
+                if (buf) {
+                        int64_t v = (int64_t)res.rawU64;
+                        memcpy(buf, &v, sizeof(int64_t));
+                        if (onVarWritten_)
+                                onVarWritten_(fnResultVar_);
+                }
+        }
 }
 
 // ─── doCallMethod ─────────────────────────────────────────────────────────────
@@ -244,6 +301,16 @@ SdkPanel::doCallMethod()
         }
         if (!res.ok)
                 setStatus(res.error, true);
+
+        if (res.ok && methResultVar_[0] != '\0' && onGetVarBuf_) {
+                void *buf = onGetVarBuf_(methResultVar_);
+                if (buf) {
+                        int64_t v = (int64_t)res.rawU64;
+                        memcpy(buf, &v, sizeof(int64_t));
+                        if (onVarWritten_)
+                                onVarWritten_(methResultVar_);
+                }
+        }
 }
 
 // ─── doNewObject ──────────────────────────────────────────────────────────────
@@ -377,6 +444,37 @@ SdkPanel::findParamEnum(const CParam &p) const
         std::string classFullName;
         if (selectedClassIdx_ >= 0 && selectedClassIdx_ < (int)parseResult_.classes.size())
                 classFullName = parseResult_.classes[selectedClassIdx_].fullName;
+        return findEnum(parseResult_, raw, classFullName);
+}
+
+const CEnumDecl *
+SdkPanel::getParamEnumDecl(bool isCFunc, int classIdx, int methodIdx, int paramIdx) const
+{
+        std::string raw;
+        std::string classFullName;
+        if (isCFunc) {
+                if (methodIdx < 0 || methodIdx >= (int)parseResult_.functions.size())
+                        return nullptr;
+                const CFuncDecl &fn = parseResult_.functions[methodIdx];
+                if (paramIdx < 0 || paramIdx >= (int)fn.params.size())
+                        return nullptr;
+                raw = fn.params[paramIdx].rawType;
+        } else {
+                if (classIdx < 0 || classIdx >= (int)parseResult_.classes.size())
+                        return nullptr;
+                const CClassDecl &cls = parseResult_.classes[classIdx];
+                classFullName         = cls.fullName;
+                if (methodIdx < 0 || methodIdx >= (int)cls.methods.size())
+                        return nullptr;
+                const CMethodDecl &m = cls.methods[methodIdx];
+                if (paramIdx < 0 || paramIdx >= (int)m.params.size())
+                        return nullptr;
+                raw = m.params[paramIdx].rawType;
+        }
+        while (!raw.empty() && (raw.back() == '*' || raw.back() == '&' || raw.back() == ' ' || raw.back() == '\t'))
+                raw.pop_back();
+        if (raw.size() > 6 && raw.substr(0, 6) == "const ")
+                raw = raw.substr(6);
         return findEnum(parseResult_, raw, classFullName);
 }
 
@@ -857,6 +955,8 @@ SdkPanel::doLoadPy()
         pySelFnIdx_ = pySelClsIdx_ = pySelMethIdx_ = pySelObjIdx_ = -1;
         pyFnArgBufs_.clear();
         pyMethArgBufs_.clear();
+        pyFnArgBufsCache_.clear();
+        pyMethArgBufsCache_.clear();
         pyObjects_.clear();
 
         if (!pyRunner_ || !pyRunner_->isAlive())
@@ -927,6 +1027,16 @@ SdkPanel::doCallPyFunc()
         }
         call += ")";
         pushHistory(call, pyLastResult_, rr.ok, sessionTimeSec());
+
+        if (rr.ok && pyFnResultVar_[0] != '\0' && onGetVarBuf_) {
+                void *buf = onGetVarBuf_(pyFnResultVar_);
+                if (buf) {
+                        int64_t v = (int64_t)strtoll(rr.result.c_str(), nullptr, 0);
+                        memcpy(buf, &v, sizeof(int64_t));
+                        if (onVarWritten_)
+                                onVarWritten_(pyFnResultVar_);
+                }
+        }
 }
 
 // ─── doNewPyObject / doNewPyObjectWithArgs ────────────────────────────────────
@@ -1138,36 +1248,83 @@ SdkPanel::drawCFunctionsTab()
                 ImGui::Text("%s  %s", fn.retRaw.c_str(), fn.name.c_str());
                 ImGui::PopStyleColor();
 
-                if (fn.params.empty()) {
-                        ImGui::TextDisabled("  (%s)", tr("no parameters", "无参数"));
-                } else {
-                        for (size_t i = 0; i < fn.params.size(); ++i) {
-                                const CParam &p       = fn.params[i];
-                                bool          isCharP = ctypeIsCharPtr(p.type, p.rawType);
-                                char          lbl[128], id[64];
-                                if (!p.name.empty())
-                                        snprintf(lbl, sizeof(lbl), "%s %s", ctypeLabel(p.type), p.name.c_str());
-                                else
-                                        snprintf(lbl, sizeof(lbl), "%s [%zu]", ctypeLabel(p.type), i);
-                                snprintf(id, sizeof(id), "##farg%zu", i);
-                                ImGui::SetNextItemWidth(280.0f);
-                                if (i < fnArgBufs_.size()) {
-                                        if (isCharP)
-                                                ImGui::InputText(id, fnArgBufs_[i].text, sizeof(ArgBuf::text));
-                                        else if (ctypeIsFloat(p.type))
-                                                ImGui::InputText(id,
-                                                                 fnArgBufs_[i].text,
-                                                                 sizeof(ArgBuf::text),
-                                                                 ImGuiInputTextFlags_CharsDecimal);
+                {
+                        static ImGuiTableFlags tblFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                                          ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Resizable;
+                        if (ImGui::BeginTable("##cfarg_tbl", 3, tblFlags)) {
+                                ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 75.0f);
+                                ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch, 0.35f);
+                                ImGui::TableSetupColumn(
+                                    tr("Value / Args", "值/参数"), ImGuiTableColumnFlags_WidthStretch, 0.65f);
+                                ImGui::TableHeadersRow();
+
+                                for (size_t i = 0; i < fn.params.size(); ++i) {
+                                        const CParam &p       = fn.params[i];
+                                        bool          isCharP = ctypeIsCharPtr(p.type, p.rawType);
+                                        char          id[64];
+                                        snprintf(id, sizeof(id), "##farg%zu", i);
+                                        const char *rawT = p.rawType.empty() ? ctypeLabel(p.type) : p.rawType.c_str();
+
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::TextUnformatted(rawT);
+                                        ImGui::TableSetColumnIndex(1);
+                                        if (!p.name.empty())
+                                                ImGui::TextUnformatted(p.name.c_str());
                                         else
-                                                ImGui::InputText(id,
-                                                                 fnArgBufs_[i].text,
-                                                                 sizeof(ArgBuf::text),
-                                                                 ImGuiInputTextFlags_CharsHexadecimal |
-                                                                     ImGuiInputTextFlags_CharsDecimal);
-                                        ImGui::SameLine();
-                                        ImGui::TextDisabled("%s", lbl);
+                                                ImGui::Text("[%zu]", i);
+                                        ImGui::TableSetColumnIndex(2);
+                                        if (i < fnArgBufs_.size()) {
+                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                if (isCharP)
+                                                        ImGui::InputText(id, fnArgBufs_[i].text, sizeof(ArgBuf::text));
+                                                else if (ctypeIsFloat(p.type))
+                                                        ImGui::InputText(id,
+                                                                         fnArgBufs_[i].text,
+                                                                         sizeof(ArgBuf::text),
+                                                                         ImGuiInputTextFlags_CharsDecimal);
+                                                else
+                                                        ImGui::InputText(id,
+                                                                         fnArgBufs_[i].text,
+                                                                         sizeof(ArgBuf::text),
+                                                                         ImGuiInputTextFlags_CharsHexadecimal |
+                                                                             ImGuiInputTextFlags_CharsDecimal);
+                                        }
                                 }
+
+                                // ── Return value row ──
+                                {
+                                        std::string retT = fn.retRaw.empty() ? std::string(ctypeLabel(fn.retType)) : fn.retRaw;
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::TextUnformatted(retT.c_str());
+                                        ImGui::TableSetColumnIndex(1);
+                                        ImGui::TextUnformatted(tr("return", "返回值"));
+                                        ImGui::TableSetColumnIndex(2);
+                                        float rvW = onListLocalVars_ ? ImGui::GetContentRegionAvail().x - 26.0f : -1.0f;
+                                        if (rvW > 0.0f)
+                                                ImGui::SetNextItemWidth(rvW);
+                                        ImGui::InputTextWithHint(
+                                            "##fnrv", tr("variable name", "变量名"), fnResultVar_, sizeof(fnResultVar_));
+                                        if (onListLocalVars_) {
+                                                auto localVars = onListLocalVars_();
+                                                if (!localVars.empty()) {
+                                                        ImGui::SameLine(0, 2);
+                                                        if (ImGui::SmallButton("v##fnrvpick"))
+                                                                ImGui::OpenPopup("##fnrvpop");
+                                                        if (ImGui::BeginPopup("##fnrvpop")) {
+                                                                for (const auto &vn : localVars)
+                                                                        if (ImGui::Selectable(vn.c_str()))
+                                                                                strncpy(fnResultVar_,
+                                                                                        vn.c_str(),
+                                                                                        sizeof(fnResultVar_) - 1);
+                                                                ImGui::EndPopup();
+                                                        }
+                                                }
+                                        }
+                                }
+
+                                ImGui::EndTable();
                         }
                 }
 
@@ -1207,17 +1364,21 @@ SdkPanel::drawCFunctionsTab()
                 }
                 for (int i = (int)histSnap.size() - 1; i >= 0; --i) {
                         const HistEntry &e = histSnap[i];
-                        // Timestamp badge
                         {
-                                uint64_t ms  = e.tsMs % 86400000ULL;
-                                int      hh  = (int)(ms / 3600000);
-                                ms          %= 3600000;
-                                int mm       = (int)(ms / 60000);
-                                ms          %= 60000;
-                                int ss       = (int)(ms / 1000);
-                                ms          %= 1000;
-                                char ts[24];
-                                snprintf(ts, sizeof(ts), "[%02d:%02d:%02d.%03d] ", hh, mm, ss, (int)ms);
+                                std::time_t t   = (std::time_t)(e.tsMs / 1000);
+                                struct tm   tm_ = {};
+                                localtime_s(&tm_, &t);
+                                char ts[32];
+                                snprintf(ts,
+                                         sizeof(ts),
+                                         "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                                         tm_.tm_year + 1900,
+                                         tm_.tm_mon + 1,
+                                         tm_.tm_mday,
+                                         tm_.tm_hour,
+                                         tm_.tm_min,
+                                         tm_.tm_sec,
+                                         (int)(e.tsMs % 1000));
                                 ImGui::TextDisabled("%s", ts);
                                 ImGui::SameLine(0, 0);
                         }
@@ -1225,8 +1386,6 @@ SdkPanel::drawCFunctionsTab()
                                               e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f));
                         ImGui::TextUnformatted(e.call.c_str());
                         ImGui::PopStyleColor();
-                        ImGui::SameLine();
-                        ImGui::TextDisabled(" → ");
                         ImGui::SameLine();
                         ImGui::PushStyleColor(ImGuiCol_Text,
                                               e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
@@ -1260,6 +1419,11 @@ SdkPanel::drawCppClassesTab()
                 char              clsLbl[128];
                 snprintf(clsLbl, sizeof(clsLbl), "%s (%d)", cls.name.c_str(), (int)cls.methods.size());
                 if (ImGui::Selectable(clsLbl, selCls, ImGuiSelectableFlags_None) && !selCls) {
+                        if (selectedClassIdx_ >= 0 && selectedMethodIdx_ >= 0) {
+                                int key                = selectedClassIdx_ * 10000 + selectedMethodIdx_;
+                                methArgBufsCache_[key] = methArgBufs_;
+                                structBufsCache_[key]  = structBufs_;
+                        }
                         selectedClassIdx_  = ci;
                         selectedMethodIdx_ = -1;
                         selectedObjIdx_    = -1;
@@ -1320,40 +1484,6 @@ SdkPanel::drawCppClassesTab()
         ImGui::Text("class %s", cls.fullName.c_str());
         ImGui::PopStyleColor();
 
-        // ── object manager ──
-        ImGui::Spacing();
-        ImGui::Text("%s:", tr("Objects", "对象管理"));
-        ImGui::SameLine();
-        bool canNew = loader_.isLoaded();
-        if (!canNew)
-                ImGui::BeginDisabled();
-        if (ImGui::Button(tr("+ New", "+ 新建")))
-                doNewObject(selectedClassIdx_);
-        if (!canNew)
-                ImGui::EndDisabled();
-
-        if (!objects_.empty()) {
-                ImGui::SameLine();
-                bool canDel = (selectedObjIdx_ >= 0 && selectedObjIdx_ < (int)objects_.size());
-                if (!canDel)
-                        ImGui::BeginDisabled();
-                if (ImGui::Button(tr("Delete", "删除")))
-                        doDeleteObject(selectedObjIdx_);
-                if (!canDel)
-                        ImGui::EndDisabled();
-
-                ImGui::BeginChild("##objlist", ImVec2(0, 60.0f), true);
-                for (int oi = 0; oi < (int)objects_.size(); ++oi) {
-                        const ObjInstance &obj  = objects_[oi];
-                        bool               selO = (oi == selectedObjIdx_);
-                        char               objLbl[128];
-                        snprintf(objLbl, sizeof(objLbl), "%s  @0x%p", obj.label, obj.ptr);
-                        if (ImGui::Selectable(objLbl, selO))
-                                selectedObjIdx_ = oi;
-                }
-                ImGui::EndChild();
-        }
-
         ImGui::Separator();
 
         if (selectedMethodIdx_ < 0 || selectedMethodIdx_ >= (int)cls.methods.size()) {
@@ -1374,206 +1504,289 @@ SdkPanel::drawCppClassesTab()
                 ImGui::Text("%s  %s", meth.retRaw.empty() ? "?" : meth.retRaw.c_str(), meth.name.c_str());
         ImGui::PopStyleColor();
 
-        // ── object selector (non-ctor) ──
-        if (!meth.isCtor && !meth.isDtor) {
-                ImGui::SetNextItemWidth(260.0f);
-                const char *preview = (selectedObjIdx_ >= 0 && selectedObjIdx_ < (int)objects_.size())
-                                          ? objects_[selectedObjIdx_].label
-                                          : tr("(none)", "(无)");
-                if (ImGui::BeginCombo(tr("Object (this)##obj", "对象 (this)##obj"), preview)) {
-                        for (int oi = 0; oi < (int)objects_.size(); ++oi) {
-                                bool sel = (oi == selectedObjIdx_);
-                                char lbl[128];
-                                snprintf(lbl, sizeof(lbl), "%s  @0x%p", objects_[oi].label, objects_[oi].ptr);
-                                if (ImGui::Selectable(lbl, sel))
-                                        selectedObjIdx_ = oi;
-                                if (sel)
-                                        ImGui::SetItemDefaultFocus();
-                        }
-                        ImGui::EndCombo();
-                }
-        }
-
         ImGui::Spacing();
 
-        // ── parameters ──
-        if (meth.params.empty()) {
-                ImGui::TextDisabled("  (%s)", tr("no parameters", "无参数"));
-        } else {
-                for (size_t pi = 0; pi < meth.params.size(); ++pi) {
-                        const CParam &p = meth.params[pi];
-                        char          rowId[64];
-                        snprintf(rowId, sizeof(rowId), "##mp%zu", pi);
+        // ── parameters (+ object + return value) ──
+        {
+                const bool             showObjRow = !meth.isCtor && !meth.isDtor;
+                const bool             showRetRow = !meth.isDtor;
+                static ImGuiTableFlags tblFlags   = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                                  ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Resizable;
+                if (ImGui::BeginTable("##mparg_tbl", 3, tblFlags)) {
+                        ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 75.0f);
+                        ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch, 0.35f);
+                        ImGui::TableSetupColumn(tr("Value / Args", "值/参数"), ImGuiTableColumnFlags_WidthStretch, 0.65f);
+                        ImGui::TableHeadersRow();
 
-                        // Struct reference parameter → show struct field editor.
-                        if (pi < structBufs_.size() && structBufs_[pi].decl) {
-                                const CStructDecl    *sd       = structBufs_[pi].decl;
-                                std::vector<uint8_t> &buf      = structBufs_[pi].data;
-                                bool                 &expanded = structBufs_[pi].expanded;
-
-                                char hdr[128];
-                                snprintf(hdr,
-                                         sizeof(hdr),
-                                         "%s: [%s]  ##shdr%zu",
-                                         p.name.empty() ? "param" : p.name.c_str(),
-                                         sd->name.c_str(),
-                                         pi);
-                                ImGui::SetNextItemOpen(expanded, ImGuiCond_Always);
-                                expanded = ImGui::CollapsingHeader(hdr);
-                                if (expanded && buf.size() >= sd->totalSize) {
-                                        ImGui::Indent(16.0f);
-                                        for (const auto &field : sd->fields) {
-                                                if (field.isArray) {
-                                                        // Show array elements.
-                                                        ImGui::TextDisabled("[array %zu × %s]",
-                                                                            field.arrayCount,
-                                                                            ctypeLabel(field.arrayElemType));
-                                                        size_t esz = ctypeSize(field.arrayElemType);
-                                                        for (size_t ai = 0; ai < field.arrayCount; ++ai) {
-                                                                char fid[64];
-                                                                snprintf(fid,
-                                                                         sizeof(fid),
-                                                                         "##af%zu_%zu_%zu",
-                                                                         pi,
-                                                                         &field - sd->fields.data(),
-                                                                         ai);
-                                                                ImGui::SetNextItemWidth(140.0f);
-                                                                uint8_t *p2 = buf.data() + field.offset + ai * esz;
-                                                                if (field.arrayElemType == CType::F64) {
-                                                                        double v;
-                                                                        memcpy(&v, p2, 8);
-                                                                        if (ImGui::InputDouble(fid, &v, 0, 0, "%.6g"))
-                                                                                memcpy(p2, &v, 8);
-                                                                } else if (field.arrayElemType == CType::F32) {
-                                                                        float v;
-                                                                        memcpy(&v, p2, 4);
-                                                                        if (ImGui::InputFloat(fid, &v))
-                                                                                memcpy(p2, &v, 4);
-                                                                } else {
-                                                                        int iv = 0;
-                                                                        memcpy(&iv, p2, std::min(esz, (size_t)4));
-                                                                        if (ImGui::InputInt(fid, &iv))
-                                                                                memcpy(p2, &iv, std::min(esz, (size_t)4));
-                                                                }
-                                                                ImGui::SameLine();
-                                                                ImGui::TextDisabled("%s[%zu]", field.name.c_str(), ai);
-                                                        }
-                                                } else if (field.type == CType::F64) {
-                                                        char fid[64];
-                                                        snprintf(
-                                                            fid, sizeof(fid), "##df%zu_%zu", pi, &field - sd->fields.data());
-                                                        ImGui::SetNextItemWidth(180.0f);
-                                                        double v;
-                                                        memcpy(&v, buf.data() + field.offset, 8);
-                                                        if (ImGui::InputDouble(fid, &v, 0, 0, "%.6g"))
-                                                                memcpy(buf.data() + field.offset, &v, 8);
-                                                        ImGui::SameLine();
-                                                        ImGui::TextDisabled("double %s", field.name.c_str());
-                                                } else if (field.type == CType::F32) {
-                                                        char fid[64];
-                                                        snprintf(
-                                                            fid, sizeof(fid), "##ff%zu_%zu", pi, &field - sd->fields.data());
-                                                        ImGui::SetNextItemWidth(180.0f);
-                                                        float v;
-                                                        memcpy(&v, buf.data() + field.offset, 4);
-                                                        if (ImGui::InputFloat(fid, &v))
-                                                                memcpy(buf.data() + field.offset, &v, 4);
-                                                        ImGui::SameLine();
-                                                        ImGui::TextDisabled("float %s", field.name.c_str());
-                                                } else {
-                                                        char fid[64];
-                                                        snprintf(
-                                                            fid, sizeof(fid), "##if%zu_%zu", pi, &field - sd->fields.data());
-                                                        ImGui::SetNextItemWidth(180.0f);
-                                                        int64_t v = 0;
-                                                        memcpy(&v, buf.data() + field.offset, std::min(field.size, (size_t)8));
-                                                        int iv = (int)v;
-                                                        if (ImGui::InputInt(fid, &iv)) {
-                                                                v = iv;
-                                                                memcpy(buf.data() + field.offset,
-                                                                       &v,
-                                                                       std::min(field.size, (size_t)8));
-                                                        }
-                                                        ImGui::SameLine();
-                                                        ImGui::TextDisabled(
-                                                            "%s %s", ctypeLabel(field.type), field.name.c_str());
-                                                }
-                                        }
-                                        ImGui::Unindent(16.0f);
-                                }
-                                continue;
-                        }
-
-                        // Enum parameter → dropdown.
-                        const CEnumDecl *ed = findParamEnum(p);
-                        if (ed && !ed->values.empty()) {
-                                // Find current value as index.
-                                int64_t curVal = 0;
-                                if (pi < methArgBufs_.size())
-                                        curVal = strtoll(methArgBufs_[pi].text, nullptr, 0);
-                                const char *preview2 = ed->values[0].name.c_str();
-                                int         curIdx   = 0;
-                                for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
-                                        if (ed->values[ei].value == curVal) {
-                                                preview2 = ed->values[ei].name.c_str();
-                                                curIdx   = ei;
-                                                break;
-                                        }
-                                }
-                                char cmId[64];
-                                snprintf(cmId, sizeof(cmId), "##ec%zu", pi);
-                                ImGui::SetNextItemWidth(260.0f);
-                                if (ImGui::BeginCombo(cmId, preview2)) {
-                                        for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
-                                                bool sel2 = (ei == curIdx);
-                                                char evLbl[128];
-                                                snprintf(evLbl,
-                                                         sizeof(evLbl),
-                                                         "%s (%lld)",
-                                                         ed->values[ei].name.c_str(),
-                                                         (long long)ed->values[ei].value);
-                                                if (ImGui::Selectable(evLbl, sel2) && pi < methArgBufs_.size()) {
-                                                        snprintf(methArgBufs_[pi].text,
-                                                                 sizeof(ArgBuf::text),
-                                                                 "%lld",
-                                                                 (long long)ed->values[ei].value);
-                                                }
-                                                if (sel2)
+                        // ── Object (this) row ──
+                        if (showObjRow) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextUnformatted(cls.name.c_str());
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::TextUnformatted(tr("Object", "对象"));
+                                ImGui::TableSetColumnIndex(2);
+                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                const char *objPrev = (selectedObjIdx_ >= 0 && selectedObjIdx_ < (int)objects_.size())
+                                                          ? objects_[selectedObjIdx_].label
+                                                          : tr("(none)", "(无)");
+                                if (ImGui::BeginCombo("##obj_sel", objPrev)) {
+                                        if (loader_.isLoaded() &&
+                                            ImGui::Selectable(tr("[+ New Object]", "[+ 新建对象]"), false))
+                                                doNewObject(selectedClassIdx_);
+                                        for (int oi = 0; oi < (int)objects_.size(); ++oi) {
+                                                bool sel = (oi == selectedObjIdx_);
+                                                char objLbl[128];
+                                                snprintf(
+                                                    objLbl, sizeof(objLbl), "%s  @%p", objects_[oi].label, objects_[oi].ptr);
+                                                if (ImGui::Selectable(objLbl, sel))
+                                                        selectedObjIdx_ = oi;
+                                                if (sel)
                                                         ImGui::SetItemDefaultFocus();
                                         }
                                         ImGui::EndCombo();
                                 }
-                                ImGui::SameLine();
-                                ImGui::TextDisabled("%s %s", ed->name.c_str(), p.name.empty() ? "" : p.name.c_str());
-                                continue;
                         }
 
-                        // Plain parameter → text input.
-                        char lbl[128];
-                        if (!p.name.empty())
-                                snprintf(lbl, sizeof(lbl), "%s %s", ctypeLabel(p.type), p.name.c_str());
-                        else
-                                snprintf(lbl, sizeof(lbl), "%s [%zu]", ctypeLabel(p.type), pi);
+                        if (meth.params.empty() && !showObjRow && !showRetRow) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::TextDisabled("(%s)", tr("no parameters", "无参数"));
+                        }
 
-                        ImGui::SetNextItemWidth(260.0f);
-                        if (pi < methArgBufs_.size()) {
-                                bool isCharP = ctypeIsCharPtr(p.type, p.rawType);
-                                if (isCharP)
-                                        ImGui::InputText(rowId, methArgBufs_[pi].text, sizeof(ArgBuf::text));
-                                else if (ctypeIsFloat(p.type))
-                                        ImGui::InputText(rowId,
-                                                         methArgBufs_[pi].text,
-                                                         sizeof(ArgBuf::text),
-                                                         ImGuiInputTextFlags_CharsDecimal);
+                        for (size_t pi = 0; pi < meth.params.size(); ++pi) {
+                                const CParam &p = meth.params[pi];
+                                char          rowId[64];
+                                snprintf(rowId, sizeof(rowId), "##mp%zu", pi);
+
+                                // Struct reference parameter → header row + field sub-rows.
+                                if (pi < structBufs_.size() && structBufs_[pi].decl) {
+                                        const CStructDecl    *sd       = structBufs_[pi].decl;
+                                        std::vector<uint8_t> &buf      = structBufs_[pi].data;
+                                        bool                 &expanded = structBufs_[pi].expanded;
+
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::TextUnformatted(sd->name.c_str());
+                                        ImGui::TableSetColumnIndex(1);
+                                        char hdr[128];
+                                        snprintf(
+                                            hdr, sizeof(hdr), "%s##shdr%zu", p.name.empty() ? "param" : p.name.c_str(), pi);
+                                        ImGui::SetNextItemOpen(expanded, ImGuiCond_Always);
+                                        expanded = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_SpanFullWidth);
+
+                                        if (expanded) {
+                                                if (buf.size() >= sd->totalSize) {
+                                                        for (size_t fi = 0; fi < sd->fields.size(); ++fi) {
+                                                                const auto &field = sd->fields[fi];
+                                                                if (field.isArray) {
+                                                                        size_t esz = ctypeSize(field.arrayElemType);
+                                                                        for (size_t ai = 0; ai < field.arrayCount; ++ai) {
+                                                                                ImGui::TableNextRow();
+                                                                                ImGui::TableSetColumnIndex(1);
+                                                                                ImGui::TextDisabled(
+                                                                                    "  .%s[%zu]  %s",
+                                                                                    field.name.c_str(),
+                                                                                    ai,
+                                                                                    ctypeLabel(field.arrayElemType));
+                                                                                ImGui::TableSetColumnIndex(2);
+                                                                                char fid[64];
+                                                                                snprintf(fid,
+                                                                                         sizeof(fid),
+                                                                                         "##af%zu_%zu_%zu",
+                                                                                         pi,
+                                                                                         fi,
+                                                                                         ai);
+                                                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                                                uint8_t *p2 =
+                                                                                    buf.data() + field.offset + ai * esz;
+                                                                                if (field.arrayElemType == CType::F64) {
+                                                                                        double v;
+                                                                                        memcpy(&v, p2, 8);
+                                                                                        if (ImGui::InputDouble(
+                                                                                                fid, &v, 0, 0, "%.6g"))
+                                                                                                memcpy(p2, &v, 8);
+                                                                                } else if (field.arrayElemType == CType::F32) {
+                                                                                        float v;
+                                                                                        memcpy(&v, p2, 4);
+                                                                                        if (ImGui::InputFloat(fid, &v))
+                                                                                                memcpy(p2, &v, 4);
+                                                                                } else {
+                                                                                        int iv = 0;
+                                                                                        memcpy(
+                                                                                            &iv, p2, std::min(esz, (size_t)4));
+                                                                                        if (ImGui::InputInt(fid, &iv))
+                                                                                                memcpy(
+                                                                                                    p2,
+                                                                                                    &iv,
+                                                                                                    std::min(esz, (size_t)4));
+                                                                                }
+                                                                        }
+                                                                } else if (field.type == CType::F64) {
+                                                                        ImGui::TableNextRow();
+                                                                        ImGui::TableSetColumnIndex(1);
+                                                                        ImGui::TextDisabled("  .%s  double",
+                                                                                            field.name.c_str());
+                                                                        ImGui::TableSetColumnIndex(2);
+                                                                        char fid[64];
+                                                                        snprintf(fid, sizeof(fid), "##df%zu_%zu", pi, fi);
+                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                                                        double v;
+                                                                        memcpy(&v, buf.data() + field.offset, 8);
+                                                                        if (ImGui::InputDouble(fid, &v, 0, 0, "%.6g"))
+                                                                                memcpy(buf.data() + field.offset, &v, 8);
+                                                                } else if (field.type == CType::F32) {
+                                                                        ImGui::TableNextRow();
+                                                                        ImGui::TableSetColumnIndex(1);
+                                                                        ImGui::TextDisabled("  .%s  float", field.name.c_str());
+                                                                        ImGui::TableSetColumnIndex(2);
+                                                                        char fid[64];
+                                                                        snprintf(fid, sizeof(fid), "##ff%zu_%zu", pi, fi);
+                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                                                        float v;
+                                                                        memcpy(&v, buf.data() + field.offset, 4);
+                                                                        if (ImGui::InputFloat(fid, &v))
+                                                                                memcpy(buf.data() + field.offset, &v, 4);
+                                                                } else {
+                                                                        ImGui::TableNextRow();
+                                                                        ImGui::TableSetColumnIndex(1);
+                                                                        ImGui::TextDisabled("  .%s  %s",
+                                                                                            field.name.c_str(),
+                                                                                            ctypeLabel(field.type));
+                                                                        ImGui::TableSetColumnIndex(2);
+                                                                        char fid[64];
+                                                                        snprintf(fid, sizeof(fid), "##if%zu_%zu", pi, fi);
+                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                                                        int64_t v = 0;
+                                                                        memcpy(&v,
+                                                                               buf.data() + field.offset,
+                                                                               std::min(field.size, (size_t)8));
+                                                                        int iv = (int)v;
+                                                                        if (ImGui::InputInt(fid, &iv)) {
+                                                                                v = iv;
+                                                                                memcpy(buf.data() + field.offset,
+                                                                                       &v,
+                                                                                       std::min(field.size, (size_t)8));
+                                                                        }
+                                                                }
+                                                        }
+                                                }
+                                                ImGui::TreePop();
+                                        }
+                                        continue;
+                                }
+
+                                // Enum parameter → dropdown row.
+                                const CEnumDecl *ed = findParamEnum(p);
+                                if (ed && !ed->values.empty()) {
+                                        int64_t curVal = 0;
+                                        if (pi < methArgBufs_.size())
+                                                curVal = strtoll(methArgBufs_[pi].text, nullptr, 0);
+                                        const char *preview2 = ed->values[0].name.c_str();
+                                        int         curIdx   = 0;
+                                        for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
+                                                if (ed->values[ei].value == curVal) {
+                                                        preview2 = ed->values[ei].name.c_str();
+                                                        curIdx   = ei;
+                                                        break;
+                                                }
+                                        }
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::TextUnformatted(ed->name.c_str());
+                                        ImGui::TableSetColumnIndex(1);
+                                        ImGui::TextUnformatted(p.name.empty() ? "?" : p.name.c_str());
+                                        ImGui::TableSetColumnIndex(2);
+                                        char cmId[64];
+                                        snprintf(cmId, sizeof(cmId), "##ec%zu", pi);
+                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                        if (ImGui::BeginCombo(cmId, preview2)) {
+                                                for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
+                                                        bool sel2 = (ei == curIdx);
+                                                        char evLbl[128];
+                                                        snprintf(evLbl,
+                                                                 sizeof(evLbl),
+                                                                 "%s (%lld)",
+                                                                 ed->values[ei].name.c_str(),
+                                                                 (long long)ed->values[ei].value);
+                                                        if (ImGui::Selectable(evLbl, sel2) && pi < methArgBufs_.size()) {
+                                                                snprintf(methArgBufs_[pi].text,
+                                                                         sizeof(ArgBuf::text),
+                                                                         "%lld",
+                                                                         (long long)ed->values[ei].value);
+                                                        }
+                                                        if (sel2)
+                                                                ImGui::SetItemDefaultFocus();
+                                                }
+                                                ImGui::EndCombo();
+                                        }
+                                        continue;
+                                }
+
+                                // Plain parameter → text input row.
+                                const char *rawT2 = p.rawType.empty() ? ctypeLabel(p.type) : p.rawType.c_str();
+
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextUnformatted(rawT2);
+                                ImGui::TableSetColumnIndex(1);
+                                if (!p.name.empty())
+                                        ImGui::TextUnformatted(p.name.c_str());
                                 else
-                                        ImGui::InputText(rowId,
-                                                         methArgBufs_[pi].text,
-                                                         sizeof(ArgBuf::text),
-                                                         ImGuiInputTextFlags_CharsHexadecimal |
-                                                             ImGuiInputTextFlags_CharsDecimal);
-                                ImGui::SameLine();
-                                ImGui::TextDisabled("%s", lbl);
+                                        ImGui::Text("[%zu]", pi);
+                                ImGui::TableSetColumnIndex(2);
+                                if (pi < methArgBufs_.size()) {
+                                        bool isCharP = ctypeIsCharPtr(p.type, p.rawType);
+                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                        if (isCharP)
+                                                ImGui::InputText(rowId, methArgBufs_[pi].text, sizeof(ArgBuf::text));
+                                        else if (ctypeIsFloat(p.type))
+                                                ImGui::InputText(rowId,
+                                                                 methArgBufs_[pi].text,
+                                                                 sizeof(ArgBuf::text),
+                                                                 ImGuiInputTextFlags_CharsDecimal);
+                                        else
+                                                ImGui::InputText(rowId,
+                                                                 methArgBufs_[pi].text,
+                                                                 sizeof(ArgBuf::text),
+                                                                 ImGuiInputTextFlags_CharsHexadecimal |
+                                                                     ImGuiInputTextFlags_CharsDecimal);
+                                }
                         }
+
+                        // ── Return value row ──
+                        if (showRetRow) {
+                                std::string retT = meth.retRaw.empty() ? std::string(ctypeLabel(meth.retType)) : meth.retRaw;
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextUnformatted(retT.c_str());
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::TextUnformatted(tr("return", "返回值"));
+                                ImGui::TableSetColumnIndex(2);
+                                float rvW = onListLocalVars_ ? ImGui::GetContentRegionAvail().x - 26.0f : -1.0f;
+                                if (rvW > 0.0f)
+                                        ImGui::SetNextItemWidth(rvW);
+                                ImGui::InputTextWithHint(
+                                    "##methrv", tr("variable name", "变量名"), methResultVar_, sizeof(methResultVar_));
+                                if (onListLocalVars_) {
+                                        auto localVars = onListLocalVars_();
+                                        if (!localVars.empty()) {
+                                                ImGui::SameLine(0, 2);
+                                                if (ImGui::SmallButton("v##methrvpick"))
+                                                        ImGui::OpenPopup("##methrvpop");
+                                                if (ImGui::BeginPopup("##methrvpop")) {
+                                                        for (const auto &vn : localVars)
+                                                                if (ImGui::Selectable(vn.c_str()))
+                                                                        strncpy(methResultVar_,
+                                                                                vn.c_str(),
+                                                                                sizeof(methResultVar_) - 1);
+                                                        ImGui::EndPopup();
+                                                }
+                                        }
+                                }
+                        }
+
+                        ImGui::EndTable();
                 }
         }
 
@@ -1588,10 +1801,6 @@ SdkPanel::drawCppClassesTab()
                 doCallMethod();
         if (!canCall)
                 ImGui::EndDisabled();
-        if (!canCall && loader_.isLoaded() && !meth.isCtor && objects_.empty()) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", tr("(create an object first)", "(请先创建对象)"));
-        }
 
         // ── history ──
         ImGui::Spacing();
@@ -1607,23 +1816,26 @@ SdkPanel::drawCppClassesTab()
         for (int i = (int)histSnapM.size() - 1; i >= 0; --i) {
                 const HistEntry &e = histSnapM[i];
                 {
-                        uint64_t ms  = e.tsMs % 86400000ULL;
-                        int      hh  = (int)(ms / 3600000);
-                        ms          %= 3600000;
-                        int mm       = (int)(ms / 60000);
-                        ms          %= 60000;
-                        int ss       = (int)(ms / 1000);
-                        ms          %= 1000;
-                        char ts[24];
-                        snprintf(ts, sizeof(ts), "[%02d:%02d:%02d.%03d] ", hh, mm, ss, (int)ms);
+                        std::time_t t   = (std::time_t)(e.tsMs / 1000);
+                        struct tm   tm_ = {};
+                        localtime_s(&tm_, &t);
+                        char ts[32];
+                        snprintf(ts,
+                                 sizeof(ts),
+                                 "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                                 tm_.tm_year + 1900,
+                                 tm_.tm_mon + 1,
+                                 tm_.tm_mday,
+                                 tm_.tm_hour,
+                                 tm_.tm_min,
+                                 tm_.tm_sec,
+                                 (int)(e.tsMs % 1000));
                         ImGui::TextDisabled("%s", ts);
                         ImGui::SameLine(0, 0);
                 }
                 ImGui::PushStyleColor(ImGuiCol_Text, e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f));
                 ImGui::TextUnformatted(e.call.c_str());
                 ImGui::PopStyleColor();
-                ImGui::SameLine();
-                ImGui::TextDisabled(" → ");
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Text, e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
                 ImGui::TextUnformatted(e.result.c_str());
@@ -1653,11 +1865,8 @@ SdkPanel::drawPythonTab()
         bool runnerOk = pyRunner_ && pyRunner_->isAlive();
         ImGui::TextDisabled(runnerOk ? tr("[py: online]", "[py: 在线]") : tr("[py: offline]", "[py: 离线]"));
         if (pyPath_[0]) {
-                std::string fullPath(pyPath_);
-                auto        slash = fullPath.find_last_of("/\\");
-                std::string fname = (slash != std::string::npos) ? fullPath.substr(slash + 1) : fullPath;
                 ImGui::SameLine();
-                ImGui::TextDisabled("— %s", fname.c_str());
+                ImGui::TextDisabled("— %s", pyPath_);
         }
 
         ImGui::Spacing();
@@ -1685,17 +1894,24 @@ SdkPanel::drawPythonTab()
                         for (int i = 0; i < (int)pyResult_.functions.size(); ++i) {
                                 bool sel = (i == pySelFnIdx_);
                                 if (ImGui::Selectable(pyResult_.functions[i].name.c_str(), sel) && !sel) {
+                                        if (pySelFnIdx_ >= 0 && pySelFnIdx_ < (int)pyResult_.functions.size())
+                                                pyFnArgBufsCache_[pySelFnIdx_] = pyFnArgBufs_;
                                         pySelFnIdx_ = i;
-                                        pyFnArgBufs_.clear();
-                                        pyFnArgBufs_.resize(pyResult_.functions[i].params.size());
-                                        for (size_t j = 0; j < pyResult_.functions[i].params.size(); ++j) {
-                                                const auto &parm = pyResult_.functions[i].params[j];
-                                                if (!parm.defaultVal.empty())
-                                                        strncpy(pyFnArgBufs_[j].text,
-                                                                parm.defaultVal.c_str(),
-                                                                sizeof(ArgBuf::text) - 1);
-                                        }
                                         pyLastResult_.clear();
+                                        const auto &fn2 = pyResult_.functions[i];
+                                        auto        cit = pyFnArgBufsCache_.find(i);
+                                        if (cit != pyFnArgBufsCache_.end() && cit->second.size() == fn2.params.size()) {
+                                                pyFnArgBufs_ = cit->second;
+                                        } else {
+                                                pyFnArgBufs_.clear();
+                                                pyFnArgBufs_.resize(fn2.params.size());
+                                                for (size_t j = 0; j < fn2.params.size(); ++j) {
+                                                        if (!fn2.params[j].defaultVal.empty())
+                                                                strncpy(pyFnArgBufs_[j].text,
+                                                                        fn2.params[j].defaultVal.c_str(),
+                                                                        sizeof(ArgBuf::text) - 1);
+                                                }
+                                        }
                                 }
                                 // Drag to SequenceEditor
                                 if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
@@ -1723,14 +1939,32 @@ SdkPanel::drawPythonTab()
                                 if (fn.params.empty()) {
                                         ImGui::TextDisabled("  (%s)", tr("no parameters", "无参数"));
                                 } else {
-                                        for (size_t i = 0; i < fn.params.size(); ++i) {
-                                                char id[64];
-                                                snprintf(id, sizeof(id), "##pyfa%zu", i);
-                                                ImGui::SetNextItemWidth(260.0f);
-                                                if (i < pyFnArgBufs_.size())
-                                                        ImGui::InputText(id, pyFnArgBufs_[i].text, sizeof(ArgBuf::text));
-                                                ImGui::SameLine();
-                                                ImGui::TextDisabled("%s", fn.params[i].name.c_str());
+                                        static ImGuiTableFlags pyFTblFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                                                             ImGuiTableFlags_SizingStretchProp |
+                                                                             ImGuiTableFlags_Resizable;
+                                        if (ImGui::BeginTable("##pyfarg_tbl", 3, pyFTblFlags)) {
+                                                ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 28.0f);
+                                                ImGui::TableSetupColumn(
+                                                    tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch, 0.35f);
+                                                ImGui::TableSetupColumn(
+                                                    tr("Value / Args", "值/参数"), ImGuiTableColumnFlags_WidthStretch, 0.65f);
+                                                ImGui::TableHeadersRow();
+                                                for (size_t i = 0; i < fn.params.size(); ++i) {
+                                                        char id[64];
+                                                        snprintf(id, sizeof(id), "##pyfa%zu", i);
+                                                        ImGui::TableNextRow();
+                                                        ImGui::TableSetColumnIndex(0);
+                                                        ImGui::Text("%d", (int)(i + 1));
+                                                        ImGui::TableSetColumnIndex(1);
+                                                        ImGui::TextUnformatted(fn.params[i].name.c_str());
+                                                        ImGui::TableSetColumnIndex(2);
+                                                        if (i < pyFnArgBufs_.size()) {
+                                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                                ImGui::InputText(
+                                                                    id, pyFnArgBufs_[i].text, sizeof(ArgBuf::text));
+                                                        }
+                                                }
+                                                ImGui::EndTable();
                                         }
                                 }
 
@@ -1745,6 +1979,28 @@ SdkPanel::drawPythonTab()
                                         ImGui::EndDisabled();
                                         ImGui::SameLine();
                                         ImGui::TextDisabled("%s", tr("(Python not running)", "(Python 未运行)"));
+                                }
+                                ImGui::SameLine();
+                                ImGui::SetNextItemWidth(120.0f);
+                                ImGui::InputTextWithHint(
+                                    "##pyrv", tr("variable name", "变量名"), pyFnResultVar_, sizeof(pyFnResultVar_));
+                                if (onListLocalVars_) {
+                                        auto localVars = onListLocalVars_();
+                                        if (!localVars.empty()) {
+                                                ImGui::SameLine();
+                                                if (ImGui::SmallButton("v##pyrvpick"))
+                                                        ImGui::OpenPopup("##pyrvpop");
+                                                if (ImGui::IsItemHovered())
+                                                        ImGui::SetTooltip("%s", tr("Pick LOCAL variable", "选择 LOCAL 变量"));
+                                                if (ImGui::BeginPopup("##pyrvpop")) {
+                                                        for (const auto &vn : localVars)
+                                                                if (ImGui::Selectable(vn.c_str()))
+                                                                        strncpy(pyFnResultVar_,
+                                                                                vn.c_str(),
+                                                                                sizeof(pyFnResultVar_) - 1);
+                                                        ImGui::EndPopup();
+                                                }
+                                        }
                                 }
 
                                 if (!pyLastResult_.empty()) {
@@ -1768,25 +2024,30 @@ SdkPanel::drawPythonTab()
                                         snap = history_;
                                 }
                                 for (int i = (int)snap.size() - 1; i >= 0; --i) {
-                                        const HistEntry &e  = snap[i];
-                                        uint64_t         ms = e.tsMs % 86400000ULL;
-                                        char             ts[24];
-                                        snprintf(ts,
-                                                 sizeof(ts),
-                                                 "[%02d:%02d:%02d.%03d] ",
-                                                 (int)(ms / 3600000),
-                                                 (int)(ms % 3600000 / 60000),
-                                                 (int)(ms % 60000 / 1000),
-                                                 (int)(ms % 1000));
-                                        ImGui::TextDisabled("%s", ts);
-                                        ImGui::SameLine(0, 0);
+                                        const HistEntry &e = snap[i];
+                                        {
+                                                std::time_t t   = (std::time_t)(e.tsMs / 1000);
+                                                struct tm   tm_ = {};
+                                                localtime_s(&tm_, &t);
+                                                char ts[32];
+                                                snprintf(ts,
+                                                         sizeof(ts),
+                                                         "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                                                         tm_.tm_year + 1900,
+                                                         tm_.tm_mon + 1,
+                                                         tm_.tm_mday,
+                                                         tm_.tm_hour,
+                                                         tm_.tm_min,
+                                                         tm_.tm_sec,
+                                                         (int)(e.tsMs % 1000));
+                                                ImGui::TextDisabled("%s", ts);
+                                                ImGui::SameLine(0, 0);
+                                        }
                                         ImGui::PushStyleColor(ImGuiCol_Text,
                                                               e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f)
                                                                    : ImVec4(1.f, 0.4f, 0.4f, 1.f));
                                         ImGui::TextUnformatted(e.call.c_str());
                                         ImGui::PopStyleColor();
-                                        ImGui::SameLine();
-                                        ImGui::TextDisabled(" → ");
                                         ImGui::SameLine();
                                         ImGui::PushStyleColor(
                                             ImGuiCol_Text, e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
@@ -1816,6 +2077,8 @@ SdkPanel::drawPythonTab()
                                 char               lbl[128];
                                 snprintf(lbl, sizeof(lbl), "%s (%d)", cls.name.c_str(), (int)cls.methods.size());
                                 if (ImGui::Selectable(lbl, selCls) && !selCls) {
+                                        if (pySelClsIdx_ >= 0 && pySelMethIdx_ >= 0)
+                                                pyMethArgBufsCache_[pySelClsIdx_ * 1000 + pySelMethIdx_] = pyMethArgBufs_;
                                         pySelClsIdx_  = ci;
                                         pySelMethIdx_ = -1;
                                         pyMethArgBufs_.clear();
@@ -1832,15 +2095,25 @@ SdkPanel::drawPythonTab()
                                         char mlbl[256];
                                         snprintf(mlbl, sizeof(mlbl), "def %s", cls.methods[mi].name.c_str());
                                         if (ImGui::Selectable(mlbl, selM) && !selM) {
-                                                pySelMethIdx_ = mi;
-                                                pyMethArgBufs_.clear();
-                                                pyMethArgBufs_.resize(cls.methods[mi].params.size());
-                                                for (size_t j = 0; j < cls.methods[mi].params.size(); ++j) {
-                                                        const auto &parm = cls.methods[mi].params[j];
-                                                        if (!parm.defaultVal.empty())
-                                                                strncpy(pyMethArgBufs_[j].text,
-                                                                        parm.defaultVal.c_str(),
-                                                                        sizeof(ArgBuf::text) - 1);
+                                                if (pySelMethIdx_ >= 0 && pySelClsIdx_ >= 0)
+                                                        pyMethArgBufsCache_[pySelClsIdx_ * 1000 + pySelMethIdx_] =
+                                                            pyMethArgBufs_;
+                                                pySelMethIdx_     = mi;
+                                                const auto &meth2 = cls.methods[mi];
+                                                int         mkey  = pySelClsIdx_ * 1000 + mi;
+                                                auto        mcit  = pyMethArgBufsCache_.find(mkey);
+                                                if (mcit != pyMethArgBufsCache_.end() &&
+                                                    mcit->second.size() == meth2.params.size()) {
+                                                        pyMethArgBufs_ = mcit->second;
+                                                } else {
+                                                        pyMethArgBufs_.clear();
+                                                        pyMethArgBufs_.resize(meth2.params.size());
+                                                        for (size_t j = 0; j < meth2.params.size(); ++j) {
+                                                                if (!meth2.params[j].defaultVal.empty())
+                                                                        strncpy(pyMethArgBufs_[j].text,
+                                                                                meth2.params[j].defaultVal.c_str(),
+                                                                                sizeof(ArgBuf::text) - 1);
+                                                        }
                                                 }
                                         }
                                 }
@@ -1909,14 +2182,32 @@ SdkPanel::drawPythonTab()
                                 if (meth.params.empty()) {
                                         ImGui::TextDisabled("  (%s)", tr("no parameters", "无参数"));
                                 } else {
-                                        for (size_t i = 0; i < meth.params.size(); ++i) {
-                                                char id[64];
-                                                snprintf(id, sizeof(id), "##pyma%zu", i);
-                                                ImGui::SetNextItemWidth(260.0f);
-                                                if (i < pyMethArgBufs_.size())
-                                                        ImGui::InputText(id, pyMethArgBufs_[i].text, sizeof(ArgBuf::text));
-                                                ImGui::SameLine();
-                                                ImGui::TextDisabled("%s", meth.params[i].name.c_str());
+                                        static ImGuiTableFlags pyMTblFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                                                             ImGuiTableFlags_SizingStretchProp |
+                                                                             ImGuiTableFlags_Resizable;
+                                        if (ImGui::BeginTable("##pymarg_tbl", 3, pyMTblFlags)) {
+                                                ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 28.0f);
+                                                ImGui::TableSetupColumn(
+                                                    tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch, 0.35f);
+                                                ImGui::TableSetupColumn(
+                                                    tr("Value / Args", "值/参数"), ImGuiTableColumnFlags_WidthStretch, 0.65f);
+                                                ImGui::TableHeadersRow();
+                                                for (size_t i = 0; i < meth.params.size(); ++i) {
+                                                        char id[64];
+                                                        snprintf(id, sizeof(id), "##pyma%zu", i);
+                                                        ImGui::TableNextRow();
+                                                        ImGui::TableSetColumnIndex(0);
+                                                        ImGui::Text("%d", (int)(i + 1));
+                                                        ImGui::TableSetColumnIndex(1);
+                                                        ImGui::TextUnformatted(meth.params[i].name.c_str());
+                                                        ImGui::TableSetColumnIndex(2);
+                                                        if (i < pyMethArgBufs_.size()) {
+                                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                                ImGui::InputText(
+                                                                    id, pyMethArgBufs_[i].text, sizeof(ArgBuf::text));
+                                                        }
+                                                }
+                                                ImGui::EndTable();
                                         }
                                 }
 
@@ -1946,25 +2237,30 @@ SdkPanel::drawPythonTab()
                                         snap = history_;
                                 }
                                 for (int i = (int)snap.size() - 1; i >= 0; --i) {
-                                        const HistEntry &e  = snap[i];
-                                        uint64_t         ms = e.tsMs % 86400000ULL;
-                                        char             ts[24];
-                                        snprintf(ts,
-                                                 sizeof(ts),
-                                                 "[%02d:%02d:%02d.%03d] ",
-                                                 (int)(ms / 3600000),
-                                                 (int)(ms % 3600000 / 60000),
-                                                 (int)(ms % 60000 / 1000),
-                                                 (int)(ms % 1000));
-                                        ImGui::TextDisabled("%s", ts);
-                                        ImGui::SameLine(0, 0);
+                                        const HistEntry &e = snap[i];
+                                        {
+                                                std::time_t t   = (std::time_t)(e.tsMs / 1000);
+                                                struct tm   tm_ = {};
+                                                localtime_s(&tm_, &t);
+                                                char ts[32];
+                                                snprintf(ts,
+                                                         sizeof(ts),
+                                                         "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                                                         tm_.tm_year + 1900,
+                                                         tm_.tm_mon + 1,
+                                                         tm_.tm_mday,
+                                                         tm_.tm_hour,
+                                                         tm_.tm_min,
+                                                         tm_.tm_sec,
+                                                         (int)(e.tsMs % 1000));
+                                                ImGui::TextDisabled("%s", ts);
+                                                ImGui::SameLine(0, 0);
+                                        }
                                         ImGui::PushStyleColor(ImGuiCol_Text,
                                                               e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f)
                                                                    : ImVec4(1.f, 0.4f, 0.4f, 1.f));
                                         ImGui::TextUnformatted(e.call.c_str());
                                         ImGui::PopStyleColor();
-                                        ImGui::SameLine();
-                                        ImGui::TextDisabled(" → ");
                                         ImGui::SameLine();
                                         ImGui::PushStyleColor(
                                             ImGuiCol_Text, e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
@@ -1993,6 +2289,40 @@ SdkPanel::draw()
         if (!ImGui::Begin(titleBuf_, &open_)) {
                 ImGui::End();
                 return;
+        }
+
+        // Double-click the title bar (or dock tab) to rename this window.
+        {
+                ImGuiWindow *win       = ImGui::GetCurrentWindow();
+                ImRect       titleRect = win->DockIsActive ? win->DC.DockTabItemRect : win->TitleBarRect();
+                if (ImGui::IsMouseHoveringRect(titleRect.Min, titleRect.Max, false) &&
+                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        snprintf(renameBuf_, sizeof(renameBuf_), "%s", userLabel_);
+                        ImGui::OpenPopup("Rename SDK");
+                }
+                if (ImGui::BeginPopup("Rename SDK")) {
+                        ImGui::TextDisabled("%s", tr("Rename", "重命名"));
+                        ImGui::SetNextItemWidth(220.0f);
+                        if (ImGui::IsWindowAppearing())
+                                ImGui::SetKeyboardFocusHere();
+                        bool commit =
+                            ImGui::InputText("##renameSdk",
+                                             renameBuf_,
+                                             sizeof(renameBuf_),
+                                             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+                        ImGui::SameLine();
+                        if (ImGui::Button("OK"))
+                                commit = true;
+                        if (commit) {
+                                if (renameBuf_[0] != '\0') {
+                                        strncpy(userLabel_, renameBuf_, sizeof(userLabel_) - 1);
+                                        userLabel_[sizeof(userLabel_) - 1] = '\0';
+                                        snprintf(titleBuf_, sizeof(titleBuf_), "%s###SdkPanel%d", userLabel_, winId_);
+                                }
+                                ImGui::CloseCurrentPopup();
+                        }
+                        ImGui::EndPopup();
+                }
         }
 
         // Apply OS-level file drops if this window is hovered.
@@ -2058,10 +2388,8 @@ SdkPanel::draw()
                                 }
                         }
                         if (dllPath_[0]) {
-                                std::string dp(dllPath_);
-                                auto        sl = dp.find_last_of("/\\");
                                 ImGui::SameLine();
-                                ImGui::TextDisabled("— %s", (sl != std::string::npos ? dp.substr(sl + 1) : dp).c_str());
+                                ImGui::TextDisabled("— %s", dllPath_);
                         }
 
                         // Header browse row
@@ -2074,10 +2402,8 @@ SdkPanel::draw()
                                 }
                         }
                         if (headerPath_[0]) {
-                                std::string hp(headerPath_);
-                                auto        sl = hp.find_last_of("/\\");
                                 ImGui::SameLine();
-                                ImGui::TextDisabled("— %s", (sl != std::string::npos ? hp.substr(sl + 1) : hp).c_str());
+                                ImGui::TextDisabled("— %s", headerPath_);
                         }
 
                         ImGui::Spacing();
@@ -2124,8 +2450,10 @@ SdkPanel::pushHistory(const std::string &call, const std::string &result, bool o
         e.call   = call;
         e.result = result;
         e.ok     = ok;
-        e.tsMs   = get_mono_ts_ms();
-        e.tsSec  = tsSec;
+        e.tsMs =
+            (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        e.tsSec = tsSec;
         std::lock_guard<std::mutex> lk(histMtx_);
         if (history_.size() >= 400)
                 history_.erase(history_.begin());
@@ -2481,8 +2809,6 @@ SdkPanel::drawStepEditor(SdkSeqStep &step, int /*depth*/)
                         char rvId[32];
                         snprintf(rvId, sizeof(rvId), "##rv%p", &step);
                         ImGui::InputText(rvId, step.resultVar, sizeof(step.resultVar));
-                        ImGui::SameLine();
-                        ImGui::TextDisabled("→$var");
                         break;
                 }
 
@@ -2684,6 +3010,14 @@ SdkPanel::drawStepList(std::vector<SdkSeqStep> &steps, int depth, std::vector<Sd
 // ─── Public info helpers (used by SequenceEditor) ────────────────────────────
 
 std::string
+SdkPanel::getClassName(int classIdx) const
+{
+        if (classIdx < 0 || classIdx >= (int)parseResult_.classes.size())
+                return "";
+        return parseResult_.classes[classIdx].name;
+}
+
+std::string
 SdkPanel::getCallLabel(int ci, int mi) const
 {
         if (ci < 0 || ci >= (int)parseResult_.classes.size())
@@ -2800,6 +3134,26 @@ SdkPanel::getCFuncParamRawType(int fi, int pi) const
         return fn.params[pi].rawType;
 }
 
+std::string
+SdkPanel::getCallReturnType(bool isCFunc, bool isPython, int classIdx, int methodIdx, const std::string & /*pyFuncName*/) const
+{
+        if (isPython)
+                return "";
+        if (isCFunc) {
+                if (methodIdx < 0 || methodIdx >= (int)parseResult_.functions.size())
+                        return "";
+                const CFuncDecl &fn = parseResult_.functions[methodIdx];
+                return fn.retRaw.empty() ? std::string(ctypeLabel(fn.retType)) : fn.retRaw;
+        }
+        if (classIdx < 0 || classIdx >= (int)parseResult_.classes.size())
+                return "";
+        const CClassDecl &cls = parseResult_.classes[classIdx];
+        if (methodIdx < 0 || methodIdx >= (int)cls.methods.size())
+                return "";
+        const CMethodDecl &m = cls.methods[methodIdx];
+        return m.retRaw.empty() ? std::string(ctypeLabel(m.retType)) : m.retRaw;
+}
+
 const CStructDecl *
 SdkPanel::getParamStructDecl(bool isCFunc, int ci, int mi, int pi) const
 {
@@ -2896,7 +3250,7 @@ SdkPanel::directCall(int ci, int mi, int objIdx, const std::vector<std::string> 
         if (res.ok && ctypeIsInteger(meth.retType))
                 pushToMonitor(cls.name + "::" + meth.name, static_cast<float>(res.rawU64), tsSec);
 
-        return {res.ok, disp};
+        return {res.ok, disp, res.ok ? (int64_t)res.rawU64 : 0};
 }
 
 SdkPanel::DirectCallResult
@@ -2935,7 +3289,7 @@ SdkPanel::directCallC(int fi, const std::vector<std::string> &args)
         if (res.ok && ctypeIsInteger(fn.retType))
                 pushToMonitor(fn.name, static_cast<float>(res.rawU64), tsSec);
 
-        return {res.ok, disp};
+        return {res.ok, disp, res.ok ? (int64_t)res.rawU64 : 0};
 }
 
 // ─── directCallPy / Python info helpers ──────────────────────────────────────
@@ -3004,30 +3358,28 @@ SdkPanel::directCallPy(const std::string &funcName, const std::vector<std::strin
         call += ")";
         // Sequence-editor calls keep their own log (seqLog_); don't mirror into the
         // SDK panel's call history.
-        return {rr.ok, result};
+        // Parse result for variable write-back.
+        int64_t rawV = 0;
+        double  rawD = 0.0;
+        if (rr.ok && !rr.result.empty()) {
+                rawV = (int64_t)strtoll(rr.result.c_str(), nullptr, 0);
+                rawD = strtod(rr.result.c_str(), nullptr);
+        }
+        return {rr.ok, result, rawV, rawD};
 }
 
 // ─── save / load ──────────────────────────────────────────────────────────────
 
 void
-SdkPanel::save(void *node, const std::string &baseDir) const
+SdkPanel::save(void *node, const std::string & /*baseDir*/) const
 {
         cJSON *obj = static_cast<cJSON *>(node);
         cJSON_AddNumberToObject(obj, "winId", winId_);
+        cJSON_AddStringToObject(obj, "userLabel", userLabel_);
 
-        auto toRel = [&](const char *path) -> std::string {
-                if (!path || !path[0] || baseDir.empty())
-                        return path ? path : "";
-                std::error_code       ec;
-                std::filesystem::path rel = std::filesystem::relative(path, baseDir, ec);
-                if (ec || rel.empty())
-                        return path;
-                return rel.generic_string();
-        };
-
-        cJSON_AddStringToObject(obj, "dllPath", toRel(dllPath_).c_str());
-        cJSON_AddStringToObject(obj, "headerPath", toRel(headerPath_).c_str());
-        cJSON_AddStringToObject(obj, "pyPath", toRel(pyPath_).c_str());
+        cJSON_AddStringToObject(obj, "dllPath", dllPath_);
+        cJSON_AddStringToObject(obj, "headerPath", headerPath_);
+        cJSON_AddStringToObject(obj, "pyPath", pyPath_);
 }
 
 void
@@ -3037,16 +3389,28 @@ SdkPanel::load(const void *node, const std::string &baseDir)
 
         if (const cJSON *w = cJSON_GetObjectItem(obj, "winId"); cJSON_IsNumber(w))
                 setWindowId(w->valueint);
+        if (const cJSON *l = cJSON_GetObjectItem(obj, "userLabel"); cJSON_IsString(l) && l->valuestring[0]) {
+                strncpy(userLabel_, l->valuestring, sizeof(userLabel_) - 1);
+                userLabel_[sizeof(userLabel_) - 1] = '\0';
+                snprintf(titleBuf_, sizeof(titleBuf_), "%s###SdkPanel%d", userLabel_, winId_);
+        }
 
-        auto toAbs = [&](const char *rel) -> std::string {
-                if (!rel || !rel[0])
+        auto toAbs = [&](const char *stored) -> std::string {
+                if (!stored || !stored[0])
                         return "";
-                if (baseDir.empty())
-                        return rel;
-                std::filesystem::path p = std::filesystem::path(baseDir) / rel;
+                // If the stored path is already absolute (new format), use it directly.
                 std::error_code       ec;
-                auto                  abs = std::filesystem::canonical(p, ec);
-                return ec ? p.generic_string() : abs.generic_string();
+                std::filesystem::path fp(stored);
+                if (fp.is_absolute()) {
+                        auto abs = std::filesystem::canonical(fp, ec);
+                        return ec ? stored : abs.generic_string();
+                }
+                // Legacy: stored as relative path → resolve from baseDir.
+                if (baseDir.empty())
+                        return stored;
+                std::filesystem::path joined = std::filesystem::path(baseDir) / fp;
+                auto                  abs    = std::filesystem::canonical(joined, ec);
+                return ec ? joined.generic_string() : abs.generic_string();
         };
 
         if (const cJSON *d = cJSON_GetObjectItem(obj, "dllPath"); cJSON_IsString(d) && d->valuestring[0]) {

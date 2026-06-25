@@ -108,6 +108,7 @@ class SdkPanel
         }
 
         // Info helpers — used by SequenceEditor to populate dragged steps.
+        std::string getClassName(int classIdx) const;
         std::string getCallLabel(int classIdx, int methodIdx) const;
         std::string getCFuncLabel(int fnIdx) const;
         int         getParamCount(int classIdx, int methodIdx) const;
@@ -118,6 +119,11 @@ class SdkPanel
         std::string getCFuncParamName(int fnIdx, int paramIdx) const;
         std::string getParamRawType(int classIdx, int methodIdx, int paramIdx) const;
         std::string getCFuncParamRawType(int fnIdx, int paramIdx) const;
+        // Raw return type string (e.g. "int", "float*"). Empty string for void/Python.
+        std::string
+        getCallReturnType(bool isCFunc, bool isPython, int classIdx, int methodIdx, const std::string &pyFuncName = "") const;
+        // Returns the CEnumDecl for a parameter if its type is an enum, nullptr otherwise.
+        const CEnumDecl *getParamEnumDecl(bool isCFunc, int classIdx, int methodIdx, int paramIdx) const;
         // Returns the CStructDecl for the pointed-to type of a parameter, or nullptr.
         const CStructDecl *getParamStructDecl(bool isCFunc, int classIdx, int methodIdx, int paramIdx) const;
 
@@ -134,6 +140,8 @@ class SdkPanel
         struct DirectCallResult {
                 bool        ok;
                 std::string text;
+                int64_t     rawValue{0};  // raw bits of return value (memcpy-safe for int/float)
+                double      rawDouble{0}; // parsed as double (valid for Python string results)
         };
         DirectCallResult directCall(int classIdx, int methodIdx, int objIdx, const std::vector<std::string> &args);
         DirectCallResult directCallC(int fnIdx, const std::vector<std::string> &args);
@@ -155,13 +163,16 @@ class SdkPanel
         void setWindowId(int id)
         {
                 winId_ = id;
-                snprintf(titleBuf_, sizeof(titleBuf_), "SDK Debug [%d]###SdkPanel%d", id, id);
+                snprintf(userLabel_, sizeof(userLabel_), "SDK 调用器 [%d]", id);
+                snprintf(titleBuf_, sizeof(titleBuf_), "%s###SdkPanel%d", userLabel_, id);
         }
 
       private:
         // ── window identity ───────────────────────────────────────────────────────
         int  winId_{0};
-        char titleBuf_[64]{"SDK Debug [0]###SdkPanel0"};
+        char userLabel_[64]{"SDK 调用器 [0]"};
+        char renameBuf_[64]{};
+        char titleBuf_[64]{"SDK 调用器 [0]###SdkPanel0"};
 
         // ── file paths ────────────────────────────────────────────────────────────
         char                     dllPath_[512]{};
@@ -173,28 +184,33 @@ class SdkPanel
         ParseResult parseResult_;
 
         // ── C functions tab ───────────────────────────────────────────────────────
-        int selectedFnIdx_{-1};
+        int  selectedFnIdx_{-1};
+        char fnResultVar_[64]{}; // LOCAL variable to store C function return value
         struct ArgBuf {
                 char text[512]{};
         };
-        std::vector<ArgBuf> fnArgBufs_;
-        std::string         fnLastResult_;
-        bool                fnLastResultOk_{false};
+        std::vector<ArgBuf>                          fnArgBufs_;
+        std::unordered_map<int, std::vector<ArgBuf>> fnArgBufsCache_; // persists args across fn switches
+        std::string                                  fnLastResult_;
+        bool                                         fnLastResultOk_{false};
 
         // ── C++ classes tab ───────────────────────────────────────────────────────
         int   selectedClassIdx_{-1};
         int   selectedMethodIdx_{-1};
         int   selectedObjIdx_{-1};
-        float clsSplitW_{220.0f}; // resizable left panel width
+        float clsSplitW_{220.0f};   // resizable left panel width
+        char  methResultVar_[64]{}; // LOCAL variable to store C++ method return value
 
-        std::vector<ArgBuf> methArgBufs_;
+        std::vector<ArgBuf>                          methArgBufs_;
+        std::unordered_map<int, std::vector<ArgBuf>> methArgBufsCache_; // key: clsIdx*10000+methIdx
 
         struct StructBuf {
                 std::vector<uint8_t> data;
                 const CStructDecl   *decl{nullptr};
                 bool                 expanded{false};
         };
-        std::vector<StructBuf> structBufs_;
+        std::vector<StructBuf>                          structBufs_;
+        std::unordered_map<int, std::vector<StructBuf>> structBufsCache_; // key: clsIdx*10000+methIdx
 
         struct ObjInstance {
                 char        label[64]{};
@@ -207,7 +223,7 @@ class SdkPanel
         struct HistEntry {
                 std::string call, result;
                 bool        ok{false};
-                uint64_t    tsMs{0};    // get_mono_ts_ms()
+                uint64_t    tsMs{0};    // ms since epoch (wall-clock)
                 double      tsSec{0.0}; // sessionTimeSec() for monitor push
         };
         std::vector<HistEntry> history_;
@@ -258,15 +274,18 @@ class SdkPanel
         // ── Python tab ───────────────────────────────────────────────────────────
         char                pyPath_[512]{};
         PyParseResult       pyResult_;
+        char                pyFnResultVar_[64]{}; // LOCAL variable to store Python function return value
         int                 pySelFnIdx_{-1};
         int                 pySelClsIdx_{-1};
         int                 pySelMethIdx_{-1};
         int                 pySelObjIdx_{-1};
         float               pySplitW_{220.0f};
         std::vector<ArgBuf> pyFnArgBufs_;
-        std::vector<ArgBuf> pyMethArgBufs_;
-        std::string         pyLastResult_;
-        bool                pyLastResultOk_{false};
+        std::unordered_map<int, std::vector<ArgBuf>> pyFnArgBufsCache_;
+        std::vector<ArgBuf>                          pyMethArgBufs_;
+        std::unordered_map<int, std::vector<ArgBuf>> pyMethArgBufsCache_; // key: clsIdx*1000+methIdx
+        std::string                                  pyLastResult_;
+        bool                                         pyLastResultOk_{false};
 
         struct PyObjEntry {
                 int         pyId{-1};

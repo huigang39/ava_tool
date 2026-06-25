@@ -30,6 +30,10 @@ extern std::atomic<bool> g_monitorPaused;
 // (which is display-only and keeps acquiring), this stops J-Link acquisition
 // entirely: the sampler drops all J-Link read tasks, so HSS auto-stops.
 extern std::atomic<bool> g_jlinkSamplingPaused;
+// Global HSS target sample rate (Hz) — shared by all monitors in HSS mode.
+// Displayed and edited in the app top bar; the per-monitor maxSampleHz_ is
+// used only for POLL mode.
+extern std::atomic<int> g_maxHssHz;
 
 struct ChannelMovePayload {
         MonitorScope *srcScope;
@@ -98,6 +102,7 @@ class Monitor
         std::shared_ptr<CsvExportState> csvExport_{std::make_shared<CsvExportState>()};
 
         f32                           actualHz_{0.0f};
+        f32                           displayHz_{0.0f}; // EMA-smoothed Hz for stable display
         u64                           pointAccum_{0};
         u64                           lastHzTick_{get_mono_ts_ms()};
         static std::vector<Monitor *> sInstances_;
@@ -144,14 +149,26 @@ class Monitor
                                 pair.second->clearData();
                         }
                 purgeDeletedScopes();
-                needsLayout_ = true;
-                pointAccum_  = 0;
-                actualHz_    = 0.0f;
+                pointAccum_ = 0;
+                actualHz_   = 0.0f;
                 LOG_I("Monitor[%s] data cleared: %llu points", name_.c_str(), totalCleared);
         }
 
         void addPoints(u64 n) { pointAccum_ += n; }
         f32  getHz() const { return actualHz_; }
+
+        // Returns the max actualHz_ across all Monitor instances that are in HSS mode.
+        // Safe to call on the GUI thread; actualHz_ reads may race with sampler writes
+        // but are acceptable for display (float reads are atomic on x86/x64).
+        static f32 getGlobalHssHz()
+        {
+                std::lock_guard lk(sMtxInstances_);
+                f32             hz = 0.0f;
+                for (auto *m : sInstances_)
+                        if (m->samplingMode_ == SamplingMode::HSS && m->actualHz_ > hz)
+                                hz = m->actualHz_;
+                return hz;
+        }
 
         void updateHz()
         {

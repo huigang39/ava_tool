@@ -19,3 +19,7 @@ std::string nativeDlgSave(const std::string                  &title,
 
 // Blocking pick-directory dialog. Returns chosen path, or "" if cancelled.
 std::string nativeDlgPickDir(const std::string &title);
+
+// Platform-correct fopen for a UTF-8 encoded path (needed on Windows where
+// the C runtime uses ANSI codepage). Equivalent to fopen(path, mode) on POSIX.
+FILE *nativeFopen(const std::string &utf8Path, const char *mode);

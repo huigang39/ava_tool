@@ -3,6 +3,12 @@
 #include <cstdlib>
 #include <string>
 
+FILE *
+nativeFopen(const std::string &utf8Path, const char *mode)
+{
+        return fopen(utf8Path.c_str(), mode);
+}
+
 static std::string
 runCmd(const std::string &cmd)
 {

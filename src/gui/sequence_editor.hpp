@@ -40,7 +40,7 @@ struct SeqLogEntry {
         std::string desc;  // e.g. "Write: target.voltage" or "SDK: Init" or "EXCEPTION"
         std::string value; // e.g. "= 3.3" or "OK: 0" or "FAIL: timeout" or ex.what()
         bool        ok{true};
-        uint64_t    tsMs{0}; // ms since midnight (wall-clock, for display)
+        uint64_t    tsMs{0}; // ms since epoch (wall-clock, for display)
 };
 
 // Payload for dragging a function/method out of an SDK Debug window.
@@ -64,7 +64,8 @@ struct SdkStepInfo {
         int                      objIdx{0};
         std::vector<std::string> args;
         std::string              label;
-        std::string              pyFuncName; // Python function name (when isPython == true)
+        std::string              pyFuncName;      // Python function name (when isPython == true)
+        char                     resultVar[32]{}; // LOCAL variable to receive return value (empty = discard)
 };
 
 // Kept for backward compatibility: SdkCall is no longer a user-creatable step
@@ -116,6 +117,10 @@ class SequenceEditor
       public:
         // Wired by Gui: read a LOCAL variable buffer for condition evaluation.
         std::function<void *(const std::string &)> onGetLocalBuf_;
+        // Wired by Gui: return the DataType of a LOCAL variable (for type-aware write-back).
+        std::function<DataType(const std::string &)> onGetLocalVarDataType_;
+        // Wired by Gui: notify the variable manager that a LOCAL variable's buffer was written.
+        std::function<void(const std::string &)> onLocalVarWritten_;
         // Wired by Gui: create a new LOCAL scalar variable in the variable manager.
         std::function<void(const std::string &, DataType, size_t)> onAddLocalVar_;
         // Wired by Gui: create a new LOCAL struct variable in the variable manager.
@@ -198,6 +203,8 @@ class SequenceEditor
         std::atomic<bool>        seqDone_{false};
         std::vector<SeqLogEntry> seqLog_;
         float                    seqLogHeight_{120.0f};
+        bool                     seqLogCollapsed_{false};
+        static constexpr int     kMaxLogEntries{500};
 
         std::vector<std::weak_ptr<SdkPanel>> sdkPanels_;
 };
