@@ -27,6 +27,108 @@
 #include "platform/native_dlg.hpp"
 #include "timeops.h"
 
+static void
+showPathTooltipIfHovered(const char *path)
+{
+        if (path && path[0] && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", path);
+}
+
+// ─── drawSdkStructFieldRows ───────────────────────────────────────────────────
+// Shared struct-field editor used by both the SDK caller and the sequence editor.
+
+bool
+drawSdkStructFieldRows(const CStructDecl &sd, uint8_t *buf, size_t bufSize, int idSalt)
+{
+        if (!buf || bufSize < sd.totalSize)
+                return false;
+
+        bool edited = false;
+        for (size_t fi = 0; fi < sd.fields.size(); ++fi) {
+                const auto &field = sd.fields[fi];
+                if (field.isArray) {
+                        size_t esz = ctypeSize(field.arrayElemType);
+                        for (size_t ai = 0; ai < field.arrayCount; ++ai) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::TextDisabled("  .%s[%zu]  %s", field.name.c_str(), ai, ctypeLabel(field.arrayElemType));
+                                ImGui::TableSetColumnIndex(2);
+                                char fid[64];
+                                snprintf(fid, sizeof(fid), "##af%d_%zu_%zu", idSalt, fi, ai);
+                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                uint8_t *p2 = buf + field.offset + ai * esz;
+                                if (field.arrayElemType == CType::F64) {
+                                        double v;
+                                        memcpy(&v, p2, 8);
+                                        if (ImGui::InputDouble(fid, &v, 0, 0, "%.6g")) {
+                                                memcpy(p2, &v, 8);
+                                                edited = true;
+                                        }
+                                } else if (field.arrayElemType == CType::F32) {
+                                        float v;
+                                        memcpy(&v, p2, 4);
+                                        if (ImGui::InputFloat(fid, &v)) {
+                                                memcpy(p2, &v, 4);
+                                                edited = true;
+                                        }
+                                } else {
+                                        int iv = 0;
+                                        memcpy(&iv, p2, std::min(esz, (size_t)4));
+                                        if (ImGui::InputInt(fid, &iv)) {
+                                                memcpy(p2, &iv, std::min(esz, (size_t)4));
+                                                edited = true;
+                                        }
+                                }
+                        }
+                } else if (field.type == CType::F64) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextDisabled("  .%s  double", field.name.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        char fid[64];
+                        snprintf(fid, sizeof(fid), "##df%d_%zu", idSalt, fi);
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        double v;
+                        memcpy(&v, buf + field.offset, 8);
+                        if (ImGui::InputDouble(fid, &v, 0, 0, "%.6g")) {
+                                memcpy(buf + field.offset, &v, 8);
+                                edited = true;
+                        }
+                } else if (field.type == CType::F32) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextDisabled("  .%s  float", field.name.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        char fid[64];
+                        snprintf(fid, sizeof(fid), "##ff%d_%zu", idSalt, fi);
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        float v;
+                        memcpy(&v, buf + field.offset, 4);
+                        if (ImGui::InputFloat(fid, &v)) {
+                                memcpy(buf + field.offset, &v, 4);
+                                edited = true;
+                        }
+                } else {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextDisabled("  .%s  %s", field.name.c_str(), ctypeLabel(field.type));
+                        ImGui::TableSetColumnIndex(2);
+                        char fid[64];
+                        snprintf(fid, sizeof(fid), "##if%d_%zu", idSalt, fi);
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        int64_t v = 0;
+                        memcpy(&v, buf + field.offset, std::min(field.size, (size_t)8));
+                        int iv = (int)v;
+                        if (ImGui::InputInt(fid, &iv)) {
+                                v = iv;
+                                memcpy(buf + field.offset, &v, std::min(field.size, (size_t)8));
+                                edited = true;
+                        }
+                }
+        }
+        return edited;
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 void
@@ -105,6 +207,7 @@ SdkPanel::selectFn(int idx)
         selectedFnIdx_ = idx;
         fnLastResult_.clear();
         fnLastResultOk_ = false;
+        fnResultVar_[0] = '\0'; // result-var name is per-function, not shared
         if (idx < 0 || idx >= (int)parseResult_.functions.size()) {
                 fnArgBufs_.clear();
                 return;
@@ -132,6 +235,7 @@ SdkPanel::selectMethod(int classIdx, int methodIdx)
 
         selectedClassIdx_  = classIdx;
         selectedMethodIdx_ = methodIdx;
+        methResultVar_[0]  = '\0'; // result-var name is per-method, not shared
 
         if (classIdx < 0 || classIdx >= (int)parseResult_.classes.size()) {
                 methArgBufs_.clear();
@@ -197,7 +301,7 @@ SdkPanel::doCallC()
         const CFuncDecl         &fn = parseResult_.functions[selectedFnIdx_];
         std::vector<std::string> args(fn.params.size());
         for (size_t i = 0; i < fn.params.size(); ++i)
-                args[i] = fnArgBufs_[i].text;
+                args[i] = resolveArgVar(fnArgBufs_[i].text, fn.params[i]);
 
         CallResult res = loader_.call(fn, args);
 
@@ -214,18 +318,10 @@ SdkPanel::doCallC()
 
         double tsSec = sessionTimeSec();
         pushHistory(callStr, fnLastResult_, res.ok, tsSec);
-        if (res.ok && ctypeIsInteger(fn.retType))
-                pushToMonitor(fn.name, static_cast<float>(res.rawU64), tsSec);
-
-        if (res.ok && fnResultVar_[0] != '\0' && onGetVarBuf_) {
-                void *buf = onGetVarBuf_(fnResultVar_);
-                if (buf) {
-                        int64_t v = (int64_t)res.rawU64;
-                        memcpy(buf, &v, sizeof(int64_t));
-                        if (onVarWritten_)
-                                onVarWritten_(fnResultVar_);
-                }
-        }
+        // Store the return value only into the user-chosen result variable (created
+        // manually via the "+" button); no auto-creation.
+        if (res.ok)
+                writeResultVar(fnResultVar_, res, fn.retType);
 }
 
 // ─── doCallMethod ─────────────────────────────────────────────────────────────
@@ -254,13 +350,24 @@ SdkPanel::doCallMethod()
         }
 
         std::vector<std::string> args(meth.params.size());
-        for (size_t i = 0; i < meth.params.size(); ++i)
-                args[i] = methArgBufs_[i].text;
-
-        std::vector<void *> structPtrs(meth.params.size(), nullptr);
+        std::vector<void *>      structPtrs(meth.params.size(), nullptr);
+        // Default struct buffers come from the inline field editor.
         for (size_t i = 0; i < structBufs_.size(); ++i) {
                 if (structBufs_[i].decl && !structBufs_[i].data.empty())
                         structPtrs[i] = structBufs_[i].data.data();
+        }
+        for (size_t i = 0; i < meth.params.size(); ++i) {
+                const std::string raw = methArgBufs_[i].text;
+                // "&var" bound to a struct param → use that LOCAL variable's buffer instead
+                // of the inline editor's buffer.
+                if (raw.size() > 1 && raw[0] == '&' && findParamStruct(meth.params[i]) && onGetVarBuf_) {
+                        if (void *buf = onGetVarBuf_(raw.substr(1))) {
+                                structPtrs[i] = buf;
+                                args[i]       = raw;
+                                continue;
+                        }
+                }
+                args[i] = resolveArgVar(raw, meth.params[i]);
         }
 
         CallResult res = loader_.callMethod(thisPtr, meth, args, structPtrs);
@@ -295,22 +402,11 @@ SdkPanel::doCallMethod()
 
         double tsSec = sessionTimeSec();
         pushHistory(callStr, display, res.ok, tsSec);
-        if (res.ok && ctypeIsInteger(meth.retType)) {
-                std::string chKey = cls.name + "::" + meth.name;
-                pushToMonitor(chKey, static_cast<float>(res.rawU64), tsSec);
-        }
         if (!res.ok)
                 setStatus(res.error, true);
-
-        if (res.ok && methResultVar_[0] != '\0' && onGetVarBuf_) {
-                void *buf = onGetVarBuf_(methResultVar_);
-                if (buf) {
-                        int64_t v = (int64_t)res.rawU64;
-                        memcpy(buf, &v, sizeof(int64_t));
-                        if (onVarWritten_)
-                                onVarWritten_(methResultVar_);
-                }
-        }
+        // Store the return value only into the user-chosen result variable.
+        if (res.ok)
+                writeResultVar(methResultVar_, res, meth.retType);
 }
 
 // ─── doNewObject ──────────────────────────────────────────────────────────────
@@ -490,6 +586,84 @@ SdkPanel::findParamStruct(const CParam &p) const
         if (raw.size() > 6 && raw.substr(0, 6) == "const ")
                 raw = raw.substr(6);
         return findStruct(parseResult_, raw);
+}
+
+// ─── resolveArgVar ────────────────────────────────────────────────────────────
+
+std::string
+SdkPanel::resolveArgVar(const std::string &raw, const CParam &p) const
+{
+        if (raw.size() < 2)
+                return raw;
+        if (raw[0] == '&' && onGetVarBuf_) {
+                // Pointer/reference param bound to a LOCAL buffer — pass its address.
+                if (void *buf = onGetVarBuf_(raw.substr(1))) {
+                        char h[32];
+                        snprintf(h, sizeof(h), "0x%llx", (unsigned long long)(uintptr_t)buf);
+                        return h;
+                }
+        } else if (raw[0] == '$' && onReadLocalVar_) {
+                // Value param bound to a LOCAL variable — substitute its current value.
+                double v = 0;
+                if (onReadLocalVar_(raw.substr(1), v)) {
+                        char b[64];
+                        if (ctypeIsFloat(p.type))
+                                snprintf(b, sizeof(b), "%g", v);
+                        else
+                                snprintf(b, sizeof(b), "%lld", (long long)(int64_t)v);
+                        return b;
+                }
+        }
+        return raw;
+}
+
+// ─── drawParamVarButtons ──────────────────────────────────────────────────────
+
+void
+SdkPanel::drawParamVarButtons(char *argBuf, size_t argBufSz, const CParam &p, int salt)
+{
+        std::string rt = p.rawType;
+        while (!rt.empty() && (rt.back() == ' ' || rt.back() == '\t'))
+                rt.pop_back();
+        bool               isPtr = !rt.empty() && (rt.back() == '*' || rt.back() == '&');
+        const CStructDecl *sd    = findParamStruct(p);
+        std::string        pn    = p.name.empty() ? ("arg" + std::to_string(salt)) : p.name;
+
+        // "+" — create a LOCAL variable for this parameter.
+        if (onCreateLocalVar_) {
+                ImGui::SameLine(0, 2);
+                char id[24];
+                snprintf(id, sizeof(id), "+##pc%d", salt);
+                if (ImGui::SmallButton(id))
+                        onCreateLocalVar_(pn, p.type, sd);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Add this parameter as a variable", "把该参数添加为变量"));
+        }
+
+        // "v" — pick an existing LOCAL variable and bind it to this argument.
+        if (onListLocalVars_) {
+                ImGui::SameLine(0, 2);
+                char btnId[24], popId[24];
+                snprintf(btnId, sizeof(btnId), "v##pv%d", salt);
+                snprintf(popId, sizeof(popId), "##pvp%d", salt);
+                if (ImGui::SmallButton(btnId))
+                        ImGui::OpenPopup(popId);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Use a variable for this argument", "用变量作为该参数"));
+                if (ImGui::BeginPopup(popId)) {
+                        auto vars = onListLocalVars_();
+                        if (vars.empty())
+                                ImGui::TextDisabled("%s", tr("(no variables)", "(无变量)"));
+                        for (const auto &vn : vars) {
+                                if (ImGui::Selectable(vn.c_str())) {
+                                        std::string bound = (isPtr ? "&" : "$") + vn;
+                                        strncpy(argBuf, bound.c_str(), argBufSz - 1);
+                                        argBuf[argBufSz - 1] = '\0';
+                                }
+                        }
+                        ImGui::EndPopup();
+                }
+        }
 }
 
 // ─── Python runner script (embedded) ─────────────────────────────────────────
@@ -1275,7 +1449,9 @@ SdkPanel::drawCFunctionsTab()
                                                 ImGui::Text("[%zu]", i);
                                         ImGui::TableSetColumnIndex(2);
                                         if (i < fnArgBufs_.size()) {
-                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                bool hasBtns = onCreateLocalVar_ || onListLocalVars_;
+                                                ImGui::SetNextItemWidth(hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW
+                                                                                : -FLT_MIN);
                                                 if (isCharP)
                                                         ImGui::InputText(id, fnArgBufs_[i].text, sizeof(ArgBuf::text));
                                                 else if (ctypeIsFloat(p.type))
@@ -1289,6 +1465,7 @@ SdkPanel::drawCFunctionsTab()
                                                                          sizeof(ArgBuf::text),
                                                                          ImGuiInputTextFlags_CharsHexadecimal |
                                                                              ImGuiInputTextFlags_CharsDecimal);
+                                                drawParamVarButtons(fnArgBufs_[i].text, sizeof(ArgBuf::text), p, (int)i);
                                         }
                                 }
 
@@ -1301,25 +1478,39 @@ SdkPanel::drawCFunctionsTab()
                                         ImGui::TableSetColumnIndex(1);
                                         ImGui::TextUnformatted(tr("return", "返回值"));
                                         ImGui::TableSetColumnIndex(2);
-                                        float rvW = onListLocalVars_ ? ImGui::GetContentRegionAvail().x - 26.0f : -1.0f;
-                                        if (rvW > 0.0f)
-                                                ImGui::SetNextItemWidth(rvW);
+                                        std::vector<std::string> localVars;
+                                        if (onListLocalVars_)
+                                                localVars = onListLocalVars_();
+                                        bool  hasCreate = onCreateLocalVar_ && !ctypeIsVoid(fn.retType);
+                                        bool  hasPick   = !localVars.empty();
+                                        float reserve   = (hasCreate ? 24.0f : 0.0f) + (hasPick ? 24.0f : 0.0f);
+                                        float rvW = reserve > 0.0f ? ImGui::GetContentRegionAvail().x - reserve : -FLT_MIN;
+                                        ImGui::SetNextItemWidth(rvW);
                                         ImGui::InputTextWithHint(
                                             "##fnrv", tr("variable name", "变量名"), fnResultVar_, sizeof(fnResultVar_));
-                                        if (onListLocalVars_) {
-                                                auto localVars = onListLocalVars_();
-                                                if (!localVars.empty()) {
-                                                        ImGui::SameLine(0, 2);
-                                                        if (ImGui::SmallButton("v##fnrvpick"))
-                                                                ImGui::OpenPopup("##fnrvpop");
-                                                        if (ImGui::BeginPopup("##fnrvpop")) {
-                                                                for (const auto &vn : localVars)
-                                                                        if (ImGui::Selectable(vn.c_str()))
-                                                                                strncpy(fnResultVar_,
-                                                                                        vn.c_str(),
-                                                                                        sizeof(fnResultVar_) - 1);
-                                                                ImGui::EndPopup();
-                                                        }
+                                        if (hasCreate) {
+                                                ImGui::SameLine(0, 2);
+                                                if (ImGui::SmallButton("+##fnrvnew")) {
+                                                        std::string vn = fnResultVar_[0] ? std::string(fnResultVar_) : fn.name;
+                                                        onCreateLocalVar_(vn, fn.retType, nullptr);
+                                                        strncpy(fnResultVar_, vn.c_str(), sizeof(fnResultVar_) - 1);
+                                                        fnResultVar_[sizeof(fnResultVar_) - 1] = '\0';
+                                                }
+                                                if (ImGui::IsItemHovered())
+                                                        ImGui::SetTooltip("%s", tr("Create result variable", "创建结果变量"));
+                                        }
+                                        if (hasPick) {
+                                                ImGui::SameLine(0, 2);
+                                                if (ImGui::SmallButton("v##fnrvpick"))
+                                                        ImGui::OpenPopup("##fnrvpop");
+                                                if (ImGui::BeginPopup("##fnrvpop")) {
+                                                        for (const auto &vn : localVars)
+                                                                if (ImGui::Selectable(vn.c_str())) {
+                                                                        strncpy(
+                                                                            fnResultVar_, vn.c_str(), sizeof(fnResultVar_) - 1);
+                                                                        fnResultVar_[sizeof(fnResultVar_) - 1] = '\0';
+                                                                }
+                                                        ImGui::EndPopup();
                                                 }
                                         }
                                 }
@@ -1575,102 +1766,23 @@ SdkPanel::drawCppClassesTab()
                                         ImGui::SetNextItemOpen(expanded, ImGuiCond_Always);
                                         expanded = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_SpanFullWidth);
 
+                                        // col2: show whether this struct uses the inline editor or is bound to a
+                                        // LOCAL variable, plus the [+][v] buttons.
+                                        ImGui::TableSetColumnIndex(2);
+                                        if (pi < methArgBufs_.size()) {
+                                                const char *bound = methArgBufs_[pi].text;
+                                                if (bound[0] == '&')
+                                                        ImGui::TextDisabled("%s", bound);
+                                                else
+                                                        ImGui::TextDisabled("%s", tr("(inline)", "(内联编辑)"));
+                                                drawParamVarButtons(methArgBufs_[pi].text, sizeof(ArgBuf::text), p, (int)pi);
+                                        }
+
+                                        // Inline field editor is used only when not bound to a "&var".
+                                        bool bound = (pi < methArgBufs_.size() && methArgBufs_[pi].text[0] == '&');
                                         if (expanded) {
-                                                if (buf.size() >= sd->totalSize) {
-                                                        for (size_t fi = 0; fi < sd->fields.size(); ++fi) {
-                                                                const auto &field = sd->fields[fi];
-                                                                if (field.isArray) {
-                                                                        size_t esz = ctypeSize(field.arrayElemType);
-                                                                        for (size_t ai = 0; ai < field.arrayCount; ++ai) {
-                                                                                ImGui::TableNextRow();
-                                                                                ImGui::TableSetColumnIndex(1);
-                                                                                ImGui::TextDisabled(
-                                                                                    "  .%s[%zu]  %s",
-                                                                                    field.name.c_str(),
-                                                                                    ai,
-                                                                                    ctypeLabel(field.arrayElemType));
-                                                                                ImGui::TableSetColumnIndex(2);
-                                                                                char fid[64];
-                                                                                snprintf(fid,
-                                                                                         sizeof(fid),
-                                                                                         "##af%zu_%zu_%zu",
-                                                                                         pi,
-                                                                                         fi,
-                                                                                         ai);
-                                                                                ImGui::SetNextItemWidth(-FLT_MIN);
-                                                                                uint8_t *p2 =
-                                                                                    buf.data() + field.offset + ai * esz;
-                                                                                if (field.arrayElemType == CType::F64) {
-                                                                                        double v;
-                                                                                        memcpy(&v, p2, 8);
-                                                                                        if (ImGui::InputDouble(
-                                                                                                fid, &v, 0, 0, "%.6g"))
-                                                                                                memcpy(p2, &v, 8);
-                                                                                } else if (field.arrayElemType == CType::F32) {
-                                                                                        float v;
-                                                                                        memcpy(&v, p2, 4);
-                                                                                        if (ImGui::InputFloat(fid, &v))
-                                                                                                memcpy(p2, &v, 4);
-                                                                                } else {
-                                                                                        int iv = 0;
-                                                                                        memcpy(
-                                                                                            &iv, p2, std::min(esz, (size_t)4));
-                                                                                        if (ImGui::InputInt(fid, &iv))
-                                                                                                memcpy(
-                                                                                                    p2,
-                                                                                                    &iv,
-                                                                                                    std::min(esz, (size_t)4));
-                                                                                }
-                                                                        }
-                                                                } else if (field.type == CType::F64) {
-                                                                        ImGui::TableNextRow();
-                                                                        ImGui::TableSetColumnIndex(1);
-                                                                        ImGui::TextDisabled("  .%s  double",
-                                                                                            field.name.c_str());
-                                                                        ImGui::TableSetColumnIndex(2);
-                                                                        char fid[64];
-                                                                        snprintf(fid, sizeof(fid), "##df%zu_%zu", pi, fi);
-                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
-                                                                        double v;
-                                                                        memcpy(&v, buf.data() + field.offset, 8);
-                                                                        if (ImGui::InputDouble(fid, &v, 0, 0, "%.6g"))
-                                                                                memcpy(buf.data() + field.offset, &v, 8);
-                                                                } else if (field.type == CType::F32) {
-                                                                        ImGui::TableNextRow();
-                                                                        ImGui::TableSetColumnIndex(1);
-                                                                        ImGui::TextDisabled("  .%s  float", field.name.c_str());
-                                                                        ImGui::TableSetColumnIndex(2);
-                                                                        char fid[64];
-                                                                        snprintf(fid, sizeof(fid), "##ff%zu_%zu", pi, fi);
-                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
-                                                                        float v;
-                                                                        memcpy(&v, buf.data() + field.offset, 4);
-                                                                        if (ImGui::InputFloat(fid, &v))
-                                                                                memcpy(buf.data() + field.offset, &v, 4);
-                                                                } else {
-                                                                        ImGui::TableNextRow();
-                                                                        ImGui::TableSetColumnIndex(1);
-                                                                        ImGui::TextDisabled("  .%s  %s",
-                                                                                            field.name.c_str(),
-                                                                                            ctypeLabel(field.type));
-                                                                        ImGui::TableSetColumnIndex(2);
-                                                                        char fid[64];
-                                                                        snprintf(fid, sizeof(fid), "##if%zu_%zu", pi, fi);
-                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
-                                                                        int64_t v = 0;
-                                                                        memcpy(&v,
-                                                                               buf.data() + field.offset,
-                                                                               std::min(field.size, (size_t)8));
-                                                                        int iv = (int)v;
-                                                                        if (ImGui::InputInt(fid, &iv)) {
-                                                                                v = iv;
-                                                                                memcpy(buf.data() + field.offset,
-                                                                                       &v,
-                                                                                       std::min(field.size, (size_t)8));
-                                                                        }
-                                                                }
-                                                        }
-                                                }
+                                                if (!bound)
+                                                        drawSdkStructFieldRows(*sd, buf.data(), buf.size(), (int)pi);
                                                 ImGui::TreePop();
                                         }
                                         continue;
@@ -1679,18 +1791,19 @@ SdkPanel::drawCppClassesTab()
                                 // Enum parameter → dropdown row.
                                 const CEnumDecl *ed = findParamEnum(p);
                                 if (ed && !ed->values.empty()) {
-                                        int64_t curVal = 0;
-                                        if (pi < methArgBufs_.size())
-                                                curVal = strtoll(methArgBufs_[pi].text, nullptr, 0);
-                                        const char *preview2 = ed->values[0].name.c_str();
+                                        const char *boundTxt = (pi < methArgBufs_.size()) ? methArgBufs_[pi].text : "";
+                                        bool        isBound  = boundTxt[0] == '$' || boundTxt[0] == '&';
+                                        int64_t     curVal   = isBound ? 0 : strtoll(boundTxt, nullptr, 0);
+                                        const char *preview2 = isBound ? boundTxt : ed->values[0].name.c_str();
                                         int         curIdx   = 0;
-                                        for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
-                                                if (ed->values[ei].value == curVal) {
-                                                        preview2 = ed->values[ei].name.c_str();
-                                                        curIdx   = ei;
-                                                        break;
+                                        if (!isBound)
+                                                for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
+                                                        if (ed->values[ei].value == curVal) {
+                                                                preview2 = ed->values[ei].name.c_str();
+                                                                curIdx   = ei;
+                                                                break;
+                                                        }
                                                 }
-                                        }
                                         ImGui::TableNextRow();
                                         ImGui::TableSetColumnIndex(0);
                                         ImGui::TextUnformatted(ed->name.c_str());
@@ -1699,7 +1812,9 @@ SdkPanel::drawCppClassesTab()
                                         ImGui::TableSetColumnIndex(2);
                                         char cmId[64];
                                         snprintf(cmId, sizeof(cmId), "##ec%zu", pi);
-                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                        bool hasBtns = onCreateLocalVar_ || onListLocalVars_;
+                                        ImGui::SetNextItemWidth(hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW
+                                                                        : -FLT_MIN);
                                         if (ImGui::BeginCombo(cmId, preview2)) {
                                                 for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
                                                         bool sel2 = (ei == curIdx);
@@ -1720,6 +1835,8 @@ SdkPanel::drawCppClassesTab()
                                                 }
                                                 ImGui::EndCombo();
                                         }
+                                        if (pi < methArgBufs_.size())
+                                                drawParamVarButtons(methArgBufs_[pi].text, sizeof(ArgBuf::text), p, (int)pi);
                                         continue;
                                 }
 
@@ -1737,7 +1854,9 @@ SdkPanel::drawCppClassesTab()
                                 ImGui::TableSetColumnIndex(2);
                                 if (pi < methArgBufs_.size()) {
                                         bool isCharP = ctypeIsCharPtr(p.type, p.rawType);
-                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                        bool hasBtns = onCreateLocalVar_ || onListLocalVars_;
+                                        ImGui::SetNextItemWidth(hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW
+                                                                        : -FLT_MIN);
                                         if (isCharP)
                                                 ImGui::InputText(rowId, methArgBufs_[pi].text, sizeof(ArgBuf::text));
                                         else if (ctypeIsFloat(p.type))
@@ -1751,6 +1870,7 @@ SdkPanel::drawCppClassesTab()
                                                                  sizeof(ArgBuf::text),
                                                                  ImGuiInputTextFlags_CharsHexadecimal |
                                                                      ImGuiInputTextFlags_CharsDecimal);
+                                        drawParamVarButtons(methArgBufs_[pi].text, sizeof(ArgBuf::text), p, (int)pi);
                                 }
                         }
 
@@ -1763,25 +1883,38 @@ SdkPanel::drawCppClassesTab()
                                 ImGui::TableSetColumnIndex(1);
                                 ImGui::TextUnformatted(tr("return", "返回值"));
                                 ImGui::TableSetColumnIndex(2);
-                                float rvW = onListLocalVars_ ? ImGui::GetContentRegionAvail().x - 26.0f : -1.0f;
-                                if (rvW > 0.0f)
-                                        ImGui::SetNextItemWidth(rvW);
+                                std::vector<std::string> localVars;
+                                if (onListLocalVars_)
+                                        localVars = onListLocalVars_();
+                                bool  hasCreate = onCreateLocalVar_ && !ctypeIsVoid(meth.retType);
+                                bool  hasPick   = !localVars.empty();
+                                float reserve   = (hasCreate ? 24.0f : 0.0f) + (hasPick ? 24.0f : 0.0f);
+                                float rvW       = reserve > 0.0f ? ImGui::GetContentRegionAvail().x - reserve : -FLT_MIN;
+                                ImGui::SetNextItemWidth(rvW);
                                 ImGui::InputTextWithHint(
                                     "##methrv", tr("variable name", "变量名"), methResultVar_, sizeof(methResultVar_));
-                                if (onListLocalVars_) {
-                                        auto localVars = onListLocalVars_();
-                                        if (!localVars.empty()) {
-                                                ImGui::SameLine(0, 2);
-                                                if (ImGui::SmallButton("v##methrvpick"))
-                                                        ImGui::OpenPopup("##methrvpop");
-                                                if (ImGui::BeginPopup("##methrvpop")) {
-                                                        for (const auto &vn : localVars)
-                                                                if (ImGui::Selectable(vn.c_str()))
-                                                                        strncpy(methResultVar_,
-                                                                                vn.c_str(),
-                                                                                sizeof(methResultVar_) - 1);
-                                                        ImGui::EndPopup();
-                                                }
+                                if (hasCreate) {
+                                        ImGui::SameLine(0, 2);
+                                        if (ImGui::SmallButton("+##methrvnew")) {
+                                                std::string vn = methResultVar_[0] ? std::string(methResultVar_) : meth.name;
+                                                onCreateLocalVar_(vn, meth.retType, nullptr);
+                                                strncpy(methResultVar_, vn.c_str(), sizeof(methResultVar_) - 1);
+                                                methResultVar_[sizeof(methResultVar_) - 1] = '\0';
+                                        }
+                                        if (ImGui::IsItemHovered())
+                                                ImGui::SetTooltip("%s", tr("Create result variable", "创建结果变量"));
+                                }
+                                if (hasPick) {
+                                        ImGui::SameLine(0, 2);
+                                        if (ImGui::SmallButton("v##methrvpick"))
+                                                ImGui::OpenPopup("##methrvpop");
+                                        if (ImGui::BeginPopup("##methrvpop")) {
+                                                for (const auto &vn : localVars)
+                                                        if (ImGui::Selectable(vn.c_str())) {
+                                                                strncpy(methResultVar_, vn.c_str(), sizeof(methResultVar_) - 1);
+                                                                methResultVar_[sizeof(methResultVar_) - 1] = '\0';
+                                                        }
+                                                ImGui::EndPopup();
                                         }
                                 }
                         }
@@ -1867,6 +2000,7 @@ SdkPanel::drawPythonTab()
         if (pyPath_[0]) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("— %s", pyPath_);
+                showPathTooltipIfHovered(pyPath_);
         }
 
         ImGui::Spacing();
@@ -2382,6 +2516,9 @@ SdkPanel::draw()
                         }
                         if (loader_.isLoaded()) {
                                 ImGui::SameLine();
+                                if (ImGui::Button(tr("View Symbols##sym", "查看符号##sym")))
+                                        showSymbolsWindow_ = true;
+                                ImGui::SameLine();
                                 if (ui::Button(tr("Unload", "卸载"), ui::BtnStyle::Danger)) {
                                         loader_.unload();
                                         setStatus(tr("Unloaded", "已卸载"), false);
@@ -2390,6 +2527,7 @@ SdkPanel::draw()
                         if (dllPath_[0]) {
                                 ImGui::SameLine();
                                 ImGui::TextDisabled("— %s", dllPath_);
+                                showPathTooltipIfHovered(dllPath_);
                         }
 
                         // Header browse row
@@ -2404,6 +2542,7 @@ SdkPanel::draw()
                         if (headerPath_[0]) {
                                 ImGui::SameLine();
                                 ImGui::TextDisabled("— %s", headerPath_);
+                                showPathTooltipIfHovered(headerPath_);
                         }
 
                         ImGui::Spacing();
@@ -2439,6 +2578,79 @@ SdkPanel::draw()
         }
 
         ImGui::End();
+
+        // Symbols viewer (separate dockable window).
+        drawSymbolsWindow();
+}
+
+// ─── drawSymbolsWindow ───────────────────────────────────────────────────────
+
+void
+SdkPanel::drawSymbolsWindow()
+{
+        if (!showSymbolsWindow_)
+                return;
+
+        char winTitle[96];
+        snprintf(winTitle, sizeof(winTitle), "%s###SdkSymbols%d", tr("SDK Symbols", "SDK 符号"), winId_);
+        ImGui::SetNextWindowSize(ImVec2(620, 420), ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin(winTitle, &showSymbolsWindow_)) {
+                ImGui::End();
+                return;
+        }
+
+        const auto &syms = loader_.exports();
+
+        ImGui::Text("%s: %d", tr("Total symbols", "符号总数"), (int)syms.size());
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##symfilter", tr("Filter symbols…", "过滤符号…"), symbolFilter_, sizeof(symbolFilter_));
+
+        // Case-insensitive substring match.
+        auto containsCI = [](const std::string &hay, const char *needle) -> bool {
+                if (!needle || !needle[0])
+                        return true;
+                std::string h = hay, n = needle;
+                std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return (char)tolower(c); });
+                std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return (char)tolower(c); });
+                return h.find(n) != std::string::npos;
+        };
+
+        static ImGuiTableFlags tblFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+                                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+        if (ImGui::BeginTable("##symtbl", 3, tblFlags)) {
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                ImGui::TableSetupColumn(tr("Demangled", "解析名称"), ImGuiTableColumnFlags_WidthStretch, 0.60f);
+                ImGui::TableSetupColumn(tr("Mangled", "符号名"), ImGuiTableColumnFlags_WidthStretch, 0.40f);
+                ImGui::TableHeadersRow();
+
+                int shown = 0;
+                for (int i = 0; i < (int)syms.size(); ++i) {
+                        const ExportedSymbol &s = syms[i];
+                        if (!containsCI(s.demangled, symbolFilter_) && !containsCI(s.mangled, symbolFilter_))
+                                continue;
+                        ++shown;
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::Text("%d", i);
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextUnformatted(s.demangled.c_str());
+                        // Click a row's demangled name to copy it to the clipboard.
+                        if (ImGui::IsItemClicked())
+                                ImGui::SetClipboardText(s.demangled.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::TextDisabled("%s", s.mangled.c_str());
+                        if (ImGui::IsItemClicked())
+                                ImGui::SetClipboardText(s.mangled.c_str());
+                }
+                ImGui::EndTable();
+
+                if (symbolFilter_[0])
+                        ImGui::TextDisabled("%s: %d", tr("Matched", "匹配"), shown);
+        }
+
+        ImGui::End();
 }
 
 // ─── pushHistory ─────────────────────────────────────────────────────────────
@@ -2460,14 +2672,17 @@ SdkPanel::pushHistory(const std::string &call, const std::string &result, bool o
         history_.push_back(std::move(e));
 }
 
-// ─── pushToMonitor ────────────────────────────────────────────────────────────
+// ─── writeResultVar ──────────────────────────────────────────────────────────
 
 void
-SdkPanel::pushToMonitor(const std::string &chanKey, float val, double tsSec)
+SdkPanel::writeResultVar(const std::string &name, const CallResult &res, CType retType)
 {
-        pinnedChannels_[chanKey] = val;
-        if (onMonitorPush_)
-                onMonitorPush_(chanKey, val, tsSec);
+        if (name.empty() || !onWriteLocalScalar_)
+                return;
+        if (ctypeIsInteger(retType))
+                onWriteLocalScalar_(name, (double)(int64_t)res.rawU64, false);
+        else if (ctypeIsFloat(retType))
+                onWriteLocalScalar_(name, res.rawF64, true);
 }
 
 // ─── evalCond ────────────────────────────────────────────────────────────────
@@ -2571,9 +2786,6 @@ SdkPanel::execStep(const SdkSeqStep &step, SeqCtx &ctx)
                                                         callStr += args[i];
                                                 }
                                                 callStr += ")";
-                                                if (res.ok && ctypeIsInteger(meth.retType))
-                                                        pushToMonitor(
-                                                            cls.name + "::" + meth.name, static_cast<float>(res.rawU64), ts);
                                         }
                                 }
                         }
@@ -3234,6 +3446,16 @@ SdkPanel::directCall(int ci, int mi, int objIdx, const std::vector<std::string> 
                                 structPtrs[i]  = buf;
                                 ptrVarNames[i] = vn;
                         }
+                } else if (effArgs[i].size() > 1 && effArgs[i][0] == '$' && onReadLocalVar_) {
+                        double v = 0;
+                        if (onReadLocalVar_(effArgs[i].substr(1), v)) {
+                                char b[64];
+                                if (i < meth.params.size() && ctypeIsFloat(meth.params[i].type))
+                                        snprintf(b, sizeof(b), "%g", v);
+                                else
+                                        snprintf(b, sizeof(b), "%lld", (long long)(int64_t)v);
+                                effArgs[i] = b;
+                        }
                 }
         }
 
@@ -3243,12 +3465,8 @@ SdkPanel::directCall(int ci, int mi, int objIdx, const std::vector<std::string> 
                         if (!vn.empty())
                                 onVarWritten_(vn);
 
-        std::string disp  = res.ok ? res.display : res.error;
-        double      tsSec = sessionTimeSec();
-        // Sequence-editor calls keep their own log (seqLog_); don't mirror into the
-        // SDK panel's call history.
-        if (res.ok && ctypeIsInteger(meth.retType))
-                pushToMonitor(cls.name + "::" + meth.name, static_cast<float>(res.rawU64), tsSec);
+        std::string disp = res.ok ? res.display : res.error;
+        // Sequence-editor calls keep their own log (seqLog_) and result-var handling.
 
         return {res.ok, disp, res.ok ? (int64_t)res.rawU64 : 0};
 }
@@ -3273,6 +3491,16 @@ SdkPanel::directCallC(int fi, const std::vector<std::string> &args)
                                 effArgs[i]     = addrStr;
                                 ptrVarNames[i] = vn;
                         }
+                } else if (effArgs[i].size() > 1 && effArgs[i][0] == '$' && onReadLocalVar_) {
+                        double v = 0;
+                        if (onReadLocalVar_(effArgs[i].substr(1), v)) {
+                                char b[64];
+                                if (i < fn.params.size() && ctypeIsFloat(fn.params[i].type))
+                                        snprintf(b, sizeof(b), "%g", v);
+                                else
+                                        snprintf(b, sizeof(b), "%lld", (long long)(int64_t)v);
+                                effArgs[i] = b;
+                        }
                 }
         }
 
@@ -3282,12 +3510,8 @@ SdkPanel::directCallC(int fi, const std::vector<std::string> &args)
                         if (!vn.empty())
                                 onVarWritten_(vn);
 
-        std::string disp  = res.ok ? res.display : res.error;
-        double      tsSec = sessionTimeSec();
-        // Sequence-editor calls keep their own log (seqLog_); don't mirror into the
-        // SDK panel's call history.
-        if (res.ok && ctypeIsInteger(fn.retType))
-                pushToMonitor(fn.name, static_cast<float>(res.rawU64), tsSec);
+        std::string disp = res.ok ? res.display : res.error;
+        // Sequence-editor calls keep their own log (seqLog_) and result-var handling.
 
         return {res.ok, disp, res.ok ? (int64_t)res.rawU64 : 0};
 }

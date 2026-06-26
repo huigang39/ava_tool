@@ -162,6 +162,17 @@ class SequenceEditor
         void drawStepDetail(SequenceStep &step);
         void drawBodySteps(std::vector<SequenceStep> &steps, int depth);
         void drawSdkStepDetail(SdkStepInfo &sdk, std::shared_ptr<SdkPanel> panel);
+        // Renders a struct-pointer SDK argument as an expandable row (type / tree / editable
+        // fields), like the SDK caller. Binds the param to an auto-created LOCAL struct
+        // variable on first expand. Returns true if it handled the row (caller should
+        // `continue`); false when param `p` is not a struct (caller renders it normally).
+        bool drawSdkStructArgRow(SdkPanel *panel, SdkStepInfo &sdk, int p, const std::string &pname, const std::string &ptype);
+        // Renders [+][v] buttons (SameLine) for an SDK argument so every parameter row —
+        // text, enum and struct — offers the same create/pick controls. "+" creates a LOCAL
+        // variable for the parameter; "v" picks an existing one and binds it as "&var"
+        // (pointer/reference) or "$var" (value).
+        void drawSdkArgButtons(
+            SdkPanel *panel, SdkStepInfo &sdk, int p, const std::string &pname, const std::string &ptype, bool isPtr);
         void acceptSdkPayload(const void *data, int insertAfter);
         // Build an SDK op from a drag payload; false if the source panel is gone.
         bool makeSdkOp(const SdkDragPayload &pl, SeqOp &out);

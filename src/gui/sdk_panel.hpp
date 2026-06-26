@@ -15,6 +15,13 @@
 #include "core/export_enum.hpp"
 #include "core/sdk_loader.hpp"
 
+// Render a struct's fields as editable sub-rows of the *current* 3-column ImGui
+// table (column 1 = ".field  type", column 2 = value input), writing edits into
+// `buf` at each field's offset. `idSalt` disambiguates widget IDs across params.
+// Shared by the SDK caller and the sequence editor so both look identical.
+// Returns true if any field value was edited this frame.
+bool drawSdkStructFieldRows(const CStructDecl &sd, uint8_t *buf, size_t bufSize, int idSalt);
+
 // ─── Python parse result ──────────────────────────────────────────────────────
 
 struct PyParam {
@@ -84,9 +91,18 @@ class SdkPanel
       public:
         bool open_{true}; // false = window closed → Gui prunes it from the list
 
-        // Set by Gui after construction to enable monitor/variable push.
-        // Callback: (channelName, value, sessionTimeSec) — called under caller's lock.
-        std::function<void(const std::string &, float, double)> onMonitorPush_;
+        // Set by Gui to write a numeric value into an EXISTING LOCAL variable (type-aware,
+        // never creates). Used to store a call's return value into the user-chosen result
+        // variable. No-op if no LOCAL variable with that name exists.
+        std::function<void(const std::string &name, double value, bool isFloat)> onWriteLocalScalar_;
+
+        // Set by Gui to create a LOCAL variable in the variable manager (the "+" buttons).
+        // For a struct type pass structDecl != nullptr; otherwise scalarType is used.
+        std::function<void(const std::string &name, CType scalarType, const CStructDecl *structDecl)> onCreateLocalVar_;
+
+        // Set by Gui to read the current value of a LOCAL variable (for "$var" value args).
+        // Returns false if no such LOCAL variable exists.
+        std::function<bool(const std::string &name, double &out)> onReadLocalVar_;
 
         // Set by Gui to connect SDK pointer/reference args to Variable LOCAL buffers.
         // onGetVarBuf_("varname") → returns stable buffer ptr (pre-allocated size), or nullptr.
@@ -229,11 +245,6 @@ class SdkPanel
         std::vector<HistEntry> history_;
         std::mutex             histMtx_; // protects history_ (background thread writes)
 
-        // ── monitor push ─────────────────────────────────────────────────────────
-        // Channel name → latest value (for display in the history header)
-        // Always-on: every integer-returning call is pushed to the monitor.
-        std::unordered_map<std::string, float> pinnedChannels_;
-
         // ── sequence ──────────────────────────────────────────────────────────────
         std::vector<SdkSeqStep> seqSteps_;
         int                     seqSelectedStep_{-1};
@@ -251,6 +262,10 @@ class SdkPanel
         std::string statusMsg_;
         bool        statusIsErr_{false};
 
+        // ── symbols viewer ──────────────────────────────────────────────────────────
+        bool showSymbolsWindow_{false};
+        char symbolFilter_[128]{};
+
         // ── helpers ───────────────────────────────────────────────────────────────
         void doLoadDll();
         void doParseHeader();
@@ -262,14 +277,29 @@ class SdkPanel
         void selectMethod(int classIdx, int methodIdx);
         void setStatus(const std::string &msg, bool isErr);
         void pushHistory(const std::string &call, const std::string &result, bool ok, double tsSec);
-        void pushToMonitor(const std::string &chanKey, float val, double tsSec);
+        // Store a successful call's integer/float return value into the LOCAL variable
+        // named `name` (no-op if name is empty or the variable does not exist).
+        void writeResultVar(const std::string &name, const CallResult &res, CType retType);
 
         const CEnumDecl   *findParamEnum(const CParam &p) const;
         const CStructDecl *findParamStruct(const CParam &p) const;
 
+        // Resolve a "&var" (→ LOCAL buffer address) or "$var" (→ current value) argument
+        // string against the variable manager. Plain literals pass through unchanged.
+        std::string resolveArgVar(const std::string &raw, const CParam &p) const;
+
+        // Renders [+][v] buttons (SameLine) after a parameter's value widget. "+" creates a
+        // LOCAL variable for the parameter; "v" picks an existing LOCAL variable and binds it
+        // into argBuf as "&var" (pointer/reference param) or "$var" (value param). `salt`
+        // makes widget IDs unique. Width for the buttons must be reserved by the caller
+        // (see kParamBtnsW).
+        void             drawParamVarButtons(char *argBuf, size_t argBufSz, const CParam &p, int salt);
+        static const int kParamBtnsW = 48; // px to reserve for the [+][v] buttons
+
         void drawCFunctionsTab();
         void drawCppClassesTab();
         void drawPythonTab();
+        void drawSymbolsWindow();
 
         // ── Python tab ───────────────────────────────────────────────────────────
         char                pyPath_[512]{};

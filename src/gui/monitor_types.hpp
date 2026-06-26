@@ -9,6 +9,8 @@
 #include <string>
 #include <vector>
 
+class MonitorScope;
+
 // Payload carried when dragging a single scalar symbol from the symbol browser
 // onto a monitor scope. Serialised into the ImGui drag-drop system as POD.
 struct ChannelDropPayload {
@@ -63,6 +65,15 @@ struct StructChannelPayload {
         Entry entries[kMaxEntries];
         // See ChannelDropPayload::srcWatch.
         const void *srcWatch{nullptr};
+};
+
+struct ChannelMovePayload {
+        MonitorScope *srcScope;
+        // When isGroup is false: the exact channel key to move.
+        // When isGroup is true: a struct/array group path prefix; every channel whose
+        // key equals it or starts with "<chName>." is moved together.
+        char chName[128];
+        bool isGroup{false};
 };
 
 // A request, queued when a symbol-browser drag is dropped on a monitor, to mirror
