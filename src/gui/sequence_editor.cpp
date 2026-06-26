@@ -546,6 +546,68 @@ ptrTypeFromRaw(const std::string &rawType)
         return DataType::U32;
 }
 
+// ─── drawSdkStructArgRow ──────────────────────────────────────────────────────
+// Struct-pointer argument rendered like the SDK caller: an expandable tree whose
+// editable fields are backed by an auto-created LOCAL struct variable (bound via
+// the "&varname" arg convention the executor already understands).
+
+bool
+SequenceEditor::drawSdkStructArgRow(SdkPanel          *panel,
+                                    SdkStepInfo       &sdk,
+                                    int                p,
+                                    const std::string &pname,
+                                    const std::string &ptype)
+{
+        if (!panel || sdk.isPython)
+                return false;
+        const CStructDecl *sd = panel->getParamStructDecl(sdk.isCFunc, sdk.classIdx, sdk.methodIdx, p);
+        if (!sd)
+                return false;
+
+        // Name of the LOCAL struct variable this argument is bound to.
+        std::string varName;
+        if (!sdk.args[p].empty() && sdk.args[p][0] == '&')
+                varName = sdk.args[p].substr(1);
+        else
+                varName = pname.empty() ? ("arg" + std::to_string(p)) : pname;
+
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        ImGui::TextUnformatted(ptype.empty() ? "struct*" : ptype.c_str());
+
+        ImGui::TableSetColumnIndex(1);
+        char hdr[128];
+        snprintf(hdr, sizeof(hdr), "%s##sstk%d", pname.empty() ? "param" : pname.c_str(), p);
+        bool open = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_SpanFullWidth);
+
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextDisabled("&%s", varName.c_str());
+
+        if (open) {
+                // Bind to (and create) a LOCAL struct variable on first expand.
+                if (sdk.args[p].empty() || sdk.args[p][0] != '&') {
+                        if (onAddLocalStructVar_)
+                                onAddLocalStructVar_(varName, structDeclToFields(*sd), sd->totalSize);
+                        sdk.args[p] = "&" + varName;
+                        isModified_ = true;
+                }
+                void *buf = onGetLocalBuf_ ? onGetLocalBuf_(varName) : nullptr;
+                if (buf) {
+                        if (drawSdkStructFieldRows(*sd, (uint8_t *)buf, sd->totalSize, p)) {
+                                isModified_ = true;
+                                if (onLocalVarWritten_)
+                                        onLocalVarWritten_(varName);
+                        }
+                } else {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextDisabled("(%s)", tr("no buffer", "无缓冲"));
+                }
+                ImGui::TreePop();
+        }
+        return true;
+}
+
 // ─── drawBodySteps ────────────────────────────────────────────────────────────
 // Renders an inline editable list of steps (used for If/While/For bodies).
 
@@ -775,6 +837,12 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                                         ? panel->isCFuncParamPtrOrRef(op.sdk.methodIdx, p)
                                                                         : panel->isParamPtrOrRef(
                                                                               op.sdk.classIdx, op.sdk.methodIdx, p);
+                                                                // Struct param → expandable field editor (like the SDK caller).
+                                                                if (drawSdkStructArgRow(
+                                                                        panel.get(), op.sdk, p, pname, ptype)) {
+                                                                        ImGui::PopID();
+                                                                        continue;
+                                                                }
                                                                 ImGui::TableNextRow();
                                                                 ImGui::TableSetColumnIndex(0);
                                                                 ImGui::TextUnformatted(ptype.empty() ? "?" : ptype.c_str());
@@ -1801,6 +1869,15 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                                        op.sdk.classIdx,
                                                                                                        op.sdk.methodIdx,
                                                                                                        p);
+                                                                                // Struct param → expandable field editor.
+                                                                                if (drawSdkStructArgRow(panel.get(),
+                                                                                                        op.sdk,
+                                                                                                        p,
+                                                                                                        pname,
+                                                                                                        ptype)) {
+                                                                                        ImGui::PopID();
+                                                                                        continue;
+                                                                                }
 
                                                                                 ImGui::TableNextRow();
 

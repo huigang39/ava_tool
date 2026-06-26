@@ -695,26 +695,19 @@ classifyPreamble(const std::string &preamble)
                         }
                         return info;
                 }
-                if (toks[idx] == "struct") {
-                        info.kind            = ScopeKind::Struct;
-                        info.isPublicDefault = true;
-                        for (size_t k = idx + 1; k < toks.size(); ++k) {
-                                if (!toks[k].empty() && isIdChar(toks[k][0])) {
-                                        info.name = toks[k];
-                                        break;
-                                }
-                        }
-                        return info;
-                }
-                if (toks[idx] == "class") {
+                if (toks[idx] == "struct" || toks[idx] == "class") {
                         // Guard: don't trigger on "enum class" (we'd have seen "enum" first)
-                        info.kind = ScopeKind::Class;
+                        info.kind            = toks[idx] == "struct" ? ScopeKind::Struct : ScopeKind::Class;
+                        info.isPublicDefault = toks[idx] == "struct";
+                        // The class/struct name is the LAST identifier before the base-clause
+                        // ':' (or end of preamble), skipping any leading export/attribute
+                        // macros such as `class NEOFSA_API NeoFSA` or `struct __declspec(...) S`.
                         for (size_t k = idx + 1; k < toks.size(); ++k) {
-                                if (!toks[k].empty() && isIdChar(toks[k][0]) && toks[k] != "public" && toks[k] != "private" &&
-                                    toks[k] != "virtual" && toks[k] != "final") {
-                                        info.name = toks[k];
+                                if (toks[k] == ":") // start of base-clause → name already found
                                         break;
-                                }
+                                if (!toks[k].empty() && isIdChar(toks[k][0]) && toks[k] != "public" && toks[k] != "private" &&
+                                    toks[k] != "protected" && toks[k] != "virtual" && toks[k] != "final")
+                                        info.name = toks[k];
                         }
                         return info;
                 }

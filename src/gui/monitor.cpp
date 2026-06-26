@@ -258,7 +258,7 @@ MonitorScope::menu()
         }
 
         // Right-aligned buttons: Delete Scope, Hide Scope, Pause/Resume
-        float delBtnWidth = ImGui::CalcTextSize(tr("Delete Scope", "删除示波器")).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        float delBtnWidth  = ImGui::CalcTextSize(tr("Delete Scope", "删除示波器")).x + ImGui::GetStyle().FramePadding.x * 2.0f;
         float hideBtnWidth = std::max(ImGui::CalcTextSize(tr("Hide Scope", "隐藏示波器")).x,
                                       ImGui::CalcTextSize(tr("Show Scope", "显示示波器")).x) +
                              ImGui::GetStyle().FramePadding.x * 2.0f;

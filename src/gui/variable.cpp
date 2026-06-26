@@ -3430,6 +3430,87 @@ Variable::addLocalVar(const std::string &name, DataType type, size_t bufSize)
 }
 
 void
+Variable::setLocalScalar(const std::string &name, double value)
+{
+        // Only LOCAL scalar entries are writable here; a user-configured JLINK/UDP/SHM
+        // variable of the same name is intentionally left untouched.
+        DataType type = DataType::UNKNOWN;
+        for (const auto &v : vars_)
+                if (v.name == name && v.port == PortType::LOCAL && v.structFields.empty()) {
+                        type = v.type;
+                        break;
+                }
+        if (type == DataType::UNKNOWN)
+                return;
+
+        std::lock_guard<std::mutex> lk(mtxLocal_);
+        auto                        it = localBufs_.find(name);
+        if (it == localBufs_.end())
+                return;
+        auto &buf = it->second;
+        auto  put = [&](const void *src, size_t n) {
+                if (buf.size() < n)
+                        buf.resize(n, 0);
+                std::memcpy(buf.data(), src, n);
+        };
+        switch (type) {
+                case DataType::F32: {
+                        float f = (float)value;
+                        put(&f, 4);
+                        break;
+                }
+                case DataType::F64: {
+                        double d = value;
+                        put(&d, 8);
+                        break;
+                }
+                case DataType::U8: {
+                        uint8_t v = (uint8_t)(int64_t)value;
+                        put(&v, 1);
+                        break;
+                }
+                case DataType::I8: {
+                        int8_t v = (int8_t)(int64_t)value;
+                        put(&v, 1);
+                        break;
+                }
+                case DataType::U16: {
+                        uint16_t v = (uint16_t)(int64_t)value;
+                        put(&v, 2);
+                        break;
+                }
+                case DataType::I16: {
+                        int16_t v = (int16_t)(int64_t)value;
+                        put(&v, 2);
+                        break;
+                }
+                case DataType::U32: {
+                        uint32_t v = (uint32_t)(int64_t)value;
+                        put(&v, 4);
+                        break;
+                }
+                case DataType::I32: {
+                        int32_t v = (int32_t)(int64_t)value;
+                        put(&v, 4);
+                        break;
+                }
+                case DataType::U64: {
+                        uint64_t v = (uint64_t)(int64_t)value;
+                        put(&v, 8);
+                        break;
+                }
+                case DataType::I64: {
+                        int64_t v = (int64_t)value;
+                        put(&v, 8);
+                        break;
+                }
+                default:
+                        return;
+        }
+        isModified_ = true;
+}
+
+void
 Variable::addLocalStructVar(const std::string &name, const std::vector<VarEntry::StructField> &fields, size_t totalSize)
 {
         if (watchHasName(name))

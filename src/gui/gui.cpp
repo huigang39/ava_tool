@@ -2737,6 +2737,38 @@ Gui::drawUpdateUI()
         }
 }
 
+// Map a parser CType to the variable manager's DataType (for "+"-created LOCAL vars).
+static DataType
+ctypeToVarDataType(CType t)
+{
+        switch (t) {
+                case CType::F32:
+                        return DataType::F32;
+                case CType::F64:
+                        return DataType::F64;
+                case CType::I8:
+                        return DataType::I8;
+                case CType::I16:
+                        return DataType::I16;
+                case CType::I32:
+                        return DataType::I32;
+                case CType::I64:
+                        return DataType::I64;
+                case CType::U8:
+                case CType::Bool:
+                        return DataType::U8;
+                case CType::U16:
+                        return DataType::U16;
+                case CType::U32:
+                        return DataType::U32;
+                case CType::U64:
+                case CType::Ptr:
+                        return DataType::U64;
+                default:
+                        return DataType::I32;
+        }
+}
+
 void
 Gui::newSdkPanel()
 {
@@ -2773,32 +2805,53 @@ Gui::newSdkPanel()
                 return names;
         };
 
-        sp->onMonitorPush_ = [this](const std::string &chanKey, float val, double ts) {
-                // Split "ClassName::MethodName" → scope / channel.
-                std::string scope, chName;
-                auto        pos = chanKey.rfind("::");
-                if (pos != std::string::npos) {
-                        scope  = chanKey.substr(0, pos);
-                        chName = chanKey.substr(pos + 2);
-                } else {
-                        scope  = "SDK";
-                        chName = chanKey;
-                }
-
+        // Store a call's return value into an EXISTING LOCAL variable (the one the user
+        // created via the "+" button). Never creates — a no-op if no such variable exists.
+        // It plots only if the user also adds it to a monitor (LOCAL→monitor feed).
+        sp->onWriteLocalScalar_ = [this](const std::string &name, double value, bool /*isFloat*/) {
                 std::lock_guard<std::mutex> lk(mtxMonitors_);
-                auto                       &mon = monitors_["SDK"];
-                if (!mon)
-                        mon = std::make_shared<Monitor>("SDK");
-                mon->addScope(scope);
-                MonitorScope *sc = mon->getScopes()[scope].get();
-                if (!sc)
-                        return;
-                sc->addChannel(chName);
-                MonitorChannel *ch = sc->findChannel(chName);
-                if (!ch)
-                        return;
-                ch->pushBatch(&val, &ts, 1);
-                ch->publishSnapshot();
+                for (auto &[_, vw] : vars_)
+                        for (const auto &ve : vw->vars_)
+                                if (ve.name == name) {
+                                        vw->setLocalScalar(name, value);
+                                        return;
+                                }
+        };
+        // Create a LOCAL variable in the variable manager (the "+" buttons). Scalar when
+        // structDecl is null, otherwise a struct variable with the decl's fields. Creates
+        // a Variable manager window if none is open. No-op if the name already exists.
+        sp->onCreateLocalVar_ = [this](const std::string &name, CType scalarType, const CStructDecl *sd) {
+                std::lock_guard<std::mutex> lk(mtxMonitors_);
+                if (vars_.empty()) {
+                        std::string key = "变量管理器_" + std::to_string(vars_.size());
+                        while (vars_.count(key))
+                                key += "_";
+                        vars_[key] = std::make_shared<Variable>(key);
+                        vars_[key]->setTitle("变量管理器 [0]");
+                }
+                Variable *target = vars_.begin()->second.get();
+                if (sd) {
+                        std::vector<VarEntry::StructField> fields;
+                        for (const auto &f : sd->fields) {
+                                auto emit = [&](const std::string &fname, CType ct, size_t off) {
+                                        VarEntry::StructField vf{};
+                                        strncpy(vf.name, fname.c_str(), sizeof(vf.name) - 1);
+                                        vf.type       = ctypeToVarDataType(ct);
+                                        vf.byteOffset = (u32)off;
+                                        fields.push_back(vf);
+                                };
+                                if (f.isArray && f.arrayCount > 0) {
+                                        size_t esz = ctypeSize(f.arrayElemType);
+                                        for (size_t ai = 0; ai < f.arrayCount; ++ai)
+                                                emit(f.name + "[" + std::to_string(ai) + "]", f.arrayElemType, f.offset + ai * esz);
+                                } else {
+                                        emit(f.name, f.type, f.offset);
+                                }
+                        }
+                        target->addLocalStructVar(name, fields, sd->totalSize);
+                } else {
+                        target->addLocalVar(name, ctypeToVarDataType(scalarType), 8);
+                }
         };
         // Wire sequence editor LOCAL variable lookup (same lambda as SdkPanel).
         if (!seqEditor_.onGetLocalBuf_) {

@@ -27,6 +27,101 @@
 #include "platform/native_dlg.hpp"
 #include "timeops.h"
 
+// ─── drawSdkStructFieldRows ───────────────────────────────────────────────────
+// Shared struct-field editor used by both the SDK caller and the sequence editor.
+
+bool
+drawSdkStructFieldRows(const CStructDecl &sd, uint8_t *buf, size_t bufSize, int idSalt)
+{
+        if (!buf || bufSize < sd.totalSize)
+                return false;
+
+        bool edited = false;
+        for (size_t fi = 0; fi < sd.fields.size(); ++fi) {
+                const auto &field = sd.fields[fi];
+                if (field.isArray) {
+                        size_t esz = ctypeSize(field.arrayElemType);
+                        for (size_t ai = 0; ai < field.arrayCount; ++ai) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::TextDisabled("  .%s[%zu]  %s", field.name.c_str(), ai, ctypeLabel(field.arrayElemType));
+                                ImGui::TableSetColumnIndex(2);
+                                char fid[64];
+                                snprintf(fid, sizeof(fid), "##af%d_%zu_%zu", idSalt, fi, ai);
+                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                uint8_t *p2 = buf + field.offset + ai * esz;
+                                if (field.arrayElemType == CType::F64) {
+                                        double v;
+                                        memcpy(&v, p2, 8);
+                                        if (ImGui::InputDouble(fid, &v, 0, 0, "%.6g")) {
+                                                memcpy(p2, &v, 8);
+                                                edited = true;
+                                        }
+                                } else if (field.arrayElemType == CType::F32) {
+                                        float v;
+                                        memcpy(&v, p2, 4);
+                                        if (ImGui::InputFloat(fid, &v)) {
+                                                memcpy(p2, &v, 4);
+                                                edited = true;
+                                        }
+                                } else {
+                                        int iv = 0;
+                                        memcpy(&iv, p2, std::min(esz, (size_t)4));
+                                        if (ImGui::InputInt(fid, &iv)) {
+                                                memcpy(p2, &iv, std::min(esz, (size_t)4));
+                                                edited = true;
+                                        }
+                                }
+                        }
+                } else if (field.type == CType::F64) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextDisabled("  .%s  double", field.name.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        char fid[64];
+                        snprintf(fid, sizeof(fid), "##df%d_%zu", idSalt, fi);
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        double v;
+                        memcpy(&v, buf + field.offset, 8);
+                        if (ImGui::InputDouble(fid, &v, 0, 0, "%.6g")) {
+                                memcpy(buf + field.offset, &v, 8);
+                                edited = true;
+                        }
+                } else if (field.type == CType::F32) {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextDisabled("  .%s  float", field.name.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        char fid[64];
+                        snprintf(fid, sizeof(fid), "##ff%d_%zu", idSalt, fi);
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        float v;
+                        memcpy(&v, buf + field.offset, 4);
+                        if (ImGui::InputFloat(fid, &v)) {
+                                memcpy(buf + field.offset, &v, 4);
+                                edited = true;
+                        }
+                } else {
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextDisabled("  .%s  %s", field.name.c_str(), ctypeLabel(field.type));
+                        ImGui::TableSetColumnIndex(2);
+                        char fid[64];
+                        snprintf(fid, sizeof(fid), "##if%d_%zu", idSalt, fi);
+                        ImGui::SetNextItemWidth(-FLT_MIN);
+                        int64_t v = 0;
+                        memcpy(&v, buf + field.offset, std::min(field.size, (size_t)8));
+                        int iv = (int)v;
+                        if (ImGui::InputInt(fid, &iv)) {
+                                v = iv;
+                                memcpy(buf + field.offset, &v, std::min(field.size, (size_t)8));
+                                edited = true;
+                        }
+                }
+        }
+        return edited;
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
 void
@@ -105,6 +200,7 @@ SdkPanel::selectFn(int idx)
         selectedFnIdx_ = idx;
         fnLastResult_.clear();
         fnLastResultOk_ = false;
+        fnResultVar_[0] = '\0'; // result-var name is per-function, not shared
         if (idx < 0 || idx >= (int)parseResult_.functions.size()) {
                 fnArgBufs_.clear();
                 return;
@@ -132,6 +228,7 @@ SdkPanel::selectMethod(int classIdx, int methodIdx)
 
         selectedClassIdx_  = classIdx;
         selectedMethodIdx_ = methodIdx;
+        methResultVar_[0]  = '\0'; // result-var name is per-method, not shared
 
         if (classIdx < 0 || classIdx >= (int)parseResult_.classes.size()) {
                 methArgBufs_.clear();
@@ -214,18 +311,10 @@ SdkPanel::doCallC()
 
         double tsSec = sessionTimeSec();
         pushHistory(callStr, fnLastResult_, res.ok, tsSec);
-        if (res.ok && ctypeIsInteger(fn.retType))
-                pushToMonitor(fn.name, static_cast<float>(res.rawU64), tsSec);
-
-        if (res.ok && fnResultVar_[0] != '\0' && onGetVarBuf_) {
-                void *buf = onGetVarBuf_(fnResultVar_);
-                if (buf) {
-                        int64_t v = (int64_t)res.rawU64;
-                        memcpy(buf, &v, sizeof(int64_t));
-                        if (onVarWritten_)
-                                onVarWritten_(fnResultVar_);
-                }
-        }
+        // Store the return value only into the user-chosen result variable (created
+        // manually via the "+" button); no auto-creation.
+        if (res.ok)
+                writeResultVar(fnResultVar_, res, fn.retType);
 }
 
 // ─── doCallMethod ─────────────────────────────────────────────────────────────
@@ -295,22 +384,11 @@ SdkPanel::doCallMethod()
 
         double tsSec = sessionTimeSec();
         pushHistory(callStr, display, res.ok, tsSec);
-        if (res.ok && ctypeIsInteger(meth.retType)) {
-                std::string chKey = cls.name + "::" + meth.name;
-                pushToMonitor(chKey, static_cast<float>(res.rawU64), tsSec);
-        }
         if (!res.ok)
                 setStatus(res.error, true);
-
-        if (res.ok && methResultVar_[0] != '\0' && onGetVarBuf_) {
-                void *buf = onGetVarBuf_(methResultVar_);
-                if (buf) {
-                        int64_t v = (int64_t)res.rawU64;
-                        memcpy(buf, &v, sizeof(int64_t));
-                        if (onVarWritten_)
-                                onVarWritten_(methResultVar_);
-                }
-        }
+        // Store the return value only into the user-chosen result variable.
+        if (res.ok)
+                writeResultVar(methResultVar_, res, meth.retType);
 }
 
 // ─── doNewObject ──────────────────────────────────────────────────────────────
@@ -1275,7 +1353,9 @@ SdkPanel::drawCFunctionsTab()
                                                 ImGui::Text("[%zu]", i);
                                         ImGui::TableSetColumnIndex(2);
                                         if (i < fnArgBufs_.size()) {
-                                                ImGui::SetNextItemWidth(-FLT_MIN);
+                                                bool hasCreate = (bool)onCreateLocalVar_;
+                                                ImGui::SetNextItemWidth(
+                                                    hasCreate ? ImGui::GetContentRegionAvail().x - 24.0f : -FLT_MIN);
                                                 if (isCharP)
                                                         ImGui::InputText(id, fnArgBufs_[i].text, sizeof(ArgBuf::text));
                                                 else if (ctypeIsFloat(p.type))
@@ -1289,6 +1369,21 @@ SdkPanel::drawCFunctionsTab()
                                                                          sizeof(ArgBuf::text),
                                                                          ImGuiInputTextFlags_CharsHexadecimal |
                                                                              ImGuiInputTextFlags_CharsDecimal);
+                                                if (hasCreate) {
+                                                        ImGui::SameLine(0, 2);
+                                                        char nbId[32];
+                                                        snprintf(nbId, sizeof(nbId), "+##fnewp%zu", i);
+                                                        if (ImGui::SmallButton(nbId)) {
+                                                                std::string vn =
+                                                                    p.name.empty() ? ("arg" + std::to_string(i)) : p.name;
+                                                                onCreateLocalVar_(vn, p.type, findParamStruct(p));
+                                                        }
+                                                        if (ImGui::IsItemHovered())
+                                                                ImGui::SetTooltip(
+                                                                    "%s",
+                                                                    tr("Add this parameter as a variable",
+                                                                       "把该参数添加为变量"));
+                                                }
                                         }
                                 }
 
@@ -1301,25 +1396,39 @@ SdkPanel::drawCFunctionsTab()
                                         ImGui::TableSetColumnIndex(1);
                                         ImGui::TextUnformatted(tr("return", "返回值"));
                                         ImGui::TableSetColumnIndex(2);
-                                        float rvW = onListLocalVars_ ? ImGui::GetContentRegionAvail().x - 26.0f : -1.0f;
-                                        if (rvW > 0.0f)
-                                                ImGui::SetNextItemWidth(rvW);
+                                        std::vector<std::string> localVars;
+                                        if (onListLocalVars_)
+                                                localVars = onListLocalVars_();
+                                        bool  hasCreate = onCreateLocalVar_ && !ctypeIsVoid(fn.retType);
+                                        bool  hasPick   = !localVars.empty();
+                                        float reserve   = (hasCreate ? 24.0f : 0.0f) + (hasPick ? 24.0f : 0.0f);
+                                        float rvW       = reserve > 0.0f ? ImGui::GetContentRegionAvail().x - reserve : -FLT_MIN;
+                                        ImGui::SetNextItemWidth(rvW);
                                         ImGui::InputTextWithHint(
                                             "##fnrv", tr("variable name", "变量名"), fnResultVar_, sizeof(fnResultVar_));
-                                        if (onListLocalVars_) {
-                                                auto localVars = onListLocalVars_();
-                                                if (!localVars.empty()) {
-                                                        ImGui::SameLine(0, 2);
-                                                        if (ImGui::SmallButton("v##fnrvpick"))
-                                                                ImGui::OpenPopup("##fnrvpop");
-                                                        if (ImGui::BeginPopup("##fnrvpop")) {
-                                                                for (const auto &vn : localVars)
-                                                                        if (ImGui::Selectable(vn.c_str()))
-                                                                                strncpy(fnResultVar_,
-                                                                                        vn.c_str(),
-                                                                                        sizeof(fnResultVar_) - 1);
-                                                                ImGui::EndPopup();
-                                                        }
+                                        if (hasCreate) {
+                                                ImGui::SameLine(0, 2);
+                                                if (ImGui::SmallButton("+##fnrvnew")) {
+                                                        std::string vn = fnResultVar_[0] ? std::string(fnResultVar_) : fn.name;
+                                                        onCreateLocalVar_(vn, fn.retType, nullptr);
+                                                        strncpy(fnResultVar_, vn.c_str(), sizeof(fnResultVar_) - 1);
+                                                        fnResultVar_[sizeof(fnResultVar_) - 1] = '\0';
+                                                }
+                                                if (ImGui::IsItemHovered())
+                                                        ImGui::SetTooltip("%s",
+                                                                          tr("Create result variable", "创建结果变量"));
+                                        }
+                                        if (hasPick) {
+                                                ImGui::SameLine(0, 2);
+                                                if (ImGui::SmallButton("v##fnrvpick"))
+                                                        ImGui::OpenPopup("##fnrvpop");
+                                                if (ImGui::BeginPopup("##fnrvpop")) {
+                                                        for (const auto &vn : localVars)
+                                                                if (ImGui::Selectable(vn.c_str())) {
+                                                                        strncpy(fnResultVar_, vn.c_str(), sizeof(fnResultVar_) - 1);
+                                                                        fnResultVar_[sizeof(fnResultVar_) - 1] = '\0';
+                                                                }
+                                                        ImGui::EndPopup();
                                                 }
                                         }
                                 }
@@ -1576,101 +1685,7 @@ SdkPanel::drawCppClassesTab()
                                         expanded = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_SpanFullWidth);
 
                                         if (expanded) {
-                                                if (buf.size() >= sd->totalSize) {
-                                                        for (size_t fi = 0; fi < sd->fields.size(); ++fi) {
-                                                                const auto &field = sd->fields[fi];
-                                                                if (field.isArray) {
-                                                                        size_t esz = ctypeSize(field.arrayElemType);
-                                                                        for (size_t ai = 0; ai < field.arrayCount; ++ai) {
-                                                                                ImGui::TableNextRow();
-                                                                                ImGui::TableSetColumnIndex(1);
-                                                                                ImGui::TextDisabled(
-                                                                                    "  .%s[%zu]  %s",
-                                                                                    field.name.c_str(),
-                                                                                    ai,
-                                                                                    ctypeLabel(field.arrayElemType));
-                                                                                ImGui::TableSetColumnIndex(2);
-                                                                                char fid[64];
-                                                                                snprintf(fid,
-                                                                                         sizeof(fid),
-                                                                                         "##af%zu_%zu_%zu",
-                                                                                         pi,
-                                                                                         fi,
-                                                                                         ai);
-                                                                                ImGui::SetNextItemWidth(-FLT_MIN);
-                                                                                uint8_t *p2 =
-                                                                                    buf.data() + field.offset + ai * esz;
-                                                                                if (field.arrayElemType == CType::F64) {
-                                                                                        double v;
-                                                                                        memcpy(&v, p2, 8);
-                                                                                        if (ImGui::InputDouble(
-                                                                                                fid, &v, 0, 0, "%.6g"))
-                                                                                                memcpy(p2, &v, 8);
-                                                                                } else if (field.arrayElemType == CType::F32) {
-                                                                                        float v;
-                                                                                        memcpy(&v, p2, 4);
-                                                                                        if (ImGui::InputFloat(fid, &v))
-                                                                                                memcpy(p2, &v, 4);
-                                                                                } else {
-                                                                                        int iv = 0;
-                                                                                        memcpy(
-                                                                                            &iv, p2, std::min(esz, (size_t)4));
-                                                                                        if (ImGui::InputInt(fid, &iv))
-                                                                                                memcpy(
-                                                                                                    p2,
-                                                                                                    &iv,
-                                                                                                    std::min(esz, (size_t)4));
-                                                                                }
-                                                                        }
-                                                                } else if (field.type == CType::F64) {
-                                                                        ImGui::TableNextRow();
-                                                                        ImGui::TableSetColumnIndex(1);
-                                                                        ImGui::TextDisabled("  .%s  double",
-                                                                                            field.name.c_str());
-                                                                        ImGui::TableSetColumnIndex(2);
-                                                                        char fid[64];
-                                                                        snprintf(fid, sizeof(fid), "##df%zu_%zu", pi, fi);
-                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
-                                                                        double v;
-                                                                        memcpy(&v, buf.data() + field.offset, 8);
-                                                                        if (ImGui::InputDouble(fid, &v, 0, 0, "%.6g"))
-                                                                                memcpy(buf.data() + field.offset, &v, 8);
-                                                                } else if (field.type == CType::F32) {
-                                                                        ImGui::TableNextRow();
-                                                                        ImGui::TableSetColumnIndex(1);
-                                                                        ImGui::TextDisabled("  .%s  float", field.name.c_str());
-                                                                        ImGui::TableSetColumnIndex(2);
-                                                                        char fid[64];
-                                                                        snprintf(fid, sizeof(fid), "##ff%zu_%zu", pi, fi);
-                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
-                                                                        float v;
-                                                                        memcpy(&v, buf.data() + field.offset, 4);
-                                                                        if (ImGui::InputFloat(fid, &v))
-                                                                                memcpy(buf.data() + field.offset, &v, 4);
-                                                                } else {
-                                                                        ImGui::TableNextRow();
-                                                                        ImGui::TableSetColumnIndex(1);
-                                                                        ImGui::TextDisabled("  .%s  %s",
-                                                                                            field.name.c_str(),
-                                                                                            ctypeLabel(field.type));
-                                                                        ImGui::TableSetColumnIndex(2);
-                                                                        char fid[64];
-                                                                        snprintf(fid, sizeof(fid), "##if%zu_%zu", pi, fi);
-                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
-                                                                        int64_t v = 0;
-                                                                        memcpy(&v,
-                                                                               buf.data() + field.offset,
-                                                                               std::min(field.size, (size_t)8));
-                                                                        int iv = (int)v;
-                                                                        if (ImGui::InputInt(fid, &iv)) {
-                                                                                v = iv;
-                                                                                memcpy(buf.data() + field.offset,
-                                                                                       &v,
-                                                                                       std::min(field.size, (size_t)8));
-                                                                        }
-                                                                }
-                                                        }
-                                                }
+                                                drawSdkStructFieldRows(*sd, buf.data(), buf.size(), (int)pi);
                                                 ImGui::TreePop();
                                         }
                                         continue;
@@ -1736,8 +1751,10 @@ SdkPanel::drawCppClassesTab()
                                         ImGui::Text("[%zu]", pi);
                                 ImGui::TableSetColumnIndex(2);
                                 if (pi < methArgBufs_.size()) {
-                                        bool isCharP = ctypeIsCharPtr(p.type, p.rawType);
-                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                        bool isCharP   = ctypeIsCharPtr(p.type, p.rawType);
+                                        bool hasCreate = (bool)onCreateLocalVar_;
+                                        ImGui::SetNextItemWidth(
+                                            hasCreate ? ImGui::GetContentRegionAvail().x - 24.0f : -FLT_MIN);
                                         if (isCharP)
                                                 ImGui::InputText(rowId, methArgBufs_[pi].text, sizeof(ArgBuf::text));
                                         else if (ctypeIsFloat(p.type))
@@ -1751,6 +1768,20 @@ SdkPanel::drawCppClassesTab()
                                                                  sizeof(ArgBuf::text),
                                                                  ImGuiInputTextFlags_CharsHexadecimal |
                                                                      ImGuiInputTextFlags_CharsDecimal);
+                                        if (hasCreate) {
+                                                ImGui::SameLine(0, 2);
+                                                char nbId[32];
+                                                snprintf(nbId, sizeof(nbId), "+##mnewp%zu", pi);
+                                                if (ImGui::SmallButton(nbId)) {
+                                                        std::string vn =
+                                                            p.name.empty() ? ("arg" + std::to_string(pi)) : p.name;
+                                                        onCreateLocalVar_(vn, p.type, findParamStruct(p));
+                                                }
+                                                if (ImGui::IsItemHovered())
+                                                        ImGui::SetTooltip("%s",
+                                                                          tr("Add this parameter as a variable",
+                                                                             "把该参数添加为变量"));
+                                        }
                                 }
                         }
 
@@ -1763,25 +1794,39 @@ SdkPanel::drawCppClassesTab()
                                 ImGui::TableSetColumnIndex(1);
                                 ImGui::TextUnformatted(tr("return", "返回值"));
                                 ImGui::TableSetColumnIndex(2);
-                                float rvW = onListLocalVars_ ? ImGui::GetContentRegionAvail().x - 26.0f : -1.0f;
-                                if (rvW > 0.0f)
-                                        ImGui::SetNextItemWidth(rvW);
+                                std::vector<std::string> localVars;
+                                if (onListLocalVars_)
+                                        localVars = onListLocalVars_();
+                                bool  hasCreate = onCreateLocalVar_ && !ctypeIsVoid(meth.retType);
+                                bool  hasPick   = !localVars.empty();
+                                float reserve   = (hasCreate ? 24.0f : 0.0f) + (hasPick ? 24.0f : 0.0f);
+                                float rvW       = reserve > 0.0f ? ImGui::GetContentRegionAvail().x - reserve : -FLT_MIN;
+                                ImGui::SetNextItemWidth(rvW);
                                 ImGui::InputTextWithHint(
                                     "##methrv", tr("variable name", "变量名"), methResultVar_, sizeof(methResultVar_));
-                                if (onListLocalVars_) {
-                                        auto localVars = onListLocalVars_();
-                                        if (!localVars.empty()) {
-                                                ImGui::SameLine(0, 2);
-                                                if (ImGui::SmallButton("v##methrvpick"))
-                                                        ImGui::OpenPopup("##methrvpop");
-                                                if (ImGui::BeginPopup("##methrvpop")) {
-                                                        for (const auto &vn : localVars)
-                                                                if (ImGui::Selectable(vn.c_str()))
-                                                                        strncpy(methResultVar_,
-                                                                                vn.c_str(),
-                                                                                sizeof(methResultVar_) - 1);
-                                                        ImGui::EndPopup();
-                                                }
+                                if (hasCreate) {
+                                        ImGui::SameLine(0, 2);
+                                        if (ImGui::SmallButton("+##methrvnew")) {
+                                                std::string vn =
+                                                    methResultVar_[0] ? std::string(methResultVar_) : meth.name;
+                                                onCreateLocalVar_(vn, meth.retType, nullptr);
+                                                strncpy(methResultVar_, vn.c_str(), sizeof(methResultVar_) - 1);
+                                                methResultVar_[sizeof(methResultVar_) - 1] = '\0';
+                                        }
+                                        if (ImGui::IsItemHovered())
+                                                ImGui::SetTooltip("%s", tr("Create result variable", "创建结果变量"));
+                                }
+                                if (hasPick) {
+                                        ImGui::SameLine(0, 2);
+                                        if (ImGui::SmallButton("v##methrvpick"))
+                                                ImGui::OpenPopup("##methrvpop");
+                                        if (ImGui::BeginPopup("##methrvpop")) {
+                                                for (const auto &vn : localVars)
+                                                        if (ImGui::Selectable(vn.c_str())) {
+                                                                strncpy(methResultVar_, vn.c_str(), sizeof(methResultVar_) - 1);
+                                                                methResultVar_[sizeof(methResultVar_) - 1] = '\0';
+                                                        }
+                                                ImGui::EndPopup();
                                         }
                                 }
                         }
@@ -2382,6 +2427,9 @@ SdkPanel::draw()
                         }
                         if (loader_.isLoaded()) {
                                 ImGui::SameLine();
+                                if (ImGui::Button(tr("View Symbols##sym", "查看符号##sym")))
+                                        showSymbolsWindow_ = true;
+                                ImGui::SameLine();
                                 if (ui::Button(tr("Unload", "卸载"), ui::BtnStyle::Danger)) {
                                         loader_.unload();
                                         setStatus(tr("Unloaded", "已卸载"), false);
@@ -2439,6 +2487,79 @@ SdkPanel::draw()
         }
 
         ImGui::End();
+
+        // Symbols viewer (separate dockable window).
+        drawSymbolsWindow();
+}
+
+// ─── drawSymbolsWindow ───────────────────────────────────────────────────────
+
+void
+SdkPanel::drawSymbolsWindow()
+{
+        if (!showSymbolsWindow_)
+                return;
+
+        char winTitle[96];
+        snprintf(winTitle, sizeof(winTitle), "%s###SdkSymbols%d", tr("SDK Symbols", "SDK 符号"), winId_);
+        ImGui::SetNextWindowSize(ImVec2(620, 420), ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin(winTitle, &showSymbolsWindow_)) {
+                ImGui::End();
+                return;
+        }
+
+        const auto &syms = loader_.exports();
+
+        ImGui::Text("%s: %d", tr("Total symbols", "符号总数"), (int)syms.size());
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputTextWithHint("##symfilter", tr("Filter symbols…", "过滤符号…"), symbolFilter_, sizeof(symbolFilter_));
+
+        // Case-insensitive substring match.
+        auto containsCI = [](const std::string &hay, const char *needle) -> bool {
+                if (!needle || !needle[0])
+                        return true;
+                std::string h = hay, n = needle;
+                std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return (char)tolower(c); });
+                std::transform(n.begin(), n.end(), n.begin(), [](unsigned char c) { return (char)tolower(c); });
+                return h.find(n) != std::string::npos;
+        };
+
+        static ImGuiTableFlags tblFlags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
+                                          ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp;
+        if (ImGui::BeginTable("##symtbl", 3, tblFlags)) {
+                ImGui::TableSetupScrollFreeze(0, 1);
+                ImGui::TableSetupColumn(tr("#", "#"), ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                ImGui::TableSetupColumn(tr("Demangled", "解析名称"), ImGuiTableColumnFlags_WidthStretch, 0.60f);
+                ImGui::TableSetupColumn(tr("Mangled", "符号名"), ImGuiTableColumnFlags_WidthStretch, 0.40f);
+                ImGui::TableHeadersRow();
+
+                int shown = 0;
+                for (int i = 0; i < (int)syms.size(); ++i) {
+                        const ExportedSymbol &s = syms[i];
+                        if (!containsCI(s.demangled, symbolFilter_) && !containsCI(s.mangled, symbolFilter_))
+                                continue;
+                        ++shown;
+                        ImGui::TableNextRow();
+                        ImGui::TableSetColumnIndex(0);
+                        ImGui::Text("%d", i);
+                        ImGui::TableSetColumnIndex(1);
+                        ImGui::TextUnformatted(s.demangled.c_str());
+                        // Click a row's demangled name to copy it to the clipboard.
+                        if (ImGui::IsItemClicked())
+                                ImGui::SetClipboardText(s.demangled.c_str());
+                        ImGui::TableSetColumnIndex(2);
+                        ImGui::TextDisabled("%s", s.mangled.c_str());
+                        if (ImGui::IsItemClicked())
+                                ImGui::SetClipboardText(s.mangled.c_str());
+                }
+                ImGui::EndTable();
+
+                if (symbolFilter_[0])
+                        ImGui::TextDisabled("%s: %d", tr("Matched", "匹配"), shown);
+        }
+
+        ImGui::End();
 }
 
 // ─── pushHistory ─────────────────────────────────────────────────────────────
@@ -2460,14 +2581,17 @@ SdkPanel::pushHistory(const std::string &call, const std::string &result, bool o
         history_.push_back(std::move(e));
 }
 
-// ─── pushToMonitor ────────────────────────────────────────────────────────────
+// ─── writeResultVar ──────────────────────────────────────────────────────────
 
 void
-SdkPanel::pushToMonitor(const std::string &chanKey, float val, double tsSec)
+SdkPanel::writeResultVar(const std::string &name, const CallResult &res, CType retType)
 {
-        pinnedChannels_[chanKey] = val;
-        if (onMonitorPush_)
-                onMonitorPush_(chanKey, val, tsSec);
+        if (name.empty() || !onWriteLocalScalar_)
+                return;
+        if (ctypeIsInteger(retType))
+                onWriteLocalScalar_(name, (double)(int64_t)res.rawU64, false);
+        else if (ctypeIsFloat(retType))
+                onWriteLocalScalar_(name, res.rawF64, true);
 }
 
 // ─── evalCond ────────────────────────────────────────────────────────────────
@@ -2571,9 +2695,6 @@ SdkPanel::execStep(const SdkSeqStep &step, SeqCtx &ctx)
                                                         callStr += args[i];
                                                 }
                                                 callStr += ")";
-                                                if (res.ok && ctypeIsInteger(meth.retType))
-                                                        pushToMonitor(
-                                                            cls.name + "::" + meth.name, static_cast<float>(res.rawU64), ts);
                                         }
                                 }
                         }
@@ -3243,12 +3364,8 @@ SdkPanel::directCall(int ci, int mi, int objIdx, const std::vector<std::string> 
                         if (!vn.empty())
                                 onVarWritten_(vn);
 
-        std::string disp  = res.ok ? res.display : res.error;
-        double      tsSec = sessionTimeSec();
-        // Sequence-editor calls keep their own log (seqLog_); don't mirror into the
-        // SDK panel's call history.
-        if (res.ok && ctypeIsInteger(meth.retType))
-                pushToMonitor(cls.name + "::" + meth.name, static_cast<float>(res.rawU64), tsSec);
+        std::string disp = res.ok ? res.display : res.error;
+        // Sequence-editor calls keep their own log (seqLog_) and result-var handling.
 
         return {res.ok, disp, res.ok ? (int64_t)res.rawU64 : 0};
 }
@@ -3282,12 +3399,8 @@ SdkPanel::directCallC(int fi, const std::vector<std::string> &args)
                         if (!vn.empty())
                                 onVarWritten_(vn);
 
-        std::string disp  = res.ok ? res.display : res.error;
-        double      tsSec = sessionTimeSec();
-        // Sequence-editor calls keep their own log (seqLog_); don't mirror into the
-        // SDK panel's call history.
-        if (res.ok && ctypeIsInteger(fn.retType))
-                pushToMonitor(fn.name, static_cast<float>(res.rawU64), tsSec);
+        std::string disp = res.ok ? res.display : res.error;
+        // Sequence-editor calls keep their own log (seqLog_) and result-var handling.
 
         return {res.ok, disp, res.ok ? (int64_t)res.rawU64 : 0};
 }

@@ -25,6 +25,32 @@
 #define SDK_FREE(h)   dlclose(h)
 #endif
 
+// ─── crash-guarded ffi_call ───────────────────────────────────────────────────
+// A misbehaving SDK function (bad pointer, wrong struct size, null deref) raises a
+// hardware exception that would otherwise tear down the whole app. On Windows we
+// wrap the call in SEH so an access violation (etc.) is turned into a clean error
+// return instead of a crash. This MUST stay in its own function with no C++ objects
+// that require unwinding (a hard requirement for __try/__except).
+//
+// Caveat: SEH catches the fault at the moment it happens. It cannot undo heap/stack
+// corruption a buggy callee may have already done, so a later crash is still
+// possible — but the common "the SDK call itself segfaults" case no longer kills us.
+static bool
+guardedFfiCall(ffi_cif *cif, void (*fn)(void), void *retBuf, void **argPtrs) noexcept
+{
+#if defined(_WIN32)
+        __try {
+                ffi_call(cif, fn, retBuf, argPtrs);
+                return true;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+                return false;
+        }
+#else
+        ffi_call(cif, fn, retBuf, argPtrs);
+        return true;
+#endif
+}
+
 // ─── load / unload ────────────────────────────────────────────────────────────
 
 bool
@@ -274,7 +300,11 @@ SdkLoader::call(const CFuncDecl &decl, const std::vector<std::string> &argStrs)
         // libffi stores small integer returns zero/sign-extended in ffi_arg.
         alignas(16) uint8_t retBuf[16] = {};
 
-        ffi_call(&cif, (void (*)())fn, retBuf, nArgs ? argPtrs.data() : nullptr);
+        if (!guardedFfiCall(&cif, (void (*)(void))fn, retBuf, nArgs ? argPtrs.data() : nullptr)) {
+                res.ok    = false;
+                res.error = "SDK function crashed (access violation) — call aborted, app kept alive";
+                return res;
+        }
 
         // Format result
         res.ok = true;
@@ -539,7 +569,11 @@ SdkLoader::callMethod(void                           *thisPtr,
         }
 
         alignas(16) uint8_t retBuf[16] = {};
-        ffi_call(&cif, reinterpret_cast<void (*)()>(fn), retBuf, argPtrs.data());
+        if (!guardedFfiCall(&cif, reinterpret_cast<void (*)(void)>(fn), retBuf, argPtrs.data())) {
+                res.ok    = false;
+                res.error = "SDK method crashed (access violation) — call aborted, app kept alive";
+                return res;
+        }
 
         // Format result (reuse the same logic as call()).
         res.ok = true;

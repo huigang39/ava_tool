@@ -280,6 +280,10 @@ class Variable
         // Programmatically add a LOCAL scalar variable (used by sequence editor "create output vars").
         // No-op if a variable with this name already exists.
         void addLocalVar(const std::string &name, DataType type, size_t bufSize);
+        // Write a numeric value into a LOCAL scalar variable's buffer, encoding it
+        // per the variable's DataType. No-op if `name` is not a LOCAL variable
+        // (so a user's manually-configured non-LOCAL entry is left untouched).
+        void setLocalScalar(const std::string &name, double value);
         // Programmatically add a LOCAL struct variable with predefined fields.
         // No-op if a variable with this name already exists.
         void addLocalStructVar(const std::string &name, const std::vector<VarEntry::StructField> &fields, size_t totalSize);
