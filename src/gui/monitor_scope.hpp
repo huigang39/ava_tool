@@ -134,6 +134,16 @@ class MonitorScope
         // Reorder channel `src` so it sits at `dst`'s display position, then
         // renumber all channels' display order sequentially. Used by drag-reorder.
         void reorderChannelTo(const std::string &src, const std::string &dst);
+        // Move every channel under the group path `srcGroup` (a struct/array) so the group
+        // sits just before `dst`'s display position, preserving the members' relative order.
+        void reorderGroupBefore(const std::string &srcGroup, const std::string &dst);
+        // The lowest-display-order leaf under `groupPath` — the group's anchor position.
+        std::string groupAnchorKey(const std::string &groupPath) const;
+        // Transfer the channel(s) described by a DND_CHANNEL_MOVE payload from another scope
+        // into this one. No-op when the payload originates from this scope.
+        void moveChannelsFrom(ChannelMovePayload *data);
+        // Accept a DND_CHANNEL_MOVE payload: reorder inside this scope, move across scopes.
+        void applyChannelMoveDrop(ChannelMovePayload *data, const std::string &dst);
 
       public:
         static void shmInit(MonitorChannel &ch);

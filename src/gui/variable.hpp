@@ -180,6 +180,15 @@ class Variable
         char                     searchBuf_[128]{};
         std::vector<SearchEntry> searchResults_;
         i32                      lastSelectedIndex_{-1};
+        // Index of the row whose "=" grip is being dragged. Lets the "=" handle carry the
+        // monitor (CHANNEL/STRUCT_CHANNEL) payload while still driving in-window reordering:
+        // a drop target reorders when this is >= 0, and the symbol-browser "add" path ignores
+        // such internal drags. -1 when no row grip drag is active.
+        i32                      rowDragSrc_{-1};
+        // Parallel grip-drag state for struct sub-items (manual struct fields): packed
+        // (parentVarIdx, fieldIdx) of the dragged field, or -1/-1 when inactive.
+        i32                      fieldDragParent_{-1};
+        i32                      fieldDragSrc_{-1};
         i32                      enumEditIdx_{-1};
         bool                     pendingDeleteFromSubVar_{false};
         i32                      enumSubEditParentIdx_{-1};
@@ -289,6 +298,8 @@ class Variable
         void addLocalStructVar(const std::string &name, const std::vector<VarEntry::StructField> &fields, size_t totalSize);
         // Read one LOCAL struct field as float. Returns false if var/field not found.
         bool readLocalFieldAsFloat(const std::string &varName, const std::string &fieldName, float &out) const;
+        // Read a LOCAL scalar variable's current value as double. False if not a LOCAL scalar.
+        bool readLocalScalar(const std::string &name, double &out) const;
         // Snapshot all LOCAL values as (channelName, value) pairs — "<var>" for a
         // scalar and "<var>.<field>" for each manual-struct field. The GUI feeds
         // these into matching scope channels each frame so LOCAL data plots live.

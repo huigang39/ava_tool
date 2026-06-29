@@ -582,6 +582,7 @@ SequenceEditor::drawSdkStructArgRow(SdkPanel          *panel,
 
         ImGui::TableSetColumnIndex(2);
         ImGui::TextDisabled("&%s", varName.c_str());
+        drawSdkArgButtons(panel, sdk, p, pname, ptype, /*isPtr=*/true);
 
         if (open) {
                 // Bind to (and create) a LOCAL struct variable on first expand.
@@ -606,6 +607,68 @@ SequenceEditor::drawSdkStructArgRow(SdkPanel          *panel,
                 ImGui::TreePop();
         }
         return true;
+}
+
+// ─── drawSdkArgButtons ────────────────────────────────────────────────────────
+
+void
+SequenceEditor::drawSdkArgButtons(SdkPanel          *panel,
+                                  SdkStepInfo       &sdk,
+                                  int                p,
+                                  const std::string &pname,
+                                  const std::string &ptype,
+                                  bool               isPtr)
+{
+        std::string pn = pname.empty() ? ("arg" + std::to_string(p)) : pname;
+
+        // "+" — create a LOCAL variable for this parameter.
+        if (onAddLocalVar_) {
+                ImGui::SameLine(0, 2);
+                char id[24];
+                snprintf(id, sizeof(id), "+##sa%d", p);
+                if (ImGui::SmallButton(id)) {
+                        const CStructDecl *sd =
+                            panel ? panel->getParamStructDecl(sdk.isCFunc, sdk.classIdx, sdk.methodIdx, p) : nullptr;
+                        if (sd && onAddLocalStructVar_)
+                                onAddLocalStructVar_(pn, structDeclToFields(*sd), sd->totalSize);
+                        else {
+                                DataType dt = ptrTypeFromRaw(ptype);
+                                size_t   sz = Parser::typeBytes(dt);
+                                if (sz == 0)
+                                        sz = 4;
+                                onAddLocalVar_(pn, dt, sz);
+                        }
+                        if (isPtr) {
+                                sdk.args[p] = "&" + pn;
+                                isModified_ = true;
+                        }
+                }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Add this parameter as a variable", "把该参数添加为变量"));
+        }
+
+        // "v" — pick an existing LOCAL variable and bind it to this argument.
+        if (panel && panel->onListLocalVars_) {
+                ImGui::SameLine(0, 2);
+                char btnId[24], popId[24];
+                snprintf(btnId, sizeof(btnId), "v##sap%d", p);
+                snprintf(popId, sizeof(popId), "##sapp%d", p);
+                if (ImGui::SmallButton(btnId))
+                        ImGui::OpenPopup(popId);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Use a variable for this argument", "用变量作为该参数"));
+                if (ImGui::BeginPopup(popId)) {
+                        auto vars = panel->onListLocalVars_();
+                        if (vars.empty())
+                                ImGui::TextDisabled("%s", tr("(no variables)", "(无变量)"));
+                        for (const auto &vn : vars)
+                                if (ImGui::Selectable(vn.c_str())) {
+                                        sdk.args[p] = (isPtr ? "&" : "$") + vn;
+                                        isModified_ = true;
+                                }
+                        ImGui::EndPopup();
+                }
+        }
 }
 
 // ─── drawBodySteps ────────────────────────────────────────────────────────────
@@ -882,7 +945,8 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                                                         break;
                                                                                 }
                                                                         }
-                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                                                        ImGui::SetNextItemWidth(
+                                                                            ImGui::GetContentRegionAvail().x - 48.0f);
                                                                         char cmId[16];
                                                                         snprintf(cmId, sizeof(cmId), "##ec%d", p);
                                                                         if (ImGui::BeginCombo(cmId, preview)) {
@@ -912,6 +976,8 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                                                 }
                                                                                 ImGui::EndCombo();
                                                                         }
+                                                                        drawSdkArgButtons(
+                                                                            panel.get(), op.sdk, p, pname, ptype, isPtr);
                                                                 } else {
                                                                         ImGui::SetNextItemWidth(inputW);
                                                                         if (ImGui::InputText("##arg", argBuf, sizeof(argBuf))) {
@@ -1934,7 +2000,9 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                                         break;
                                                                                                 }
                                                                                         }
-                                                                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                                                                        ImGui::SetNextItemWidth(
+                                                                                            ImGui::GetContentRegionAvail().x -
+                                                                                            48.0f);
                                                                                         char cmId2[16];
                                                                                         snprintf(
                                                                                             cmId2, sizeof(cmId2), "##ec%d", p);
@@ -1979,6 +2047,12 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                                 }
                                                                                                 ImGui::EndCombo();
                                                                                         }
+                                                                                        drawSdkArgButtons(panel.get(),
+                                                                                                          op.sdk,
+                                                                                                          p,
+                                                                                                          pname,
+                                                                                                          ptype,
+                                                                                                          isPtr);
                                                                                 } else {
                                                                                         ImGui::SetNextItemWidth(inputW);
                                                                                         if (ImGui::InputText("##arg",

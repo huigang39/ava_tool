@@ -35,15 +35,6 @@ extern std::atomic<bool> g_jlinkSamplingPaused;
 // used only for POLL mode.
 extern std::atomic<int> g_maxHssHz;
 
-struct ChannelMovePayload {
-        MonitorScope *srcScope;
-        // When isGroup is false: the exact channel key to move.
-        // When isGroup is true: a struct/array group path prefix — every channel whose
-        // key equals it or starts with "<chName>." is moved together.
-        char chName[128];
-        bool isGroup{false};
-};
-
 // Progress/lifetime state for a background CSV export. Held via shared_ptr so
 // the writer thread can outlive the Monitor (e.g. window closed mid-export)
 // without dangling.

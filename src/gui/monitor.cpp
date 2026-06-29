@@ -323,11 +323,12 @@ MonitorScope::tableDraw()
         if (!ImGui::BeginTable("MonitorTable",
                                6,
                                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
-                                   ImGuiTableFlags_Sortable))
+                                   ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate))
                 return;
 
-        ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
-                                ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
+        // No DefaultSort: the table starts in manual (drag-reordered) order. Clicking a
+        // column header sorts; clicking until it clears (tristate) returns to manual order.
+        ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"), ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn(tr("Value###col_value", "数值###col_value"), ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthStretch);
@@ -473,23 +474,55 @@ MonitorScope::tableDraw()
                         // Group header — show collapsible tree node, empty other columns.
                         ImGui::TableNextRow();
                         ImGui::TableNextColumn();
+
+                        // "=" grip — the single drag handle for this struct/array group: drop it on
+                        // another row's grip in this scope to reorder, or on another scope to move the
+                        // whole group there.
+                        {
+                                char ggrip[192];
+                                snprintf(ggrip, sizeof(ggrip), "=##grp_%s", fullPath.c_str());
+                                ImGui::SmallButton(ggrip);
+                                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                                        ChannelMovePayload payload;
+                                        payload.srcScope = this;
+                                        payload.isGroup  = true;
+                                        snprintf(payload.chName, sizeof(payload.chName), "%s", fullPath.c_str());
+                                        ImGui::SetDragDropPayload("DND_CHANNEL_MOVE", &payload, sizeof(ChannelMovePayload));
+                                        ImGui::Text(tr("Drag: %s", "拖动: %s"), label.c_str());
+                                        ImGui::EndDragDropSource();
+                                }
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s", tr("Drag: reorder / move to scope", "拖动：排序 / 移动到示波器"));
+                                if (ImGui::BeginDragDropTarget()) {
+                                        if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE")) {
+                                                std::string anchor = groupAnchorKey(fullPath);
+                                                if (!anchor.empty())
+                                                        applyChannelMoveDrop(static_cast<ChannelMovePayload *>(mv->Data), anchor);
+                                        }
+                                        ImGui::EndDragDropTarget();
+                                }
+                                ImGui::SameLine();
+                        }
+
                         ImGuiTreeNodeFlags treeFlags = ImGuiTreeNodeFlags_SpanFullWidth;
                         if (isGroupSelected)
                                 treeFlags |= ImGuiTreeNodeFlags_Selected;
                         const bool wasOpen = expandedGroups_.count(fullPath) > 0;
                         ImGui::SetNextItemOpen(wasOpen);
+                        // Suppress the hover/selected highlight on the group header (matches leaf rows).
+                        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
+                        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+                        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
                         bool open = ImGui::TreeNodeEx(label.c_str(), treeFlags);
+                        ImGui::PopStyleColor(3);
 
-                        // Drag the whole struct/array group to another scope (moves every leaf
-                        // under it together — see the DND_CHANNEL_MOVE drop handler).
-                        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
-                                ChannelMovePayload payload;
-                                payload.srcScope = this;
-                                payload.isGroup  = true;
-                                snprintf(payload.chName, sizeof(payload.chName), "%s", fullPath.c_str());
-                                ImGui::SetDragDropPayload("DND_CHANNEL_MOVE", &payload, sizeof(ChannelMovePayload));
-                                ImGui::Text(tr("Move group: %s", "移动分组: %s"), label.c_str());
-                                ImGui::EndDragDropSource();
+                        if (ImGui::BeginDragDropTarget()) {
+                                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE")) {
+                                        std::string anchor = groupAnchorKey(fullPath);
+                                        if (!anchor.empty())
+                                                applyChannelMoveDrop(static_cast<ChannelMovePayload *>(mv->Data), anchor);
+                                }
+                                ImGui::EndDragDropTarget();
                         }
 
                         if (open != wasOpen) {
@@ -604,19 +637,22 @@ MonitorScope::drawTableRow(const std::string               &chName,
         // 1. Name (Selectable for Shift/Ctrl support)
         ImGui::TableNextColumn();
 
-        // Reorder grip — a dedicated drag handle so reordering doesn't clash with
-        // the row's existing "move to another scope" (DND_CHANNEL_MOVE) source.
+        // "=" grip: reorder inside this scope, or move to another scope.
         ImGui::SmallButton("=##chgrip");
         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
-                ImGui::SetDragDropPayload("CH_ROW_REORDER", chName.c_str(), chName.size() + 1);
-                ImGui::Text(tr("Reorder: %s", "调整顺序: %s"), chName.c_str());
+                ChannelMovePayload payload;
+                payload.srcScope = this;
+                payload.isGroup  = false;
+                snprintf(payload.chName, sizeof(payload.chName), "%s", chName.c_str());
+                ImGui::SetDragDropPayload("DND_CHANNEL_MOVE", &payload, sizeof(ChannelMovePayload));
+                ImGui::Text(tr("Drag: %s", "拖动: %s"), chName.c_str());
                 ImGui::EndDragDropSource();
         }
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", tr("Drag to reorder", "拖动以调整顺序"));
+                ImGui::SetTooltip("%s", tr("Drag: reorder / move to scope", "拖动：排序 / 移动到示波器"));
         if (ImGui::BeginDragDropTarget()) {
-                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("CH_ROW_REORDER"))
-                        reorderChannelTo(std::string(static_cast<const char *>(mv->Data)), chName);
+                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE"))
+                        applyChannelMoveDrop(static_cast<ChannelMovePayload *>(mv->Data), chName);
                 ImGui::EndDragDropTarget();
         }
         ImGui::SameLine();
@@ -651,6 +687,12 @@ MonitorScope::drawTableRow(const std::string               &chName,
                 lastSelectedIndex_ = idx;
         }
         ImGui::PopStyleColor(3);
+
+        if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE"))
+                        applyChannelMoveDrop(static_cast<ChannelMovePayload *>(mv->Data), chName);
+                ImGui::EndDragDropTarget();
+        }
 
         if (ImGui::BeginPopupContextItem()) {
                 // Right-click implies selection — auto-select this row so Delete works
@@ -1563,6 +1605,74 @@ MonitorScope::reorderChannelTo(const std::string &src, const std::string &dst)
                 parent_->setModified();
 }
 
+std::string
+MonitorScope::groupAnchorKey(const std::string &groupPath) const
+{
+        const std::string prefix  = groupPath + ".";
+        std::string       best;
+        i64               bestOrd = std::numeric_limits<i64>::max();
+        for (const auto &[k, ch] : chs_) {
+                if (k == groupPath || k.rfind(prefix, 0) == 0) {
+                        i64 o = ch->getOrder();
+                        if (o < bestOrd) {
+                                bestOrd = o;
+                                best    = k;
+                        }
+                }
+        }
+        return best;
+}
+
+void
+MonitorScope::reorderGroupBefore(const std::string &srcGroup, const std::string &dst)
+{
+        if (chs_.find(dst) == chs_.end())
+                return;
+
+        // Collect the leaves that belong to the dragged group.
+        const std::string     prefix = srcGroup + ".";
+        std::set<std::string> srcSet;
+        for (const auto &[k, _] : chs_)
+                if (k == srcGroup || k.rfind(prefix, 0) == 0)
+                        srcSet.insert(k);
+        if (srcSet.empty() || srcSet.count(dst)) // empty, or dropping a group onto its own member
+                return;
+
+        // Current display order.
+        std::vector<std::string> keys;
+        keys.reserve(chs_.size());
+        for (auto &[k, _] : chs_)
+                keys.push_back(k);
+        std::sort(keys.begin(), keys.end(), [&](const std::string &a, const std::string &b) {
+                const i64 oa = chs_[a]->getOrder(), ob = chs_[b]->getOrder();
+                return oa != ob ? oa < ob : a < b;
+        });
+
+        // Pull the group's members out, preserving their relative order.
+        std::vector<std::string> moved;
+        moved.reserve(srcSet.size());
+        for (const auto &k : keys)
+                if (srcSet.count(k))
+                        moved.push_back(k);
+        keys.erase(std::remove_if(keys.begin(), keys.end(), [&](const std::string &k) { return srcSet.count(k) > 0; }),
+                   keys.end());
+
+        // Re-insert before the destination.
+        int didx = (int)keys.size();
+        for (int i = 0; i < (int)keys.size(); ++i)
+                if (keys[i] == dst) {
+                        didx = i;
+                        break;
+                }
+        keys.insert(keys.begin() + didx, moved.begin(), moved.end());
+
+        for (int i = 0; i < (int)keys.size(); ++i)
+                chs_[keys[i]]->setOrder(i);
+        nextChannelOrder_ = (i64)keys.size();
+        if (parent_)
+                parent_->setModified();
+}
+
 int
 MonitorScope::addChannel(const std::string &chName)
 {
@@ -1707,37 +1817,63 @@ MonitorScope::dropTarget()
                         }
                 }
 
-                if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE")) {
-                        auto *data = static_cast<ChannelMovePayload *>(payload->Data);
-                        if (data->srcScope != this) {
-                                auto &src = data->srcScope->getChannels();
-                                if (data->isGroup) {
-                                        // Move every channel under the group: key == prefix or "prefix.".
-                                        const std::string        exact  = data->chName;
-                                        const std::string        prefix = exact + ".";
-                                        std::vector<std::string> toMove;
-                                        for (auto &[k, _] : src)
-                                                if (k == exact || k.rfind(prefix, 0) == 0)
-                                                        toMove.push_back(k);
-                                        for (auto &k : toMove) {
-                                                auto it = src.find(k);
-                                                if (it != src.end()) {
-                                                        this->getChannels()[k] = std::move(it->second);
-                                                        src.erase(it);
-                                                }
-                                        }
-                                } else {
-                                        auto it = src.find(data->chName);
-                                        if (it != src.end()) {
-                                                // Transfer ownership
-                                                this->getChannels()[data->chName] = std::move(it->second);
-                                                src.erase(it);
-                                        }
-                                }
-                        }
-                }
+                if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE"))
+                        moveChannelsFrom(static_cast<ChannelMovePayload *>(payload->Data));
                 ImGui::EndDragDropTarget();
         }
+}
+
+void
+MonitorScope::moveChannelsFrom(ChannelMovePayload *data)
+{
+        if (!data || data->srcScope == this)
+                return;
+        auto &src = data->srcScope->getChannels();
+        if (data->isGroup) {
+                // Move every channel under the group: key == prefix or "prefix.".
+                const std::string        exact  = data->chName;
+                const std::string        prefix = exact + ".";
+                std::vector<std::string> toMove;
+                for (auto &[k, _] : src)
+                        if (k == exact || k.rfind(prefix, 0) == 0)
+                                toMove.push_back(k);
+                for (auto &k : toMove) {
+                        auto it = src.find(k);
+                        if (it != src.end()) {
+                                this->getChannels()[k] = std::move(it->second);
+                                src.erase(it);
+                        }
+                }
+        } else {
+                auto it = src.find(data->chName);
+                if (it != src.end()) {
+                        this->getChannels()[data->chName] = std::move(it->second);
+                        src.erase(it);
+                }
+        }
+        if (parent_)
+                parent_->setModified();
+}
+
+void
+MonitorScope::applyChannelMoveDrop(ChannelMovePayload *data, const std::string &dst)
+{
+        if (!data)
+                return;
+        if (data->srcScope == this) {
+                if (data->isGroup)
+                        reorderGroupBefore(data->chName, dst);
+                else
+                        reorderChannelTo(data->chName, dst);
+                return;
+        }
+        const bool movedGroup = data->isGroup;
+        const std::string movedName = data->chName;
+        moveChannelsFrom(data);
+        if (movedGroup)
+                reorderGroupBefore(movedName, dst);
+        else
+                reorderChannelTo(movedName, dst);
 }
 
 void

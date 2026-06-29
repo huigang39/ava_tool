@@ -294,7 +294,7 @@ SdkPanel::doCallC()
         const CFuncDecl         &fn = parseResult_.functions[selectedFnIdx_];
         std::vector<std::string> args(fn.params.size());
         for (size_t i = 0; i < fn.params.size(); ++i)
-                args[i] = fnArgBufs_[i].text;
+                args[i] = resolveArgVar(fnArgBufs_[i].text, fn.params[i]);
 
         CallResult res = loader_.call(fn, args);
 
@@ -343,13 +343,24 @@ SdkPanel::doCallMethod()
         }
 
         std::vector<std::string> args(meth.params.size());
-        for (size_t i = 0; i < meth.params.size(); ++i)
-                args[i] = methArgBufs_[i].text;
-
-        std::vector<void *> structPtrs(meth.params.size(), nullptr);
+        std::vector<void *>      structPtrs(meth.params.size(), nullptr);
+        // Default struct buffers come from the inline field editor.
         for (size_t i = 0; i < structBufs_.size(); ++i) {
                 if (structBufs_[i].decl && !structBufs_[i].data.empty())
                         structPtrs[i] = structBufs_[i].data.data();
+        }
+        for (size_t i = 0; i < meth.params.size(); ++i) {
+                const std::string raw = methArgBufs_[i].text;
+                // "&var" bound to a struct param → use that LOCAL variable's buffer instead
+                // of the inline editor's buffer.
+                if (raw.size() > 1 && raw[0] == '&' && findParamStruct(meth.params[i]) && onGetVarBuf_) {
+                        if (void *buf = onGetVarBuf_(raw.substr(1))) {
+                                structPtrs[i] = buf;
+                                args[i]       = raw;
+                                continue;
+                        }
+                }
+                args[i] = resolveArgVar(raw, meth.params[i]);
         }
 
         CallResult res = loader_.callMethod(thisPtr, meth, args, structPtrs);
@@ -568,6 +579,84 @@ SdkPanel::findParamStruct(const CParam &p) const
         if (raw.size() > 6 && raw.substr(0, 6) == "const ")
                 raw = raw.substr(6);
         return findStruct(parseResult_, raw);
+}
+
+// ─── resolveArgVar ────────────────────────────────────────────────────────────
+
+std::string
+SdkPanel::resolveArgVar(const std::string &raw, const CParam &p) const
+{
+        if (raw.size() < 2)
+                return raw;
+        if (raw[0] == '&' && onGetVarBuf_) {
+                // Pointer/reference param bound to a LOCAL buffer — pass its address.
+                if (void *buf = onGetVarBuf_(raw.substr(1))) {
+                        char h[32];
+                        snprintf(h, sizeof(h), "0x%llx", (unsigned long long)(uintptr_t)buf);
+                        return h;
+                }
+        } else if (raw[0] == '$' && onReadLocalVar_) {
+                // Value param bound to a LOCAL variable — substitute its current value.
+                double v = 0;
+                if (onReadLocalVar_(raw.substr(1), v)) {
+                        char b[64];
+                        if (ctypeIsFloat(p.type))
+                                snprintf(b, sizeof(b), "%g", v);
+                        else
+                                snprintf(b, sizeof(b), "%lld", (long long)(int64_t)v);
+                        return b;
+                }
+        }
+        return raw;
+}
+
+// ─── drawParamVarButtons ──────────────────────────────────────────────────────
+
+void
+SdkPanel::drawParamVarButtons(char *argBuf, size_t argBufSz, const CParam &p, int salt)
+{
+        std::string rt = p.rawType;
+        while (!rt.empty() && (rt.back() == ' ' || rt.back() == '\t'))
+                rt.pop_back();
+        bool               isPtr = !rt.empty() && (rt.back() == '*' || rt.back() == '&');
+        const CStructDecl *sd    = findParamStruct(p);
+        std::string        pn    = p.name.empty() ? ("arg" + std::to_string(salt)) : p.name;
+
+        // "+" — create a LOCAL variable for this parameter.
+        if (onCreateLocalVar_) {
+                ImGui::SameLine(0, 2);
+                char id[24];
+                snprintf(id, sizeof(id), "+##pc%d", salt);
+                if (ImGui::SmallButton(id))
+                        onCreateLocalVar_(pn, p.type, sd);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Add this parameter as a variable", "把该参数添加为变量"));
+        }
+
+        // "v" — pick an existing LOCAL variable and bind it to this argument.
+        if (onListLocalVars_) {
+                ImGui::SameLine(0, 2);
+                char btnId[24], popId[24];
+                snprintf(btnId, sizeof(btnId), "v##pv%d", salt);
+                snprintf(popId, sizeof(popId), "##pvp%d", salt);
+                if (ImGui::SmallButton(btnId))
+                        ImGui::OpenPopup(popId);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", tr("Use a variable for this argument", "用变量作为该参数"));
+                if (ImGui::BeginPopup(popId)) {
+                        auto vars = onListLocalVars_();
+                        if (vars.empty())
+                                ImGui::TextDisabled("%s", tr("(no variables)", "(无变量)"));
+                        for (const auto &vn : vars) {
+                                if (ImGui::Selectable(vn.c_str())) {
+                                        std::string bound = (isPtr ? "&" : "$") + vn;
+                                        strncpy(argBuf, bound.c_str(), argBufSz - 1);
+                                        argBuf[argBufSz - 1] = '\0';
+                                }
+                        }
+                        ImGui::EndPopup();
+                }
+        }
 }
 
 // ─── Python runner script (embedded) ─────────────────────────────────────────
@@ -1353,9 +1442,9 @@ SdkPanel::drawCFunctionsTab()
                                                 ImGui::Text("[%zu]", i);
                                         ImGui::TableSetColumnIndex(2);
                                         if (i < fnArgBufs_.size()) {
-                                                bool hasCreate = (bool)onCreateLocalVar_;
+                                                bool hasBtns = onCreateLocalVar_ || onListLocalVars_;
                                                 ImGui::SetNextItemWidth(
-                                                    hasCreate ? ImGui::GetContentRegionAvail().x - 24.0f : -FLT_MIN);
+                                                    hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW : -FLT_MIN);
                                                 if (isCharP)
                                                         ImGui::InputText(id, fnArgBufs_[i].text, sizeof(ArgBuf::text));
                                                 else if (ctypeIsFloat(p.type))
@@ -1369,21 +1458,7 @@ SdkPanel::drawCFunctionsTab()
                                                                          sizeof(ArgBuf::text),
                                                                          ImGuiInputTextFlags_CharsHexadecimal |
                                                                              ImGuiInputTextFlags_CharsDecimal);
-                                                if (hasCreate) {
-                                                        ImGui::SameLine(0, 2);
-                                                        char nbId[32];
-                                                        snprintf(nbId, sizeof(nbId), "+##fnewp%zu", i);
-                                                        if (ImGui::SmallButton(nbId)) {
-                                                                std::string vn =
-                                                                    p.name.empty() ? ("arg" + std::to_string(i)) : p.name;
-                                                                onCreateLocalVar_(vn, p.type, findParamStruct(p));
-                                                        }
-                                                        if (ImGui::IsItemHovered())
-                                                                ImGui::SetTooltip(
-                                                                    "%s",
-                                                                    tr("Add this parameter as a variable",
-                                                                       "把该参数添加为变量"));
-                                                }
+                                                drawParamVarButtons(fnArgBufs_[i].text, sizeof(ArgBuf::text), p, (int)i);
                                         }
                                 }
 
@@ -1684,8 +1759,23 @@ SdkPanel::drawCppClassesTab()
                                         ImGui::SetNextItemOpen(expanded, ImGuiCond_Always);
                                         expanded = ImGui::TreeNodeEx(hdr, ImGuiTreeNodeFlags_SpanFullWidth);
 
+                                        // col2: show whether this struct uses the inline editor or is bound to a
+                                        // LOCAL variable, plus the [+][v] buttons.
+                                        ImGui::TableSetColumnIndex(2);
+                                        if (pi < methArgBufs_.size()) {
+                                                const char *bound = methArgBufs_[pi].text;
+                                                if (bound[0] == '&')
+                                                        ImGui::TextDisabled("%s", bound);
+                                                else
+                                                        ImGui::TextDisabled("%s", tr("(inline)", "(内联编辑)"));
+                                                drawParamVarButtons(methArgBufs_[pi].text, sizeof(ArgBuf::text), p, (int)pi);
+                                        }
+
+                                        // Inline field editor is used only when not bound to a "&var".
+                                        bool bound = (pi < methArgBufs_.size() && methArgBufs_[pi].text[0] == '&');
                                         if (expanded) {
-                                                drawSdkStructFieldRows(*sd, buf.data(), buf.size(), (int)pi);
+                                                if (!bound)
+                                                        drawSdkStructFieldRows(*sd, buf.data(), buf.size(), (int)pi);
                                                 ImGui::TreePop();
                                         }
                                         continue;
@@ -1694,18 +1784,19 @@ SdkPanel::drawCppClassesTab()
                                 // Enum parameter → dropdown row.
                                 const CEnumDecl *ed = findParamEnum(p);
                                 if (ed && !ed->values.empty()) {
-                                        int64_t curVal = 0;
-                                        if (pi < methArgBufs_.size())
-                                                curVal = strtoll(methArgBufs_[pi].text, nullptr, 0);
-                                        const char *preview2 = ed->values[0].name.c_str();
+                                        const char *boundTxt = (pi < methArgBufs_.size()) ? methArgBufs_[pi].text : "";
+                                        bool        isBound  = boundTxt[0] == '$' || boundTxt[0] == '&';
+                                        int64_t     curVal   = isBound ? 0 : strtoll(boundTxt, nullptr, 0);
+                                        const char *preview2 = isBound ? boundTxt : ed->values[0].name.c_str();
                                         int         curIdx   = 0;
-                                        for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
-                                                if (ed->values[ei].value == curVal) {
-                                                        preview2 = ed->values[ei].name.c_str();
-                                                        curIdx   = ei;
-                                                        break;
+                                        if (!isBound)
+                                                for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
+                                                        if (ed->values[ei].value == curVal) {
+                                                                preview2 = ed->values[ei].name.c_str();
+                                                                curIdx   = ei;
+                                                                break;
+                                                        }
                                                 }
-                                        }
                                         ImGui::TableNextRow();
                                         ImGui::TableSetColumnIndex(0);
                                         ImGui::TextUnformatted(ed->name.c_str());
@@ -1714,7 +1805,9 @@ SdkPanel::drawCppClassesTab()
                                         ImGui::TableSetColumnIndex(2);
                                         char cmId[64];
                                         snprintf(cmId, sizeof(cmId), "##ec%zu", pi);
-                                        ImGui::SetNextItemWidth(-FLT_MIN);
+                                        bool hasBtns = onCreateLocalVar_ || onListLocalVars_;
+                                        ImGui::SetNextItemWidth(
+                                            hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW : -FLT_MIN);
                                         if (ImGui::BeginCombo(cmId, preview2)) {
                                                 for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
                                                         bool sel2 = (ei == curIdx);
@@ -1735,6 +1828,8 @@ SdkPanel::drawCppClassesTab()
                                                 }
                                                 ImGui::EndCombo();
                                         }
+                                        if (pi < methArgBufs_.size())
+                                                drawParamVarButtons(methArgBufs_[pi].text, sizeof(ArgBuf::text), p, (int)pi);
                                         continue;
                                 }
 
@@ -1751,10 +1846,10 @@ SdkPanel::drawCppClassesTab()
                                         ImGui::Text("[%zu]", pi);
                                 ImGui::TableSetColumnIndex(2);
                                 if (pi < methArgBufs_.size()) {
-                                        bool isCharP   = ctypeIsCharPtr(p.type, p.rawType);
-                                        bool hasCreate = (bool)onCreateLocalVar_;
+                                        bool isCharP = ctypeIsCharPtr(p.type, p.rawType);
+                                        bool hasBtns = onCreateLocalVar_ || onListLocalVars_;
                                         ImGui::SetNextItemWidth(
-                                            hasCreate ? ImGui::GetContentRegionAvail().x - 24.0f : -FLT_MIN);
+                                            hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW : -FLT_MIN);
                                         if (isCharP)
                                                 ImGui::InputText(rowId, methArgBufs_[pi].text, sizeof(ArgBuf::text));
                                         else if (ctypeIsFloat(p.type))
@@ -1768,20 +1863,7 @@ SdkPanel::drawCppClassesTab()
                                                                  sizeof(ArgBuf::text),
                                                                  ImGuiInputTextFlags_CharsHexadecimal |
                                                                      ImGuiInputTextFlags_CharsDecimal);
-                                        if (hasCreate) {
-                                                ImGui::SameLine(0, 2);
-                                                char nbId[32];
-                                                snprintf(nbId, sizeof(nbId), "+##mnewp%zu", pi);
-                                                if (ImGui::SmallButton(nbId)) {
-                                                        std::string vn =
-                                                            p.name.empty() ? ("arg" + std::to_string(pi)) : p.name;
-                                                        onCreateLocalVar_(vn, p.type, findParamStruct(p));
-                                                }
-                                                if (ImGui::IsItemHovered())
-                                                        ImGui::SetTooltip("%s",
-                                                                          tr("Add this parameter as a variable",
-                                                                             "把该参数添加为变量"));
-                                        }
+                                        drawParamVarButtons(methArgBufs_[pi].text, sizeof(ArgBuf::text), p, (int)pi);
                                 }
                         }
 
@@ -3355,6 +3437,16 @@ SdkPanel::directCall(int ci, int mi, int objIdx, const std::vector<std::string> 
                                 structPtrs[i]  = buf;
                                 ptrVarNames[i] = vn;
                         }
+                } else if (effArgs[i].size() > 1 && effArgs[i][0] == '$' && onReadLocalVar_) {
+                        double v = 0;
+                        if (onReadLocalVar_(effArgs[i].substr(1), v)) {
+                                char b[64];
+                                if (i < meth.params.size() && ctypeIsFloat(meth.params[i].type))
+                                        snprintf(b, sizeof(b), "%g", v);
+                                else
+                                        snprintf(b, sizeof(b), "%lld", (long long)(int64_t)v);
+                                effArgs[i] = b;
+                        }
                 }
         }
 
@@ -3389,6 +3481,16 @@ SdkPanel::directCallC(int fi, const std::vector<std::string> &args)
                                 snprintf(addrStr, sizeof(addrStr), "0x%llx", (unsigned long long)(uintptr_t)buf);
                                 effArgs[i]     = addrStr;
                                 ptrVarNames[i] = vn;
+                        }
+                } else if (effArgs[i].size() > 1 && effArgs[i][0] == '$' && onReadLocalVar_) {
+                        double v = 0;
+                        if (onReadLocalVar_(effArgs[i].substr(1), v)) {
+                                char b[64];
+                                if (i < fn.params.size() && ctypeIsFloat(fn.params[i].type))
+                                        snprintf(b, sizeof(b), "%g", v);
+                                else
+                                        snprintf(b, sizeof(b), "%lld", (long long)(int64_t)v);
+                                effArgs[i] = b;
                         }
                 }
         }

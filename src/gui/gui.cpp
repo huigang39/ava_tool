@@ -2785,6 +2785,14 @@ Gui::newSdkPanel()
                 }
                 return nullptr;
         };
+        // LOCAL Variable value read — for "$var" value substitution in arguments.
+        sp->onReadLocalVar_ = [this](const std::string &varName, double &out) -> bool {
+                std::lock_guard<std::mutex> lk(mtxMonitors_);
+                for (auto &[_, vw] : vars_)
+                        if (vw->readLocalScalar(varName, out))
+                                return true;
+                return false;
+        };
         sp->onVarWritten_ = [this](const std::string &varName) {
                 for (auto &[_, vw] : vars_) {
                         for (const auto &ve : vw->vars_) {

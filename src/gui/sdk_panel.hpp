@@ -100,6 +100,10 @@ class SdkPanel
         // For a struct type pass structDecl != nullptr; otherwise scalarType is used.
         std::function<void(const std::string &name, CType scalarType, const CStructDecl *structDecl)> onCreateLocalVar_;
 
+        // Set by Gui to read the current value of a LOCAL variable (for "$var" value args).
+        // Returns false if no such LOCAL variable exists.
+        std::function<bool(const std::string &name, double &out)> onReadLocalVar_;
+
         // Set by Gui to connect SDK pointer/reference args to Variable LOCAL buffers.
         // onGetVarBuf_("varname") → returns stable buffer ptr (pre-allocated size), or nullptr.
         std::function<void *(const std::string &)> onGetVarBuf_;
@@ -279,6 +283,18 @@ class SdkPanel
 
         const CEnumDecl   *findParamEnum(const CParam &p) const;
         const CStructDecl *findParamStruct(const CParam &p) const;
+
+        // Resolve a "&var" (→ LOCAL buffer address) or "$var" (→ current value) argument
+        // string against the variable manager. Plain literals pass through unchanged.
+        std::string resolveArgVar(const std::string &raw, const CParam &p) const;
+
+        // Renders [+][v] buttons (SameLine) after a parameter's value widget. "+" creates a
+        // LOCAL variable for the parameter; "v" picks an existing LOCAL variable and binds it
+        // into argBuf as "&var" (pointer/reference param) or "$var" (value param). `salt`
+        // makes widget IDs unique. Width for the buttons must be reserved by the caller
+        // (see kParamBtnsW).
+        void              drawParamVarButtons(char *argBuf, size_t argBufSz, const CParam &p, int salt);
+        static const int  kParamBtnsW = 48; // px to reserve for the [+][v] buttons
 
         void drawCFunctionsTab();
         void drawCppClassesTab();

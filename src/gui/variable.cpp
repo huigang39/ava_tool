@@ -1229,6 +1229,93 @@ Variable::drawVariableList()
                 // mutate vars_ mid-iteration.
                 int varMoveSrc = -1, varMoveDst = -1;
 
+                // Drop the grip drag state once the drag ends.
+                if (!ImGui::IsDragDropActive()) {
+                        rowDragSrc_      = -1;
+                        fieldDragParent_ = -1;
+                        fieldDragSrc_    = -1;
+                }
+
+                // Build the monitor drag payload (CHANNEL / STRUCT_CHANNEL) for a row. This is
+                // carried by the "=" grip so the same handle both reorders the row (in-window)
+                // and drops onto a monitor to add channels.
+                auto setMonitorPayload = [&](const VarEntry &v, bool isComplex, bool hasManualStruct) {
+                        if (isComplex) {
+                                StructChannelPayload sp{};
+                                sp.writable = v.writable;
+                                snprintf(sp.device,
+                                         sizeof(sp.device),
+                                         "%s",
+                                         v.port == PortType::JLINK ? "JLINK" : (v.port == PortType::SHM ? "SHM" : "LOCAL"));
+                                if (v.port == PortType::SHM)
+                                        snprintf(sp.shmName, sizeof(sp.shmName), "%s", v.shm.name);
+                                snprintf(sp.rootName, sizeof(sp.rootName), "%s", v.name.c_str());
+                                sp.rootAddr    = v.addr;
+                                sp.rootTypeOff = v.typeOff;
+                                if (hasManualStruct) {
+                                        for (const auto &sf : v.structFields) {
+                                                if (sp.count >= StructChannelPayload::kMaxEntries)
+                                                        break;
+                                                auto &e = sp.entries[sp.count++];
+                                                snprintf(e.name, sizeof(e.name), "%s.%s", v.name.c_str(), sf.name);
+                                                e.addr = v.addr + sf.byteOffset;
+                                                snprintf(e.type, sizeof(e.type), "%s", Parser::dataTypeToStr(sf.type));
+                                                e.writable = v.writable;
+                                                e.numEnums = 0;
+                                                auto eit   = v.memberEnumDefs.find(e.name);
+                                                if (eit != v.memberEnumDefs.end() && !eit->second.empty()) {
+                                                        e.numEnums = (u8)std::min((int)eit->second.size(),
+                                                                                  StructChannelPayload::kMaxEnums);
+                                                        for (int k = 0; k < e.numEnums; ++k) {
+                                                                snprintf(e.enums[k].name,
+                                                                         sizeof(e.enums[k].name),
+                                                                         "%s",
+                                                                         eit->second[k].name.c_str());
+                                                                e.enums[k].value = eit->second[k].value;
+                                                        }
+                                                }
+                                        }
+                                } else {
+                                        std::lock_guard lk(mtxElf_);
+                                        flattenForStructPayload(dwarfInfo_, v.name, v.addr, v.typeOff, sp, &v.memberEnumDefs);
+                                }
+                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
+                        } else {
+                                ChannelDropPayload p{};
+                                p.writable = v.writable;
+                                snprintf(p.name, sizeof(p.name), "%s", v.name.c_str());
+                                p.addr = v.addr;
+                                snprintf(p.type, sizeof(p.type), "%s", Parser::dataTypeToStr(v.type));
+                                snprintf(p.device,
+                                         sizeof(p.device),
+                                         "%s",
+                                         v.port == PortType::JLINK ? "JLINK" : (v.port == PortType::SHM ? "SHM" : "LOCAL"));
+                                if (v.port == PortType::SHM)
+                                        snprintf(p.shmName, sizeof(p.shmName), "%s", v.shm.name);
+                                p.numBytes = (u8)Parser::typeBytes(v.type);
+                                p.typeOff  = v.typeOff;
+                                {
+                                        std::lock_guard lk(mtxElf_);
+                                        fillEnumPayload(dwarfInfo_, v.typeOff, p, &v.enumDefs);
+                                }
+                                ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
+                        }
+                };
+
+                // A row reorder target: reorders when the active drag is an internal "=" grip
+                // drag (rowDragSrc_ >= 0). Returns nothing; updates varMoveSrc/Dst.
+                auto acceptRowReorder = [&](int dstRow) {
+                        if (rowDragSrc_ < 0)
+                                return;
+                        const ImGuiPayload *pl = ImGui::GetDragDropPayload();
+                        if (!pl || !(pl->IsDataType("CHANNEL") || pl->IsDataType("STRUCT_CHANNEL")))
+                                return;
+                        if (ImGui::AcceptDragDropPayload(pl->DataType, ImGuiDragDropFlags_AcceptNoDrawDefaultRect)) {
+                                varMoveSrc = rowDragSrc_;
+                                varMoveDst = dstRow;
+                        }
+                };
+
                 for (int i = 0; i < (int)vars_.size(); ++i) {
                         auto      &v          = vars_[i];
                         const bool isSelected = v.selected;
@@ -1236,8 +1323,21 @@ Variable::drawVariableList()
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
 
-                        // Reorder grip — a dedicated drag handle so row reordering doesn't
-                        // clash with the row's existing "drag to scope" source.
+                        // Detect a struct/array type up front — the "=" grip needs it to build
+                        // the monitor drag payload.
+                        const dwarf::Type *t = nullptr;
+                        {
+                                std::lock_guard lk(mtxElf_);
+                                t = resolveAlias(dwarfInfo_, v.typeOff);
+                        }
+                        const bool hasManualStruct = !v.structFields.empty();
+                        const bool isComplex =
+                            hasManualStruct || (t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
+                                                      t->kind == dwarf::TypeKind::ARRAY));
+
+                        // "=" grip — selection + the single drag handle for this row. Dragging it
+                        // reorders the row (drop on another row's grip) or adds the variable to a
+                        // monitor (drop on a monitor scope).
                         if (ui::SmallButton("=##rowgrip", v.selected ? ui::BtnStyle::Primary : ui::BtnStyle::Neutral)) {
                                 if (ImGui::GetIO().KeyCtrl) {
                                         v.selected = !v.selected;
@@ -1254,32 +1354,19 @@ Variable::drawVariableList()
                                 lastSelectedIndex_ = i;
                         }
                         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
-                                ImGui::SetDragDropPayload("VAR_ROW_MOVE", &i, sizeof(i));
-                                ImGui::TextUnformatted(v.name.c_str());
+                                rowDragSrc_ = i;
+                                setMonitorPayload(v, isComplex, hasManualStruct);
+                                ImGui::Text(tr("Dragging %s", "拖拽 %s"), v.name.c_str());
                                 ImGui::EndDragDropSource();
                         }
                         if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("%s", tr("Drag to reorder", "拖动以调整顺序"));
+                                ImGui::SetTooltip("%s", tr("Drag: reorder / add to monitor", "拖动：调整顺序 / 添加到监视器"));
                         if (ImGui::BeginDragDropTarget()) {
-                                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("VAR_ROW_MOVE"))
-                                        if (mv->DataSize == (int)sizeof(int)) {
-                                                varMoveSrc = *static_cast<const int *>(mv->Data);
-                                                varMoveDst = i;
-                                        }
+                                acceptRowReorder(i);
                                 ImGui::EndDragDropTarget();
                         }
                         ImGui::OpenPopupOnItemClick("##var_row_ctx", ImGuiPopupFlags_MouseButtonRight);
                         ImGui::SameLine();
-
-                        const dwarf::Type *t = nullptr;
-                        {
-                                std::lock_guard lk(mtxElf_);
-                                t = resolveAlias(dwarfInfo_, v.typeOff);
-                        }
-                        const bool hasManualStruct = !v.structFields.empty();
-                        const bool isComplex =
-                            hasManualStruct || (t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
-                                                      t->kind == dwarf::TypeKind::ARRAY));
 
                         bool pendingDelete   = false;
                         bool pendingEnumEdit = false;
@@ -1355,11 +1442,7 @@ Variable::drawVariableList()
                         ImGui::PopStyleColor(2);
                         // Accept reorder drops on the whole row (larger target than the grip).
                         if (ImGui::BeginDragDropTarget()) {
-                                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("VAR_ROW_MOVE"))
-                                        if (mv->DataSize == (int)sizeof(int)) {
-                                                varMoveSrc = *static_cast<const int *>(mv->Data);
-                                                varMoveDst = i;
-                                        }
+                                acceptRowReorder(i);
                                 ImGui::EndDragDropTarget();
                         }
                         if (isComplex && open != wasOpenTop) {
@@ -1387,73 +1470,7 @@ Variable::drawVariableList()
                                 lastSelectedIndex_ = i;
                         }
 
-                        if (ImGui::BeginDragDropSource()) {
-                                if (isComplex) {
-                                        StructChannelPayload sp{};
-                                        sp.writable = v.writable;
-                                        snprintf(sp.device,
-                                                 sizeof(sp.device),
-                                                 "%s",
-                                                 v.port == PortType::JLINK ? "JLINK"
-                                                                           : (v.port == PortType::SHM ? "SHM" : "LOCAL"));
-                                        if (v.port == PortType::SHM)
-                                                snprintf(sp.shmName, sizeof(sp.shmName), "%s", v.shm.name);
-                                        snprintf(sp.rootName, sizeof(sp.rootName), "%s", v.name.c_str());
-                                        sp.rootAddr    = v.addr;
-                                        sp.rootTypeOff = v.typeOff;
-                                        if (hasManualStruct) {
-                                                // Manual (LOCAL) struct: there is no DWARF type to walk —
-                                                // flatten directly from the user-defined fields so each
-                                                // member becomes a "<var>.<field>" scalar channel.
-                                                for (const auto &sf : v.structFields) {
-                                                        if (sp.count >= StructChannelPayload::kMaxEntries)
-                                                                break;
-                                                        auto &e = sp.entries[sp.count++];
-                                                        snprintf(e.name, sizeof(e.name), "%s.%s", v.name.c_str(), sf.name);
-                                                        e.addr = v.addr + sf.byteOffset;
-                                                        snprintf(e.type, sizeof(e.type), "%s", Parser::dataTypeToStr(sf.type));
-                                                        e.writable = v.writable;
-                                                        e.numEnums = 0;
-                                                        auto eit   = v.memberEnumDefs.find(e.name);
-                                                        if (eit != v.memberEnumDefs.end() && !eit->second.empty()) {
-                                                                e.numEnums = (u8)std::min((int)eit->second.size(),
-                                                                                          StructChannelPayload::kMaxEnums);
-                                                                for (int k = 0; k < e.numEnums; ++k) {
-                                                                        snprintf(e.enums[k].name,
-                                                                                 sizeof(e.enums[k].name),
-                                                                                 "%s",
-                                                                                 eit->second[k].name.c_str());
-                                                                        e.enums[k].value = eit->second[k].value;
-                                                                }
-                                                        }
-                                                }
-                                        } else {
-                                                std::lock_guard lk(mtxElf_);
-                                                flattenForStructPayload(
-                                                    dwarfInfo_, v.name, v.addr, v.typeOff, sp, &v.memberEnumDefs);
-                                        }
-                                        ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
-                                } else {
-                                        ChannelDropPayload p{};
-                                        p.writable = v.writable;
-                                        snprintf(p.name, sizeof(p.name), "%s", v.name.c_str());
-                                        p.addr = v.addr;
-                                        snprintf(p.type, sizeof(p.type), "%s", Parser::dataTypeToStr(v.type));
-                                        snprintf(p.device,
-                                                 sizeof(p.device),
-                                                 "%s",
-                                                 v.port == PortType::JLINK ? "JLINK"
-                                                                           : (v.port == PortType::SHM ? "SHM" : "LOCAL"));
-                                        if (v.port == PortType::SHM)
-                                                snprintf(p.shmName, sizeof(p.shmName), "%s", v.shm.name);
-                                        p.numBytes = (u8)Parser::typeBytes(v.type);
-                                        p.typeOff  = v.typeOff;
-                                        fillEnumPayload(dwarfInfo_, v.typeOff, p, &v.enumDefs);
-                                        ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
-                                }
-                                ImGui::Text(tr("Dragging %s", "拖拽 %s"), v.name.c_str());
-                                ImGui::EndDragDropSource();
-                        }
+                        // (The monitor drag source now lives on the "=" grip — see above.)
 
                         // Value
                         ImGui::TableSetColumnIndex(1);
@@ -1502,17 +1519,68 @@ Variable::drawVariableList()
                         if (open && isComplex) {
                                 if (hasManualStruct) {
                                         // Render manually defined struct fields from LOCAL buffer
-                                        std::lock_guard<std::mutex> lk(mtxLocal_);
+                                        int                         fieldMoveSrc = -1, fieldMoveDst = -1;
+                                        std::unique_lock<std::mutex> lk(mtxLocal_);
                                         auto                        it = localBufs_.find(v.name);
                                         for (int fi = 0; fi < (int)v.structFields.size(); ++fi) {
                                                 const auto &sf = v.structFields[fi];
                                                 ImGui::PushID(fi);
                                                 ImGui::TableNextRow();
                                                 ImGui::TableSetColumnIndex(0);
+                                                // "=" grip: reorder this field (drop on a sibling) or drag it to a
+                                                // monitor (drop on a scope).
+                                                ui::SmallButton("=##fgrip", ui::BtnStyle::Neutral);
+                                                if (ImGui::BeginDragDropSource()) {
+                                                        fieldDragParent_ = i;
+                                                        fieldDragSrc_    = fi;
+                                                        ChannelDropPayload p{};
+                                                        p.writable = v.writable;
+                                                        snprintf(p.name, sizeof(p.name), "%s.%s", v.name.c_str(), sf.name);
+                                                        p.addr = v.addr + sf.byteOffset;
+                                                        snprintf(p.type, sizeof(p.type), "%s", Parser::dataTypeToStr(sf.type));
+                                                        snprintf(p.device, sizeof(p.device), "LOCAL");
+                                                        p.numBytes = (u8)Parser::typeBytes(sf.type);
+                                                        auto eit   = v.memberEnumDefs.find(p.name);
+                                                        if (eit != v.memberEnumDefs.end() && !eit->second.empty()) {
+                                                                p.numEnums = (u8)std::min((int)eit->second.size(),
+                                                                                          ChannelDropPayload::kMaxEnums);
+                                                                for (int k = 0; k < p.numEnums; ++k) {
+                                                                        snprintf(p.enums[k].name,
+                                                                                 sizeof(p.enums[k].name),
+                                                                                 "%s",
+                                                                                 eit->second[k].name.c_str());
+                                                                        p.enums[k].value = eit->second[k].value;
+                                                                }
+                                                        }
+                                                        ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
+                                                        ImGui::Text(tr("Dragging %s", "拖拽 %s"), p.name);
+                                                        ImGui::EndDragDropSource();
+                                                }
+                                                if (ImGui::IsItemHovered())
+                                                        ImGui::SetTooltip("%s",
+                                                                          tr("Drag: reorder / add to monitor",
+                                                                             "拖动：调整顺序 / 添加到监视器"));
+                                                if (ImGui::BeginDragDropTarget()) {
+                                                        if (fieldDragParent_ == i && fieldDragSrc_ >= 0) {
+                                                                const ImGuiPayload *pl = ImGui::GetDragDropPayload();
+                                                                if (pl && pl->IsDataType("CHANNEL") &&
+                                                                    ImGui::AcceptDragDropPayload(
+                                                                        "CHANNEL", ImGuiDragDropFlags_AcceptNoDrawDefaultRect)) {
+                                                                        fieldMoveSrc = fieldDragSrc_;
+                                                                        fieldMoveDst = fi;
+                                                                }
+                                                        }
+                                                        ImGui::EndDragDropTarget();
+                                                }
+                                                ImGui::SameLine();
+                                                // Suppress the hover/active highlight on struct sub-items.
+                                                ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+                                                ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
                                                 ImGui::TreeNodeEx(sf.name,
                                                                   ImGuiTreeNodeFlags_Leaf |
                                                                       ImGuiTreeNodeFlags_NoTreePushOnOpen |
                                                                       ImGuiTreeNodeFlags_SpanFullWidth);
+                                                ImGui::PopStyleColor(2);
                                                 ImGui::TableSetColumnIndex(1);
                                                 if (it != localBufs_.end()) {
                                                         const auto &fbuf = it->second;
@@ -1532,6 +1600,17 @@ Variable::drawVariableList()
                                                 ImGui::TableSetColumnIndex(3);
                                                 ImGui::Text("+0x%X", sf.byteOffset);
                                                 ImGui::PopID();
+                                        }
+                                        lk.unlock();
+                                        // Apply a deferred field reorder (struct sub-item grip). Reorders the
+                                        // display order; byte offsets are unchanged.
+                                        if (fieldMoveSrc >= 0 && fieldMoveDst >= 0 && fieldMoveSrc != fieldMoveDst &&
+                                            fieldMoveSrc < (int)v.structFields.size() && fieldMoveDst < (int)v.structFields.size()) {
+                                                auto moved = v.structFields[fieldMoveSrc];
+                                                v.structFields.erase(v.structFields.begin() + fieldMoveSrc);
+                                                int dst = fieldMoveDst > fieldMoveSrc ? fieldMoveDst - 1 : fieldMoveDst;
+                                                v.structFields.insert(v.structFields.begin() + dst, moved);
+                                                isModified_ = true;
                                         }
                                 } else {
                                         std::lock_guard lk(mtxElf_);
@@ -1558,7 +1637,9 @@ Variable::drawVariableList()
                 ImGui::EndTable();
         }
 
-        if (ImGui::BeginDragDropTarget()) {
+        // Only accept "add to watch list" drops from outside (symbol browser). An internal
+        // "=" grip drag (row or struct field) is a reorder/monitor drag — never re-add it here.
+        if (rowDragSrc_ < 0 && fieldDragParent_ < 0 && ImGui::BeginDragDropTarget()) {
                 // A struct/array dragged from the symbol browser arrives as a
                 // STRUCT_CHANNEL (flattened for the monitor); here we re-add it as a
                 // single expandable watch-list entry using the carried root metadata.
@@ -3169,43 +3250,13 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
 
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
-                        ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_OpenOnArrow;
-                        if (!isComplex)
-                                nodeFlags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-                        std::set<std::string> *expSetM  = (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size())
-                                                              ? &vars_[parentVarIdx].expandedMembers
-                                                              : nullptr;
-                        const bool             wasOpenM = isComplex && expSetM && expSetM->count(memberPath) > 0;
-                        if (isComplex && expSetM)
-                                ImGui::SetNextItemOpen(wasOpenM);
-                        bool open = ImGui::TreeNodeEx(m.name.empty() ? "<anon>" : m.name.c_str(),
-                                                      nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
-                        if (isComplex && expSetM && open != wasOpenM) {
-                                if (open)
-                                        expSetM->insert(memberPath);
-                                else
-                                        expSetM->erase(memberPath);
-                                isModified_ = true;
-                        }
-
+                        // "=" grip: drag this member to a monitor (DWARF members are memory-mapped,
+                        // so they are not reorderable — the grip is the drag handle only).
                         {
-                                const dwarf::Type *mt           = resolveAlias(dwarfInfo_, m.type);
-                                const bool         isMemberEnum = mt && mt->kind == dwarf::TypeKind::ENUM;
-                                if (ImGui::BeginPopupContextItem()) {
-                                        if (ImGui::MenuItem(tr("Delete", "删除"))) {
-                                                if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
-                                                        vars_[parentVarIdx].hiddenMembers.insert(memberPath);
-                                                        isModified_ = true;
-                                                }
-                                        }
-                                        if (isMemberEnum && ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
-                                                enumSubEditParentIdx_     = parentVarIdx;
-                                                enumSubEditMemberPath_    = memberPath;
-                                                enumSubEditMemberTypeOff_ = m.type;
-                                        }
-                                        ImGui::EndPopup();
-                                }
-                                if (ImGui::BeginDragDropSource()) {
+                                char gid[192];
+                                snprintf(gid, sizeof(gid), "=##mg_%s", memberPath.c_str());
+                                ImGui::SmallButton(gid);
+                                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
                                         const std::unordered_map<std::string, std::vector<VarEntry::EnumDef>> *memOvr =
                                             (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size())
                                                 ? &vars_[parentVarIdx].memberEnumDefs
@@ -3239,6 +3290,51 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                         ImGui::Text(tr("Dragging %s", "拖拽 %s"), memberPath.c_str());
                                         ImGui::EndDragDropSource();
                                 }
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s", tr("Drag to add to monitor", "拖动以添加到监视器"));
+                                ImGui::SameLine();
+                        }
+                        ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_OpenOnArrow;
+                        if (!isComplex)
+                                nodeFlags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+                        std::set<std::string> *expSetM  = (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size())
+                                                              ? &vars_[parentVarIdx].expandedMembers
+                                                              : nullptr;
+                        const bool             wasOpenM = isComplex && expSetM && expSetM->count(memberPath) > 0;
+                        if (isComplex && expSetM)
+                                ImGui::SetNextItemOpen(wasOpenM);
+                        // Suppress the hover/active highlight on struct sub-items.
+                        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+                        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
+                        bool open = ImGui::TreeNodeEx(m.name.empty() ? "<anon>" : m.name.c_str(),
+                                                      nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
+                        ImGui::PopStyleColor(2);
+                        if (isComplex && expSetM && open != wasOpenM) {
+                                if (open)
+                                        expSetM->insert(memberPath);
+                                else
+                                        expSetM->erase(memberPath);
+                                isModified_ = true;
+                        }
+
+                        {
+                                const dwarf::Type *mt           = resolveAlias(dwarfInfo_, m.type);
+                                const bool         isMemberEnum = mt && mt->kind == dwarf::TypeKind::ENUM;
+                                if (ImGui::BeginPopupContextItem()) {
+                                        if (ImGui::MenuItem(tr("Delete", "删除"))) {
+                                                if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
+                                                        vars_[parentVarIdx].hiddenMembers.insert(memberPath);
+                                                        isModified_ = true;
+                                                }
+                                        }
+                                        if (isMemberEnum && ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
+                                                enumSubEditParentIdx_     = parentVarIdx;
+                                                enumSubEditMemberPath_    = memberPath;
+                                                enumSubEditMemberTypeOff_ = m.type;
+                                        }
+                                        ImGui::EndPopup();
+                                }
+                                // (Monitor drag source now lives on the "=" grip — see above.)
                                 ImGui::TableSetColumnIndex(1);
                                 if (sType) {
                                         std::string valStr =
@@ -3287,6 +3383,49 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
 
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
+                        // "=" grip: drag this array element to a monitor (memory-mapped, not reorderable).
+                        {
+                                char gid[192];
+                                snprintf(gid, sizeof(gid), "=##ag_%s", memberPath.c_str());
+                                ImGui::SmallButton(gid);
+                                if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
+                                        const std::unordered_map<std::string, std::vector<VarEntry::EnumDef>> *memOvr =
+                                            (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size())
+                                                ? &vars_[parentVarIdx].memberEnumDefs
+                                                : nullptr;
+                                        if (!sType) {
+                                                StructChannelPayload sp{};
+                                                snprintf(sp.device, sizeof(sp.device), "%s", devLabel);
+                                                if (!shmRegionName.empty())
+                                                        snprintf(sp.shmName, sizeof(sp.shmName), "%s", shmRegionName.c_str());
+                                                flattenForStructPayload(dwarfInfo_, memberPath, memberAddr, t->inner, sp, memOvr);
+                                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
+                                        } else {
+                                                ChannelDropPayload p{};
+                                                snprintf(p.name, sizeof(p.name), "%s", memberPath.c_str());
+                                                p.addr = memberAddr;
+                                                snprintf(p.type, sizeof(p.type), "%s", sType);
+                                                snprintf(p.device, sizeof(p.device), "%s", devLabel);
+                                                if (!shmRegionName.empty())
+                                                        snprintf(p.shmName, sizeof(p.shmName), "%s", shmRegionName.c_str());
+                                                p.numBytes = (u8)typeSize(dwarfInfo_, t->inner);
+                                                p.typeOff  = t->inner;
+                                                const std::vector<VarEntry::EnumDef> *leafOvr = nullptr;
+                                                if (memOvr) {
+                                                        auto it = memOvr->find(memberPath);
+                                                        if (it != memOvr->end() && !it->second.empty())
+                                                                leafOvr = &it->second;
+                                                }
+                                                fillEnumPayload(dwarfInfo_, t->inner, p, leafOvr);
+                                                ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
+                                        }
+                                        ImGui::Text(tr("Dragging %s", "拖拽 %s"), memberPath.c_str());
+                                        ImGui::EndDragDropSource();
+                                }
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s", tr("Drag to add to monitor", "拖动以添加到监视器"));
+                                ImGui::SameLine();
+                        }
                         ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_SpanFullWidth | ImGuiTreeNodeFlags_OpenOnArrow;
                         if (!isComplex)
                                 nodeFlags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
@@ -3296,7 +3435,11 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         const bool             wasOpenA = isComplex && expSetA && expSetA->count(memberPath) > 0;
                         if (isComplex && expSetA)
                                 ImGui::SetNextItemOpen(wasOpenA);
+                        // Suppress the hover/active highlight on struct/array sub-items.
+                        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
+                        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
                         bool open = ImGui::TreeNodeEx(idxStr.c_str(), nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
+                        ImGui::PopStyleColor(2);
                         if (isComplex && expSetA && open != wasOpenA) {
                                 if (open)
                                         expSetA->insert(memberPath);
@@ -3322,41 +3465,7 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                         }
                                         ImGui::EndPopup();
                                 }
-                                if (ImGui::BeginDragDropSource()) {
-                                        const std::unordered_map<std::string, std::vector<VarEntry::EnumDef>> *memOvr =
-                                            (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size())
-                                                ? &vars_[parentVarIdx].memberEnumDefs
-                                                : nullptr;
-                                        if (!sType) {
-                                                StructChannelPayload sp{};
-                                                snprintf(sp.device, sizeof(sp.device), "%s", devLabel);
-                                                if (!shmRegionName.empty())
-                                                        snprintf(sp.shmName, sizeof(sp.shmName), "%s", shmRegionName.c_str());
-                                                flattenForStructPayload(
-                                                    dwarfInfo_, memberPath, memberAddr, t->inner, sp, memOvr);
-                                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
-                                        } else {
-                                                ChannelDropPayload p{};
-                                                snprintf(p.name, sizeof(p.name), "%s", memberPath.c_str());
-                                                p.addr = memberAddr;
-                                                snprintf(p.type, sizeof(p.type), "%s", sType);
-                                                snprintf(p.device, sizeof(p.device), "%s", devLabel);
-                                                if (!shmRegionName.empty())
-                                                        snprintf(p.shmName, sizeof(p.shmName), "%s", shmRegionName.c_str());
-                                                p.numBytes = (u8)typeSize(dwarfInfo_, t->inner);
-                                                p.typeOff  = t->inner;
-                                                const std::vector<VarEntry::EnumDef> *leafOvr = nullptr;
-                                                if (memOvr) {
-                                                        auto it = memOvr->find(memberPath);
-                                                        if (it != memOvr->end() && !it->second.empty())
-                                                                leafOvr = &it->second;
-                                                }
-                                                fillEnumPayload(dwarfInfo_, t->inner, p, leafOvr);
-                                                ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
-                                        }
-                                        ImGui::Text(tr("Dragging %s", "拖拽 %s"), memberPath.c_str());
-                                        ImGui::EndDragDropSource();
-                                }
+                                // (Monitor drag source now lives on the "=" grip — see above.)
                                 ImGui::TableSetColumnIndex(1);
                                 if (sType) {
                                         std::string valStr = drawValueCell(memberAddr, sType, t->inner, memberPath, 0, 0);
@@ -3810,4 +3919,32 @@ Variable::readLocalFieldAsFloat(const std::string &varName, const std::string &f
         uint8_t tmp[8]{};
         std::memcpy(tmp, buf.data() + sf->byteOffset, fsz);
         return decodeLocalScalar(tmp, sf->type, out);
+}
+
+bool
+Variable::readLocalScalar(const std::string &name, double &out) const
+{
+        DataType type = DataType::UNKNOWN;
+        for (const auto &v : vars_)
+                if (v.name == name && (v.port == PortType::LOCAL || v.port == PortType::MANUAL) && v.structFields.empty()) {
+                        type = v.type;
+                        break;
+                }
+        if (type == DataType::UNKNOWN)
+                return false;
+
+        std::lock_guard<std::mutex> lk(mtxLocal_);
+        auto                        it = localBufs_.find(name);
+        if (it == localBufs_.end() || it->second.empty())
+                return false;
+        u32 sz = Parser::typeBytes(type);
+        if (sz == 0 || sz > it->second.size())
+                return false;
+        uint8_t tmp[8]{};
+        std::memcpy(tmp, it->second.data(), sz);
+        float f;
+        if (!decodeLocalScalar(tmp, type, f))
+                return false;
+        out = f;
+        return true;
 }
