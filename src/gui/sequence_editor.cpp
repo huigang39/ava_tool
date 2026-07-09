@@ -552,11 +552,8 @@ ptrTypeFromRaw(const std::string &rawType)
 // the "&varname" arg convention the executor already understands).
 
 bool
-SequenceEditor::drawSdkStructArgRow(SdkPanel          *panel,
-                                    SdkStepInfo       &sdk,
-                                    int                p,
-                                    const std::string &pname,
-                                    const std::string &ptype)
+SequenceEditor::drawSdkStructArgRow(
+    SdkPanel *panel, SdkStepInfo &sdk, int p, const std::string &pname, const std::string &ptype)
 {
         if (!panel || sdk.isPython)
                 return false;
@@ -612,12 +609,8 @@ SequenceEditor::drawSdkStructArgRow(SdkPanel          *panel,
 // ─── drawSdkArgButtons ────────────────────────────────────────────────────────
 
 void
-SequenceEditor::drawSdkArgButtons(SdkPanel          *panel,
-                                  SdkStepInfo       &sdk,
-                                  int                p,
-                                  const std::string &pname,
-                                  const std::string &ptype,
-                                  bool               isPtr)
+SequenceEditor::drawSdkArgButtons(
+    SdkPanel *panel, SdkStepInfo &sdk, int p, const std::string &pname, const std::string &ptype, bool isPtr)
 {
         std::string pn = pname.empty() ? ("arg" + std::to_string(p)) : pname;
 
@@ -901,8 +894,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                                         : panel->isParamPtrOrRef(
                                                                               op.sdk.classIdx, op.sdk.methodIdx, p);
                                                                 // Struct param → expandable field editor (like the SDK caller).
-                                                                if (drawSdkStructArgRow(
-                                                                        panel.get(), op.sdk, p, pname, ptype)) {
+                                                                if (drawSdkStructArgRow(panel.get(), op.sdk, p, pname, ptype)) {
                                                                         ImGui::PopID();
                                                                         continue;
                                                                 }
@@ -1936,11 +1928,8 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                                        op.sdk.methodIdx,
                                                                                                        p);
                                                                                 // Struct param → expandable field editor.
-                                                                                if (drawSdkStructArgRow(panel.get(),
-                                                                                                        op.sdk,
-                                                                                                        p,
-                                                                                                        pname,
-                                                                                                        ptype)) {
+                                                                                if (drawSdkStructArgRow(
+                                                                                        panel.get(), op.sdk, p, pname, ptype)) {
                                                                                         ImGui::PopID();
                                                                                         continue;
                                                                                 }

@@ -338,6 +338,10 @@ MonitorScope::tableDraw()
         ImGui::TableHeadersRow();
 
         ImGuiTableSortSpecs *sortSpecs = ImGui::TableGetSortSpecs();
+        if (sortSpecs && sortSpecs->SpecsDirty) {
+                forceManualTableOrder_ = false;
+                sortSpecs->SpecsDirty  = false;
+        }
 
         auto chOrder = [&](const std::string &k) -> i64 {
                 auto it = chs_.find(k);
@@ -384,7 +388,7 @@ MonitorScope::tableDraw()
                 for (auto &[lbl, child] : n.children)
                         v.emplace_back(&lbl, &child);
 
-                if (sortSpecs && sortSpecs->SpecsCount > 0) {
+                if (!forceManualTableOrder_ && sortSpecs && sortSpecs->SpecsCount > 0) {
                         const auto *spec = &sortSpecs->Specs[0];
                         std::sort(v.begin(), v.end(), [&](const auto &a, const auto &b) -> bool {
                                 bool isLeafA = !a.second->leafKey.empty();
@@ -492,12 +496,14 @@ MonitorScope::tableDraw()
                                         ImGui::EndDragDropSource();
                                 }
                                 if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip("%s", tr("Drag: reorder / move to scope", "拖动：排序 / 移动到示波器"));
+                                        ImGui::SetTooltip("%s",
+                                                          tr("Drag: reorder / move to scope", "拖动：排序 / 移动到示波器"));
                                 if (ImGui::BeginDragDropTarget()) {
                                         if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE")) {
                                                 std::string anchor = groupAnchorKey(fullPath);
                                                 if (!anchor.empty())
-                                                        applyChannelMoveDrop(static_cast<ChannelMovePayload *>(mv->Data), anchor);
+                                                        applyChannelMoveDrop(static_cast<ChannelMovePayload *>(mv->Data),
+                                                                             anchor);
                                         }
                                         ImGui::EndDragDropTarget();
                                 }
@@ -515,15 +521,6 @@ MonitorScope::tableDraw()
                         ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
                         bool open = ImGui::TreeNodeEx(label.c_str(), treeFlags);
                         ImGui::PopStyleColor(3);
-
-                        if (ImGui::BeginDragDropTarget()) {
-                                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE")) {
-                                        std::string anchor = groupAnchorKey(fullPath);
-                                        if (!anchor.empty())
-                                                applyChannelMoveDrop(static_cast<ChannelMovePayload *>(mv->Data), anchor);
-                                }
-                                ImGui::EndDragDropTarget();
-                        }
 
                         if (open != wasOpen) {
                                 if (open)
@@ -688,12 +685,6 @@ MonitorScope::drawTableRow(const std::string               &chName,
         }
         ImGui::PopStyleColor(3);
 
-        if (ImGui::BeginDragDropTarget()) {
-                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE"))
-                        applyChannelMoveDrop(static_cast<ChannelMovePayload *>(mv->Data), chName);
-                ImGui::EndDragDropTarget();
-        }
-
         if (ImGui::BeginPopupContextItem()) {
                 // Right-click implies selection — auto-select this row so Delete works
                 // without requiring a prior left-click.
@@ -733,15 +724,6 @@ MonitorScope::drawTableRow(const std::string               &chName,
                         }
                 }
                 ImGui::EndPopup();
-        }
-
-        if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
-                ChannelMovePayload payload;
-                payload.srcScope = this;
-                snprintf(payload.chName, sizeof(payload.chName), "%s", chName.c_str());
-                ImGui::SetDragDropPayload("DND_CHANNEL_MOVE", &payload, sizeof(ChannelMovePayload));
-                ImGui::Text(tr("Move: %s", "移动: %s"), chName.c_str());
-                ImGui::EndDragDropSource();
         }
 
         // 2. Value (Interactive if writable)
@@ -1600,7 +1582,8 @@ MonitorScope::reorderChannelTo(const std::string &src, const std::string &dst)
 
         for (int i = 0; i < (int)keys.size(); ++i)
                 chs_[keys[i]]->setOrder(i);
-        nextChannelOrder_ = (i64)keys.size();
+        nextChannelOrder_      = (i64)keys.size();
+        forceManualTableOrder_ = true;
         if (parent_)
                 parent_->setModified();
 }
@@ -1608,7 +1591,7 @@ MonitorScope::reorderChannelTo(const std::string &src, const std::string &dst)
 std::string
 MonitorScope::groupAnchorKey(const std::string &groupPath) const
 {
-        const std::string prefix  = groupPath + ".";
+        const std::string prefix = groupPath + ".";
         std::string       best;
         i64               bestOrd = std::numeric_limits<i64>::max();
         for (const auto &[k, ch] : chs_) {
@@ -1668,7 +1651,8 @@ MonitorScope::reorderGroupBefore(const std::string &srcGroup, const std::string 
 
         for (int i = 0; i < (int)keys.size(); ++i)
                 chs_[keys[i]]->setOrder(i);
-        nextChannelOrder_ = (i64)keys.size();
+        nextChannelOrder_      = (i64)keys.size();
+        forceManualTableOrder_ = true;
         if (parent_)
                 parent_->setModified();
 }
@@ -1727,6 +1711,13 @@ MonitorScope::shmInit(MonitorChannel &ch)
 void
 MonitorScope::dropTarget()
 {
+        if (const ImGuiPayload *pending = ImGui::GetDragDropPayload();
+            pending && pending->IsDataType("DND_CHANNEL_MOVE") && pending->DataSize == sizeof(ChannelMovePayload)) {
+                auto *data = static_cast<ChannelMovePayload *>(pending->Data);
+                if (data && data->srcScope == this)
+                        return;
+        }
+
         if (ImGui::BeginDragDropTarget()) {
                 if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("CHANNEL")) {
                         if (payload->DataSize == sizeof(ChannelDropPayload)) {
@@ -1867,8 +1858,8 @@ MonitorScope::applyChannelMoveDrop(ChannelMovePayload *data, const std::string &
                         reorderChannelTo(data->chName, dst);
                 return;
         }
-        const bool movedGroup = data->isGroup;
-        const std::string movedName = data->chName;
+        const bool        movedGroup = data->isGroup;
+        const std::string movedName  = data->chName;
         moveChannelsFrom(data);
         if (movedGroup)
                 reorderGroupBefore(movedName, dst);
@@ -1986,7 +1977,7 @@ Monitor::updateDisplay()
                         const char *frames[] = {"|", "/", "-", "\\"};
                         int         fi       = static_cast<int>(ImGui::GetTime() * 8.0) % 4;
                         ImGui::TextColored(
-                            ImVec4(0.4f, 0.8f, 1.0f, 1.0f), tr("%s  Parsing CSV...", "%s  正在解析 CSV..."), frames[fi]);
+                            ImVec4(0.4f, 0.8f, 1.0f, 1.0f), tr("%s  Importing data...", "%s  正在导入数据..."), frames[fi]);
                         ImGui::End();
                         return;
                 }

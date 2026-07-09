@@ -73,6 +73,7 @@ class MonitorScope
         bool                  paused_{false};
         int                   lastSelectedIndex_{-1};
         std::set<std::string> selectedGroupPaths_{};
+        bool                  forceManualTableOrder_{false};
         // Full paths (e.g. "foo.bar") of group nodes the user has expanded;
         // persisted across sessions via Gui save/load.
         bool                  hidden_{false};

@@ -2,10 +2,10 @@ ifeq ($(OS),Windows_NT)
 SHELL := cmd.exe
 ifndef VCVARS_DONE
 
-# Targets that only need Python / file ops — not the MSVC compiler/linker.
-# When every requested goal is one of these, skip the (slow) vcvars init below.
-# NOTE: `package` is NOT here — it depends on `all`, so it must initialize MSVC
-# (otherwise a build after `make clean` can't find cl.exe).
+#Targets that only need Python / file ops — not the MSVC compiler / linker.
+#When every requested goal is one of these, skip the(slow) vcvars init below.
+#NOTE : `package` is NOT here — it depends on `all`, so it must initialize MSVC
+#(otherwise a build after `make clean` can't find cl.exe).
 _NO_MSVC_GOALS := icon sign clean fmt info help
 _NEED_MSVC     := $(if $(MAKECMDGOALS),$(filter-out $(_NO_MSVC_GOALS),$(MAKECMDGOALS)),all)
 
@@ -131,8 +131,8 @@ ifeq ($(COMPILER),msvc)
         FFTW_LIB     := $(DIR_MODULE)/lib/win/libfftw3f-3.lib
         FFTW_DLL     := $(DIR_MODULE)/lib/win/libfftw3f-3.dll
         MODULE_LIB   := $(DIR_MODULE)/lib/module/win/module.lib
-        # libffi: obtain via  vcpkg install libffi:x64-windows-static
-        # then copy the include/ and lib/x64-windows-static/ output here.
+#libffi : obtain via vcpkg install libffi : x64 - windows - static
+#then copy the include / and lib / x64 - windows - static / output here.
         LIBFFI_DIR   := $(DIR_THIRDPARTY)/libffi
         LIBFFI_LIB   := $(LIBFFI_DIR)/lib/win/ffi.lib
         IMGUI_NOTIFY := $(DIR_THIRDPARTY)/ImGuiNotify/win32
@@ -147,6 +147,7 @@ ifeq ($(COMPILER),msvc)
                         /I"$(DIR_THIRDPARTY)/cJSON" \
                         /I"$(LIBFFI_DIR)/include"
         LDLIBS       := ws2_32.lib winmm.lib shlwapi.lib comdlg32.lib OpenGL32.lib advapi32.lib ole32.lib dbghelp.lib \
+                        mfplat.lib mfreadwrite.lib mfuuid.lib \
                         "$(GLFW_LIB)" "$(JLINK_LIB)" "$(FFTW_LIB)" "$(MODULE_LIB)" "$(LIBFFI_LIB)"
         PLATFORM_DIR := win
     else
@@ -174,7 +175,7 @@ else ifeq ($(COMPILER),gcc)
                         -I$(DIR_THIRDPARTY)/GLFW/inc \
                         -I$(DIR_THIRDPARTY)/cJSON
         LDFLAGS      := -Wl,-rpath,'$$ORIGIN'
-        # libffi: sudo apt install libffi-dev
+#libffi : sudo apt install libffi - dev
         LDLIBS       := "$(GLFW_LIB)" "$(JLINK_LIB)" -lfftw3f \
                         "$(MODULE_LIB)" -lGL -ldl -lpthread -lffi
         PLATFORM_DIR := linux
@@ -212,7 +213,7 @@ else ifeq ($(COMPILER),clang)
         LDFLAGS      := -L$(MAC_BREW_PREFIX)/lib \
                         -L$(JLINK_DIR) \
                         -Wl,-rpath,$(JLINK_DIR)
-        # libffi: brew install libffi
+#libffi : brew install libffi
         LDLIBS       := -lglfw -ljlinkarm -lfftw3f \
                         "$(MODULE_LIB)" -lpthread -lffi \
                         -framework Cocoa -framework IOKit \
@@ -232,11 +233,11 @@ OUTPUT_BUILD_DIR := $(BUILD_DIR)/$(COMPILER)-$(PLATFORM)-$(ARCH)
 OUTPUT_BIN_DIR   := $(BIN_DIR)/$(PLATFORM_DIR)
 OUTPUT_EXE       := $(OUTPUT_BIN_DIR)/$(PROJECT_NAME)$(EXE_EXT)
 
-# Standalone auto-update helper (Windows/MSVC only).
+#Standalone auto - update helper(Windows / MSVC only).
 ifeq ($(COMPILER),msvc)
     UPDATER_EXE := $(OUTPUT_BIN_DIR)/updater$(EXE_EXT)
-    # Embed the app icon when assets/icon.ico exists (generate it with `make icon`).
-    # Guarded by wildcard so the build still works before the icon is created.
+#Embed the app icon when assets / icon.ico                       exists(generate it with `make icon`).
+#Guarded by wildcard so the build still works before the icon is created.
     ifneq ($(wildcard assets/icon.ico),)
         APP_RES := $(OUTPUT_BUILD_DIR)/app.res
     endif
@@ -258,7 +259,7 @@ SRC_CXX := \
     $(DIR_GUI)/monitor.cpp \
     $(DIR_GUI)/variable.cpp \
     $(DIR_GUI)/bode.cpp \
-    $(DIR_GUI)/audio_fft.cpp \
+    $(DIR_GUI)/audio_input.cpp \
     $(DIR_GUI)/assembly_viewer.cpp \
     $(DIR_GUI)/sequence_editor.cpp \
     $(DIR_GUI)/tutorial_guide.cpp \
@@ -295,13 +296,13 @@ OBJ_MM  := $(patsubst %.mm,$(OUTPUT_BUILD_DIR)/%.o,$(SRC_MM))
 OBJ_ALL := $(OBJ_CXX) $(OBJ_C) $(OBJ_MM)
 
 # ─── Header dependencies ────────────────────────────────────────────────────────
-# This build does no per-translation-unit dependency scanning. Without it, editing
-# a header leaves dependent objects stale — and if that header changes a class's
-# size/layout (e.g. adding a member), some TUs see the new layout while others keep
-# the old one, corrupting memory at runtime (a make_shared<T> in one TU under-
-# allocates for code in another TU). To prevent that, conservatively rebuild every
-# first-party object whenever ANY project header changes. Thirdparty objects don't
-# include these headers, so they are intentionally left out and never over-rebuild.
+#This build does no per - translation - unit dependency scanning.Without it, editing
+#a header leaves dependent objects stale — and if that header changes a class's
+#size / layout(e.g.adding a member), some TUs see the new layout while others keep
+#the old one, corrupting memory at runtime(a make_shared<T> in one TU under -
+#allocates for code in another TU).To prevent that, conservatively rebuild every
+#first - party object whenever ANY project header changes.Thirdparty objects don't
+#include these headers, so they are intentionally left out and never over - rebuild.
 PROJECT_HEADERS := $(wildcard \
     $(DIR_SRC)/*.hpp        $(DIR_SRC)/*.h \
     $(DIR_GUI)/*.hpp        $(DIR_GUI)/*.h \

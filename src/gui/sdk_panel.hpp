@@ -293,8 +293,8 @@ class SdkPanel
         // into argBuf as "&var" (pointer/reference param) or "$var" (value param). `salt`
         // makes widget IDs unique. Width for the buttons must be reserved by the caller
         // (see kParamBtnsW).
-        void              drawParamVarButtons(char *argBuf, size_t argBufSz, const CParam &p, int salt);
-        static const int  kParamBtnsW = 48; // px to reserve for the [+][v] buttons
+        void             drawParamVarButtons(char *argBuf, size_t argBufSz, const CParam &p, int salt);
+        static const int kParamBtnsW = 48; // px to reserve for the [+][v] buttons
 
         void drawCFunctionsTab();
         void drawCppClassesTab();

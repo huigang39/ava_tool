@@ -80,12 +80,14 @@ class Monitor
         f64               dataStartTime_{0.0};
         f64               pauseXMax_{-1.0};
         bool              wasPaused_{false};
-        float             historySeconds_{10.0f};
+        float             historySeconds_{0.0f};
         u32               maxDisplayPoints_{5000};
         bool              hssAutoPeriod_{true};
         int               maxSampleHz_{100};
         std::atomic<bool> pendingDelete_{false};
         std::atomic<bool> csvLoading_{false};
+        std::string       importSourcePath_{};
+        std::string       importSourceType_{};
         // Pause acquisition for every scope in this monitor at once (monitor toolbar).
         // The sampler skips the whole monitor while set.
         std::atomic<bool> samplingPaused_{false};

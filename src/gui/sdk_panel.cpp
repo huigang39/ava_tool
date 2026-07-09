@@ -27,6 +27,13 @@
 #include "platform/native_dlg.hpp"
 #include "timeops.h"
 
+static void
+showPathTooltipIfHovered(const char *path)
+{
+        if (path && path[0] && ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", path);
+}
+
 // ─── drawSdkStructFieldRows ───────────────────────────────────────────────────
 // Shared struct-field editor used by both the SDK caller and the sequence editor.
 
@@ -1443,8 +1450,8 @@ SdkPanel::drawCFunctionsTab()
                                         ImGui::TableSetColumnIndex(2);
                                         if (i < fnArgBufs_.size()) {
                                                 bool hasBtns = onCreateLocalVar_ || onListLocalVars_;
-                                                ImGui::SetNextItemWidth(
-                                                    hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW : -FLT_MIN);
+                                                ImGui::SetNextItemWidth(hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW
+                                                                                : -FLT_MIN);
                                                 if (isCharP)
                                                         ImGui::InputText(id, fnArgBufs_[i].text, sizeof(ArgBuf::text));
                                                 else if (ctypeIsFloat(p.type))
@@ -1477,7 +1484,7 @@ SdkPanel::drawCFunctionsTab()
                                         bool  hasCreate = onCreateLocalVar_ && !ctypeIsVoid(fn.retType);
                                         bool  hasPick   = !localVars.empty();
                                         float reserve   = (hasCreate ? 24.0f : 0.0f) + (hasPick ? 24.0f : 0.0f);
-                                        float rvW       = reserve > 0.0f ? ImGui::GetContentRegionAvail().x - reserve : -FLT_MIN;
+                                        float rvW = reserve > 0.0f ? ImGui::GetContentRegionAvail().x - reserve : -FLT_MIN;
                                         ImGui::SetNextItemWidth(rvW);
                                         ImGui::InputTextWithHint(
                                             "##fnrv", tr("variable name", "变量名"), fnResultVar_, sizeof(fnResultVar_));
@@ -1490,8 +1497,7 @@ SdkPanel::drawCFunctionsTab()
                                                         fnResultVar_[sizeof(fnResultVar_) - 1] = '\0';
                                                 }
                                                 if (ImGui::IsItemHovered())
-                                                        ImGui::SetTooltip("%s",
-                                                                          tr("Create result variable", "创建结果变量"));
+                                                        ImGui::SetTooltip("%s", tr("Create result variable", "创建结果变量"));
                                         }
                                         if (hasPick) {
                                                 ImGui::SameLine(0, 2);
@@ -1500,7 +1506,8 @@ SdkPanel::drawCFunctionsTab()
                                                 if (ImGui::BeginPopup("##fnrvpop")) {
                                                         for (const auto &vn : localVars)
                                                                 if (ImGui::Selectable(vn.c_str())) {
-                                                                        strncpy(fnResultVar_, vn.c_str(), sizeof(fnResultVar_) - 1);
+                                                                        strncpy(
+                                                                            fnResultVar_, vn.c_str(), sizeof(fnResultVar_) - 1);
                                                                         fnResultVar_[sizeof(fnResultVar_) - 1] = '\0';
                                                                 }
                                                         ImGui::EndPopup();
@@ -1806,8 +1813,8 @@ SdkPanel::drawCppClassesTab()
                                         char cmId[64];
                                         snprintf(cmId, sizeof(cmId), "##ec%zu", pi);
                                         bool hasBtns = onCreateLocalVar_ || onListLocalVars_;
-                                        ImGui::SetNextItemWidth(
-                                            hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW : -FLT_MIN);
+                                        ImGui::SetNextItemWidth(hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW
+                                                                        : -FLT_MIN);
                                         if (ImGui::BeginCombo(cmId, preview2)) {
                                                 for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
                                                         bool sel2 = (ei == curIdx);
@@ -1848,8 +1855,8 @@ SdkPanel::drawCppClassesTab()
                                 if (pi < methArgBufs_.size()) {
                                         bool isCharP = ctypeIsCharPtr(p.type, p.rawType);
                                         bool hasBtns = onCreateLocalVar_ || onListLocalVars_;
-                                        ImGui::SetNextItemWidth(
-                                            hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW : -FLT_MIN);
+                                        ImGui::SetNextItemWidth(hasBtns ? ImGui::GetContentRegionAvail().x - kParamBtnsW
+                                                                        : -FLT_MIN);
                                         if (isCharP)
                                                 ImGui::InputText(rowId, methArgBufs_[pi].text, sizeof(ArgBuf::text));
                                         else if (ctypeIsFloat(p.type))
@@ -1889,8 +1896,7 @@ SdkPanel::drawCppClassesTab()
                                 if (hasCreate) {
                                         ImGui::SameLine(0, 2);
                                         if (ImGui::SmallButton("+##methrvnew")) {
-                                                std::string vn =
-                                                    methResultVar_[0] ? std::string(methResultVar_) : meth.name;
+                                                std::string vn = methResultVar_[0] ? std::string(methResultVar_) : meth.name;
                                                 onCreateLocalVar_(vn, meth.retType, nullptr);
                                                 strncpy(methResultVar_, vn.c_str(), sizeof(methResultVar_) - 1);
                                                 methResultVar_[sizeof(methResultVar_) - 1] = '\0';
@@ -1994,6 +2000,7 @@ SdkPanel::drawPythonTab()
         if (pyPath_[0]) {
                 ImGui::SameLine();
                 ImGui::TextDisabled("— %s", pyPath_);
+                showPathTooltipIfHovered(pyPath_);
         }
 
         ImGui::Spacing();
@@ -2520,6 +2527,7 @@ SdkPanel::draw()
                         if (dllPath_[0]) {
                                 ImGui::SameLine();
                                 ImGui::TextDisabled("— %s", dllPath_);
+                                showPathTooltipIfHovered(dllPath_);
                         }
 
                         // Header browse row
@@ -2534,6 +2542,7 @@ SdkPanel::draw()
                         if (headerPath_[0]) {
                                 ImGui::SameLine();
                                 ImGui::TextDisabled("— %s", headerPath_);
+                                showPathTooltipIfHovered(headerPath_);
                         }
 
                         ImGui::Spacing();

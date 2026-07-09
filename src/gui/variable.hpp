@@ -27,7 +27,7 @@ struct ChannelDropPayload;
 struct StructChannelPayload;
 struct WatchMirrorRequest;
 
-enum class PortType { JLINK, UDP, SHM, MANUAL, LOCAL };
+enum class PortType { JLINK, UDP, SHM, MANUAL, LOCAL, AUDIO };
 
 struct VarEntry {
         std::string name;
@@ -54,6 +54,10 @@ struct VarEntry {
                 shm_t handle;
                 bool  inited = false;
         } shm{};
+        struct {
+                int  deviceIndex = -1;
+                char deviceName[128]{};
+        } audio{};
 
         u64  typeOff     = 0; // For DWARF nested display
         bool selected    = false;
@@ -184,16 +188,16 @@ class Variable
         // monitor (CHANNEL/STRUCT_CHANNEL) payload while still driving in-window reordering:
         // a drop target reorders when this is >= 0, and the symbol-browser "add" path ignores
         // such internal drags. -1 when no row grip drag is active.
-        i32                      rowDragSrc_{-1};
+        i32 rowDragSrc_{-1};
         // Parallel grip-drag state for struct sub-items (manual struct fields): packed
         // (parentVarIdx, fieldIdx) of the dragged field, or -1/-1 when inactive.
-        i32                      fieldDragParent_{-1};
-        i32                      fieldDragSrc_{-1};
-        i32                      enumEditIdx_{-1};
-        bool                     pendingDeleteFromSubVar_{false};
-        i32                      enumSubEditParentIdx_{-1};
-        std::string              enumSubEditMemberPath_;
-        u64                      enumSubEditMemberTypeOff_{0};
+        i32         fieldDragParent_{-1};
+        i32         fieldDragSrc_{-1};
+        i32         enumEditIdx_{-1};
+        bool        pendingDeleteFromSubVar_{false};
+        i32         enumSubEditParentIdx_{-1};
+        std::string enumSubEditMemberPath_;
+        u64         enumSubEditMemberTypeOff_{0};
 
         i32 editPropIdx_{-1};
         struct {
@@ -205,6 +209,8 @@ class Variable
                 char                               udpIp[16]{};
                 int                                udpPort = 8080;
                 char                               shmName[64]{};
+                int                                audioDeviceIndex{-1};
+                char                               audioDeviceName[128]{};
                 bool                               structMode{false};
                 std::vector<VarEntry::StructField> structFields;
         } editPropBuf_;
@@ -232,6 +238,8 @@ class Variable
                 char                               udpIp[16]   = "127.0.0.1";
                 int                                udpPort     = 8080;
                 char                               shmName[64] = "GlobalVariable";
+                int                                audioDeviceIndex{-1};
+                char                               audioDeviceName[128]{};
                 char                               addrBuf[32] = "0"; // To avoid static persistence issues
                 bool                               structMode  = false;
                 std::vector<VarEntry::StructField> structFields;

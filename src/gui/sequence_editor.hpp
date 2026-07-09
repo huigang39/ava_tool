@@ -171,7 +171,8 @@ class SequenceEditor
         // text, enum and struct — offers the same create/pick controls. "+" creates a LOCAL
         // variable for the parameter; "v" picks an existing one and binds it as "&var"
         // (pointer/reference) or "$var" (value).
-        void drawSdkArgButtons(SdkPanel *panel, SdkStepInfo &sdk, int p, const std::string &pname, const std::string &ptype, bool isPtr);
+        void drawSdkArgButtons(
+            SdkPanel *panel, SdkStepInfo &sdk, int p, const std::string &pname, const std::string &ptype, bool isPtr);
         void acceptSdkPayload(const void *data, int insertAfter);
         // Build an SDK op from a drag payload; false if the source panel is gone.
         bool makeSdkOp(const SdkDragPayload &pl, SeqOp &out);

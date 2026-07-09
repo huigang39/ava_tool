@@ -7,7 +7,11 @@
 
 #include <GLFW/glfw3.h>
 #include <commdlg.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
 #include <shellapi.h>
+#include <wrl/client.h>
 #define GLFW_EXPOSE_NATIVE_WIN32
 #include <GLFW/glfw3native.h>
 #else
@@ -15,10 +19,12 @@
 #endif
 
 #include "timeops.h"
+#include <algorithm>
 #include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <ranges>
 #include <sstream>
@@ -64,6 +70,14 @@ static struct {
         };
         std::vector<EffPoint> rawData; // raw recorded (speed, torque, eta) table
 } s_eff;
+
+static bool
+hasAudioExtension(const std::string &path)
+{
+        std::string ext = std::filesystem::path(path).extension().string();
+        std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return ext == ".m4a" || ext == ".mp3" || ext == ".wav" || ext == ".aac" || ext == ".flac" || ext == ".wma";
+}
 
 void
 Gui::glfwErrCb(const i32 err, const char *desc)
@@ -119,6 +133,7 @@ Gui::Gui(const std::string &initialPath)
         ImGui::CreateContext();
         ImGuiIO &io     = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+        io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
         // On macOS Retina the GLFW backend already sets DisplayFramebufferScale = 2,
         // so ImGui renders in logical pixels and the backend up-scales to physical.
@@ -146,6 +161,11 @@ Gui::Gui(const std::string &initialPath)
 
         ImGui::StyleColorsDark();
         ImGui::GetStyle().ScaleAllSizes(uiScale);
+        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+                ImGuiStyle &style                 = ImGui::GetStyle();
+                style.WindowRounding              = 0.0f;
+                style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+        }
 
         static std::string iniPath = getAppDir() + "/imgui.ini";
         io.IniFilename             = iniPath.c_str();
@@ -335,6 +355,17 @@ Gui::saveSession(const std::string &path)
         std::string     targetPath = path.empty() ? currentSessionPath_ : path;
         cJSON          *root       = cJSON_CreateObject();
 
+        const std::filesystem::path monitorBaseDir = std::filesystem::path(targetPath).parent_path();
+        auto                        monitorToRel   = [&](const std::string &p) -> std::string {
+                if (p.empty() || monitorBaseDir.empty())
+                        return p;
+                std::error_code ec;
+                auto            rel = std::filesystem::relative(p, monitorBaseDir, ec);
+                if (ec || rel.empty())
+                        return p;
+                return rel.generic_string();
+        };
+
         cJSON *jlink = cJSON_CreateObject();
         cJSON_AddStringToObject(jlink, "device", JLinkPort::instance().deviceName().c_str());
         cJSON_AddNumberToObject(jlink, "speedKHz", JLinkPort::instance().speed());
@@ -381,6 +412,13 @@ Gui::saveSession(const std::string &path)
                 cJSON_AddNumberToObject(mObj, "maxSampleHz", m->maxSampleHz_);
                 cJSON_AddNumberToObject(mObj, "historySeconds", static_cast<f64>(m->historySeconds_));
                 cJSON_AddNumberToObject(mObj, "maxDisplayPoints", static_cast<f64>(m->maxDisplayPoints_));
+                if (!m->importSourcePath_.empty()) {
+                        const std::string importType =
+                            !m->importSourceType_.empty() ? m->importSourceType_
+                                                           : (hasAudioExtension(m->importSourcePath_) ? "audio" : "csv");
+                        cJSON_AddStringToObject(mObj, "importSourcePath", monitorToRel(m->importSourcePath_).c_str());
+                        cJSON_AddStringToObject(mObj, "importSourceType", importType.c_str());
+                }
 
                 cJSON *scopesArr = cJSON_CreateArray();
                 // Persist scopes in their user-defined display order so it survives a
@@ -519,7 +557,6 @@ Gui::saveSession(const std::string &path)
 
         // Tool page visibility
         cJSON_AddBoolToObject(root, "showBode", bode_.show_);
-        cJSON_AddBoolToObject(root, "showAudioFft", audioFft_.show_);
         cJSON_AddBoolToObject(root, "showAsmViewer", asmViewer_.show_);
         cJSON_AddBoolToObject(root, "showSeqEditor", seqEditor_.isOpen());
 
@@ -598,6 +635,25 @@ Gui::loadSession(const std::string &path)
         u64 monitorStart = get_mono_ts_ms();
         monitors_.clear();
         vars_.clear();
+
+        // Resolve file paths that were stored relative to the .ava file back to
+        // absolute paths. Already-absolute paths (old sessions) are used as-is.
+        const std::filesystem::path baseDir = std::filesystem::path(targetPath).parent_path();
+        auto                        toAbs   = [&](const std::string &p) -> std::string {
+                if (p.empty() || baseDir.empty())
+                        return p;
+                std::filesystem::path fp(p);
+                if (fp.is_absolute())
+                        return p;
+                return (baseDir / fp).lexically_normal().string();
+        };
+
+        struct PendingImportSource {
+                std::string monitorName;
+                std::string path;
+                std::string type;
+        };
+        std::vector<PendingImportSource> pendingImportSources;
 
         if (const cJSON *jlink = cJSON_GetObjectItem(root, "jlink")) {
                 if (const cJSON *dev = cJSON_GetObjectItem(jlink, "device"); cJSON_IsString(dev))
@@ -685,6 +741,20 @@ Gui::loadSession(const std::string &path)
                                         monitor->samplingMode_ = Monitor::SamplingMode::POLL;
                                 else
                                         monitor->samplingMode_ = Monitor::SamplingMode::HSS;
+                        }
+
+                        if (const cJSON *srcPath = cJSON_GetObjectItem(mItem, "importSourcePath");
+                            cJSON_IsString(srcPath) && srcPath->valuestring[0] != '\0') {
+                                monitor->importSourcePath_ = toAbs(srcPath->valuestring);
+                                if (const cJSON *srcType = cJSON_GetObjectItem(mItem, "importSourceType");
+                                    cJSON_IsString(srcType) && srcType->valuestring[0] != '\0') {
+                                        monitor->importSourceType_ = srcType->valuestring;
+                                } else {
+                                        monitor->importSourceType_ =
+                                            hasAudioExtension(monitor->importSourcePath_) ? "audio" : "csv";
+                                }
+                                pendingImportSources.push_back(
+                                    {mName, monitor->importSourcePath_, monitor->importSourceType_});
                         }
 
                         const cJSON *scopesArr = cJSON_GetObjectItem(mItem, "scopes");
@@ -843,18 +913,6 @@ Gui::loadSession(const std::string &path)
                 }
         }
 
-        // Resolve file paths that were stored relative to the .ava file back to
-        // absolute paths. Already-absolute paths (old sessions) are used as-is.
-        const std::filesystem::path baseDir = std::filesystem::path(targetPath).parent_path();
-        auto                        toAbs   = [&](const std::string &p) -> std::string {
-                if (p.empty() || baseDir.empty())
-                        return p;
-                std::filesystem::path fp(p);
-                if (fp.is_absolute())
-                        return p;
-                return (baseDir / fp).lexically_normal().string();
-        };
-
         u64 varStart = get_mono_ts_ms();
         if (const cJSON *VarArr = cJSON_GetObjectItem(root, "Variables"); cJSON_IsArray(VarArr)) {
                 for (const cJSON *pItem = VarArr->child; pItem; pItem = pItem->next) {
@@ -921,8 +979,6 @@ Gui::loadSession(const std::string &path)
         // Tool page visibility
         if (const cJSON *v = cJSON_GetObjectItem(root, "showBode"); cJSON_IsBool(v))
                 bode_.show_ = cJSON_IsTrue(v);
-        if (const cJSON *v = cJSON_GetObjectItem(root, "showAudioFft"); cJSON_IsBool(v))
-                audioFft_.show_ = cJSON_IsTrue(v);
         if (const cJSON *v = cJSON_GetObjectItem(root, "showAsmViewer"); cJSON_IsBool(v))
                 asmViewer_.show_ = cJSON_IsTrue(v);
         if (const cJSON *v = cJSON_GetObjectItem(root, "showSeqEditor"); cJSON_IsBool(v))
@@ -943,6 +999,26 @@ Gui::loadSession(const std::string &path)
 
         for (auto &pair : monitors_)
                 pair.second->clearModified();
+
+        for (const auto &src : pendingImportSources) {
+                std::error_code ec;
+                if (!std::filesystem::exists(src.path, ec)) {
+                        LOG_E("Session import source missing for monitor '%s': %s",
+                              src.monitorName.c_str(),
+                              src.path.c_str());
+                        continue;
+                }
+
+                auto it = monitors_.find(src.monitorName);
+                if (it == monitors_.end() || !it->second)
+                        continue;
+
+                it->second->csvLoading_.store(true, std::memory_order_release);
+                if (src.type == "audio" || (src.type.empty() && hasAudioExtension(src.path)))
+                        importAudioAsync(src.path, src.monitorName);
+                else
+                        importCsvAsync(src.path, src.monitorName);
+        }
 
         cJSON_Delete(root);
 
@@ -1046,7 +1122,6 @@ Gui::drawBar()
                 if (toolsMenuOpen) {
                         ImGui::MenuItem(tr("Joint Calculator", "电机参数计算器"), nullptr, &showCalculator_);
                         ImGui::MenuItem(tr("Bode Plot", "伯德图"), nullptr, &bode_.show_);
-                        ImGui::MenuItem(tr("Audio FFT", "音频FFT"), nullptr, &audioFft_.show_);
                         ImGui::MenuItem(tr("Assembly Viewer", "汇编查看器"), nullptr, &asmViewer_.show_);
                         bool seqOpen = seqEditor_.isOpen();
                         if (ImGui::MenuItem(tr("Sequence Editor", "序列编辑器"), nullptr, &seqOpen)) {
@@ -1450,6 +1525,79 @@ Gui::loop()
                         }
                 }
 
+                // Feed AUDIO variables into matching monitor channels. Audio capture
+                // runs in WaveIn callbacks; the GUI drains complete sample batches and
+                // pushes them through the same MonitorChannel store used by J-Link/LOCAL.
+                {
+                        std::unordered_map<std::string, int> audioVars;
+                        for (auto &vw : vars_ | std::views::values) {
+                                for (const auto &ve : vw->vars_) {
+                                        if (ve.port == PortType::AUDIO)
+                                                audioVars[ve.name] = ve.audio.deviceIndex;
+                                }
+                        }
+
+                        std::vector<int> activeAudioDevices;
+                        if (!audioVars.empty()) {
+                                std::lock_guard lk(mtxMonitors_);
+                                for (auto &m : monitors_ | std::views::values)
+                                        for (auto &s : m->getScopes() | std::views::values)
+                                                for (auto &[cn, ch] : s->getChannels()) {
+                                                        if (ch->getDevice() != "AUDIO")
+                                                                continue;
+                                                        const std::string &key =
+                                                            ch->getSymbolName().empty() ? cn : ch->getSymbolName();
+                                                        auto it = audioVars.find(key);
+                                                        if (it != audioVars.end())
+                                                                activeAudioDevices.push_back(it->second);
+                                                }
+                        }
+
+                        std::sort(activeAudioDevices.begin(), activeAudioDevices.end());
+                        activeAudioDevices.erase(std::unique(activeAudioDevices.begin(), activeAudioDevices.end()),
+                                                 activeAudioDevices.end());
+                        AudioInput::instance().setActiveDevices(activeAudioDevices);
+
+                        if (!activeAudioDevices.empty()) {
+                                std::unordered_map<int, std::vector<AudioSample>> batches;
+                                for (int devIdx : activeAudioDevices) {
+                                        std::vector<AudioSample> samples;
+                                        if (AudioInput::instance().drainSamples(devIdx, samples) && !samples.empty())
+                                                batches.emplace(devIdx, std::move(samples));
+                                }
+
+                                if (!batches.empty()) {
+                                        std::lock_guard lk(mtxMonitors_);
+                                        for (auto &m : monitors_ | std::views::values)
+                                                for (auto &s : m->getScopes() | std::views::values)
+                                                        for (auto &[cn, ch] : s->getChannels()) {
+                                                                if (ch->getDevice() != "AUDIO")
+                                                                        continue;
+                                                                const std::string &key =
+                                                                    ch->getSymbolName().empty() ? cn : ch->getSymbolName();
+                                                                auto vit = audioVars.find(key);
+                                                                if (vit == audioVars.end())
+                                                                        continue;
+                                                                auto bit = batches.find(vit->second);
+                                                                if (bit == batches.end())
+                                                                        continue;
+
+                                                                std::vector<float>  vals;
+                                                                std::vector<double> ts;
+                                                                vals.reserve(bit->second.size());
+                                                                ts.reserve(bit->second.size());
+                                                                for (const auto &sample : bit->second) {
+                                                                        vals.push_back(sample.value);
+                                                                        ts.push_back(sample.ts);
+                                                                }
+                                                                ch->pushBatch(vals.data(), ts.data(), vals.size());
+                                                                ch->publishSnapshot();
+                                                                m->addPoints(vals.size());
+                                                        }
+                                }
+                        }
+                }
+
                 // Mirror symbols dropped from a symbol browser onto a monitor back into the
                 // originating Variable's watch list (requests queued by MonitorScope::dropTarget).
                 if (auto &mirrorQ = watchMirrorQueue(); !mirrorQ.empty()) {
@@ -1463,7 +1611,6 @@ Gui::loop()
                 }
 
                 bode_.updateDisplay();
-                audioFft_.draw();
                 asmViewer_.draw(this);
                 seqEditor_.draw();
 
@@ -1485,7 +1632,11 @@ Gui::loop()
                         } else if (file.ends_with(".dll") || file.ends_with(".h") || file.ends_with(".hpp")) {
                                 for (auto &sp : sdkPanels_)
                                         sp->pushDroppedFiles({file});
-                        } else if (file.ends_with(".csv") || file.ends_with(".CSV")) {
+                        } else if (file.ends_with(".csv") || file.ends_with(".CSV") || hasAudioExtension(file)) {
+                                const bool        isAudioImport = hasAudioExtension(file);
+                                std::error_code   absEc;
+                                const std::string importPath =
+                                    std::filesystem::absolute(std::filesystem::path(file), absEc).string();
                                 // Create the monitor immediately (shows loading spinner)
                                 std::string stem = std::filesystem::path(file).stem().string();
                                 std::string monName;
@@ -1497,10 +1648,15 @@ Gui::loop()
                                                 monName = stem + "_" + std::to_string(idx++);
                                         auto mon = std::make_shared<Monitor>(monName);
                                         mon->csvLoading_.store(true, std::memory_order_release);
+                                        mon->importSourcePath_ = absEc ? file : importPath;
+                                        mon->importSourceType_ = isAudioImport ? "audio" : "csv";
                                         monitors_[monName] = mon;
                                         isModified_        = true;
                                 }
-                                importCsvAsync(file, monName);
+                                if (isAudioImport)
+                                        importAudioAsync(file, monName);
+                                else
+                                        importCsvAsync(file, monName);
                         }
                 }
                 sDroppedFiles_.clear();
@@ -1552,6 +1708,13 @@ Gui::loop()
                 glClearColor(0.45f, 0.55f, 0.60f, 1.00f);
                 glClear(GL_COLOR_BUFFER_BIT);
                 ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+                if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
+                        GLFWwindow *backupCurrentContext = glfwGetCurrentContext();
+                        ImGui::UpdatePlatformWindows();
+                        ImGui::RenderPlatformWindowsDefault();
+                        glfwMakeContextCurrent(backupCurrentContext);
+                }
 
                 glfwSwapBuffers(window_);
         }
@@ -1649,14 +1812,31 @@ Gui::syncVariableProperties(Variable *var)
                                         if (isMatch) {
                                                 ch->setWritable(v.writable);
                                                 ch->setAddr(v.addr);
-                                                const char *deviceNames[] = {"JLINK", "UDP", "SHM", "MANUAL"};
-                                                ch->setDevice(deviceNames[(int)v.port]);
-                                                if (v.port == PortType::UDP) {
-                                                        ch->setDevice("LOCAL");
+                                                const char *deviceName = "JLINK";
+                                                switch (v.port) {
+                                                        case PortType::JLINK:
+                                                                deviceName = "JLINK";
+                                                                break;
+                                                        case PortType::UDP:
+                                                        case PortType::LOCAL:
+                                                        case PortType::MANUAL:
+                                                                deviceName = "LOCAL";
+                                                                break;
+                                                        case PortType::SHM:
+                                                                deviceName = "SHM";
+                                                                break;
+                                                        case PortType::AUDIO:
+                                                                deviceName = "AUDIO";
+                                                                break;
                                                 }
+                                                ch->setDevice(deviceName);
                                                 if (v.port == PortType::SHM) {
                                                         ch->setShmRegionName(v.shm.name);
                                                         MonitorScope::shmInit(*ch);
+                                                } else if (v.port == PortType::AUDIO) {
+                                                        ch->setType("F32");
+                                                        ch->setAddr(static_cast<usize>(std::max(0, v.audio.deviceIndex)));
+                                                        ch->setShmRegionName(v.audio.deviceName);
                                                 }
                                                 break;
                                         }
@@ -2342,9 +2522,20 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
         std::thread([this, path, monitorName]() {
                 LOG_I("CSV import started: %s", path.c_str());
 
+                auto publishResult = [&](CsvImportPending &&result) {
+                        std::lock_guard lk(mtxCsvPending_);
+                        csvPendingList_.push_back(std::move(result));
+                };
+                auto publishEmpty = [&]() {
+                        CsvImportPending result;
+                        result.monitorName = monitorName;
+                        publishResult(std::move(result));
+                };
+
                 std::ifstream f(path);
                 if (!f.is_open()) {
                         LOG_E("CSV import: cannot open %s", path.c_str());
+                        publishEmpty();
                         return;
                 }
 
@@ -2367,12 +2558,14 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
                 std::string line;
                 if (!std::getline(f, line)) {
                         LOG_E("CSV import: empty file %s", path.c_str());
+                        publishEmpty();
                         return;
                 }
 
                 std::vector<std::string> headers = splitCsv(line);
                 if (headers.empty()) {
                         LOG_E("CSV import: no columns in %s", path.c_str());
+                        publishEmpty();
                         return;
                 }
 
@@ -2476,6 +2669,7 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
                         const int                nCols = static_cast<int>(dataHeaders.size());
                         if (nCols == 0) {
                                 LOG_E("CSV import: no data columns in %s", path.c_str());
+                                publishEmpty();
                                 return;
                         }
 
@@ -2501,6 +2695,7 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
 
                         if (timestamps.empty()) {
                                 LOG_E("CSV import: no data rows in %s", path.c_str());
+                                publishEmpty();
                                 return;
                         }
 
@@ -2516,6 +2711,7 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
 
                 if (outChannels.empty()) {
                         LOG_E("CSV import: no data in %s", path.c_str());
+                        publishEmpty();
                         return;
                 }
 
@@ -2525,10 +2721,206 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
                 result.monitorName = monitorName;
                 result.channels    = std::move(outChannels);
 
-                {
+                publishResult(std::move(result));
+        }).detach();
+}
+
+void
+Gui::importAudioAsync(const std::string &path, const std::string &monitorName)
+{
+        std::thread([this, path, monitorName]() {
+                LOG_I("Audio import started: %s", path.c_str());
+
+                auto publishResult = [&](CsvImportPending &&result) {
                         std::lock_guard lk(mtxCsvPending_);
                         csvPendingList_.push_back(std::move(result));
+                };
+
+                CsvImportPending result;
+                result.monitorName = monitorName;
+
+#ifdef _WIN32
+                HRESULT coHr       = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+                bool    coDone     = SUCCEEDED(coHr);
+                auto    utf8ToWide = [](const std::string &s) {
+                        int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+                        if (len <= 0)
+                                len = MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, nullptr, 0);
+                        std::wstring out(static_cast<size_t>(std::max(1, len)), L'\0');
+                        if (len > 0) {
+                                if (MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, out.data(), len) <= 0)
+                                        MultiByteToWideChar(CP_ACP, 0, s.c_str(), -1, out.data(), len);
+                        }
+                        if (!out.empty() && out.back() == L'\0')
+                                out.pop_back();
+                        return out;
+                };
+
+                HRESULT hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+                if (FAILED(hr)) {
+                        LOG_E("Audio import: MFStartup failed 0x%08lx", (unsigned long)hr);
+                        if (coDone)
+                                CoUninitialize();
+                        publishResult(std::move(result));
+                        return;
                 }
+
+                Microsoft::WRL::ComPtr<IMFSourceReader> reader;
+                {
+                        Microsoft::WRL::ComPtr<IMFAttributes> attr;
+                        MFCreateAttributes(&attr, 1);
+                        if (attr)
+                                attr->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+                        const std::wstring wpath = utf8ToWide(path);
+                        hr                       = MFCreateSourceReaderFromURL(wpath.c_str(), attr.Get(), &reader);
+                }
+                if (FAILED(hr) || !reader) {
+                        LOG_E("Audio import: cannot open %s (0x%08lx)", path.c_str(), (unsigned long)hr);
+                        MFShutdown();
+                        if (coDone)
+                                CoUninitialize();
+                        publishResult(std::move(result));
+                        return;
+                }
+
+                auto setOutputSubtype = [&](const GUID &subtype) -> HRESULT {
+                        Microsoft::WRL::ComPtr<IMFMediaType> mt;
+                        HRESULT                              h = MFCreateMediaType(&mt);
+                        if (FAILED(h))
+                                return h;
+                        mt->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+                        mt->SetGUID(MF_MT_SUBTYPE, subtype);
+                        return reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, nullptr, mt.Get());
+                };
+
+                GUID requestedSubtype = MFAudioFormat_Float;
+                hr                    = setOutputSubtype(MFAudioFormat_Float);
+                if (FAILED(hr)) {
+                        requestedSubtype = MFAudioFormat_PCM;
+                        hr               = setOutputSubtype(MFAudioFormat_PCM);
+                }
+                if (FAILED(hr)) {
+                        LOG_E("Audio import: no PCM decoder for %s (0x%08lx)", path.c_str(), (unsigned long)hr);
+                        MFShutdown();
+                        if (coDone)
+                                CoUninitialize();
+                        publishResult(std::move(result));
+                        return;
+                }
+
+                Microsoft::WRL::ComPtr<IMFMediaType> actualType;
+                hr = reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM, &actualType);
+                if (FAILED(hr) || !actualType) {
+                        LOG_E("Audio import: GetCurrentMediaType failed 0x%08lx", (unsigned long)hr);
+                        MFShutdown();
+                        if (coDone)
+                                CoUninitialize();
+                        publishResult(std::move(result));
+                        return;
+                }
+
+                GUID subtype = requestedSubtype;
+                actualType->GetGUID(MF_MT_SUBTYPE, &subtype);
+                const UINT32 channels = MFGetAttributeUINT32(actualType.Get(), MF_MT_AUDIO_NUM_CHANNELS, 1);
+                const UINT32 rate     = MFGetAttributeUINT32(actualType.Get(), MF_MT_AUDIO_SAMPLES_PER_SECOND, 44100);
+                const UINT32 bits     = MFGetAttributeUINT32(
+                    actualType.Get(), MF_MT_AUDIO_BITS_PER_SAMPLE, subtype == MFAudioFormat_Float ? 32 : 16);
+                const UINT32 bytesPerSample = std::max<UINT32>(1, bits / 8);
+                const UINT32 frameBytes     = std::max<UINT32>(1, channels * bytesPerSample);
+                const bool   isFloat        = (subtype == MFAudioFormat_Float);
+
+                CsvChannelImport ch;
+                ch.scope   = "scope_0";
+                ch.channel = "audio";
+
+                uint64_t sampleIndex = 0;
+                for (;;) {
+                        DWORD                             streamIndex = 0;
+                        DWORD                             flags       = 0;
+                        LONGLONG                          sampleTime  = 0;
+                        Microsoft::WRL::ComPtr<IMFSample> sample;
+                        hr = reader->ReadSample(
+                            MF_SOURCE_READER_FIRST_AUDIO_STREAM, 0, &streamIndex, &flags, &sampleTime, &sample);
+                        if (FAILED(hr)) {
+                                LOG_E("Audio import: ReadSample failed 0x%08lx", (unsigned long)hr);
+                                break;
+                        }
+                        if (flags & MF_SOURCE_READERF_ENDOFSTREAM)
+                                break;
+                        if (!sample)
+                                continue;
+
+                        Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
+                        hr = sample->ConvertToContiguousBuffer(&buffer);
+                        if (FAILED(hr) || !buffer)
+                                continue;
+
+                        BYTE *data   = nullptr;
+                        DWORD maxLen = 0, curLen = 0;
+                        hr = buffer->Lock(&data, &maxLen, &curLen);
+                        if (FAILED(hr) || !data)
+                                continue;
+
+                        const UINT32 frames = curLen / frameBytes;
+                        ch.timestamps.reserve(ch.timestamps.size() + frames);
+                        ch.values.reserve(ch.values.size() + frames);
+
+                        for (UINT32 f = 0; f < frames; ++f) {
+                                double mono = 0.0;
+                                for (UINT32 c = 0; c < channels; ++c) {
+                                        const BYTE *p = data + static_cast<size_t>(f) * frameBytes +
+                                                        static_cast<size_t>(c) * bytesPerSample;
+                                        double v = 0.0;
+                                        if (isFloat && bytesPerSample >= 4) {
+                                                float fv = 0.0f;
+                                                std::memcpy(&fv, p, sizeof(float));
+                                                v = fv;
+                                        } else if (bits == 8) {
+                                                v = (static_cast<int>(*p) - 128) / 128.0;
+                                        } else if (bits == 16) {
+                                                int16_t sv = 0;
+                                                std::memcpy(&sv, p, sizeof(sv));
+                                                v = sv / 32768.0;
+                                        } else if (bits == 24) {
+                                                int32_t sv = (static_cast<int32_t>(p[0]) << 8) |
+                                                             (static_cast<int32_t>(p[1]) << 16) |
+                                                             (static_cast<int32_t>(p[2]) << 24);
+                                                sv >>= 8;
+                                                v    = sv / 8388608.0;
+                                        } else if (bits >= 32) {
+                                                int32_t sv = 0;
+                                                std::memcpy(&sv, p, sizeof(sv));
+                                                v = sv / 2147483648.0;
+                                        }
+                                        mono += v;
+                                }
+                                mono /= static_cast<double>(std::max<UINT32>(1, channels));
+                                ch.timestamps.push_back(static_cast<double>(sampleIndex) / static_cast<double>(rate));
+                                ch.values.push_back(static_cast<float>(std::clamp(mono, -1.0, 1.0)));
+                                ++sampleIndex;
+                        }
+                        buffer->Unlock();
+                }
+
+                MFShutdown();
+                if (coDone)
+                        CoUninitialize();
+
+                if (!ch.values.empty()) {
+                        result.channels.push_back(std::move(ch));
+                        LOG_I("Audio import finished: %s (%zu samples, %u Hz, %u ch)",
+                              path.c_str(),
+                              result.channels.front().values.size(),
+                              rate,
+                              channels);
+                } else {
+                        LOG_E("Audio import: no samples decoded from %s", path.c_str());
+                }
+#else
+                LOG_E("Audio import is only implemented on Windows/MSVC for now: %s", path.c_str());
+#endif
+
+                publishResult(std::move(result));
         }).detach();
 }
 
@@ -2851,7 +3243,9 @@ Gui::newSdkPanel()
                                 if (f.isArray && f.arrayCount > 0) {
                                         size_t esz = ctypeSize(f.arrayElemType);
                                         for (size_t ai = 0; ai < f.arrayCount; ++ai)
-                                                emit(f.name + "[" + std::to_string(ai) + "]", f.arrayElemType, f.offset + ai * esz);
+                                                emit(f.name + "[" + std::to_string(ai) + "]",
+                                                     f.arrayElemType,
+                                                     f.offset + ai * esz);
                                 } else {
                                         emit(f.name, f.type, f.offset);
                                 }

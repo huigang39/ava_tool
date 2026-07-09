@@ -23,8 +23,8 @@ struct ChannelDropPayload {
         char      name[128];
         u64       addr;
         char      type[8];     // "F32"/"F64"/"I8"/"I16"/"I32"/"I64"/"U8"/"U16"/"U32"/"U64"
-        char      device[8];   // "SHM" / "JLINK" / "UDP"
-        char      shmName[64]; // SHM region name (when device=="SHM"), separate from variable path
+        char      device[8];   // "SHM" / "JLINK" / "UDP" / "AUDIO"
+        char      shmName[64]; // SHM region name, or audio device name when device=="AUDIO"
         u8        numBytes;    // 1/2/4/8 - derived from type
         u8        numEnums;    // 0 = not an enum
         u64       typeOff;     // DWARF type offset
