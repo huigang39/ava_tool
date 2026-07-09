@@ -27,7 +27,7 @@ struct ChannelDropPayload;
 struct StructChannelPayload;
 struct WatchMirrorRequest;
 
-enum class PortType { JLINK, UDP, SHM, MANUAL, LOCAL };
+enum class PortType { JLINK, UDP, SHM, MANUAL, LOCAL, AUDIO };
 
 struct VarEntry {
         std::string name;
@@ -54,6 +54,10 @@ struct VarEntry {
                 shm_t handle;
                 bool  inited = false;
         } shm{};
+        struct {
+                int  deviceIndex = -1;
+                char deviceName[128]{};
+        } audio{};
 
         u64  typeOff     = 0; // For DWARF nested display
         bool selected    = false;
@@ -205,6 +209,8 @@ class Variable
                 char                               udpIp[16]{};
                 int                                udpPort = 8080;
                 char                               shmName[64]{};
+                int                                audioDeviceIndex{-1};
+                char                               audioDeviceName[128]{};
                 bool                               structMode{false};
                 std::vector<VarEntry::StructField> structFields;
         } editPropBuf_;
@@ -232,6 +238,8 @@ class Variable
                 char                               udpIp[16]   = "127.0.0.1";
                 int                                udpPort     = 8080;
                 char                               shmName[64] = "GlobalVariable";
+                int                                audioDeviceIndex{-1};
+                char                               audioDeviceName[128]{};
                 char                               addrBuf[32] = "0"; // To avoid static persistence issues
                 bool                               structMode  = false;
                 std::vector<VarEntry::StructField> structFields;

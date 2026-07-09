@@ -12,6 +12,7 @@
 
 #include "app_log.hpp"
 #include "core/jlink_port.hpp"
+#include "gui/audio_input.hpp"
 #include "gui/gui.hpp"
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
@@ -133,6 +134,66 @@ absoluteDisplayPath(const std::string &path)
         if (ec)
                 return path;
         return p.lexically_normal().string();
+}
+
+static const char *
+portName(PortType port)
+{
+        switch (port) {
+                case PortType::JLINK:
+                        return "JLINK";
+                case PortType::UDP:
+                        return "UDP";
+                case PortType::SHM:
+                        return "SHM";
+                case PortType::MANUAL:
+                        return "MANUAL";
+                case PortType::LOCAL:
+                        return "LOCAL";
+                case PortType::AUDIO:
+                        return "AUDIO";
+                default:
+                        return "JLINK";
+        }
+}
+
+static void
+drawAudioDeviceCombo(int &deviceIndex, char *deviceName, size_t deviceNameSize)
+{
+        auto &audio = AudioInput::instance();
+        if (audio.devices().empty())
+                audio.refreshDevices();
+        if (deviceIndex < 0)
+                deviceIndex = audio.defaultDeviceIndex();
+        std::string cur = audio.deviceName(deviceIndex);
+        if (deviceName && deviceNameSize > 0)
+                snprintf(deviceName, deviceNameSize, "%s", cur.c_str());
+
+        ImGui::SetNextItemWidth(260.0f);
+        if (ImGui::BeginCombo("##audioDevice", cur.c_str())) {
+                for (const auto &dev : audio.devices()) {
+                        const bool selected = dev.index == deviceIndex;
+                        if (ImGui::Selectable(dev.name.c_str(), selected)) {
+                                deviceIndex = dev.index;
+                                if (deviceName && deviceNameSize > 0)
+                                        snprintf(deviceName, deviceNameSize, "%s", dev.name.c_str());
+                        }
+                        if (selected)
+                                ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+        }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tr("Audio input device", "音频输入设备"));
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr("Refresh##auddev", "刷新##auddev"))) {
+                audio.refreshDevices();
+                if (deviceIndex < 0)
+                        deviceIndex = audio.defaultDeviceIndex();
+                std::string refreshed = audio.deviceName(deviceIndex);
+                if (deviceName && deviceNameSize > 0)
+                        snprintf(deviceName, deviceNameSize, "%s", refreshed.c_str());
+        }
 }
 
 bool
@@ -1257,12 +1318,11 @@ Variable::drawVariableList()
                         if (isComplex) {
                                 StructChannelPayload sp{};
                                 sp.writable = v.writable;
-                                snprintf(sp.device,
-                                         sizeof(sp.device),
-                                         "%s",
-                                         v.port == PortType::JLINK ? "JLINK" : (v.port == PortType::SHM ? "SHM" : "LOCAL"));
+                                snprintf(sp.device, sizeof(sp.device), "%s", portName(v.port));
                                 if (v.port == PortType::SHM)
                                         snprintf(sp.shmName, sizeof(sp.shmName), "%s", v.shm.name);
+                                if (v.port == PortType::AUDIO)
+                                        snprintf(sp.shmName, sizeof(sp.shmName), "%s", v.audio.deviceName);
                                 snprintf(sp.rootName, sizeof(sp.rootName), "%s", v.name.c_str());
                                 sp.rootAddr    = v.addr;
                                 sp.rootTypeOff = v.typeOff;
@@ -1300,12 +1360,11 @@ Variable::drawVariableList()
                                 snprintf(p.name, sizeof(p.name), "%s", v.name.c_str());
                                 p.addr = v.addr;
                                 snprintf(p.type, sizeof(p.type), "%s", Parser::dataTypeToStr(v.type));
-                                snprintf(p.device,
-                                         sizeof(p.device),
-                                         "%s",
-                                         v.port == PortType::JLINK ? "JLINK" : (v.port == PortType::SHM ? "SHM" : "LOCAL"));
+                                snprintf(p.device, sizeof(p.device), "%s", portName(v.port));
                                 if (v.port == PortType::SHM)
                                         snprintf(p.shmName, sizeof(p.shmName), "%s", v.shm.name);
+                                if (v.port == PortType::AUDIO)
+                                        snprintf(p.shmName, sizeof(p.shmName), "%s", v.audio.deviceName);
                                 p.numBytes = (u8)Parser::typeBytes(v.type);
                                 p.typeOff  = v.typeOff;
                                 {
@@ -1409,6 +1468,13 @@ Variable::drawVariableList()
                                         if (v.port == PortType::SHM) {
                                                 snprintf(editPropBuf_.shmName, sizeof(editPropBuf_.shmName), "%s", v.shm.name);
                                         }
+                                        if (v.port == PortType::AUDIO) {
+                                                editPropBuf_.audioDeviceIndex = v.audio.deviceIndex;
+                                                snprintf(editPropBuf_.audioDeviceName,
+                                                         sizeof(editPropBuf_.audioDeviceName),
+                                                         "%s",
+                                                         v.audio.deviceName);
+                                        }
                                 }
                                 const bool isEnumType = (t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty();
                                 if (!isComplex && isEnumType &&
@@ -1503,6 +1569,10 @@ Variable::drawVariableList()
                                 ImGui::TextDisabled("(local)");
                         } else if (v.port == PortType::SHM) {
                                 ImGui::TextUnformatted(v.shm.name);
+                        } else if (v.port == PortType::AUDIO) {
+                                ImGui::TextUnformatted(v.audio.deviceName[0]
+                                                           ? v.audio.deviceName
+                                                           : AudioInput::instance().deviceName(v.audio.deviceIndex).c_str());
                         } else if (v.addrUnknown) {
                                 ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "UNKNOWN");
                         } else {
@@ -1511,12 +1581,7 @@ Variable::drawVariableList()
 
                         // Port
                         ImGui::TableSetColumnIndex(4);
-                        const char *portLabel = (v.port == PortType::JLINK)    ? "JLINK"
-                                                : (v.port == PortType::SHM)    ? "SHM"
-                                                : (v.port == PortType::LOCAL)  ? "LOCAL"
-                                                : (v.port == PortType::MANUAL) ? "MANUAL"
-                                                                               : "UDP";
-                        ImGui::TextUnformatted(portLabel);
+                        ImGui::TextUnformatted(portName(v.port));
 
                         // R/W
                         ImGui::TableSetColumnIndex(5);
@@ -1692,6 +1757,11 @@ Variable::addScalarToWatch(const ChannelDropPayload &p)
         if (strcmp(p.device, "SHM") == 0) {
                 v.port = PortType::SHM;
                 snprintf(v.shm.name, sizeof(v.shm.name), "%s", p.name);
+        } else if (strcmp(p.device, "AUDIO") == 0) {
+                v.port              = PortType::AUDIO;
+                v.writable          = false;
+                v.audio.deviceIndex = static_cast<int>(p.addr);
+                snprintf(v.audio.deviceName, sizeof(v.audio.deviceName), "%s", p.shmName);
         } else if (strcmp(p.device, "LOCAL") == 0 || strcmp(p.device, "MANUAL") == 0) {
                 v.port     = PortType::MANUAL;
                 v.writable = false; // Manual/Bin data is usually readonly in this context
@@ -1722,6 +1792,11 @@ Variable::addStructToWatch(const StructChannelPayload &s)
         if (strcmp(s.device, "SHM") == 0) {
                 v.port = PortType::SHM;
                 snprintf(v.shm.name, sizeof(v.shm.name), "%s", s.shmName[0] != '\0' ? s.shmName : s.rootName);
+        } else if (strcmp(s.device, "AUDIO") == 0) {
+                v.port              = PortType::AUDIO;
+                v.writable          = false;
+                v.audio.deviceIndex = static_cast<int>(s.rootAddr);
+                snprintf(v.audio.deviceName, sizeof(v.audio.deviceName), "%s", s.shmName);
         } else if (strcmp(s.device, "LOCAL") == 0 || strcmp(s.device, "MANUAL") == 0) {
                 v.port     = PortType::MANUAL;
                 v.writable = false;
@@ -1753,18 +1828,29 @@ Variable::drawAddVariableDialog()
                 ImGui::InputText("##newVarName", newVar_.name, sizeof(newVar_.name));
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("Name", "名称"));
-                static const char    *ports[]   = {"JLINK", "SHM", "LOCAL"};
-                static const PortType portMap[] = {PortType::JLINK, PortType::SHM, PortType::LOCAL};
+                static const char    *ports[]   = {"JLINK", "SHM", "LOCAL", "AUDIO"};
+                static const PortType portMap[] = {PortType::JLINK, PortType::SHM, PortType::LOCAL, PortType::AUDIO};
                 static int            portIdx   = 0;
                 if (ImGui::Combo("##newVarPort", &portIdx, ports, IM_ARRAYSIZE(ports))) {
                         newVar_.port = portMap[portIdx];
                         if (newVar_.port != PortType::LOCAL)
                                 newVar_.structMode = false;
+                        if (newVar_.port == PortType::AUDIO) {
+                                newVar_.type             = DataType::F32;
+                                newVar_.writable         = false;
+                                newVar_.addr             = (u64)AudioInput::instance().defaultDeviceIndex();
+                                newVar_.audioDeviceIndex = static_cast<int>(newVar_.addr);
+                                std::string devName      = AudioInput::instance().deviceName(newVar_.audioDeviceIndex);
+                                snprintf(newVar_.audioDeviceName, sizeof(newVar_.audioDeviceName), "%s", devName.c_str());
+                        }
                 }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("Port", "端口"));
 
-                if (newVar_.port == PortType::LOCAL) {
+                if (newVar_.port == PortType::AUDIO) {
+                        newVar_.type = DataType::F32;
+                        ImGui::TextDisabled("%s", tr("F32 normalized PCM sample (-1..1)", "F32 归一化 PCM 采样值 (-1..1)"));
+                } else if (newVar_.port == PortType::LOCAL) {
                         // LOCAL port: type dropdown includes "Struct" option
                         static const char *localTypes[] = {
                             "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64", "Struct"};
@@ -1828,6 +1914,10 @@ Variable::drawAddVariableDialog()
                         } catch (...) {
                                 newVar_.addr = 0;
                         }
+                } else if (newVar_.port == PortType::AUDIO) {
+                        drawAudioDeviceCombo(
+                            newVar_.audioDeviceIndex, newVar_.audioDeviceName, sizeof(newVar_.audioDeviceName));
+                        newVar_.addr = (u64)std::max(0, newVar_.audioDeviceIndex);
                 } else if (newVar_.port == PortType::LOCAL) {
                         if (!newVar_.structMode) {
                                 int localSz = (newVar_.addr > 0) ? (int)newVar_.addr : 8;
@@ -1920,10 +2010,12 @@ Variable::drawAddVariableDialog()
                         }
                 }
 
-                if (newVar_.port != PortType::LOCAL)
+                if (newVar_.port == PortType::AUDIO) {
+                        newVar_.writable = false;
+                        ImGui::TextDisabled("%s", tr("Read-only", "只读"));
+                } else {
                         ImGui::Checkbox(tr("Writable", "可写"), &newVar_.writable);
-                else
-                        newVar_.writable = true;
+                }
 
                 if (ImGui::Button("OK", ImVec2(120, 0))) {
                         VarEntry v;
@@ -1935,6 +2027,12 @@ Variable::drawAddVariableDialog()
                         if (v.port == PortType::SHM) {
                                 snprintf(v.shm.name, sizeof(v.shm.name), "%s", newVar_.shmName);
                                 v.shm.inited = false;
+                        }
+                        if (v.port == PortType::AUDIO) {
+                                v.type              = DataType::F32;
+                                v.addr              = (u64)std::max(0, newVar_.audioDeviceIndex);
+                                v.audio.deviceIndex = newVar_.audioDeviceIndex;
+                                snprintf(v.audio.deviceName, sizeof(v.audio.deviceName), "%s", newVar_.audioDeviceName);
                         }
                         if (v.port == PortType::LOCAL) {
                                 size_t bsz;
@@ -2194,10 +2292,11 @@ Variable::drawEditPropertiesPopup()
                 ImGui::Text("%s", tr("Port", "端口"));
                 ImGui::SameLine(100);
                 ImGui::SetNextItemWidth(260);
-                static const char    *ports[]   = {"JLINK", "SHM", "LOCAL", "MANUAL"};
-                static const PortType portMap[] = {PortType::JLINK, PortType::SHM, PortType::LOCAL, PortType::MANUAL};
-                int                   portIdx   = 0;
-                for (int i = 0; i < 4; ++i)
+                static const char    *ports[]   = {"JLINK", "SHM", "LOCAL", "MANUAL", "AUDIO"};
+                static const PortType portMap[] = {
+                    PortType::JLINK, PortType::SHM, PortType::LOCAL, PortType::MANUAL, PortType::AUDIO};
+                int portIdx = 0;
+                for (int i = 0; i < IM_ARRAYSIZE(portMap); ++i)
                         if (portMap[i] == editPropBuf_.port) {
                                 portIdx = i;
                                 break;
@@ -2205,7 +2304,12 @@ Variable::drawEditPropertiesPopup()
                 if (ImGui::Combo("##editPropPort", &portIdx, ports, IM_ARRAYSIZE(ports)))
                         editPropBuf_.port = portMap[portIdx];
 
-                if (editPropBuf_.port == PortType::LOCAL) {
+                if (editPropBuf_.port == PortType::AUDIO) {
+                        editPropBuf_.type       = DataType::F32;
+                        editPropBuf_.writable   = false;
+                        editPropBuf_.structMode = false;
+                        ImGui::TextDisabled("%s", tr("F32 normalized PCM sample (-1..1)", "F32 归一化 PCM 采样值 (-1..1)"));
+                } else if (editPropBuf_.port == PortType::LOCAL) {
                         ImGui::TextDisabled("%s",
                                             tr("In-process buffer — use &varname in SDK sequence.",
                                                "进程内缓冲区，在 SDK 序列参数中用 &varname 引用。"));
@@ -2282,9 +2386,17 @@ Variable::drawEditPropertiesPopup()
                         ImGui::SameLine(100);
                         ImGui::SetNextItemWidth(260);
                         ImGui::InputText("##editPropShm", editPropBuf_.shmName, sizeof(editPropBuf_.shmName));
+                } else if (editPropBuf_.port == PortType::AUDIO) {
+                        ImGui::Text("%s", tr("Audio Device", "音频设备"));
+                        ImGui::SameLine(100);
+                        drawAudioDeviceCombo(
+                            editPropBuf_.audioDeviceIndex, editPropBuf_.audioDeviceName, sizeof(editPropBuf_.audioDeviceName));
                 }
 
-                ImGui::Checkbox(tr("Writable", "可写"), &editPropBuf_.writable);
+                if (editPropBuf_.port != PortType::AUDIO)
+                        ImGui::Checkbox(tr("Writable", "可写"), &editPropBuf_.writable);
+                else
+                        ImGui::TextDisabled("%s", tr("Read-only", "只读"));
 
                 ImGui::Separator();
                 if (ui::Button(tr("Apply", "应用"), ui::BtnStyle::Success, ImVec2(100, 0))) {
@@ -2300,6 +2412,13 @@ Variable::drawEditPropertiesPopup()
                         }
                         if (v.port == PortType::SHM) {
                                 snprintf(v.shm.name, sizeof(v.shm.name), "%s", editPropBuf_.shmName);
+                        }
+                        if (v.port == PortType::AUDIO) {
+                                v.type              = DataType::F32;
+                                v.writable          = false;
+                                v.addr              = (u64)std::max(0, editPropBuf_.audioDeviceIndex);
+                                v.audio.deviceIndex = editPropBuf_.audioDeviceIndex;
+                                snprintf(v.audio.deviceName, sizeof(v.audio.deviceName), "%s", editPropBuf_.audioDeviceName);
                         }
                         if (v.port == PortType::LOCAL && editPropBuf_.structMode) {
                                 v.isStruct     = true;
@@ -2344,12 +2463,7 @@ Variable::exportVarFile(const std::string &path)
                 cJSON_AddNumberToObject(vObj, "type", (int)v.type);
                 cJSON_AddStringToObject(vObj, "typeStr", Parser::dataTypeToStr(v.type));
                 cJSON_AddNumberToObject(vObj, "port", (int)v.port);
-                const char *pname = (v.port == PortType::JLINK)    ? "JLINK"
-                                    : (v.port == PortType::SHM)    ? "SHM"
-                                    : (v.port == PortType::LOCAL)  ? "LOCAL"
-                                    : (v.port == PortType::MANUAL) ? "MANUAL"
-                                                                   : "UDP";
-                cJSON_AddStringToObject(vObj, "portStr", pname);
+                cJSON_AddStringToObject(vObj, "portStr", portName(v.port));
                 char addrBuf[32];
                 snprintf(addrBuf, sizeof(addrBuf), "0x%08llX", (unsigned long long)v.addr);
                 cJSON_AddStringToObject(vObj, "addr", addrBuf);
@@ -2359,6 +2473,10 @@ Variable::exportVarFile(const std::string &path)
                 cJSON_AddNumberToObject(vObj, "bitSize", v.bitSize);
                 if (v.port == PortType::SHM) {
                         cJSON_AddStringToObject(vObj, "shmName", v.shm.name);
+                }
+                if (v.port == PortType::AUDIO) {
+                        cJSON_AddNumberToObject(vObj, "audioDeviceIndex", v.audio.deviceIndex);
+                        cJSON_AddStringToObject(vObj, "audioDeviceName", v.audio.deviceName);
                 }
                 if (!v.enumDefs.empty()) {
                         cJSON *eArr = cJSON_CreateArray();
@@ -2469,6 +2587,21 @@ Variable::importVarFile(const std::string &path)
                         if (cJSON_IsString(cJSON_GetObjectItem(vObj, "shmName")))
                                 snprintf(
                                     v.shm.name, sizeof(v.shm.name), "%s", cJSON_GetObjectItem(vObj, "shmName")->valuestring);
+                } else if (v.port == PortType::AUDIO) {
+                        v.type     = DataType::F32;
+                        v.writable = false;
+                        if (auto *adi = cJSON_GetObjectItem(vObj, "audioDeviceIndex"); cJSON_IsNumber(adi))
+                                v.audio.deviceIndex = adi->valueint;
+                        else
+                                v.audio.deviceIndex = static_cast<int>(v.addr);
+                        if (auto *adn = cJSON_GetObjectItem(vObj, "audioDeviceName"); cJSON_IsString(adn))
+                                snprintf(v.audio.deviceName, sizeof(v.audio.deviceName), "%s", adn->valuestring);
+                        else
+                                snprintf(v.audio.deviceName,
+                                         sizeof(v.audio.deviceName),
+                                         "%s",
+                                         AudioInput::instance().deviceName(v.audio.deviceIndex).c_str());
+                        v.addr = (u64)std::max(0, v.audio.deviceIndex);
                 }
 
                 cJSON *eArr = cJSON_GetObjectItem(vObj, "enumDefs");
@@ -2707,6 +2840,26 @@ Variable::updateVariables()
                                                                                memberValueCache_);
                                         }
                                 }
+                        }
+                        continue;
+                }
+
+                if (v.port == PortType::AUDIO) {
+                        v.type     = DataType::F32;
+                        v.writable = false;
+                        if (v.audio.deviceName[0] == '\0') {
+                                snprintf(v.audio.deviceName,
+                                         sizeof(v.audio.deviceName),
+                                         "%s",
+                                         AudioInput::instance().deviceName(v.audio.deviceIndex).c_str());
+                        }
+                        AudioSample latest;
+                        if (AudioInput::instance().latestSample(v.audio.deviceIndex, latest)) {
+                                char buf[32];
+                                snprintf(buf, sizeof(buf), "%.6f", latest.value);
+                                v.valueStr = buf;
+                        } else {
+                                v.valueStr = "...";
                         }
                         continue;
                 }
@@ -3069,6 +3222,22 @@ Variable::load(const void *node)
                                                  sizeof(v.shm.name),
                                                  "%s",
                                                  cJSON_GetObjectItem(vObj, "shmName")->valuestring);
+                        }
+                        if (v.port == PortType::AUDIO) {
+                                v.type     = DataType::F32;
+                                v.writable = false;
+                                if (auto *adi = cJSON_GetObjectItem(vObj, "audioDeviceIndex"); cJSON_IsNumber(adi))
+                                        v.audio.deviceIndex = adi->valueint;
+                                else
+                                        v.audio.deviceIndex = static_cast<int>(v.addr);
+                                if (auto *adn = cJSON_GetObjectItem(vObj, "audioDeviceName"); cJSON_IsString(adn))
+                                        snprintf(v.audio.deviceName, sizeof(v.audio.deviceName), "%s", adn->valuestring);
+                                else
+                                        snprintf(v.audio.deviceName,
+                                                 sizeof(v.audio.deviceName),
+                                                 "%s",
+                                                 AudioInput::instance().deviceName(v.audio.deviceIndex).c_str());
+                                v.addr = (u64)std::max(0, v.audio.deviceIndex);
                         }
                         if (cJSON *sfArr = cJSON_GetObjectItem(vObj, "structFields"); cJSON_IsArray(sfArr)) {
                                 for (int si = 0; si < cJSON_GetArraySize(sfArr); ++si) {

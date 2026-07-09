@@ -13,7 +13,7 @@
 
 #include "core/updater.hpp"
 #include "gui/assembly_viewer.hpp"
-#include "gui/audio_fft.hpp"
+#include "gui/audio_input.hpp"
 #include "gui/bode.hpp"
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
@@ -103,7 +103,6 @@ class Gui
 
         bool           showCalculator_{false};
         Bode           bode_{};
-        AudioFft       audioFft_{};
         AssemblyViewer asmViewer_{};
         SequenceEditor seqEditor_{};
 
@@ -126,6 +125,7 @@ class Gui
         std::vector<CsvImportPending> csvPendingList_{};
 
         void importCsvAsync(const std::string &path, const std::string &monitorName);
+        void importAudioAsync(const std::string &path, const std::string &monitorName);
         void processPendingCsvImports();
 
         // Auto-update (GitHub Releases). Checked once at startup and on demand from
