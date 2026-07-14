@@ -16,6 +16,7 @@ extern void foc_flux_week_ctl(foc_t *foc);
 extern void foc_pos_ctl(foc_t *foc);
 extern void foc_pd_ctl(foc_t *foc);
 extern void foc_home_ctl(foc_t *foc);
+extern void foc_ratchet_ctl(foc_t *foc);
 extern void foc_asc_ctl(foc_t *foc);
 
 void foc_disable(foc_t *foc);
@@ -67,18 +68,18 @@ foc_select_theta(foc_t *foc)
 
         switch (lo->e_elec_theta) {
                 case FOC_ELEC_THETA_FORCE: {
-                        in->rotor.elec_theta = in->rotor.elec_force_theta;
-                        in->rotor.elec_omega = in->rotor.elec_force_omega;
+                        in->rotor.elec_theta = in->rotor.elec_theta_force;
+                        in->rotor.elec_omega = in->rotor.elec_omega_force;
                         break;
                 }
                 case FOC_ELEC_THETA_SENSOR: {
-                        WARP_TAU(in->rotor.elec_theta, in->rotor.motor_elec_theta - in->rotor.sensor.elec_offset_theta);
-                        in->rotor.elec_omega = in->rotor.motor_elec_omega;
+                        WARP_TAU(in->rotor.elec_theta, in->rotor.motor_theta_elec - in->rotor.sensor.elec_theta_offset);
+                        in->rotor.elec_omega = in->rotor.motor_omega_elec;
                         break;
                 }
                 case FOC_ELEC_THETA_SENSORLESS: {
-                        in->rotor.elec_theta = in->rotor.elec_obs_theta;
-                        in->rotor.elec_omega = in->rotor.elec_obs_omega;
+                        in->rotor.elec_theta = in->rotor.elec_theta_obs;
+                        in->rotor.elec_omega = in->rotor.elec_omega_obs;
                         break;
                 }
                 case FOC_ELEC_THETA_SENSORFUSION:
@@ -88,11 +89,11 @@ foc_select_theta(foc_t *foc)
         }
 
         /* 观测器电角度和传感器电角度误差计算 */
-        WARP_PI(in->rotor.elec_fusion_theta_err,
-                in->rotor.motor_elec_theta - in->rotor.sensor.elec_offset_theta - in->rotor.elec_obs_theta);
+        WARP_PI(in->rotor.elec_theta_fusion_err,
+                in->rotor.motor_theta_elec - in->rotor.sensor.elec_theta_offset - in->rotor.elec_theta_obs);
 
-        CYCLE_CNT(in->rotor.elec_cycle_cnt, in->rotor.elec_theta, in->rotor.elec_prev_theta);
-        in->rotor.elec_total_theta = (f32)in->rotor.elec_cycle_cnt * (f32)TAU + in->rotor.elec_theta;
+        CYCLE_CNT(in->rotor.elec_cycle_cnt, in->rotor.elec_theta, in->rotor.elec_theta_prev);
+        in->rotor.elec_theta_total = (f32)in->rotor.elec_cycle_cnt * (f32)TAU + in->rotor.elec_theta;
 }
 
 void
@@ -220,6 +221,12 @@ foc_enable(foc_t *foc)
                         foc_vol_ctl(foc);
                         break;
                 }
+                case FOC_MODE_RATCHET: {
+                        foc_ratchet_ctl(foc);
+                        foc_cur_ctl(foc);
+                        foc_vol_ctl(foc);
+                        break;
+                }
                 case FOC_MODE_ASC: {
                         foc_asc_ctl(foc);
                         return;
@@ -233,9 +240,9 @@ foc_enable(foc_t *foc)
 
         /* 补偿 PWM 采样造成的延迟 */
         if (lo->e_elec_theta != FOC_ELEC_THETA_FORCE) {
-                in->rotor.elec_comp_theta =
-                    (f32)cfg->sensor_cfg.elec_theta_delay_comp_cycle * in->rotor.elec_omega / cfg->base_cfg.fs;
-                WARP_TAU(in->rotor.elec_theta, in->rotor.elec_theta + in->rotor.elec_comp_theta);
+                in->rotor.elec_theta_comp =
+                    (f32)cfg->sensor_cfg.pwm_elec_theta_delay_comp_cycle * in->rotor.elec_omega / cfg->ctl_cfg.iq_pi.fs;
+                WARP_TAU(in->rotor.elec_theta, in->rotor.elec_theta + in->rotor.elec_theta_comp);
         }
 
         /* 反 park 变换 */

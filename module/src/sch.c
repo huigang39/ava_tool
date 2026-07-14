@@ -303,6 +303,21 @@ sch_add_task(sch_t *sch, const sch_task_cfg_t task_cfg)
 }
 
 int
+sch_reinit_tasks(sch_t *sch)
+{
+        DECL(sch, cfg, lo);
+
+        for (usize i = 0; i < lo->ntasks; i++) {
+                sch_task_t *task = &lo->tasks[i];
+                if (task->cfg.f_init)
+                        task->cfg.f_init(task->cfg.arg);
+
+                task->status.next_exec_ts = cfg->f_get_ts() + task->cfg.init_delay_us;
+        }
+        return 0;
+}
+
+int
 sch_set_task_freq(sch_t *sch, const usize id, const usize exec_freq)
 {
         DECL(sch, cfg, lo);

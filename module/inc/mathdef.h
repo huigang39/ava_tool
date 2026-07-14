@@ -87,7 +87,8 @@ extern "C" {
 
 #define IS_NAN(x)                        isnan(x)
 #define IS_INF(x)                        isinf(x)
-#define IS_IN_RANGE(val, min, max)       ((val) >= (min) && (val) <= (max))
+#define IS_IN_RANGE_CLOSE(val, min, max) ((val) >= (min) && (val) <= (max))
+#define IS_IN_RANGE_OPEN(val, min, max)  ((val) > (min) && (val) < (max))
 #define IS_SAME_DIR(x, y)                ((x) * (y) > 0 ? TRUE : FALSE)
 
 #define SGN(x)                           ((x) == 0.0F ? 0.0F : (x) > 0.0F ? 1.0F : -1.0F)
@@ -202,6 +203,8 @@ extern "C" {
         do {                                                      \
                 (ret) = ((ret) <= (min)) ? (min) : MIN(ret, max); \
         } while (0)
+
+#define CLAMP_RET(val, min, max) ((val) <= (min)) ? (min) : MIN(val, max)
 
 #define UVW_CLAMP(ret, min, max)              \
         do {                                  \

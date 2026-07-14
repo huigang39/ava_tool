@@ -11,7 +11,7 @@
 #define MEMPOOL_SIZE (SIZE_1MB)
 
 NO_ASAN
-ALIGN(SIZE_16KB)
+ALIGN(4096)
 u8        g_mempool_buf[MEMPOOL_SIZE];
 mempool_t g_mempool = {
     .buf = g_mempool_buf,

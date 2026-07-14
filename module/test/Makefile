@@ -1,12 +1,46 @@
+ifeq ($(OS),Windows_NT)
+SHELL := cmd.exe
+ifndef VCVARS_DONE
+
+_CL_OK := $(shell where cl.exe 2>NUL)
+
+ifeq ($(_CL_OK),)
+
+_PFILES86 := $(strip $(shell powershell -NoProfile -Command "[Environment]::GetFolderPath('ProgramFilesX86')" 2>NUL))
+_VSWHERE  := $(_PFILES86)\Microsoft Visual Studio\Installer\vswhere.exe
+_VS       := $(strip $(shell "$(_VSWHERE)" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>NUL))
+_VCVARS   := $(_VS)\VC\Auxiliary\Build\vcvarsall.bat
+_GOALS    := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),all)
+_MSVC_REINVOKE := 1
+
+.PHONY: _msvc_env $(_GOALS)
+
+_msvc_env:
+	@echo [MSVC] Initializing Visual Studio environment...
+	@call "$(_VCVARS)" x64 >NUL 2>&1 && $(MAKE) $(_GOALS) VCVARS_DONE=1 --no-print-directory
+
+$(_GOALS): _msvc_env
+	@:
+
+.DEFAULT_GOAL := all
+
+endif # _CL_OK
+endif # VCVARS_DONE
+endif # Windows_NT (MSVC init)
+
+ifndef _MSVC_REINVOKE
+
 MODULE_DIR            := $(CURDIR)/..
 LIB_DIR               := $(MODULE_DIR)/lib/module
 BUILD_DIR             := build
 SRC_DIR               := .
+EXE_EXT               :=
 
 ifeq ($(OS),Windows_NT)
     PLATFORM          := win
     SHELL             := cmd.exe
     ECHO_NL           := echo.
+    EXE_EXT           := .exe
 define MKDIR
 	@if not exist "$(subst /,\,$(1))" mkdir "$(subst /,\,$(1))" 2>nul
 endef
@@ -37,8 +71,11 @@ CFLAGS                := -Wall -Wextra -g
 LDFLAGS               := -lpthread -lm
 
 ifeq ($(PLATFORM),win)
-    OUTPUT_STATIC_LIB := $(LIB_DIR)/win/module.a
-    LDFLAGS           += -lkernel32 -lws2_32
+    CC                := cl.exe
+    INCLUDE_DIRS      := /I"$(MODULE_DIR)"
+    CFLAGS            := /W3 /nologo /TC /MD /std:clatest /utf-8 /experimental:c11atomics /FS
+    OUTPUT_STATIC_LIB := $(LIB_DIR)/win/module.lib
+    LDFLAGS           := kernel32.lib ws2_32.lib
 else ifeq ($(PLATFORM),mac)
     ARCH              := $(UNAME_M)
     ifeq ($(ARCH),arm64)
@@ -63,7 +100,8 @@ CFLAGS                += $(INCLUDE_DIRS)
 
 SRC_FILES             := $(wildcard *.c)
 TARGETS               := $(SRC_FILES:.c=)
-BINS                  := $(addprefix $(BUILD_DIR)/,$(TARGETS))
+BINS                  := $(addprefix $(BUILD_DIR)/,$(addsuffix $(EXE_EXT),$(TARGETS)))
+FSA_MEM_SRC_FILES     := ../tool/fsa_rma/fsa_mem.c
 
 .PHONY: all clean $(TARGETS) help
 
@@ -97,12 +135,27 @@ help:
 	@echo targets: $(TARGETS)
 	@echo library: $(OUTPUT_STATIC_LIB)
 
-$(BUILD_DIR)/%: %.c | $(BUILD_DIR)
+$(BUILD_DIR)/%$(EXE_EXT): %.c | $(BUILD_DIR)
 	@$(ECHO_NL)
 	@echo [test][CC] $<
-	$(CC) $(CFLAGS) $< -o "$@" $(OUTPUT_STATIC_LIB) $(LDFLAGS)
+ifeq ($(PLATFORM),win)
+	$(CC) $(CFLAGS) "$<" /Fo"$(BUILD_DIR)\\" /Fe"$@" /link "$(OUTPUT_STATIC_LIB)" $(LDFLAGS)
+else
+	$(CC) $(CFLAGS) $< -o "$@" "$(OUTPUT_STATIC_LIB)" $(LDFLAGS)
+endif
 
-$(TARGETS): %: $(BUILD_DIR)/%
+$(BUILD_DIR)/pdo_pid_param_test$(EXE_EXT): pdo_pid_param_test.c $(FSA_MEM_SRC_FILES) | $(BUILD_DIR)
+	@$(ECHO_NL)
+	@echo [test][CC] $<
+ifeq ($(PLATFORM),win)
+	$(CC) $(CFLAGS) "$<" "$(FSA_MEM_SRC_FILES)" /Fo"$(BUILD_DIR)\\" /Fe"$@" /link $(LDFLAGS)
+else
+	$(CC) $(CFLAGS) $< $(FSA_MEM_SRC_FILES) -o "$@" $(LDFLAGS)
+endif
+
+$(TARGETS): %: $(BUILD_DIR)/%$(EXE_EXT)
 
 $(BUILD_DIR):
 	$(call MKDIR,$(BUILD_DIR))
+
+endif # _MSVC_REINVOKE

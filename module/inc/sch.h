@@ -128,6 +128,7 @@ int sch_run(sch_t *sch);
 int sch_exec(sch_t *sch);
 
 int sch_add_task(sch_t *sch, sch_task_cfg_t task_cfg);
+int sch_reinit_tasks(sch_t *sch); // 重新调用所有已注册任务的 f_init (热重载后同步各任务子模块)
 int sch_set_task_freq(sch_t *sch, usize task_id, usize exec_freq);
 int sch_set_task_state(sch_t *sch, const usize id, const sch_task_state_e e_state);
 

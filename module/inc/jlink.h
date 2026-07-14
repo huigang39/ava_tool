@@ -256,7 +256,6 @@ int32_t JLINKARM_Reset(void);
 int32_t JLINKARM_Go(void);
 int32_t JLINKARM_Halt(void);
 char    JLINKARM_IsHalted(void);
-uint32_t JLINKARM_ReadReg(uint32_t RegIndex);
 int32_t JLINKARM_SetResetType(int32_t ResetType);
 
 int32_t JLINK_HSS_Start(JLINK_HSS_MEM_BLOCK_DESC *paDesc, int32_t NumBlocks, int32_t Period_us, int32_t Flags);

@@ -1,6 +1,7 @@
 #ifndef FOCDEF_H
 #define FOCDEF_H
 
+#include "mathdef.h"
 #include "pid.h"
 #include "pll.h"
 #include "rls.h"
@@ -50,12 +51,6 @@ typedef enum foc_pwm_ch {
         PWM_CH_ALL,
 } foc_pwm_ch_e;
 
-typedef enum foc_sensor {
-        FOC_SENSOR_NONE,
-        FOC_SENSOR_ELEC, // 电角度编码器
-        FOC_SENSOR_MECH, // 机械角度编码器
-} foc_sensor_e;
-
 typedef enum foc_theta {
         FOC_ELEC_THETA_NONE,
         FOC_ELEC_THETA_FORCE,        // 强拖角度
@@ -64,36 +59,9 @@ typedef enum foc_theta {
         FOC_ELEC_THETA_SENSORFUSION, // 融合角度
 } foc_elec_theta_e;
 
-typedef enum foc_ntc {
-        FOC_NTC_NONE,
-        FOC_NTC_PT5_25E2,
-        FOC_NTC_NCP15XV103J03RC,
-        FOC_NTC_TYPE_MAX,
-} foc_ntc_e;
-
-typedef enum {
-        FUNC_BACKUP_NONE,
-        FUNC_BACKUP_FLASH,
-        FUNC_BACKUP_M4,
-} foc_func_backup_e;
-
-typedef enum {
-        FUNC_DRV_NONE,
-        FUNC_DRV_8353,
-        FUNC_DRV_INDEPENDENT,
-} foc_func_drv_e;
-
-typedef enum {
-        FUNC_THETA_SENSOR_NONE,
-        FUNC_THETA_SENSOR_GW_INNER, // 弓望内圈
-        FUNC_THETA_SENSOR_GW_OUTER, // 弓望外圈
-} foc_func_theta_sensor_e;
-
-typedef enum {
-        FUNC_TOR_SENSOR_NONE,
-        FUNC_TOR_SENSOR_LD, // 蓝点
-        FUNC_TOR_SENSOR_XH, // 星汇
-} foc_func_tor_sensor_e;
+/* NTC 型号枚举 (foc_ntc_e) 由 driver 层 ntc.h 定义                            */
+/* 后备/驱动/角度传感器/扭矩传感器选项枚举由 user 层 param_cfg.h 定义           */
+/* 本模块仅以 u32 不透明值保存这些选择, 由 driver/user 的 resolver 负责解释     */
 
 typedef union foc_obs_flag {
         u32 val;
@@ -144,15 +112,53 @@ typedef enum foc_select_state {
 
 typedef enum foc_mode {
         FOC_MODE_NONE,
-        FOC_MODE_VOL, // 电压模式
-        FOC_MODE_CUR, // 电流模式
-        FOC_MODE_TOR, // 力矩模式
-        FOC_MODE_PD,  // PD 模式
-        FOC_MODE_VEL, // 速度模式
-        FOC_MODE_POS, // 位置模式
-        FOC_MODE_HM,  // 回零模式
-        FOC_MODE_ASC, // 主动短路制动模式
+        FOC_MODE_VOL,     // 电压模式
+        FOC_MODE_CUR,     // 电流模式
+        FOC_MODE_TOR,     // 力矩模式
+        FOC_MODE_PD,      // PD 模式
+        FOC_MODE_VEL,     // 速度模式
+        FOC_MODE_POS,     // 位置模式
+        FOC_MODE_HM,      // 回零模式
+        FOC_MODE_RATCHET, // 棘轮模式
+        FOC_MODE_ASC,     // 主动短路制动模式
 } foc_mode_e;
+
+typedef enum foc_vel_unit {
+        FOC_VEL_UNIT_RADS, // rad/s
+        FOC_VEL_UNIT_DEGS, // deg/s
+        FOC_VEL_UNIT_RPM,  // rpm
+        FOC_VEL_UNIT_HZ,   // hz
+} foc_vel_unit_e;
+
+static inline f32
+foc_vel_to_rads(const f32 vel, const foc_vel_unit_e e_unit)
+{
+        switch (e_unit) {
+                case FOC_VEL_UNIT_DEGS:
+                        return DEG2RAD(vel);
+                case FOC_VEL_UNIT_RPM:
+                        return RPM2RADS(vel);
+                case FOC_VEL_UNIT_HZ:
+                        return HZ2RADS(vel);
+                default:
+                        return vel;
+        }
+}
+
+static inline f32
+foc_vel_from_rads(const f32 vel, const foc_vel_unit_e e_unit)
+{
+        switch (e_unit) {
+                case FOC_VEL_UNIT_DEGS:
+                        return RAD2DEG(vel);
+                case FOC_VEL_UNIT_RPM:
+                        return RADS2RPM(vel);
+                case FOC_VEL_UNIT_HZ:
+                        return RADS2HZ(vel);
+                default:
+                        return vel;
+        }
+}
 
 typedef struct foc_ref_pvct {
         f32 pos;     // 位置 (出轴)
@@ -173,80 +179,82 @@ typedef struct foc_fdb_pvct {
 } foc_fdb_pvct_t;
 
 typedef struct foc_stator {
-        u32       is_init;        // 初始化标志
-        f32_uvw_t cur_offset;     // 电流偏置 (上电自动校准)
-        f32_uvw_t f32_i_uvw_raw;  // 原始三相相电流
-        f32_uvw_t f32_i_uvw;      // 三相相电流
-        f32_uvw_t f32_v_uvw;      // 三相端电压
-        f32_uvw_t f32_line_v_uvw; // 三相线电压
-        f32_ab_t  i_ab;           // alpha-beta 轴电流
-        f32_ab_t  v_ab;           // alpha-beta 轴电压
-        f32_dq_t  i_dq;           // d-q 轴电流
-        f32_dq_t  v_dq;           // d-q 轴电压
-        f32       i_s;            // 电流矢量幅值
-        f32       v_s;            // 电压矢量幅值
+        u32       is_init;         // 初始化标志
+        f32_uvw_t cur_offset;      // 电流偏置 (上电自动校准)
+        f32_uvw_t f32_i_uvw_raw;   // 原始三相相电流
+        f32_uvw_t f32_i_uvw;       // 三相相电流
+        f32_uvw_t f32_v_uvw;       // 三相端电压
+        f32_uvw_t f32_line_v_uvw;  // 三相线电压
+        f32       v_n;             // 共模电压
+        f32_uvw_t f32_phase_v_uvw; // 三相相电压
+        f32_ab_t  i_ab;            // alpha-beta 轴电流
+        f32_ab_t  v_ab;            // alpha-beta 轴电压
+        f32_dq_t  i_dq;            // d-q 轴电流
+        f32_dq_t  v_dq;            // d-q 轴电压
+        f32       i_s;             // 电流矢量幅值
+        f32       v_s;             // 电压矢量幅值
         f32       line_v_amp;
 } foc_stator_t;
 
 typedef struct foc_store_theta {
         dir_e motor_sensor_dir;      // 电机轴编码器方向
         dir_e outshaft_sensor_dir;   // 出轴编码器方向
-        f32   elec_offset_theta;     // 电角度偏置
-        f32   outshaft_offset_theta; // 出轴角度偏置 (标零用)
-        f32   tor_sensor_offset;     // 扭矩传感器零偏 (标零用)
+        f32   elec_theta_offset;     // 电角度偏置
+        f32   outshaft_theta_offset; // 出轴角度偏置 (标零用)
+        f32   tor_offset;            // 扭矩传感器零偏 (标零用)
 } foc_store_sensor_t;
 
 typedef struct foc_rotor {
-        u32                is_init;             // 初始化标志
-        f32                motor_init_theta;    // 电机轴编码器角度 (上电时刻)
-        f32                outshaft_init_theta; // 出轴编码器角度 (上电时刻)
-        f32                motor_offset_theta;
-        f32                outshaft_offset_theta;
-        foc_store_sensor_t sensor; // 保存的传感器校准数据
+        u32                is_init;                          // 初始化标志
+        f32                motor_theta_start;                // 电机轴初始相对角度
+        f32                outshaft_theta_start;             // 出轴初始相对角度
+        f32                motor_theta_total_wrap_offset;    // 电机轴总角度整圈基准修正
+        f32                outshaft_theta_total_wrap_offset; // 出轴总角度整圈基准修正
+        foc_store_sensor_t sensor;                           // 保存的传感器校准数据
         // 电机轴编码器角度
         i32 motor_cycle_cnt;        // 电机轴圈数计数
         f32 motor_theta_raw;        // 电机轴角度原始值 (可能是电角度或机械角度)
-        f32 motor_comp_theta;       // 电机轴角度补偿值
+        f32 motor_theta_comp;       // 电机轴角度补偿值
         f32 motor_theta;            // 电机轴角度
-        f32 motor_prev_theta;       // 上一周期电机轴角度
-        f32 motor_total_theta;      // 总电机轴角度
+        f32 motor_theta_prev;       // 上一周期电机轴角度
+        f32 motor_theta_total;      // 总电机轴角度
         f32 motor_omega;            // 电机轴角速度
-        f32 motor_elec_theta;       // 从电机轴角度换算的电角度
-        f32 motor_elec_omega;       // 从电机轴角速度换算的电角速度
-        f32 motor_mech_theta;       // 从电机轴角度换算的机械角度
-        f32 motor_mech_total_theta; // 从电机轴角度换算的总机械角度
-        f32 motor_mech_omega;
+        f32 motor_theta_elec;       // 从电机轴角度换算的电角度
+        f32 motor_omega_elec;       // 从电机轴角速度换算的电角速度
+        f32 motor_theta_mech;       // 从电机轴角度换算的机械角度
+        f32 motor_theta_mech_total; // 从电机轴角度换算的总机械角度
+        f32 motor_omega_mech;
         // 出轴轴编码器角度
         i32 outshaft_cycle_cnt;       // 出轴圈数计数
         f32 outshaft_theta_raw;       // 出轴角度原始值
-        f32 outshaft_comp_theta;      // 出轴角度补偿值
+        f32 outshaft_theta_comp;      // 出轴角度补偿值
         f32 outshaft_theta;           // 出轴角度
-        f32 outshaft_prev_theta;      // 上一周期出轴角度
-        f32 outshaft_total_theta;     // 总出轴角度
+        f32 outshaft_theta_prev;      // 上一周期出轴角度
+        f32 outshaft_theta_total;     // 总出轴角度
         f32 outshaft_omega;           // 出轴角速度
-        f32 outshaft_est_theta;       // 从电机轴机械角度换算的出轴角度
-        f32 outshaft_est_total_theta; // 从电机轴总机械角度换算的出轴总角度
-        f32 outshaft_est_omega;       // 从电机轴机械角速度换算的出轴角速度
+        f32 outshaft_theta_est;       // 从电机轴机械角度换算的出轴角度
+        f32 outshaft_theta_total_est; // 从电机轴总机械角度换算的出轴总角度
+        f32 outshaft_omega_est;       // 从电机轴机械角速度换算的出轴角速度
         f32 outshaft_theta_err;       // outshaft_est_theta 与 outshaft_theta 的差值
         f32 outshaft_theta_err_pp;    // outshaft_theta_err 的峰峰值
         // 机械角度
         f32 mech_theta;       // 机械角度
-        f32 mech_total_theta; // 总机械角度
+        f32 mech_theta_total; // 总机械角度
         f32 mech_omega;       // 机械角速度
-        f32 mech_prev_omega;  // 上一周期机械角速度
+        f32 mech_omega_prev;  // 上一周期机械角速度
         f32 mech_acc;         // 机械角加速度
         // 电角度
         i32 elec_cycle_cnt;        // 电角度圈数
         f32 elec_theta;            // 电角度
-        f32 elec_prev_theta;       // 上一周期电角度
-        f32 elec_comp_theta;       // 电角度补偿值
-        f32 elec_total_theta;      // 总电角度
+        f32 elec_theta_prev;       // 上一周期电角度
+        f32 elec_theta_comp;       // 电角度补偿值
+        f32 elec_theta_total;      // 总电角度
         f32 elec_omega;            // 电角速度
-        f32 elec_obs_theta;        // 观测电角度
-        f32 elec_obs_omega;        // 观测电角速度
-        f32 elec_fusion_theta_err; // elec_obs_theta 与 elec_theta 的差值
-        f32 elec_force_theta;      // 强拖电角度
-        f32 elec_force_omega;      // 强拖电角速度
+        f32 elec_theta_obs;        // 观测电角度
+        f32 elec_omega_obs;        // 观测电角速度
+        f32 elec_theta_fusion_err; // elec_obs_theta 与 elec_theta 的差值
+        f32 elec_theta_force;      // 强拖电角度
+        f32 elec_omega_force;      // 强拖电角速度
 } foc_rotor_t;
 
 typedef struct foc_temp {
@@ -269,65 +277,89 @@ typedef struct foc_store {
 } foc_store_t;
 
 typedef struct foc_freq_div {
-        f32 motor_sensor;    // 电机轴编码器
-        f32 outshaft_sensor; // 出轴编码器
-        f32 tor_sensor;      // 扭矩传感器
-        f32 cur;             // 电流环
-        f32 flux_week;       // 弱磁环
-        f32 tor;             // 力矩环
-        f32 pd;              // PD 环
-        f32 vel;             // 速度环
-        f32 pos;             // 位置环
+        u32 motor_sensor;    // 电机轴编码器
+        u32 outshaft_sensor; // 出轴编码器
+        u32 tor_sensor;      // 扭矩传感器
+        u32 cur;             // 电流环
+        u32 flux_week;       // 弱磁环
+        u32 tor;             // 力矩环
+        u32 pd;              // PD 环
+        u32 vel;             // 速度环
+        u32 pos;             // 位置环
 } foc_freq_div_t;
 
+typedef struct foc_ratchet_cfg {
+        f32 step_angle;   // 棘轮档位间隔 (出轴, rad)
+        f32 switch_angle; // 过档阈值 (出轴, rad; <=0 时使用 step_angle / 2)
+        f32 kp;           // 档位吸附刚度 (A/rad)
+        f32 kd;           // 阻尼 (A/(rad/s))
+        f32 cur_max;      // 输出 q 轴电流限幅 (A; <=0 时使用电机/采样限流)
+} foc_ratchet_cfg_t;
+
+typedef struct foc_type_cfg {
+        u32 actuator;
+        u32 motor;
+        u32 reducer;
+        u32 periph;
+        u32 backup;
+        u32 motor_theta_sensor;
+        u32 outshaft_sensor;
+        u32 tor_sensor;
+        struct {
+                u32 inverter;
+                u32 stator_uv;
+                u32 stator_vw;
+        } ntc;
+} foc_type_cfg_t;
+
 typedef struct foc_base_cfg {
-        f32          fs;                // FOC 运行频率 (定时器中断频率)
-        motor_cfg_t  motor;             // 电机参数
-        periph_cfg_t periph;            // 硬件/外设参数
-        dir_e        dir;               // 执行器方向
-        f32          outshaft_ratio;    // 减速比
-        f32          acc_max;           // 最大加速度 (出轴)
-        f32          home_vel;          // 回零速度 (出轴)
-        f32          v_bus_rate;        // 母线电压利用率
-        u32          self_check_enable; // 启用上电自检
+        motor_cfg_t    motor;              // 电机参数
+        reducer_cfg_t  reducer;            // 减速机参数
+        periph_cfg_t   periph;             // 硬件/外设参数
+        dir_e          dir;                // 执行器方向
+        foc_vel_unit_e e_vel_unit;         // 速度单位 (默认 rad/s)
+        f32            acc_max;            // 最大加速度 (出轴)
+        f32            home_vel;           // 回零速度 (出轴)
+        f32            v_bus_rate;         // 母线电压利用率
+        f32            cur2tor[4];         // 电流->扭矩 多项式拟合系数
+        f32            tor2cur[4];         // 扭矩->电流 多项式拟合系数
+        u32            self_check_enable;  // 启用上电自检
+        check_fault_u  check_fault_enable; // 故障检测使能 (某位=0 则不检测该故障; .val=0 视为全部使能)
 } foc_base_cfg_t;
 
 typedef struct foc_cali_cfg {
-        f32 force_id;                          // 强拖电流
-        f32 elec_theta_nonlinear_cali_vel;     // 电角度非线性误差校准速度 (出轴), 如果设为 0 将不会校准此项
-        f32 elec_theta_offset_cali_vel;        // 电角度偏置校准速度 (出轴)
-        f32 outshaft_theta_nonlinear_cali_vel; // 出轴非线性误差校准速度 (出轴), 如果设为 0 将不会校准此项
+        foc_cali_flag_u u_cali_flag;
+        f32             force_id;                                   // 强拖电流
+        f32             nonlinear_motor_theta_cali_motor_vel;       // 电机轴角度非线性误差校准速度 (电机轴机械, rad/s)
+        f32             offset_elec_theta_cali_elec_vel;            // 电角度偏置校准速度 (电角速度, rad/s)
+        f32             nonlinear_outshaft_theta_cali_outshaft_vel; // 出轴角度非线性误差校准速度 (出轴, rad/s)
 } foc_cali_cfg_t;
 
 typedef struct foc_sensor_cfg {
-        foc_sensor_e     e_motor_sensor;               // 电机轴编码器类型
-        foc_elec_theta_e e_elec_theta;                 // 电角度源
-        u32              theta_uart_baudrate;          // 角度传感器串口波特率
-        u32              tor_uart_baudrate;            // 转矩传感器串口波特率
-        u32              outshaft_sensor_enable;       // 启用出轴编码器
-        u32              motor_sensor_comp_enable;     // 启用电机轴编码器非线性补偿
-        u32              outshaft_sensor_comp_enable;  // 启用出轴编码器非线性补偿
-        u32              tor_sensor_enable;            // 启用力矩传感器
-        u32              terminal_volt_sample_enable;  // 启用端电压采样
-        f32              motor_theta_delay_comp_cycle; // 电机轴角度补偿增益
-        f32              elec_theta_delay_comp_cycle;  // 电角度补偿增益
-        struct {
-                foc_ntc_e e_inverter;
-                foc_ntc_e e_stator_uv;
-                foc_ntc_e e_stator_vw;
-        } ntc_type;
+        foc_elec_theta_e e_elec_theta;           // 电角度源
+        u32              outshaft_sensor_enable; // 启用出轴编码器
+        u32 outshaft_theta_pos_loop_enable;      // 启用位置全闭环 (用出轴编码器实测角度作位置反馈, 否则用电机轴换算的估计值)
+        u32 swap_motor_outshaft_sensor_enable;   // 交换电机轴和出轴编码器接口
+        u32 swap_theta_tor_uart_enable;          // 交换角度传感器和力矩传感器串口接口
+        u32 motor_sensor_comp_enable;            // 启用电机轴编码器非线性补偿
+        u32 outshaft_sensor_comp_enable;         // 启用出轴编码器非线性补偿
+        u32 tor_sensor_enable;                   // 启用力矩传感器
+        u32 terminal_volt_sample_enable;         // 启用端电压采样
+        f32 motor_theta_delay_comp_cycle;        // 电机轴角度补偿增益
+        f32 pwm_elec_theta_delay_comp_cycle;     // 电角度补偿增益
 } foc_sensor_cfg_t;
 
 typedef struct foc_ctl_cfg {
-        foc_freq_div_t div;          // 分频系数
-        f32            cur_wc;       // 电流环带宽
-        pid_cfg_t      id_pi;        // d 轴电流环 PI 控制器参数
-        pid_cfg_t      iq_pi;        // q 轴电流环 PI 控制器参数
-        pid_cfg_t      tor_pi;       // 力矩环 PI 控制器参数
-        pid_cfg_t      flux_week_pi; // 弱磁环 PI 控制器参数
-        pid_cfg_t      pos_vel_pd;   // PD 环 PD 控制器参数
-        pid_cfg_t      vel_pi;       // 速度环 PI 控制器参数
-        pid_cfg_t      pos_p;        // 位置环 P 控制器参数
+        foc_freq_div_t    freq_div;     // 分频系数
+        f32               cur_wc;       // 电流环带宽
+        pid_cfg_t         id_pi;        // d 轴电流环 PI 控制器参数
+        pid_cfg_t         iq_pi;        // q 轴电流环 PI 控制器参数
+        pid_cfg_t         tor_pi;       // 力矩环 PI 控制器参数
+        pid_cfg_t         flux_week_pi; // 弱磁环 PI 控制器参数
+        pid_cfg_t         pos_vel_pd;   // PD 环 PD 控制器参数
+        pid_cfg_t         vel_pi;       // 速度环 PI 控制器参数
+        pid_cfg_t         pos_p;        // 位置环 P 控制器参数
+        foc_ratchet_cfg_t ratchet;      // 棘轮模式参数
 } foc_ctl_cfg_t;
 
 typedef struct foc_comm {
@@ -353,21 +385,11 @@ typedef int (*foc_set_status_f)(u8 status);
 typedef int (*foc_set_pwm_status_f)(foc_pwm_ch_e pwm_ch, u8 status);
 typedef void (*foc_set_pwm_duty_f)(u32_uvw_t u32_pwm_duty, u32 pwm_full_cnt);
 
-typedef struct {
-        foc_func_backup_e       e_backup;
-        foc_func_drv_e          e_drv;
-        foc_func_theta_sensor_e e_motor_theta_sensor;
-        foc_func_theta_sensor_e e_outshaft_sensor;
-        foc_func_tor_sensor_e   e_tor_sensor;
-} foc_func_opt_t;
-
-/* user 侧实现的解析回调: 根据 opt 填充 func_cfg 中所有具体函数指针 */
-typedef struct foc_func_cfg foc_func_cfg_t;
-typedef void (*foc_func_resolve_f)(foc_func_cfg_t *func_cfg);
+typedef struct foc_cfg foc_cfg_t;
+typedef void (*foc_type_resolve_f)(foc_cfg_t *foc_cfg);
 
 typedef struct foc_func_cfg {
-        foc_func_opt_t     opt;
-        foc_func_resolve_f f_resolve; // 解析回调: 据 opt 重填本结构其他字段
+        foc_type_resolve_f f_type_resolve; // 解析回调
 
         foc_load_f  f_load;  // 数据加载
         foc_store_f f_store; // 数据保存
@@ -399,6 +421,7 @@ typedef union foc_err {
 } foc_err_u;
 
 typedef struct foc_cfg {
+        foc_type_cfg_t   type_cfg;   // 类型参数
         foc_base_cfg_t   base_cfg;   // 基础参数
         foc_sensor_cfg_t sensor_cfg; // 传感器参数
         foc_ctl_cfg_t    ctl_cfg;    // 控制参数
@@ -459,13 +482,18 @@ typedef struct foc_lo {
         luenberger_obs_t luenberger; // 龙伯格观测器
         smo_obs_t        smo;        // 滑模观测器
         hfi_obs_t        hfi;        // 高频注入
-        rls_obs_t        rls;
+        rls_obs_t        rls;        // 最小二乘法
 
         f32_dq_t ref_i_dq;  // 目标 d-q 轴电流
         f32_dq_t comp_i_dq; // 补偿 d-q 轴电流
         f32_dq_t ffd_v_dq;  // 前馈 d-q 轴电压
 
-        foc_func_opt_t prev_func_opt; // 上次已应用的 func_opt 快照, foc_sync_func_opt 据此检测变更
+        f32 est_inertia;  // RLS 辨识的电机轴等效惯量 (kg*m^2)
+        f32 est_friction; // RLS 辨识的电机轴粘性摩擦系数 (N*m*s/rad)
+
+        f32 ratchet_anchor_pos; // 棘轮基准位置 (出轴)
+        f32 ratchet_detent_pos; // 当前吸附档位位置 (出轴)
+        i32 ratchet_idx;        // 当前棘轮档位编号
 } foc_lo_t;
 
 typedef struct foc_tmp {
@@ -479,6 +507,8 @@ typedef struct foc_tmp {
         u32       elec_theta_offset_cali_cycle_cnt;        // 电角度偏置校准圈数计数
         u32       elec_theta_offset_cali_sample_delay_cnt; // 电角度校准采样延时计数
         f32       elec_theta_offset_sum;                   // 电角度偏置总和
+        i32       outshaft_theta_dir_cali_cnt;             // 出轴编码器方向校准计数
+        f32       prev_outshaft_theta_raw;                 // 出轴编码器上一周期原始角度
 
         foc_state_e      e_prev_state;      // 上一个 FOC 状态
         foc_mode_e       e_prev_mode;       // 上一个控制模式

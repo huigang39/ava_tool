@@ -2,12 +2,11 @@ ifeq ($(OS),Windows_NT)
 SHELL := cmd.exe
 ifndef VCVARS_DONE
 
-# Targets that don't need the MSVC compiler/linker. When every requested goal is
-# one of these, skip the (slow) vcvars init below.
-_NO_MSVC_GOALS := clean fmt list info help
-_NEED_MSVC     := $(if $(MAKECMDGOALS),$(filter-out $(_NO_MSVC_GOALS),$(MAKECMDGOALS)),static)
+_GOALS    := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),static)
+_MSVC_DEFAULT_GOALS := static shared all msvc-win tool test
+_MSVC_ENV_GOALS := $(if $(filter msvc,$(COMPILER)),$(_GOALS),$(filter $(_MSVC_DEFAULT_GOALS),$(_GOALS)))
 
-ifneq ($(_NEED_MSVC),)
+ifneq ($(_MSVC_ENV_GOALS),)
 
 _CL_OK := $(shell where cl.exe 2>NUL)
 
@@ -17,7 +16,6 @@ _PFILES86 := $(strip $(shell powershell -NoProfile -Command "[Environment]::GetF
 _VSWHERE  := $(_PFILES86)\Microsoft Visual Studio\Installer\vswhere.exe
 _VS       := $(strip $(shell "$(_VSWHERE)" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>NUL))
 _VCVARS   := $(_VS)\VC\Auxiliary\Build\vcvarsall.bat
-_GOALS    := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),static)
 _MSVC_REINVOKE := 1
 
 .PHONY: _msvc_env $(_GOALS)
@@ -32,7 +30,7 @@ $(_GOALS): _msvc_env
 .DEFAULT_GOAL := static
 
 endif # _CL_OK
-endif # _NEED_MSVC
+endif # _MSVC_ENV_GOALS
 endif # VCVARS_DONE
 endif # Windows_NT (MSVC init)
 
@@ -237,7 +235,11 @@ ifneq ($(COMPILER),)
     endif
 endif
 
-INCLUDE_DIRS              := -I$(PROJECT_DIR)/inc
+ifeq ($(COMPILER),msvc)
+    INCLUDE_DIRS          := /I"$(PROJECT_DIR)/inc"
+else
+    INCLUDE_DIRS          := -I"$(PROJECT_DIR)/inc"
+endif
 CFLAGS                    += $(INCLUDE_DIRS)
 
 OUTPUT_BUILD_DIR          := $(BUILD_DIR)/$(COMPILER)-$(PLATFORM)-$(ARCH)
@@ -341,13 +343,8 @@ clean:
 	@echo [module] make clean complete.
 
 ifeq ($(OS),Windows_NT)
-    FMT_DIRS_PS           := $(foreach dir,$(FMT_DIRS),'$(dir)')
-    FMT_DIRS_PS           := $(subst $(space),'',$(space),$(FMT_DIRS_PS))
     FMT_EXCLUDE_PATTERN   := $(subst $(space),|,$(FMT_EXCLUDE_DIRS))
-    FMT_FILES             := $(shell powershell -NoProfile -Command "$$files=@(); $$dirs=@($(FMT_DIRS_PS)); $$excludes='$(FMT_EXCLUDE_PATTERN)'; foreach ($$dir in $$dirs) { if (Test-Path $$dir) { $$files += Get-ChildItem -Path $$dir -Include *.c,*.cpp,*.h,*.hpp -Recurse -File | Where-Object { if ($$excludes) { $$_.FullName -notmatch $$excludes } else { $$true } } | ForEach-Object { $$_.FullName } } }; $$files -join ' '" 2>nul)
-    ifeq ($(FMT_FILES),)
-        FMT_FILES         := $(foreach dir,$(FMT_DIRS),$(shell cmd /c "for /r $(dir) %%f in (*.c *.cpp *.h *.hpp) do @echo %%~ff" 2>nul))
-    endif
+    FMT_PS                := $$dirs='$(strip $(FMT_DIRS))' -split '\s+'; $$excludes='$(FMT_EXCLUDE_PATTERN)'; $$files=@(); foreach ($$dir in $$dirs) { if ($$dir -and (Test-Path $$dir)) { $$files += Get-ChildItem -Path $$dir -Include *.c,*.cpp,*.h,*.hpp -Recurse -File | Where-Object { if ($$excludes) { $$_.FullName -notmatch $$excludes } else { $$true } } } }
 else
     FMT_FILES             := $(shell find $(FMT_DIRS) -type f \( -name "*.c" -o -name "*.cpp" -o -name "*.h" -o -name "*.hpp" \) $(foreach dir,$(FMT_EXCLUDE_DIRS),! -path "*/$(dir)/*") 2>/dev/null)
 endif
@@ -358,10 +355,10 @@ fmt:
 	@echo [module] formatting code files...
 ifeq ($(PLATFORM),win)
 	@where clang-format >nul 2>&1 || (echo [ERROR] clang-format not found. please install clang-format. && exit 1)
-	@powershell -NoProfile -Command "if (Get-Command dos2unix -ErrorAction SilentlyContinue) { Write-Host 'converting line endings to LF...'; $$files='$(FMT_FILES)'.Split(' '); foreach ($$file in $$files) { if ($$file -and (Test-Path $$file)) { dos2unix \"$$file\" 2>$$null } } }"
-	@echo found $(words $(FMT_FILES)) file(s) to format
+	@powershell -NoProfile -Command "$(FMT_PS); if (Get-Command dos2unix -ErrorAction SilentlyContinue) { Write-Host 'converting line endings to LF...'; foreach ($$file in $$files) { dos2unix $$file.FullName 2>$$null } }"
+	@powershell -NoProfile -Command "$(FMT_PS); Write-Host ('found {0} file(s) to format' -f $$files.Count)"
 	@$(ECHO_NL)
-	@powershell -NoProfile -Command "$$files='$(FMT_FILES)'.Split(' '); foreach ($$file in $$files) { if ($$file -and (Test-Path $$file)) { Write-Host \"formatting: $$file\"; clang-format -i -style=file \"$$file\" 2>$$null; if ($$LASTEXITCODE -ne 0) { clang-format -i \"$$file\" 2>$$null } } }"
+	@powershell -NoProfile -Command "$(FMT_PS); foreach ($$file in $$files) { Write-Host \"formatting: $$($$file.FullName)\"; clang-format -i -style=file $$file.FullName 2>$$null; if ($$LASTEXITCODE -ne 0) { clang-format -i $$file.FullName 2>$$null } }"
 	@$(ECHO_NL)
 else
 	@command -v clang-format >/dev/null 2>&1 || (echo [ERROR] clang-format not found. please install clang-format. && exit 1)

@@ -62,15 +62,6 @@ i32 foc_set_outshaft_zero(foc_t *foc);
 i32 foc_set_tor_zero(foc_t *foc);
 
 /**
- * @brief 检测 foc->cfg.func_opt 自上次 apply 以来是否变化, 变化则在安全状态下
- *        (FOC_STATE_DISABLE) 自动 apply, 用于支持运行时实时改写函数选择器
- *
- * @param foc FOC 结构体
- * @return    void
- */
-void foc_sync_func_opt(foc_t *foc);
-
-/**
  * @brief 设置 FOC 校准标志
  *
  * @param foc FOC 结构体

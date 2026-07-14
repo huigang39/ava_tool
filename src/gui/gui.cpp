@@ -413,8 +413,8 @@ Gui::saveSession(const std::string &path)
                 cJSON_AddNumberToObject(mObj, "historySeconds", static_cast<f64>(m->historySeconds_));
                 cJSON_AddNumberToObject(mObj, "maxDisplayPoints", static_cast<f64>(m->maxDisplayPoints_));
                 if (!m->importSourcePath_.empty()) {
-                        const std::string importType =
-                            !m->importSourceType_.empty() ? m->importSourceType_
+                        const std::string importType = !m->importSourceType_.empty()
+                                                           ? m->importSourceType_
                                                            : (hasAudioExtension(m->importSourcePath_) ? "audio" : "csv");
                         cJSON_AddStringToObject(mObj, "importSourcePath", monitorToRel(m->importSourcePath_).c_str());
                         cJSON_AddStringToObject(mObj, "importSourceType", importType.c_str());
@@ -486,6 +486,8 @@ Gui::saveSession(const std::string &path)
                                 cJSON_AddBoolToObject(chObj, "showMarkers", ch->showMarkers());
                                 cJSON_AddBoolToObject(chObj, "show", ch->show());
                                 cJSON_AddBoolToObject(chObj, "writable", ch->isWritable());
+                                cJSON_AddNumberToObject(chObj, "bitOffset", ch->getBitOffset());
+                                cJSON_AddNumberToObject(chObj, "bitSize", ch->getBitSize());
 
                                 if (ch->isEnum()) {
                                         cJSON *enumsArr = cJSON_CreateArray();
@@ -753,8 +755,7 @@ Gui::loadSession(const std::string &path)
                                         monitor->importSourceType_ =
                                             hasAudioExtension(monitor->importSourcePath_) ? "audio" : "csv";
                                 }
-                                pendingImportSources.push_back(
-                                    {mName, monitor->importSourcePath_, monitor->importSourceType_});
+                                pendingImportSources.push_back({mName, monitor->importSourcePath_, monitor->importSourceType_});
                         }
 
                         const cJSON *scopesArr = cJSON_GetObjectItem(mItem, "scopes");
@@ -889,6 +890,10 @@ Gui::loadSession(const std::string &path)
                                                 ch->show() = cJSON_IsTrue(sh);
                                         if (const cJSON *wrt = cJSON_GetObjectItem(chItem, "writable"); cJSON_IsBool(wrt))
                                                 ch->setWritable(cJSON_IsTrue(wrt));
+                                        if (const cJSON *bo = cJSON_GetObjectItem(chItem, "bitOffset"); cJSON_IsNumber(bo))
+                                                ch->setBitOffset(static_cast<u32>(bo->valueint));
+                                        if (const cJSON *bsz = cJSON_GetObjectItem(chItem, "bitSize"); cJSON_IsNumber(bsz))
+                                                ch->setBitSize(static_cast<u32>(bsz->valueint));
 
                                         if (const cJSON *enumsArr = cJSON_GetObjectItem(chItem, "enums");
                                             cJSON_IsArray(enumsArr)) {
@@ -1003,9 +1008,7 @@ Gui::loadSession(const std::string &path)
         for (const auto &src : pendingImportSources) {
                 std::error_code ec;
                 if (!std::filesystem::exists(src.path, ec)) {
-                        LOG_E("Session import source missing for monitor '%s': %s",
-                              src.monitorName.c_str(),
-                              src.path.c_str());
+                        LOG_E("Session import source missing for monitor '%s': %s", src.monitorName.c_str(), src.path.c_str());
                         continue;
                 }
 
@@ -1256,11 +1259,25 @@ Gui::drawBar()
                 ImGui::SameLine();
                 const bool jlinkPaused = g_jlinkSamplingPaused.load();
                 if (jlinkPaused) {
-                        if (ui::SmallButton(tr("RESUME J-Link", "恢复 J-Link 采样"), ui::BtnStyle::Success))
+                        if (ui::SmallButton(tr("RESUME J-Link", "恢复 J-Link 采样"), ui::BtnStyle::Success)) {
+                                {
+                                        std::lock_guard lk(mtxMonitors_);
+                                        for (auto &m : monitors_ | std::views::values)
+                                                if (m)
+                                                        m->setSamplingPaused(false);
+                                }
                                 g_jlinkSamplingPaused.store(false);
+                        }
                 } else {
-                        if (ui::SmallButton(tr("PAUSE J-Link", "暂停 J-Link 采样"), ui::BtnStyle::Warning))
+                        if (ui::SmallButton(tr("PAUSE J-Link", "暂停 J-Link 采样"), ui::BtnStyle::Warning)) {
+                                {
+                                        std::lock_guard lk(mtxMonitors_);
+                                        for (auto &m : monitors_ | std::views::values)
+                                                if (m)
+                                                        m->setSamplingPaused(true);
+                                }
                                 g_jlinkSamplingPaused.store(true);
+                        }
                 }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s",
@@ -1650,8 +1667,8 @@ Gui::loop()
                                         mon->csvLoading_.store(true, std::memory_order_release);
                                         mon->importSourcePath_ = absEc ? file : importPath;
                                         mon->importSourceType_ = isAudioImport ? "audio" : "csv";
-                                        monitors_[monName] = mon;
-                                        isModified_        = true;
+                                        monitors_[monName]     = mon;
+                                        isModified_            = true;
                                 }
                                 if (isAudioImport)
                                         importAudioAsync(file, monName);
@@ -1729,10 +1746,17 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
 
         // Build a symbol map from EVERY loaded ELF (not just the reloaded one) so a
         // symbol provided by another open ELF isn't falsely flagged as missing.
-        std::unordered_map<std::string, std::pair<u64, u64>> symMap; // name -> {addr, typeOff}
+        struct SymbolSyncInfo {
+                u64      addr{0};
+                u64      typeOff{0};
+                DataType type{DataType::UNKNOWN};
+                u32      bitOffset{0};
+                u32      bitSize{0};
+        };
+        std::unordered_map<std::string, SymbolSyncInfo> symMap;
         for (auto &vp : vars_)
                 for (const auto &se : vp.second->searchPool_)
-                        symMap.try_emplace(se.path, se.addr, se.typeOff);
+                        symMap.try_emplace(se.path, SymbolSyncInfo{se.addr, se.typeOff, se.type, se.bitOffset, se.bitSize});
 
         i32 count     = 0;
         i32 unknown   = 0;
@@ -1746,7 +1770,10 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
 
                                 auto it = symMap.find(ch->getSymbolName());
                                 if (it != symMap.end()) {
-                                        ch->setAddr(it->second.first);
+                                        ch->setAddr(it->second.addr);
+                                        ch->setType(Parser::dataTypeToStr(it->second.type));
+                                        ch->setBitOffset(it->second.bitOffset);
+                                        ch->setBitSize(it->second.bitSize);
                                         ch->setAddrUnknown(false);
                                         count++;
                                 } else {
@@ -1769,8 +1796,11 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
 
                         auto it = symMap.find(v.name);
                         if (it != symMap.end()) {
-                                v.addr        = it->second.first;
-                                v.typeOff     = it->second.second;
+                                v.addr        = it->second.addr;
+                                v.typeOff     = it->second.typeOff;
+                                v.type        = it->second.type;
+                                v.bitOffset   = it->second.bitOffset;
+                                v.bitSize     = it->second.bitSize;
                                 v.addrUnknown = false;
                                 count++;
                         } else {
@@ -1789,57 +1819,82 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
 void
 Gui::syncVariableProperties(Variable *var)
 {
+        if (!var)
+                return;
+
+        std::unordered_map<std::string, const SearchEntry *> exactSymbols;
+        for (const auto &se : var->searchPool_)
+                exactSymbols.try_emplace(se.path, &se);
+
         std::lock_guard lk(mtxMonitors_);
         for (auto &pair : monitors_) {
                 for (auto &spair : pair.second->getScopes()) {
                         for (auto &cpair : spair.second->getChannels()) {
                                 MonitorChannel *ch = cpair.second.get();
-                                if (ch->getSymbolName().empty())
+                                if (!ch || ch->getSymbolName().empty())
                                         continue;
+
+                                const std::string &symbol = ch->getSymbolName();
+                                auto               seIt   = exactSymbols.find(symbol);
+
                                 for (const auto &v : var->vars_) {
                                         bool isMatch = false;
-                                        if (ch->getSymbolName() == v.name) {
+                                        if (symbol == v.name) {
                                                 isMatch = true;
-                                        } else if (ch->getSymbolName().size() > v.name.size()) {
-                                                if (ch->getSymbolName().compare(0, v.name.size(), v.name) == 0) {
-                                                        char nextChar = ch->getSymbolName()[v.name.size()];
-                                                        if (nextChar == '.' || nextChar == '[') {
-                                                                isMatch = true;
-                                                        }
-                                                }
+                                        } else if (symbol.size() > v.name.size() &&
+                                                   symbol.compare(0, v.name.size(), v.name) == 0) {
+                                                const char nextChar = symbol[v.name.size()];
+                                                isMatch             = (nextChar == '.' || nextChar == '[');
                                         }
 
-                                        if (isMatch) {
-                                                ch->setWritable(v.writable);
+                                        if (!isMatch)
+                                                continue;
+
+                                        ch->setWritable(v.writable);
+
+                                        if (seIt != exactSymbols.end()) {
+                                                const SearchEntry *se = seIt->second;
+                                                ch->setAddr(se->addr);
+                                                ch->setType(Parser::dataTypeToStr(se->type));
+                                                ch->setBitOffset(se->bitOffset);
+                                                ch->setBitSize(se->bitSize);
+                                                ch->setAddrUnknown(false);
+                                        } else if (symbol == v.name) {
                                                 ch->setAddr(v.addr);
-                                                const char *deviceName = "JLINK";
-                                                switch (v.port) {
-                                                        case PortType::JLINK:
-                                                                deviceName = "JLINK";
-                                                                break;
-                                                        case PortType::UDP:
-                                                        case PortType::LOCAL:
-                                                        case PortType::MANUAL:
-                                                                deviceName = "LOCAL";
-                                                                break;
-                                                        case PortType::SHM:
-                                                                deviceName = "SHM";
-                                                                break;
-                                                        case PortType::AUDIO:
-                                                                deviceName = "AUDIO";
-                                                                break;
-                                                }
-                                                ch->setDevice(deviceName);
-                                                if (v.port == PortType::SHM) {
-                                                        ch->setShmRegionName(v.shm.name);
-                                                        MonitorScope::shmInit(*ch);
-                                                } else if (v.port == PortType::AUDIO) {
-                                                        ch->setType("F32");
-                                                        ch->setAddr(static_cast<usize>(std::max(0, v.audio.deviceIndex)));
-                                                        ch->setShmRegionName(v.audio.deviceName);
-                                                }
-                                                break;
+                                                ch->setType(Parser::dataTypeToStr(v.type));
+                                                ch->setBitOffset(v.bitOffset);
+                                                ch->setBitSize(v.bitSize);
                                         }
+
+                                        const char *deviceName = "JLINK";
+                                        switch (v.port) {
+                                                case PortType::JLINK:
+                                                        deviceName = "JLINK";
+                                                        break;
+                                                case PortType::UDP:
+                                                case PortType::LOCAL:
+                                                case PortType::MANUAL:
+                                                        deviceName = "LOCAL";
+                                                        break;
+                                                case PortType::SHM:
+                                                        deviceName = "SHM";
+                                                        break;
+                                                case PortType::AUDIO:
+                                                        deviceName = "AUDIO";
+                                                        break;
+                                        }
+                                        ch->setDevice(deviceName);
+                                        if (v.port == PortType::SHM) {
+                                                ch->setShmRegionName(v.shm.name);
+                                                MonitorScope::shmInit(*ch);
+                                        } else if (v.port == PortType::AUDIO) {
+                                                ch->setType("F32");
+                                                ch->setAddr(static_cast<usize>(std::max(0, v.audio.deviceIndex)));
+                                                ch->setBitOffset(0);
+                                                ch->setBitSize(0);
+                                                ch->setShmRegionName(v.audio.deviceName);
+                                        }
+                                        break;
                                 }
                         }
                 }

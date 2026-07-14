@@ -575,7 +575,9 @@ Variable::flattenDwarfType(std::vector<SearchEntry> &pool,
                            const std::string        &parentPath,
                            u64                       parentAddr,
                            u64                       typeOff,
-                           int                       depth)
+                           int                       depth,
+                           u32                       bitOffset,
+                           u32                       bitSize)
 {
         if (depth > 8)
                 return;
@@ -595,7 +597,7 @@ Variable::flattenDwarfType(std::vector<SearchEntry> &pool,
                 }
                 for (const auto &m : t->members) {
                         std::string path = parentPath + "." + (m.name.empty() ? "<anon>" : m.name);
-                        flattenDwarfType(pool, info, path, parentAddr + m.offset, m.type, depth + 1);
+                        flattenDwarfType(pool, info, path, parentAddr + m.offset, m.type, depth + 1, m.bitOffset, m.bitSize);
                 }
         } else if (t->kind == dwarf::TypeKind::ARRAY) {
                 if (!parentPath.empty()) {
@@ -612,7 +614,7 @@ Variable::flattenDwarfType(std::vector<SearchEntry> &pool,
                 u64 displayed = (dim == 0) ? 0 : (dim < 8 ? dim : 8);
                 for (u64 i = 0; i < displayed; ++i) {
                         std::string path = parentPath + "[" + std::to_string(i) + "]";
-                        flattenDwarfType(pool, info, path, parentAddr + i * elemSize, t->inner, depth + 1);
+                        flattenDwarfType(pool, info, path, parentAddr + i * elemSize, t->inner, depth + 1, 0, 0);
                 }
         } else {
                 const char *sType = scalarPayloadType(info, typeOff);
@@ -623,6 +625,8 @@ Variable::flattenDwarfType(std::vector<SearchEntry> &pool,
                         e.type        = Parser::strToDataType(sType);
                         e.defaultPort = PortType::JLINK;
                         e.typeOff     = typeOff;
+                        e.bitOffset   = bitOffset;
+                        e.bitSize     = bitSize;
                         pool.push_back(e);
                 } else if (!parentPath.empty()) {
                         SearchEntry e;
@@ -1010,7 +1014,9 @@ flattenForStructPayload(const dwarf::Info                                       
                                 snprintf(e.name, sizeof(e.name), "%s", mPath.c_str());
                                 e.addr = mAddr;
                                 snprintf(e.type, sizeof(e.type), "%s", sType);
-                                e.writable = sp.writable;
+                                e.bitOffset = m.bitOffset;
+                                e.bitSize   = m.bitSize;
+                                e.writable  = sp.writable;
                                 fillEntryEnums(e, m.type, mPath);
                         } else {
                                 flattenForStructPayload(info, mPath, mAddr, m.type, sp, memberOverrides, maxDepth - 1);
@@ -1148,7 +1154,7 @@ Variable::drawSymbolBrowser()
                                 bool open = ImGui::TreeNodeEx(e.path.c_str(), nodeFlags);
 
                                 if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
-                                        addRecursive(e.path, e.addr, e.typeOff, e.defaultPort);
+                                        addRecursive(e.path, e.addr, e.typeOff, e.defaultPort, e.bitOffset, e.bitSize);
                                 }
 
                                 if (ImGui::BeginDragDropSource()) {
@@ -1172,8 +1178,10 @@ Variable::drawSymbolBrowser()
                                                 snprintf(p.device,
                                                          sizeof(p.device),
                                                          e.defaultPort == PortType::JLINK ? "JLINK" : "SHM");
-                                                p.numBytes = (u8)Parser::typeBytes(e.type);
-                                                p.typeOff  = e.typeOff;
+                                                p.numBytes  = (u8)Parser::typeBytes(e.type);
+                                                p.typeOff   = e.typeOff;
+                                                p.bitOffset = e.bitOffset;
+                                                p.bitSize   = e.bitSize;
                                                 fillEnumPayload(dwarfInfo_, e.typeOff, p);
                                                 ImGui::SetDragDropPayload("CHANNEL", &p, sizeof(p));
                                         }
@@ -1365,8 +1373,10 @@ Variable::drawVariableList()
                                         snprintf(p.shmName, sizeof(p.shmName), "%s", v.shm.name);
                                 if (v.port == PortType::AUDIO)
                                         snprintf(p.shmName, sizeof(p.shmName), "%s", v.audio.deviceName);
-                                p.numBytes = (u8)Parser::typeBytes(v.type);
-                                p.typeOff  = v.typeOff;
+                                p.numBytes  = (u8)Parser::typeBytes(v.type);
+                                p.typeOff   = v.typeOff;
+                                p.bitOffset = v.bitOffset;
+                                p.bitSize   = v.bitSize;
                                 {
                                         std::lock_guard lk(mtxElf_);
                                         fillEnumPayload(dwarfInfo_, v.typeOff, p, &v.enumDefs);
@@ -2698,6 +2708,12 @@ populateShmMemberCache(const dwarf::Info                            &info,
         }
 }
 
+static std::string
+shmShadowKey(const VarEntry &v)
+{
+        return std::string(v.shm.name) + "\n" + v.name;
+}
+
 void
 Variable::startPollThread()
 {
@@ -2829,15 +2845,29 @@ Variable::updateVariables()
                                 if (v.shm.inited) {
                                         usize sz = typeSize(dwarfInfo_, v.typeOff);
                                         if (sz > 0 && sz <= 4096) {
-                                                std::vector<u8> blob(sz);
-                                                if (shm_read(&v.shm.handle, blob.data(), sz) == sz)
+                                                auto &shadow = shmShadowBufs_[shmShadowKey(v)];
+                                                if (shadow.size() != sz)
+                                                        shadow.assign(sz, 0);
+                                                std::vector<u8> tmp(sz);
+                                                usize           nr = shm_read(&v.shm.handle, tmp.data(), sz);
+                                                if (nr > 0) {
+                                                        std::memcpy(shadow.data(), tmp.data(), std::min(nr, sz));
                                                         populateShmMemberCache(dwarfInfo_,
                                                                                v.name,
                                                                                v.addr,
                                                                                v.typeOff,
-                                                                               blob.data(),
+                                                                               shadow.data(),
                                                                                sz,
                                                                                memberValueCache_);
+                                                } else if (!shadow.empty()) {
+                                                        populateShmMemberCache(dwarfInfo_,
+                                                                               v.name,
+                                                                               v.addr,
+                                                                               v.typeOff,
+                                                                               shadow.data(),
+                                                                               sz,
+                                                                               memberValueCache_);
+                                                }
                                         }
                                 }
                         }
@@ -2864,9 +2894,9 @@ Variable::updateVariables()
                         continue;
                 }
 
-                u8  buf[8];
-                int ret = -2; // -2: No update, -1: Error, 0: Success
-                u32 sz  = Parser::typeBytes(v.type);
+                u8  buf[8] = {0};
+                int ret    = -2; // -2: No update, -1: Error, 0: Success
+                u32 sz     = Parser::typeBytes(v.type);
                 if (v.port == PortType::JLINK && JLinkPort::instance().isConnected()) {
                         // Value is read by the background poll thread; consume the
                         // cached bytes so the render thread never blocks on USB I/O.
@@ -2887,7 +2917,13 @@ Variable::updateVariables()
                                         ret = -1;
                         }
                         if (v.shm.inited) {
-                                if (shm_read(&v.shm.handle, buf, sz) == sz) {
+                                usize nr = shm_read(&v.shm.handle, buf, sz);
+                                if (nr == sz) {
+                                        ret = 0;
+                                } else if (nr > 0) {
+                                        // SHM is a byte stream, so a producer may have written a
+                                        // narrower scalar than this row expects. Keep the bytes we
+                                        // did receive instead of consuming them and showing "...".
                                         ret = 0;
                                 } else {
                                         ret = -2;
@@ -3298,7 +3334,7 @@ Variable::load(const void *node)
 }
 
 void
-Variable::addRecursive(const std::string &fullPath, u64 addr, u64 typeOff, PortType port)
+Variable::addRecursive(const std::string &fullPath, u64 addr, u64 typeOff, PortType port, u32 bitOffset, u32 bitSize)
 {
         const dwarf::Type *t = resolveAlias(dwarfInfo_, typeOff);
         if (!t)
@@ -3306,24 +3342,28 @@ Variable::addRecursive(const std::string &fullPath, u64 addr, u64 typeOff, PortT
 
         if (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION || t->kind == dwarf::TypeKind::ARRAY) {
                 VarEntry v;
-                v.name     = fullPath;
-                v.type     = DataType::U32;
-                v.port     = port;
-                v.addr     = addr;
-                v.writable = true;
-                v.typeOff  = typeOff;
+                v.name      = fullPath;
+                v.type      = DataType::U32;
+                v.port      = port;
+                v.addr      = addr;
+                v.writable  = true;
+                v.typeOff   = typeOff;
+                v.bitOffset = bitOffset;
+                v.bitSize   = bitSize;
                 vars_.push_back(v);
                 isModified_ = true;
         } else {
                 const char *sType = scalarPayloadType(dwarfInfo_, typeOff);
                 if (sType) {
                         VarEntry v;
-                        v.name     = fullPath;
-                        v.type     = Parser::strToDataType(sType);
-                        v.port     = port;
-                        v.addr     = addr;
-                        v.writable = true;
-                        v.typeOff  = typeOff;
+                        v.name      = fullPath;
+                        v.type      = Parser::strToDataType(sType);
+                        v.port      = port;
+                        v.addr      = addr;
+                        v.writable  = true;
+                        v.typeOff   = typeOff;
+                        v.bitOffset = bitOffset;
+                        v.bitSize   = bitSize;
                         vars_.push_back(v);
                         isModified_ = true;
                 }
@@ -3462,8 +3502,10 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                                 snprintf(p.device, sizeof(p.device), "%s", devLabel);
                                                 if (!shmRegionName.empty())
                                                         snprintf(p.shmName, sizeof(p.shmName), "%s", shmRegionName.c_str());
-                                                p.numBytes = (u8)typeSize(dwarfInfo_, m.type);
-                                                p.typeOff  = m.type;
+                                                p.numBytes  = (u8)typeSize(dwarfInfo_, m.type);
+                                                p.typeOff   = m.type;
+                                                p.bitOffset = m.bitOffset;
+                                                p.bitSize   = m.bitSize;
                                                 const std::vector<VarEntry::EnumDef> *leafOvr = nullptr;
                                                 if (memOvr) {
                                                         auto it = memOvr->find(memberPath);

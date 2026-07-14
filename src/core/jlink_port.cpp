@@ -2,10 +2,25 @@
  * @file  jlink_port.cpp
  * @brief JLinkPort implementation — J-Link SDK wrapper.
  */
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <thread>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+#include <devguid.h>
+#include <setupapi.h>
+#endif
 
 #include "imgui.h"
 
@@ -20,6 +35,11 @@ JLinkPort::instance()
 {
         static JLinkPort s;
         return s;
+}
+
+JLinkPort::~JLinkPort()
+{
+        vcomClose();
 }
 
 bool
@@ -259,10 +279,8 @@ JLinkPort::writeMem(const u32 addr, const u32 numBytes, const void *src)
 u32
 JLinkPort::readReg(u32 regIndex)
 {
-        std::lock_guard lk(mtx_);
-        if (!isOpen_ || !isConnected_)
-                return 0;
-        return JLINKARM_ReadReg(regIndex);
+        (void)regIndex;
+        return 0;
 }
 
 bool
@@ -370,6 +388,363 @@ JLinkPort::hssRead(void *buf, const u32 bufSize)
         return JLINK_HSS_Read(buf, bufSize);
 }
 
+#ifdef _WIN32
+static HANDLE
+vcomHandleFromVoid(void *h)
+{
+        return reinterpret_cast<HANDLE>(h);
+}
+#endif
+
+#ifdef _WIN32
+static std::string
+lowerAscii(std::string s)
+{
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+}
+
+static bool
+extractComName(const std::string &text, std::string &out)
+{
+        size_t pos = text.find("COM");
+        while (pos != std::string::npos) {
+                size_t i = pos + 3;
+                if (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) {
+                        while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i])))
+                                ++i;
+                        out = text.substr(pos, i - pos);
+                        return true;
+                }
+                pos = text.find("COM", pos + 3);
+        }
+        return false;
+}
+
+static std::string
+setupDiStringProperty(HDEVINFO info, SP_DEVINFO_DATA &devInfo, DWORD prop)
+{
+        char  buf[512] = {};
+        DWORD type     = 0;
+        if (!SetupDiGetDeviceRegistryPropertyA(info, &devInfo, prop, &type, reinterpret_cast<PBYTE>(buf), sizeof(buf), nullptr))
+                return {};
+        return buf;
+}
+#endif
+
+bool
+JLinkPort::vcomRefreshPorts(bool preferJLink)
+{
+#ifdef _WIN32
+        if (vcomOpen_.load(std::memory_order_acquire)) {
+                lastErr_ = "VCOM: close port before refresh";
+                return false;
+        }
+
+        HDEVINFO info = SetupDiGetClassDevsA(&GUID_DEVCLASS_PORTS, nullptr, nullptr, DIGCF_PRESENT);
+        if (info == INVALID_HANDLE_VALUE) {
+                lastErr_ = "VCOM: SetupDiGetClassDevs failed";
+                return false;
+        }
+
+        std::vector<std::string> ports;
+        std::vector<std::string> labels;
+        int                      jlinkIdx = -1;
+        for (DWORD idx = 0;; ++idx) {
+                SP_DEVINFO_DATA devInfo = {};
+                devInfo.cbSize          = sizeof(devInfo);
+                if (!SetupDiEnumDeviceInfo(info, idx, &devInfo))
+                        break;
+
+                std::string friendly = setupDiStringProperty(info, devInfo, SPDRP_FRIENDLYNAME);
+                std::string desc     = setupDiStringProperty(info, devInfo, SPDRP_DEVICEDESC);
+                std::string mfg      = setupDiStringProperty(info, devInfo, SPDRP_MFG);
+                std::string com;
+                if (!extractComName(friendly, com) && !extractComName(desc, com))
+                        continue;
+
+                std::string name    = !friendly.empty() ? friendly : (!desc.empty() ? desc : com);
+                std::string hay     = lowerAscii(friendly + " " + desc + " " + mfg);
+                bool        isJLink = hay.find("j-link") != std::string::npos || hay.find("jlink") != std::string::npos ||
+                               hay.find("segger") != std::string::npos;
+
+                ports.push_back(com);
+                labels.push_back(com + " - " + name + (isJLink ? "  [J-Link]" : ""));
+                if (isJLink && jlinkIdx < 0)
+                        jlinkIdx = static_cast<int>(ports.size()) - 1;
+        }
+        SetupDiDestroyDeviceInfoList(info);
+
+        if (ports.empty()) {
+                vcomPortList_.clear();
+                vcomPortLabels_.clear();
+                vcomSelectedPort_ = -1;
+                lastErr_          = "VCOM: no COM ports found";
+                return false;
+        }
+
+        int selected = -1;
+        if (preferJLink && jlinkIdx >= 0) {
+                selected = jlinkIdx;
+        } else {
+                for (int i = 0; i < static_cast<int>(ports.size()); ++i) {
+                        if (_stricmp(ports[i].c_str(), vcomPort_) == 0) {
+                                selected = i;
+                                break;
+                        }
+                }
+                if (selected < 0)
+                        selected = 0;
+        }
+
+        vcomPortList_     = std::move(ports);
+        vcomPortLabels_   = std::move(labels);
+        vcomSelectedPort_ = selected;
+        snprintf(vcomPort_, sizeof(vcomPort_), "%s", vcomPortList_[selected].c_str());
+        lastErr_.clear();
+        LOG_I("JLink VCOM ports refreshed: count=%zu selected=%s", vcomPortList_.size(), vcomPort_);
+        return true;
+#else
+        (void)preferJLink;
+        lastErr_ = "VCOM: refresh only supported on Windows";
+        return false;
+#endif
+}
+bool
+JLinkPort::vcomOpen()
+{
+#ifdef _WIN32
+        std::lock_guard lk(vcomMtx_);
+        if (vcomOpen_.load(std::memory_order_acquire))
+                return true;
+
+        std::string port = vcomPort_;
+        if (port.empty()) {
+                lastErr_ = "VCOM: empty COM port";
+                return false;
+        }
+        std::string path = port;
+        if (path.rfind("\\\\.\\", 0) != 0)
+                path = "\\\\.\\" + path;
+
+        HANDLE h =
+            CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (h == INVALID_HANDLE_VALUE) {
+                char msg[128];
+                snprintf(msg, sizeof(msg), "VCOM: failed to open %s (err=%lu)", port.c_str(), GetLastError());
+                lastErr_ = msg;
+                return false;
+        }
+
+        DCB dcb       = {};
+        dcb.DCBlength = sizeof(dcb);
+        if (!GetCommState(h, &dcb)) {
+                CloseHandle(h);
+                lastErr_ = "VCOM: GetCommState failed";
+                return false;
+        }
+        dcb.BaudRate    = static_cast<DWORD>(vcomBaud_.load(std::memory_order_relaxed));
+        dcb.ByteSize    = 8;
+        dcb.Parity      = NOPARITY;
+        dcb.StopBits    = ONESTOPBIT;
+        dcb.fBinary     = TRUE;
+        dcb.fDtrControl = DTR_CONTROL_ENABLE;
+        dcb.fRtsControl = RTS_CONTROL_ENABLE;
+        if (!SetCommState(h, &dcb)) {
+                CloseHandle(h);
+                lastErr_ = "VCOM: SetCommState failed";
+                return false;
+        }
+
+        COMMTIMEOUTS timeouts                = {};
+        timeouts.ReadIntervalTimeout         = 20;
+        timeouts.ReadTotalTimeoutConstant    = 20;
+        timeouts.ReadTotalTimeoutMultiplier  = 1;
+        timeouts.WriteTotalTimeoutConstant   = 200;
+        timeouts.WriteTotalTimeoutMultiplier = 2;
+        SetCommTimeouts(h, &timeouts);
+        PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR);
+
+        vcomHandle_ = h;
+        vcomReaderRunning_.store(true, std::memory_order_release);
+        vcomOpen_.store(true, std::memory_order_release);
+        lastErr_.clear();
+        vcomThread_ = std::thread([this]() {
+                char buf[256];
+                while (vcomReaderRunning_.load(std::memory_order_acquire)) {
+                        HANDLE rh = nullptr;
+                        {
+                                std::lock_guard lk(vcomMtx_);
+                                rh = vcomHandleFromVoid(vcomHandle_);
+                        }
+                        if (!rh || rh == INVALID_HANDLE_VALUE)
+                                break;
+
+                        DWORD nr = 0;
+                        if (ReadFile(rh, buf, sizeof(buf), &nr, nullptr) && nr > 0) {
+                                std::lock_guard rx(vcomRxMtx_);
+                                vcomRxLog_.append(buf, buf + nr);
+                                static constexpr size_t kMaxLog = 64 * 1024;
+                                if (vcomRxLog_.size() > kMaxLog)
+                                        vcomRxLog_.erase(0, vcomRxLog_.size() - kMaxLog);
+                        } else {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                        }
+                }
+        });
+        return true;
+#else
+        lastErr_ = "VCOM: only supported on Windows";
+        return false;
+#endif
+}
+
+void
+JLinkPort::vcomClose()
+{
+#ifdef _WIN32
+        vcomReaderRunning_.store(false, std::memory_order_release);
+        HANDLE h = nullptr;
+        {
+                std::lock_guard lk(vcomMtx_);
+                h = vcomHandleFromVoid(vcomHandle_);
+                if (h && h != INVALID_HANDLE_VALUE)
+                        CancelIoEx(h, nullptr);
+        }
+        if (vcomThread_.joinable())
+                vcomThread_.join();
+        {
+                std::lock_guard lk(vcomMtx_);
+                h = vcomHandleFromVoid(vcomHandle_);
+                if (h && h != INVALID_HANDLE_VALUE)
+                        CloseHandle(h);
+                vcomHandle_ = nullptr;
+        }
+#endif
+        vcomOpen_.store(false, std::memory_order_release);
+}
+
+bool
+JLinkPort::vcomSend(const char *text)
+{
+#ifdef _WIN32
+        if (!text || !text[0])
+                return true;
+        std::lock_guard lk(vcomMtx_);
+        HANDLE          h = vcomHandleFromVoid(vcomHandle_);
+        if (!vcomOpen_.load(std::memory_order_acquire) || !h || h == INVALID_HANDLE_VALUE) {
+                lastErr_ = "VCOM: not open";
+                return false;
+        }
+        DWORD len = static_cast<DWORD>(strlen(text));
+        DWORD nw  = 0;
+        if (!WriteFile(h, text, len, &nw, nullptr) || nw != len) {
+                lastErr_ = "VCOM: write failed";
+                return false;
+        }
+        return true;
+#else
+        (void)text;
+        lastErr_ = "VCOM: only supported on Windows";
+        return false;
+#endif
+}
+
+std::string
+JLinkPort::vcomRxSnapshot() const
+{
+        std::lock_guard lk(vcomRxMtx_);
+        return vcomRxLog_;
+}
+
+void
+JLinkPort::vcomClearRx()
+{
+        std::lock_guard lk(vcomRxMtx_);
+        vcomRxLog_.clear();
+}
+
+void
+JLinkPort::drawVComPopup()
+{
+        if (!ImGui::BeginPopup("JLinkVComPopup"))
+                return;
+
+        ImGui::TextUnformatted(tr("J-Link Virtual COM", "J-Link 虚拟串口"));
+        ImGui::Separator();
+
+        if (vcomPortList_.empty() && !vcomOpen_.load(std::memory_order_acquire))
+                vcomRefreshPorts(true);
+
+        ImGui::SetNextItemWidth(260.0f);
+        if (vcomPortLabels_.empty()) {
+                ImGui::InputText("##jlink_vcom_port", vcomPort_, sizeof(vcomPort_));
+        } else {
+                const char *preview = (vcomSelectedPort_ >= 0 && vcomSelectedPort_ < static_cast<int>(vcomPortLabels_.size()))
+                                          ? vcomPortLabels_[vcomSelectedPort_].c_str()
+                                          : vcomPort_;
+                if (ImGui::BeginCombo("##jlink_vcom_port_combo", preview)) {
+                        for (int i = 0; i < static_cast<int>(vcomPortLabels_.size()); ++i) {
+                                bool selected = i == vcomSelectedPort_;
+                                if (ImGui::Selectable(vcomPortLabels_[i].c_str(), selected)) {
+                                        vcomSelectedPort_ = i;
+                                        snprintf(vcomPort_, sizeof(vcomPort_), "%s", vcomPortList_[i].c_str());
+                                }
+                                if (selected)
+                                        ImGui::SetItemDefaultFocus();
+                        }
+                        ImGui::EndCombo();
+                }
+        }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tr("COM port", "串口号"));
+        ImGui::SameLine();
+        if (!vcomOpen_.load(std::memory_order_acquire)) {
+                if (ui::SmallButton(tr("Refresh", "刷新"), ui::BtnStyle::Muted))
+                        vcomRefreshPorts(false);
+                ImGui::SameLine();
+        }
+        int baud = vcomBaud_.load(std::memory_order_relaxed);
+        ImGui::SetNextItemWidth(110.0f);
+        if (ImGui::InputInt("##jlink_vcom_baud", &baud, 0, 0)) {
+                if (baud < 1200)
+                        baud = 1200;
+                vcomBaud_.store(baud, std::memory_order_relaxed);
+        }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tr("Baud rate", "波特率"));
+
+        ImGui::SameLine();
+        if (vcomOpen_.load(std::memory_order_acquire)) {
+                if (ui::SmallButton(tr("CLOSE", "关闭"), ui::BtnStyle::Danger))
+                        vcomClose();
+        } else {
+                if (ui::SmallButton(tr("OPEN", "打开"), ui::BtnStyle::Success))
+                        vcomOpen();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr("Clear", "清空")))
+                vcomClearRx();
+
+        std::string       rx = vcomRxSnapshot();
+        std::vector<char> rxBuf(rx.begin(), rx.end());
+        rxBuf.push_back('\0');
+        ImGui::InputTextMultiline(
+            "##jlink_vcom_rx", rxBuf.data(), rxBuf.size(), ImVec2(520.0f, 220.0f), ImGuiInputTextFlags_ReadOnly);
+
+        ImGui::SetNextItemWidth(430.0f);
+        bool sendNow =
+            ImGui::InputText("##jlink_vcom_tx", vcomTxBuf_, sizeof(vcomTxBuf_), ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if (ui::SmallButton(tr("SEND", "发送"), ui::BtnStyle::Success))
+                sendNow = true;
+        if (sendNow) {
+                vcomSend(vcomTxBuf_);
+                vcomTxBuf_[0] = '\0';
+        }
+
+        ImGui::EndPopup();
+}
 std::string
 JLinkPort::lastError() const
 {
@@ -446,6 +821,12 @@ JLinkPort::drawUI()
                 if (ui::SmallButton(tr("RESET MCU", "复位 MCU"), ui::BtnStyle::Warning))
                         resetAsync();
         }
+
+        ImGui::SameLine();
+        if (ui::SmallButton(vcomOpen_.load(std::memory_order_acquire) ? tr("VCOM ON", "串口 ON") : "VCOM",
+                            vcomOpen_.load(std::memory_order_acquire) ? ui::BtnStyle::Success : ui::BtnStyle::Muted))
+                ImGui::OpenPopup("JLinkVComPopup");
+        drawVComPopup();
 
         if (!lastErr_.empty()) {
                 ImGui::SameLine();

@@ -31,9 +31,10 @@ extern "C" {
 #if defined(_MSC_VER) && !defined(__clang__)
 #define AT(sec) __declspec(allocate(sec))
 #define OPTNONE
-#define ALIGN(align) __declspec(align(align))
+#define ALIGN(n) __declspec(align(n))
 #define FUNC_UNUSED
 #define FUNC_USED
+#define WEAK __declspec(selectany)
 #ifdef __cplusplus
 #define TYPEOF(var) decltype(var)
 #else
@@ -42,13 +43,14 @@ extern "C" {
 #define PACKED __declspec(align(1))
 #define NO_ASAN
 #else
-#define AT(sec)      __attribute__((section(sec)))
-#define OPTNONE      __attribute__((optnone))
-#define ALIGN(align) __attribute__((aligned(align)))
-#define FUNC_UNUSED  __attribute__((unused))
-#define FUNC_USED    __attribute__((used))
-#define TYPEOF(var)  __typeof__(var)
-#define PACKED       __attribute__((packed))
+#define AT(sec)     __attribute__((section(sec)))
+#define OPTNONE     __attribute__((optnone))
+#define ALIGN(n)    __attribute__((aligned(n)))
+#define FUNC_UNUSED __attribute__((unused))
+#define FUNC_USED   __attribute__((used))
+#define WEAK        __attribute__((weak))
+#define TYPEOF(var) __typeof__(var)
+#define PACKED      __attribute__((packed))
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)
 #define NO_ASAN __attribute__((no_sanitize("address")))
@@ -100,12 +102,6 @@ extern "C" {
 #define RENAME(ptr, name)         \
         TYPEOF((ptr)) name = ptr; \
         ARG_UNUSED(name);
-
-/**
- * @brief 检查函数指针非空
- *
- */
-#define CHECK_FUNC_PTR(func_ptr) ((func_ptr) != NULL)
 
 #define DECL_1(ptr, a1)                     \
         TYPEOF((ptr)->a1) *a1 = &(ptr)->a1; \

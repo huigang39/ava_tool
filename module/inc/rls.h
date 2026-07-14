@@ -55,6 +55,7 @@ typedef struct rls_obs {
 /* -------------------------------------------------------------------------- */
 
 void rls_init(rls_obs_t *rls, rls_cfg_t rls_cfg);
+void rls_reset(rls_obs_t *rls);
 void rls_exec(rls_obs_t *rls);
 void rls_exec_in(rls_obs_t *rls, f32 ref, const f32 *x);
 

@@ -67,7 +67,7 @@ SRC_FILES             := $(filter-out $(EXCLUDE_FILES),$(wildcard *.c))
 TARGETS               := $(SRC_FILES:.c=)
 BINS                  := $(addprefix $(BUILD_DIR)/,$(TARGETS))
 
-FSA_RMA_SRC_FILES     := $(FSA_RAM_DIR)/fsa_rmaio.c
+FSA_RMA_SRC_FILES     := $(FSA_RAM_DIR)/fsa_rmaio.c $(FSA_RAM_DIR)/fsa_mem.c
 
 .PHONY: all clean $(TARGETS) help
 

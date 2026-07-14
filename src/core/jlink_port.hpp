@@ -13,6 +13,7 @@
 #include <condition_variable>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "module.h"
@@ -129,6 +130,7 @@ class JLinkPort
 
       private:
         JLinkPort() = default;
+        ~JLinkPort();
 
         mutable FairMutex  mtx_{};       // serialises J-Link SDK I/O (held during slow reads)
         mutable std::mutex cfgMtx_{};    // guards deviceName_ only (never held during I/O)
@@ -148,6 +150,28 @@ class JLinkPort
         std::atomic<f32>  hssActualHz_{0.0f};
         std::atomic<u64>  totalPoints_{0};
         std::atomic<bool> hssReqRestart_{false};
+
+        char                     vcomPort_[32]{"COM3"};
+        char                     vcomTxBuf_[512]{};
+        std::atomic<int>         vcomBaud_{115200};
+        std::atomic<bool>        vcomOpen_{false};
+        std::atomic<bool>        vcomReaderRunning_{false};
+        void                    *vcomHandle_{nullptr};
+        std::thread              vcomThread_{};
+        mutable std::mutex       vcomMtx_{};
+        mutable std::mutex       vcomRxMtx_{};
+        std::string              vcomRxLog_{};
+        std::vector<std::string> vcomPortList_{};
+        std::vector<std::string> vcomPortLabels_{};
+        int                      vcomSelectedPort_{-1};
+
+        bool        vcomOpen();
+        bool        vcomRefreshPorts(bool preferJLink = true);
+        void        vcomClose();
+        bool        vcomSend(const char *text);
+        std::string vcomRxSnapshot() const;
+        void        vcomClearRx();
+        void        drawVComPopup();
 
       public:
         void reqRestart() { hssReqRestart_.store(true); }

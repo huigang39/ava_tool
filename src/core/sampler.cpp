@@ -295,6 +295,7 @@ threadFunc(Gui *gui)
                 std::shared_ptr<MonitorChannel> ch;
                 u32                             addr, nb;
                 std::string                     type;
+                std::string                     device;
                 f32                             wv;
         };
         struct ShmTask {
@@ -310,6 +311,8 @@ threadFunc(Gui *gui)
                 std::shared_ptr<Monitor>        monitor;
                 u32                             addr;
                 u32                             nb;
+                std::string                     type;
+                std::string                     device;
         };
 
         // Task lists persist across iterations. They're refreshed under
@@ -401,6 +404,9 @@ threadFunc(Gui *gui)
                                                                                     ch->getType(),
                                                                                     ch->getBitOffset(),
                                                                                     ch->getBitSize()});
+                                                                if (ch->waveEnable_)
+                                                                        waveTasks.push_back(
+                                                                            {ch, monitor, 0, nb, ch->getType(), "SHM"});
                                                         } else if (dev == "JLINK" && ch->getAddr() != 0) {
                                                                 // Global "pause all J-Link sampling": drop read tasks so
                                                                 // HSS auto-stops (blocks become empty). Wave output below
@@ -429,8 +435,12 @@ threadFunc(Gui *gui)
                                                                         }
                                                                 }
                                                                 if (ch->waveEnable_)
-                                                                        waveTasks.push_back(
-                                                                            {ch, monitor, static_cast<u32>(ch->getAddr()), nb});
+                                                                        waveTasks.push_back({ch,
+                                                                                             monitor,
+                                                                                             static_cast<u32>(ch->getAddr()),
+                                                                                             nb,
+                                                                                             ch->getType(),
+                                                                                             "JLINK"});
                                                         }
                                                 }
                                         }
@@ -456,17 +466,27 @@ threadFunc(Gui *gui)
                 }
 
                 // wValDirty is an atomic — check cached channels lock-free.
-                auto collectWVal = [&](const std::vector<TempCh> &src) {
+                auto collectJlinkWVal = [&](const std::vector<TempCh> &src) {
                         for (const auto &t : src) {
                                 if (t.ch->isPendingDelete())
                                         continue;
                                 f32 wv;
                                 if (t.ch->consumeWValDirty(wv))
-                                        wvalTasks.push_back({t.ch, t.addr, t.nb, t.type, wv});
+                                        wvalTasks.push_back({t.ch, t.addr, t.nb, t.type, "JLINK", wv});
                         }
                 };
-                collectWVal(tempChs);
-                collectWVal(pollTasks);
+                auto collectShmWVal = [&]() {
+                        for (const auto &t : shmTasks) {
+                                if (t.ch->isPendingDelete())
+                                        continue;
+                                f32 wv;
+                                if (t.ch->consumeWValDirty(wv))
+                                        wvalTasks.push_back({t.ch, 0, t.nb, t.type, "SHM", wv});
+                        }
+                };
+                collectJlinkWVal(tempChs);
+                collectJlinkWVal(pollTasks);
+                collectShmWVal();
 
                 // Drain SHM buffers outside the monitor lock. Cached entries
                 // may include channels that GUI just marked for deletion;
@@ -484,17 +504,24 @@ threadFunc(Gui *gui)
                 }
 
                 // Write wVal dirty values (wvalTasks already filtered by collectWVal).
-                if (JLinkPort::instance().isConnected()) {
-                        for (auto &wt : wvalTasks) {
-                                u8 wbuf[8] = {0};
-                                encodeFromF32(wt.wv, wt.type, wbuf);
+                for (auto &wt : wvalTasks) {
+                        u8 wbuf[8] = {0};
+                        encodeFromF32(wt.wv, wt.type, wbuf);
+                        if (wt.device == "JLINK") {
+                                if (!JLinkPort::instance().isConnected())
+                                        continue;
                                 JLinkPort::instance().writeMem(wt.addr, wt.nb, wbuf);
-                                loopDiag.wvalWrites++;
+                        } else if (wt.device == "SHM") {
+                                shm_write(&wt.ch->getShm(), wbuf, wt.nb);
+                                wt.ch->setRVal(decodeAs(wbuf, wt.type, 0, 0), sessionTimeSec());
+                        } else {
+                                continue;
                         }
+                        loopDiag.wvalWrites++;
                 }
 
                 // Wave generation
-                if (JLinkPort::instance().isConnected() && !waveTasks.empty()) {
+                if (!waveTasks.empty()) {
                         static std::vector<std::pair<std::shared_ptr<Monitor>, std::vector<WaveTask>>> waveGroups;
                         for (auto &pair : waveGroups)
                                 pair.second.clear();
@@ -561,7 +588,18 @@ threadFunc(Gui *gui)
                                         f32 outVal = wt.ch->wave_.out.val;
 
                                         const u64 wMemStart = get_mono_ts_us();
-                                        JLinkPort::instance().writeMem(wt.addr, wt.nb, &outVal);
+                                        if (wt.device == "JLINK") {
+                                                if (!JLinkPort::instance().isConnected())
+                                                        continue;
+                                                JLinkPort::instance().writeMem(wt.addr, wt.nb, &outVal);
+                                        } else if (wt.device == "SHM") {
+                                                u8 wbuf[8] = {0};
+                                                encodeFromF32(outVal, wt.type, wbuf);
+                                                shm_write(&wt.ch->getShm(), wbuf, wt.nb);
+                                                wt.ch->setRVal(decodeAs(wbuf, wt.type, 0, 0), sessionTimeSec());
+                                        } else {
+                                                continue;
+                                        }
                                         const u64 wMemDur   = get_mono_ts_us() - wMemStart;
                                         loopDiag.sumWMemUs += wMemDur;
                                         loopDiag.wMemCount++;

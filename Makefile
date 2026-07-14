@@ -117,7 +117,7 @@ ifeq ($(COMPILER),msvc)
                         /DNOMINMAX /D_USE_MATH_DEFINES /D_CRT_SECURE_NO_WARNINGS \
                         /EHsc /MD /nologo /Z7 /O2
         CFLAGS_C     := /c /W3 /utf-8 /FS /D_CRT_SECURE_NO_WARNINGS /MD /nologo /Z7 /O2
-        LDFLAGS      := /SUBSYSTEM:WINDOWS /nologo /DEBUG
+        LDFLAGS      := /SUBSYSTEM:WINDOWS /nologo /DEBUG /NODEFAULTLIB:LIBCMT
         JLINK_DIR    ?= $(DIR_MODULE)/lib/win
         ifeq ($(ARCH),arm64)
             JLINK_LIB := $(JLINK_DIR)/JLink_arm64.lib
@@ -146,7 +146,7 @@ ifeq ($(COMPILER),msvc)
                         /I"$(DIR_THIRDPARTY)/GLFW/inc" \
                         /I"$(DIR_THIRDPARTY)/cJSON" \
                         /I"$(LIBFFI_DIR)/include"
-        LDLIBS       := ws2_32.lib winmm.lib shlwapi.lib comdlg32.lib OpenGL32.lib advapi32.lib ole32.lib dbghelp.lib \
+        LDLIBS       := ws2_32.lib winmm.lib shlwapi.lib comdlg32.lib OpenGL32.lib advapi32.lib ole32.lib dbghelp.lib setupapi.lib \
                         mfplat.lib mfreadwrite.lib mfuuid.lib \
                         "$(GLFW_LIB)" "$(JLINK_LIB)" "$(FFTW_LIB)" "$(MODULE_LIB)" "$(LIBFFI_LIB)"
         PLATFORM_DIR := win

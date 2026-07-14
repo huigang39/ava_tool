@@ -94,6 +94,8 @@ struct SearchEntry {
         DataType    type;
         PortType    defaultPort;
         u64         typeOff; // For DWARF types
+        u32         bitOffset{0};
+        u32         bitSize{0};
 };
 
 struct ElfLoadingTask {
@@ -175,6 +177,7 @@ class Variable
         // never resized after creation, so data() pointers remain stable for SDK threads.
         mutable std::mutex                                    mtxLocal_;
         std::unordered_map<std::string, std::vector<uint8_t>> localBufs_;
+        std::unordered_map<std::string, std::vector<uint8_t>> shmShadowBufs_;
         std::unordered_map<u64, u64>                          memberRefreshTs_; // addr → last refresh ms
 
         bool                                         isModified_{false};
@@ -221,7 +224,9 @@ class Variable
                               const std::string        &parentPath,
                               u64                       parentAddr,
                               u64                       typeOff,
-                              int                       depth);
+                              int                       depth,
+                              u32                       bitOffset = 0,
+                              u32                       bitSize   = 0);
         void flattenDataTree(std::vector<SearchEntry> &pool, const std::string &parentPath, const DataTree &node);
 
         enum class WindowState { None, LoadCfg, LoadBin, LoadElf, AddVariable };
@@ -250,7 +255,8 @@ class Variable
         void load(const void *node);
         bool isModified() const { return isModified_; }
         void clearModified() { isModified_ = false; }
-        void addRecursive(const std::string &fullPath, u64 addr, u64 typeOff, PortType port);
+        void
+        addRecursive(const std::string &fullPath, u64 addr, u64 typeOff, PortType port, u32 bitOffset = 0, u32 bitSize = 0);
         bool watchHasName(const std::string &name) const; // true if a watch entry already uses this name
         void draw();
         void drawVarVarTreeRow(const std::string &name,

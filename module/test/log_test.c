@@ -1,6 +1,8 @@
 #include "module.h"
 
+#if !OS(WIN)
 #include <pthread.h>
+#endif
 #include <stdbool.h>
 #include <stdio.h>
 
@@ -13,12 +15,12 @@ static void log_stdout(void *fp, const void *src, usize size);
 #define LOG_FLUSH_BUF_SIZE (SIZE_1KB)
 
 NO_ASAN
-ALIGN(SIZE_16KB)
+ALIGN(4096)
 u64   g_producers_cnts[WRITE_THREAD_NUM];
 log_t g_log;
 
 NO_ASAN
-ALIGN(SIZE_16KB)
+ALIGN(4096)
 u8        g_mempool_buf[MEMPOOL_SIZE];
 mempool_t g_mempool = {
     .buf = g_mempool_buf,
@@ -36,8 +38,13 @@ log_stdout(void *fp, const void *src, const usize size)
         }
 }
 
-void *
+#if OS(WIN)
+static DWORD WINAPI
+flush_thread_func(LPVOID arg)
+#else
+static void *
 flush_thread_func(void *arg)
+#endif
 {
         ARG_UNUSED(arg);
 
@@ -48,11 +55,20 @@ flush_thread_func(void *arg)
 
         // 收到主线程安全退出信号后，再执行一次最终收尾
         log_flush(&g_log);
+#if OS(WIN)
+        return 0;
+#else
         return NULL;
+#endif
 }
 
-void *
+#if OS(WIN)
+static DWORD WINAPI
+write_thread_func(LPVOID arg)
+#else
+static void *
 write_thread_func(void *arg)
+#endif
 {
         const u64 idx = *(u64 *)arg;
 
@@ -66,7 +82,11 @@ write_thread_func(void *arg)
                 // delay_ms(1, YIELD);
         }
 
+#if OS(WIN)
+        return 0;
+#else
         return NULL;
+#endif
 }
 
 int
@@ -95,23 +115,46 @@ main()
         };
         log_init(&g_log, log_cfg);
 
+#if OS(WIN)
+        HANDLE flush_thread = CreateThread(NULL, 0, flush_thread_func, NULL, 0, NULL);
+#else
         pthread_t flush_thread;
         pthread_create(&flush_thread, NULL, flush_thread_func, NULL);
+#endif
 
-        u64       thread_ids[WRITE_THREAD_NUM];
+        u64 thread_ids[WRITE_THREAD_NUM];
+#if OS(WIN)
+        HANDLE write_thread[WRITE_THREAD_NUM];
+#else
         pthread_t write_thread[WRITE_THREAD_NUM];
+#endif
         for (u32 i = 0; i < WRITE_THREAD_NUM; i++) {
                 thread_ids[i] = i;
+#if OS(WIN)
+                write_thread[i] = CreateThread(NULL, 0, write_thread_func, &thread_ids[i], 0, NULL);
+#else
                 pthread_create(&write_thread[i], NULL, write_thread_func, &thread_ids[i]);
+#endif
         }
 
         // 1. 挂起等待所有生产者的写动作完毕
+#if OS(WIN)
+        WaitForMultipleObjects(WRITE_THREAD_NUM, write_thread, TRUE, INFINITE);
+        for (u32 i = 0; i < WRITE_THREAD_NUM; i++)
+                CloseHandle(write_thread[i]);
+#else
         for (u32 i = 0; i < WRITE_THREAD_NUM; i++)
                 pthread_join(write_thread[i], NULL);
+#endif
 
         // 2. 告诉后台落盘线程安全退出
         g_stop_flush = true;
+#if OS(WIN)
+        WaitForSingleObject(flush_thread, INFINITE);
+        CloseHandle(flush_thread);
+#else
         pthread_join(flush_thread, NULL);
+#endif
 
         // 3. 安全地回收模块，它会自动将所有还没满的 Chunk 刷进文件里
         log_deinit(&g_log);

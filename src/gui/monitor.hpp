@@ -178,7 +178,13 @@ class Monitor
         bool isPendingDelete() const { return pendingDelete_.load(std::memory_order_acquire); }
 
         bool isSamplingPaused() const { return samplingPaused_.load(std::memory_order_acquire); }
-        void setSamplingPaused(bool p) { samplingPaused_.store(p, std::memory_order_release); }
+        void setSamplingPaused(bool p)
+        {
+                samplingPaused_.store(p, std::memory_order_release);
+                for (auto &pair : scopes_)
+                        if (pair.second)
+                                pair.second->setPaused(p);
+        }
 
         std::string        getName() { return name_; }
         const std::string &getTitle() const { return title_.empty() ? name_ : title_; }
