@@ -8,7 +8,7 @@
 ; release tag (v<version>). Output: dist\ava_tool_setup_<version>.exe.
 
 #define MyAppName    "ava_tool"
-#define MyAppVersion "0.1.3"
+#define MyAppVersion "0.1.4"
 #define MyAppExeName "ava_tool.exe"
 #define MyAppPublisher "huigang39"
 #define MyAppURL     "https://github.com/huigang39/ava_tool"
