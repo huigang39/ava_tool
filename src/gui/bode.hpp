@@ -15,6 +15,10 @@ class Bode
       public:
         bool show_{false};
         void updateDisplay();
+        void saveSession(void *root) const;
+        void loadSession(const void *root);
+        bool isModified() const { return modified_; }
+        void clearModified() { modified_ = false; }
 
       private:
         // Sweep: drive a live swept-sine and measure H per step.
@@ -52,6 +56,7 @@ class Bode
         BodeCurveStyle         bodeMagStyle_{};
         BodeCurveStyle         bodePhsStyle_{};
         bool                   bodeStyleInit_{false};
+        bool                   modified_{false};
 
         // ---- From-data (offline FFT) mode state ----
         Mode        bodeMode_{Mode::Sweep};

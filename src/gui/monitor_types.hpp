@@ -11,6 +11,11 @@
 
 class MonitorScope;
 
+// Full DWARF paths can become long after several nested structs/arrays. Keep
+// drag/drop payloads large enough that the canonical symbol name used for
+// address re-resolution is not silently truncated.
+static constexpr usize kMaxMonitorSymbolPath = 1024;
+
 // Payload carried when dragging a single scalar symbol from the symbol browser
 // onto a monitor scope. Serialised into the ImGui drag-drop system as POD.
 struct ChannelDropPayload {
@@ -20,7 +25,7 @@ struct ChannelDropPayload {
                 i64  value;
         };
 
-        char      name[128];
+        char      name[kMaxMonitorSymbolPath];
         u64       addr;
         char      type[8];     // "F32"/"F64"/"I8"/"I16"/"I32"/"I64"/"U8"/"U16"/"U32"/"U64"
         char      device[8];   // "SHM" / "JLINK" / "UDP" / "AUDIO"
@@ -43,7 +48,7 @@ struct StructChannelPayload {
         static constexpr int kMaxEntries = 48;
         static constexpr int kMaxEnums   = ChannelDropPayload::kMaxEnums;
         struct Entry {
-                char                          name[64]; // full dotted path, e.g. "foc.cfg.base_cfg.dir"
+                char                          name[kMaxMonitorSymbolPath]; // full dotted path
                 u64                           addr;
                 char                          type[8]; // same codes as ChannelDropPayload::type
                 u8                            numEnums;
@@ -59,7 +64,7 @@ struct StructChannelPayload {
         // Root struct/array metadata, so a drop target (e.g. the variable watch
         // list) can add the whole struct as a single expandable entry instead of
         // the flattened scalar leaves the monitor consumes.
-        char  rootName[128];
+        char  rootName[kMaxMonitorSymbolPath];
         u64   rootAddr;
         u64   rootTypeOff;
         Entry entries[kMaxEntries];
@@ -72,7 +77,7 @@ struct ChannelMovePayload {
         // When isGroup is false: the exact channel key to move.
         // When isGroup is true: a struct/array group path prefix; every channel whose
         // key equals it or starts with "<chName>." is moved together.
-        char chName[128];
+        char chName[kMaxMonitorSymbolPath];
         bool isGroup{false};
 };
 

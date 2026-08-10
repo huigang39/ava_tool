@@ -115,6 +115,7 @@ ifeq ($(COMPILER),msvc)
         LD           := link.exe
         CXXFLAGS     := /c /W3 /utf-8 /FS /experimental:c11atomics /std:c++20 \
                         /DNOMINMAX /D_USE_MATH_DEFINES /D_CRT_SECURE_NO_WARNINGS \
+                        /D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR \
                         /EHsc /MD /nologo /Z7 /O2
         CFLAGS_C     := /c /W3 /utf-8 /FS /D_CRT_SECURE_NO_WARNINGS /MD /nologo /Z7 /O2
         LDFLAGS      := /SUBSYSTEM:WINDOWS /nologo /DEBUG /NODEFAULTLIB:LIBCMT
@@ -146,7 +147,7 @@ ifeq ($(COMPILER),msvc)
                         /I"$(DIR_THIRDPARTY)/GLFW/inc" \
                         /I"$(DIR_THIRDPARTY)/cJSON" \
                         /I"$(LIBFFI_DIR)/include"
-        LDLIBS       := ws2_32.lib winmm.lib shlwapi.lib comdlg32.lib OpenGL32.lib advapi32.lib ole32.lib dbghelp.lib setupapi.lib \
+        LDLIBS       := ws2_32.lib winmm.lib shlwapi.lib comdlg32.lib OpenGL32.lib advapi32.lib ole32.lib dbghelp.lib \
                         mfplat.lib mfreadwrite.lib mfuuid.lib \
                         "$(GLFW_LIB)" "$(JLINK_LIB)" "$(FFTW_LIB)" "$(MODULE_LIB)" "$(LIBFFI_LIB)"
         PLATFORM_DIR := win
@@ -259,9 +260,12 @@ SRC_CXX := \
     $(DIR_GUI)/monitor.cpp \
     $(DIR_GUI)/variable.cpp \
     $(DIR_GUI)/bode.cpp \
+    $(DIR_GUI)/bkp_sram_debugger.cpp \
     $(DIR_GUI)/audio_input.cpp \
     $(DIR_GUI)/assembly_viewer.cpp \
     $(DIR_GUI)/sequence_editor.cpp \
+    $(DIR_GUI)/device_manager.cpp \
+    $(DIR_GUI)/midi_tool.cpp \
     $(DIR_GUI)/tutorial_guide.cpp \
     $(DIR_GUI)/sdk_panel.cpp \
     $(DIR_CORE)/elf_parser.cpp \

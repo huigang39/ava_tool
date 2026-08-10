@@ -26,6 +26,7 @@ struct CFuncDecl {
         CType               retType{CType::Unknown};
         std::string         retRaw;
         std::vector<CParam> params;
+        bool                isVariadic{false};
 };
 
 // Parse a C header source string and return all function declarations found.

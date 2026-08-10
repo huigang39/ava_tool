@@ -3,6 +3,7 @@
 #include <chrono>
 #include <fstream>
 #include <functional>
+#include <memory>
 #include <sstream>
 
 #include "ImGuiNotify.hpp"
@@ -813,14 +814,14 @@ Variable::drawSymbolLeaf(
                         // monitor plots each leaf, matching the watch-list behaviour.
                         // Dropping a raw struct as a single CHANNEL produced one
                         // un-plottable channel (the abnormal display the user hit).
-                        StructChannelPayload sp{};
-                        snprintf(sp.device, sizeof(sp.device), "JLINK");
-                        snprintf(sp.rootName, sizeof(sp.rootName), "%s", fullPath.c_str());
-                        sp.rootAddr    = addr;
-                        sp.rootTypeOff = typeOff;
-                        sp.srcWatch    = this; // mirror back into this window's watch list on a monitor drop
-                        flattenForStructPayload(dwarfInfo_, fullPath, addr, typeOff, sp, nullptr, 8);
-                        ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
+                        auto sp = std::make_unique<StructChannelPayload>();
+                        snprintf(sp->device, sizeof(sp->device), "JLINK");
+                        snprintf(sp->rootName, sizeof(sp->rootName), "%s", fullPath.c_str());
+                        sp->rootAddr    = addr;
+                        sp->rootTypeOff = typeOff;
+                        sp->srcWatch    = this; // mirror back into this window's watch list on a monitor drop
+                        flattenForStructPayload(dwarfInfo_, fullPath, addr, typeOff, *sp, nullptr, 8);
+                        ImGui::SetDragDropPayload("STRUCT_CHANNEL", sp.get(), sizeof(*sp));
                 } else {
                         ChannelDropPayload p{};
                         snprintf(p.name, sizeof(p.name), "%s", fullPath.c_str());
@@ -1161,15 +1162,15 @@ Variable::drawSymbolBrowser()
                                         if (isComplex) {
                                                 // Flatten struct/array into per-member channels so the
                                                 // monitor plots each leaf instead of one bad channel.
-                                                StructChannelPayload sp{};
-                                                snprintf(sp.device,
-                                                         sizeof(sp.device),
+                                                auto sp = std::make_unique<StructChannelPayload>();
+                                                snprintf(sp->device,
+                                                         sizeof(sp->device),
                                                          e.defaultPort == PortType::JLINK ? "JLINK" : "SHM");
-                                                snprintf(sp.rootName, sizeof(sp.rootName), "%s", e.path.c_str());
-                                                sp.rootAddr    = e.addr;
-                                                sp.rootTypeOff = e.typeOff;
-                                                flattenForStructPayload(dwarfInfo_, e.path, e.addr, e.typeOff, sp, nullptr, 8);
-                                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
+                                                snprintf(sp->rootName, sizeof(sp->rootName), "%s", e.path.c_str());
+                                                sp->rootAddr    = e.addr;
+                                                sp->rootTypeOff = e.typeOff;
+                                                flattenForStructPayload(dwarfInfo_, e.path, e.addr, e.typeOff, *sp, nullptr, 8);
+                                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", sp.get(), sizeof(*sp));
                                         } else {
                                                 ChannelDropPayload p{};
                                                 snprintf(p.name, sizeof(p.name), "%s", e.path.c_str());
@@ -1324,21 +1325,21 @@ Variable::drawVariableList()
                 // and drops onto a monitor to add channels.
                 auto setMonitorPayload = [&](const VarEntry &v, bool isComplex, bool hasManualStruct) {
                         if (isComplex) {
-                                StructChannelPayload sp{};
-                                sp.writable = v.writable;
-                                snprintf(sp.device, sizeof(sp.device), "%s", portName(v.port));
+                                auto sp      = std::make_unique<StructChannelPayload>();
+                                sp->writable = v.writable;
+                                snprintf(sp->device, sizeof(sp->device), "%s", portName(v.port));
                                 if (v.port == PortType::SHM)
-                                        snprintf(sp.shmName, sizeof(sp.shmName), "%s", v.shm.name);
+                                        snprintf(sp->shmName, sizeof(sp->shmName), "%s", v.shm.name);
                                 if (v.port == PortType::AUDIO)
-                                        snprintf(sp.shmName, sizeof(sp.shmName), "%s", v.audio.deviceName);
-                                snprintf(sp.rootName, sizeof(sp.rootName), "%s", v.name.c_str());
-                                sp.rootAddr    = v.addr;
-                                sp.rootTypeOff = v.typeOff;
+                                        snprintf(sp->shmName, sizeof(sp->shmName), "%s", v.audio.deviceName);
+                                snprintf(sp->rootName, sizeof(sp->rootName), "%s", v.name.c_str());
+                                sp->rootAddr    = v.addr;
+                                sp->rootTypeOff = v.typeOff;
                                 if (hasManualStruct) {
                                         for (const auto &sf : v.structFields) {
-                                                if (sp.count >= StructChannelPayload::kMaxEntries)
+                                                if (sp->count >= StructChannelPayload::kMaxEntries)
                                                         break;
-                                                auto &e = sp.entries[sp.count++];
+                                                auto &e = sp->entries[sp->count++];
                                                 snprintf(e.name, sizeof(e.name), "%s.%s", v.name.c_str(), sf.name);
                                                 e.addr = v.addr + sf.byteOffset;
                                                 snprintf(e.type, sizeof(e.type), "%s", Parser::dataTypeToStr(sf.type));
@@ -1359,9 +1360,9 @@ Variable::drawVariableList()
                                         }
                                 } else {
                                         std::lock_guard lk(mtxElf_);
-                                        flattenForStructPayload(dwarfInfo_, v.name, v.addr, v.typeOff, sp, &v.memberEnumDefs);
+                                        flattenForStructPayload(dwarfInfo_, v.name, v.addr, v.typeOff, *sp, &v.memberEnumDefs);
                                 }
-                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
+                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", sp.get(), sizeof(*sp));
                         } else {
                                 ChannelDropPayload p{};
                                 p.writable = v.writable;
@@ -1486,6 +1487,12 @@ Variable::drawVariableList()
                                                          v.audio.deviceName);
                                         }
                                 }
+                                const u32 traceSize = Parser::typeBytes(v.type);
+                                if (v.port == PortType::JLINK && !isComplex && traceSize > 0 &&
+                                    ImGui::MenuItem(tr("Trace writes with DWT", "使用 DWT 跟踪写入"))) {
+                                        JLinkPort::instance().configureDwtWriteTrace(
+                                            static_cast<u32>(v.addr), traceSize, v.name);
+                                }
                                 const bool isEnumType = (t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty();
                                 if (!isComplex && isEnumType &&
                                     ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
@@ -1530,6 +1537,12 @@ Variable::drawVariableList()
                         ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
                         bool open = ImGui::TreeNodeEx(v.name.c_str(), nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
                         ImGui::PopStyleColor(2);
+                        // Accept reordering on the variable name as well as the
+                        // narrow grip so an adjacent row is a practical target.
+                        if (ImGui::BeginDragDropTarget()) {
+                                acceptRowReorder(i);
+                                ImGui::EndDragDropTarget();
+                        }
                         if (isComplex && open != wasOpenTop) {
                                 if (open)
                                         v.expandedMembers.insert(v.name);
@@ -1692,7 +1705,9 @@ Variable::drawVariableList()
                                             fieldMoveDst < (int)v.structFields.size()) {
                                                 auto moved = v.structFields[fieldMoveSrc];
                                                 v.structFields.erase(v.structFields.begin() + fieldMoveSrc);
-                                                int dst = fieldMoveDst > fieldMoveSrc ? fieldMoveDst - 1 : fieldMoveDst;
+                                                // Keep the original destination index after erase. For a downward
+                                                // move this inserts after the drop row, allowing adjacent rows to swap.
+                                                int dst = fieldMoveDst;
                                                 v.structFields.insert(v.structFields.begin() + dst, moved);
                                                 isModified_ = true;
                                         }
@@ -1712,7 +1727,9 @@ Variable::drawVariableList()
                     varMoveDst < (int)vars_.size()) {
                         VarEntry moved = std::move(vars_[varMoveSrc]);
                         vars_.erase(vars_.begin() + varMoveSrc);
-                        int dst = varMoveDst > varMoveSrc ? varMoveDst - 1 : varMoveDst;
+                        // As above, the original destination index is the correct
+                        // insertion point for an adjacent downward move.
+                        int dst = varMoveDst;
                         vars_.insert(vars_.begin() + dst, std::move(moved));
                         lastSelectedIndex_ = dst;
                         isModified_        = true;
@@ -2231,6 +2248,120 @@ Variable::drawSubEnumEditPopup()
 }
 
 void
+Variable::beginMemberProperties(
+    i32 parentIdx, const std::string &path, u64 defaultAddr, DataType defaultType, bool scalar, bool defaultWritable)
+{
+        if (parentIdx < 0 || parentIdx >= (int)vars_.size())
+                return;
+
+        memberPropEdit_                 = {};
+        memberPropEdit_.parentIdx       = parentIdx;
+        memberPropEdit_.path            = path;
+        memberPropEdit_.defaultAddr     = defaultAddr;
+        memberPropEdit_.defaultType     = defaultType;
+        memberPropEdit_.scalar          = scalar;
+        memberPropEdit_.defaultWritable = defaultWritable;
+
+        u64      address  = defaultAddr;
+        DataType type     = defaultType;
+        bool     writable = defaultWritable;
+        auto     it       = vars_[parentIdx].memberOverrides.find(path);
+        if (it != vars_[parentIdx].memberOverrides.end()) {
+                const auto &ov = it->second;
+                snprintf(memberPropEdit_.alias, sizeof(memberPropEdit_.alias), "%s", ov.alias.c_str());
+                if (ov.hasAddress)
+                        address = ov.address;
+                if (ov.hasType)
+                        type = ov.type;
+                if (ov.hasWritable)
+                        writable = ov.writable;
+        }
+        snprintf(memberPropEdit_.addrBuf, sizeof(memberPropEdit_.addrBuf), "%llX", (unsigned long long)address);
+        memberPropEdit_.type     = type;
+        memberPropEdit_.writable = writable;
+}
+
+void
+Variable::drawMemberPropertiesPopup()
+{
+        if (memberPropEdit_.parentIdx < 0 || memberPropEdit_.parentIdx >= (int)vars_.size()) {
+                memberPropEdit_.parentIdx = -1;
+                return;
+        }
+
+        ImGui::OpenPopup("###EditMemberProperties");
+        if (!ImGui::BeginPopupModal(
+                tr("Edit Member Properties###EditMemberProperties", "编辑子变量属性###EditMemberProperties"),
+                nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize))
+                return;
+
+        ImGui::TextWrapped("%s", memberPropEdit_.path.c_str());
+        ImGui::Separator();
+        ImGui::TextUnformatted(tr("Alias", "别名"));
+        ImGui::SameLine(100);
+        ImGui::SetNextItemWidth(360);
+        ImGui::InputText("##memberAlias", memberPropEdit_.alias, sizeof(memberPropEdit_.alias));
+
+        ImGui::TextUnformatted(tr("Address", "地址"));
+        ImGui::SameLine(100);
+        ImGui::SetNextItemWidth(360);
+        ImGui::InputText("##memberAddress", memberPropEdit_.addrBuf, sizeof(memberPropEdit_.addrBuf));
+
+        ImGui::TextUnformatted(tr("Type", "类型"));
+        ImGui::SameLine(100);
+        if (memberPropEdit_.scalar) {
+                static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
+                int                typeIdx = 0;
+                for (int i = 0; i < IM_ARRAYSIZE(types); ++i)
+                        if (Parser::strToDataType(types[i]) == memberPropEdit_.type) {
+                                typeIdx = i;
+                                break;
+                        }
+                ImGui::SetNextItemWidth(360);
+                if (ImGui::Combo("##memberType", &typeIdx, types, IM_ARRAYSIZE(types)))
+                        memberPropEdit_.type = Parser::strToDataType(types[typeIdx]);
+        } else {
+                ImGui::TextDisabled("%s", tr("STRUCT / ARRAY", "结构体 / 数组"));
+        }
+
+        ImGui::Checkbox(tr("Writable", "可写"), &memberPropEdit_.writable);
+        ImGui::Separator();
+        if (ui::Button(tr("Apply", "应用"), ui::BtnStyle::Success, ImVec2(100, 0))) {
+                auto &ov       = vars_[memberPropEdit_.parentIdx].memberOverrides[memberPropEdit_.path];
+                ov.alias       = memberPropEdit_.alias;
+                ov.hasAddress  = true;
+                ov.hasType     = memberPropEdit_.scalar;
+                ov.type        = memberPropEdit_.type;
+                ov.hasWritable = true;
+                ov.writable    = memberPropEdit_.writable;
+                try {
+                        ov.address = std::stoull(memberPropEdit_.addrBuf, nullptr, 16);
+                } catch (...) {
+                        ov.address = memberPropEdit_.defaultAddr;
+                }
+                isModified_               = true;
+                propertiesChanged_        = true;
+                memberPropEdit_.parentIdx = -1;
+                ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Reset", "重置"), ImVec2(100, 0))) {
+                vars_[memberPropEdit_.parentIdx].memberOverrides.erase(memberPropEdit_.path);
+                isModified_               = true;
+                propertiesChanged_        = true;
+                memberPropEdit_.parentIdx = -1;
+                ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Cancel", "取消"), ImVec2(100, 0))) {
+                memberPropEdit_.parentIdx = -1;
+                ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+}
+
+void
 Variable::drawEditPropertiesPopup()
 {
         if (editPropIdx_ < 0 || editPropIdx_ >= (int)vars_.size()) {
@@ -2743,8 +2874,6 @@ Variable::startPollThread()
                                         reqs = ps->reqs;
                                 }
 
-                                std::unordered_map<u64, PollVal> out;
-                                out.reserve(reqs.size());
                                 for (const auto &r : reqs) {
                                         if (!ps->running.load())
                                                 break;
@@ -2752,12 +2881,11 @@ Variable::startPollThread()
                                         pv.sz = r.sz;
                                         pv.ok = (r.sz > 0 && r.sz <= sizeof(pv.buf)) &&
                                                 JLinkPort::instance().readMem(static_cast<u32>(r.addr), r.sz, pv.buf);
-                                        out[r.addr] = pv;
-                                }
-
-                                {
+                                        // Publish each result immediately. With a large expanded
+                                        // struct, waiting for the entire request list left the later
+                                        // rows showing "..." for a long time.
                                         std::lock_guard lk(ps->mtx);
-                                        ps->vals = std::move(out);
+                                        ps->vals[r.addr] = pv;
                                 }
 
                                 // Sleep in small slices so a stop request (e.g. the
@@ -2809,7 +2937,8 @@ Variable::updateVariables()
         // take a snapshot of the latest values it has produced.
         std::unordered_map<u64, PollVal> polledVals;
         {
-                std::vector<PollReq> reqs;
+                std::unordered_map<u64, u32> reqByAddr;
+                std::vector<PollReq>         reqs;
                 for (const auto &v : vars_) {
                         if (v.port != PortType::JLINK || v.is_editing)
                                 continue;
@@ -2818,12 +2947,20 @@ Variable::updateVariables()
                                   t->kind == dwarf::TypeKind::ARRAY))
                                 continue; // complex types aren't scalar-read here
 
-                        reqs.push_back({v.addr, Parser::typeBytes(v.type)});
+                        reqByAddr[v.addr] = Parser::typeBytes(v.type);
                 }
+                for (const auto &[addr, sz] : memberPollReqs_) {
+                        auto &requestedSize = reqByAddr[addr];
+                        requestedSize       = std::max(requestedSize, sz);
+                }
+                reqs.reserve(reqByAddr.size());
+                for (const auto &[addr, sz] : reqByAddr)
+                        reqs.push_back({addr, sz});
                 std::lock_guard lk(poll_->mtx);
                 poll_->reqs = std::move(reqs);
                 polledVals  = poll_->vals;
         }
+        syncReadCache_ = polledVals;
 
         for (auto &v : vars_) {
                 if (v.is_editing)
@@ -2992,7 +3129,7 @@ Variable::updateVariables()
 void
 Variable::writeVariable(const VarEntry &v, const std::string &newVal)
 {
-        u8  buf[8];
+        u8  buf[8]{};
         u32 sz = Parser::typeBytes(v.type);
         try {
                 if (v.type == DataType::F32)
@@ -3017,7 +3154,11 @@ Variable::writeVariable(const VarEntry &v, const std::string &newVal)
                         *(i64 *)buf = std::stoll(newVal);
 
                 if (v.port == PortType::JLINK && JLinkPort::instance().isConnected()) {
-                        jlink_port_write_mem((u32)v.addr, sz, buf);
+                        if (v.bitSize > 0)
+                                JLinkPort::instance().writeMemBitfield(
+                                    static_cast<u32>(v.addr), sz, buf, v.bitOffset, v.bitSize);
+                        else
+                                JLinkPort::instance().writeMem(static_cast<u32>(v.addr), sz, buf);
                 } else if (v.port == PortType::SHM && v.shm.inited) {
                         shm_write(const_cast<shm_t *>(&v.shm.handle), buf, sz);
                 } else if (v.port == PortType::LOCAL) {
@@ -3035,7 +3176,9 @@ Variable::writeVariable(const VarEntry &v, const std::string &newVal)
 void
 Variable::draw()
 {
-        syncReadCache_.clear();
+        // Rebuilt while drawing the currently expanded tree. updateVariables()
+        // publishes this set to the background reader on the next refresh tick.
+        memberPollReqs_.clear();
 
         // The Symbol Browser pane only appears once a symbol/data source has been
         // imported (ELF/AXF via drag-drop or "Load File", or a bin/json data tree),
@@ -3063,8 +3206,10 @@ Variable::draw()
                         ImVec2 splitPos = ImGui::GetCursorScreenPos();
                         float  w        = ImGui::GetContentRegionAvail().x;
                         ImGui::InvisibleButton("##symSplit", ImVec2(w, kSplitH));
-                        if (ImGui::IsItemActive())
+                        if (ImGui::IsItemActive()) {
                                 watchListHeight_ = std::max(60.0f, watchListHeight_ + ImGui::GetIO().MouseDelta.y);
+                                isModified_      = true;
+                        }
                         ImU32 lineCol = ImGui::IsItemHovered() || ImGui::IsItemActive()
                                             ? ImGui::GetColorU32(ImGuiCol_SeparatorActive)
                                             : ImGui::GetColorU32(ImGuiCol_Separator);
@@ -3078,8 +3223,10 @@ Variable::draw()
 
                 // Header strip: collapse/expand arrow + label
                 ImGui::AlignTextToFramePadding();
-                if (ImGui::ArrowButton("##symhdr", symBrowserCollapsed_ ? ImGuiDir_Right : ImGuiDir_Down))
+                if (ImGui::ArrowButton("##symhdr", symBrowserCollapsed_ ? ImGuiDir_Right : ImGuiDir_Down)) {
                         symBrowserCollapsed_ = !symBrowserCollapsed_;
+                        isModified_          = true;
+                }
                 ImGui::SameLine();
                 const std::string symbolSourcePath =
                     absoluteDisplayPath(!elfPath_.empty() ? elfPath_ : (!binPath_.empty() ? binPath_ : cfgPath_));
@@ -3105,6 +3252,7 @@ Variable::draw()
         drawAddVariableDialog();
         drawEnumEditPopup();
         drawSubEnumEditPopup();
+        drawMemberPropertiesPopup();
         drawEditPropertiesPopup();
         if (state_ == WindowState::LoadElf) {
                 state_        = WindowState::None;
@@ -3179,6 +3327,10 @@ void
 Variable::save(void *node) const
 {
         cJSON *root = static_cast<cJSON *>(node);
+        cJSON_AddNumberToObject(root, "updateIntervalMs", updateIntervalMs_);
+        cJSON_AddNumberToObject(root, "watchListHeight", watchListHeight_);
+        cJSON_AddBoolToObject(root, "symbolBrowserCollapsed", symBrowserCollapsed_);
+        cJSON_AddBoolToObject(root, "elfFilterObjectsOnly", elfFilterObjectsOnly_);
         cJSON *vArr = cJSON_CreateArray();
         for (const auto &v : vars_) {
                 cJSON *vObj = cJSON_CreateObject();
@@ -3228,6 +3380,22 @@ Variable::save(void *node) const
                         }
                         cJSON_AddItemToObject(vObj, "memberEnumDefs", medObj);
                 }
+                if (!v.memberOverrides.empty()) {
+                        cJSON *overridesObj = cJSON_CreateObject();
+                        for (const auto &[path, ov] : v.memberOverrides) {
+                                cJSON *ovObj = cJSON_CreateObject();
+                                if (!ov.alias.empty())
+                                        cJSON_AddStringToObject(ovObj, "alias", ov.alias.c_str());
+                                if (ov.hasAddress)
+                                        cJSON_AddNumberToObject(ovObj, "address", (double)ov.address);
+                                if (ov.hasType)
+                                        cJSON_AddNumberToObject(ovObj, "type", (int)ov.type);
+                                if (ov.hasWritable)
+                                        cJSON_AddBoolToObject(ovObj, "writable", ov.writable);
+                                cJSON_AddItemToObject(overridesObj, path.c_str(), ovObj);
+                        }
+                        cJSON_AddItemToObject(vObj, "memberOverrides", overridesObj);
+                }
                 cJSON_AddItemToArray(vArr, vObj);
         }
         cJSON_AddItemToObject(root, "vars", vArr);
@@ -3237,7 +3405,15 @@ void
 Variable::load(const void *node)
 {
         const cJSON *root = static_cast<const cJSON *>(node);
-        cJSON       *vArr = cJSON_GetObjectItem(root, "vars");
+        if (const cJSON *interval = cJSON_GetObjectItem(root, "updateIntervalMs"); cJSON_IsNumber(interval))
+                updateIntervalMs_ = static_cast<u32>(std::clamp(interval->valueint, 10, 2000));
+        if (const cJSON *height = cJSON_GetObjectItem(root, "watchListHeight"); cJSON_IsNumber(height))
+                watchListHeight_ = std::max(60.0f, static_cast<float>(height->valuedouble));
+        if (const cJSON *collapsed = cJSON_GetObjectItem(root, "symbolBrowserCollapsed"); cJSON_IsBool(collapsed))
+                symBrowserCollapsed_ = cJSON_IsTrue(collapsed);
+        if (const cJSON *objectsOnly = cJSON_GetObjectItem(root, "elfFilterObjectsOnly"); cJSON_IsBool(objectsOnly))
+                elfFilterObjectsOnly_ = cJSON_IsTrue(objectsOnly);
+        cJSON *vArr = cJSON_GetObjectItem(root, "vars");
         if (cJSON_IsArray(vArr)) {
                 vars_.clear();
                 for (int i = 0; i < cJSON_GetArraySize(vArr); ++i) {
@@ -3328,9 +3504,55 @@ Variable::load(const void *node)
                                         v.memberEnumDefs[child->string] = std::move(mdefs);
                                 }
                         }
+                        cJSON *overridesObj = cJSON_GetObjectItem(vObj, "memberOverrides");
+                        if (cJSON_IsObject(overridesObj)) {
+                                for (cJSON *child = overridesObj->child; child; child = child->next) {
+                                        if (!cJSON_IsObject(child) || !child->string)
+                                                continue;
+                                        VarEntry::MemberOverride ov;
+                                        if (auto *alias = cJSON_GetObjectItem(child, "alias"); cJSON_IsString(alias))
+                                                ov.alias = alias->valuestring;
+                                        if (auto *address = cJSON_GetObjectItem(child, "address"); cJSON_IsNumber(address)) {
+                                                ov.hasAddress = true;
+                                                ov.address    = (u64)address->valuedouble;
+                                        }
+                                        if (auto *type = cJSON_GetObjectItem(child, "type"); cJSON_IsNumber(type)) {
+                                                ov.hasType = true;
+                                                ov.type    = (DataType)type->valueint;
+                                        }
+                                        if (auto *writable = cJSON_GetObjectItem(child, "writable"); cJSON_IsBool(writable)) {
+                                                ov.hasWritable = true;
+                                                ov.writable    = cJSON_IsTrue(writable);
+                                        }
+                                        v.memberOverrides[child->string] = std::move(ov);
+                                }
+                        }
                         vars_.push_back(v);
                 }
         }
+        isModified_ = false;
+}
+
+bool
+Variable::findElfSymbolAddress(const std::string &name, u32 &address) const
+{
+        std::lock_guard lk(mtxElf_);
+        for (const auto &symbol : elfInfo_.symbols) {
+                if (symbol.name == name && symbol.addr <= 0xffffffffull) {
+                        address = static_cast<u32>(symbol.addr);
+                        return true;
+                }
+        }
+        // DWARF-flattened members allow protocol fields to be located by name
+        // when debug information is present; the top-level symbols above remain
+        // sufficient for release ELFs that only retain the symbol table.
+        for (const auto &entry : searchPool_) {
+                if (entry.path == name && entry.addr <= 0xffffffffull) {
+                        address = static_cast<u32>(entry.addr);
+                        return true;
+                }
+        }
+        return false;
 }
 
 void
@@ -3419,8 +3641,8 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                             return decodeValue(buf, Parser::strToDataType(sType), bitOffset, bitSize);
                     };
                     if (port == PortType::JLINK) {
-                            u8  buf[8]{};
-                            u32 sz = Parser::typeBytes(Parser::strToDataType(sType));
+                            u32 sz                      = Parser::typeBytes(Parser::strToDataType(sType));
+                            memberPollReqs_[memberAddr] = sz;
 
                             auto itSync = syncReadCache_.find(memberAddr);
                             if (itSync != syncReadCache_.end()) {
@@ -3431,25 +3653,7 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                     }
                                     return std::string("ERR");
                             }
-
-                            u64  now        = get_mono_ts_ms();
-                            bool shouldRead = (now - lastUpdateTs_ < 20);
-                            if (shouldRead && JLinkPort::instance().isConnected()) {
-                                    bool    ok = JLinkPort::instance().readMem((u32)memberAddr, sz, buf);
-                                    PollVal pv{};
-                                    pv.sz = sz;
-                                    pv.ok = ok;
-                                    if (ok)
-                                            std::memcpy(pv.buf, buf, sz);
-                                    syncReadCache_[memberAddr] = pv;
-
-                                    if (ok) {
-                                            std::string val          = decodeWithEnum(buf, sz);
-                                            memberValueCache_[mPath] = val;
-                                            return val;
-                                    }
-                                    return std::string("ERR");
-                            } else if (it != memberValueCache_.end()) {
+                            if (it != memberValueCache_.end()) {
                                     return it->second;
                             } else {
                                     return std::string("...");
@@ -3470,9 +3674,29 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         std::string memberPath = fullPath + "." + (m.name.empty() ? "<anon>" : m.name);
                         if (hidden && hidden->count(memberPath))
                                 continue;
-                        u64         memberAddr = addr + m.offset;
-                        const char *sType      = scalarPayloadType(dwarfInfo_, m.type);
-                        bool        isComplex  = !sType;
+                        const u64   defaultMemberAddr = addr + m.offset;
+                        const char *baseSType         = scalarPayloadType(dwarfInfo_, m.type);
+                        bool        parentWritable =
+                            parentVarIdx >= 0 && parentVarIdx < (int)vars_.size() ? vars_[parentVarIdx].writable : true;
+                        const VarEntry::MemberOverride *memberOverride = nullptr;
+                        if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
+                                auto oit = vars_[parentVarIdx].memberOverrides.find(memberPath);
+                                if (oit != vars_[parentVarIdx].memberOverrides.end())
+                                        memberOverride = &oit->second;
+                        }
+                        u64 memberAddr =
+                            memberOverride && memberOverride->hasAddress ? memberOverride->address : defaultMemberAddr;
+                        DataType effectiveType = baseSType ? Parser::strToDataType(baseSType) : DataType::UNKNOWN;
+                        if (baseSType && memberOverride && memberOverride->hasType)
+                                effectiveType = memberOverride->type;
+                        std::string effectiveTypeName = baseSType ? Parser::dataTypeToStr(effectiveType) : "";
+                        const char *sType             = baseSType ? effectiveTypeName.c_str() : nullptr;
+                        const bool  isComplex         = !sType;
+                        const bool  memberWritable =
+                            memberOverride && memberOverride->hasWritable ? memberOverride->writable : parentWritable;
+                        const std::string displayName = memberOverride && !memberOverride->alias.empty()
+                                                            ? memberOverride->alias
+                                                            : (m.name.empty() ? "<anon>" : m.name);
 
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
@@ -3488,21 +3712,24 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                                 ? &vars_[parentVarIdx].memberEnumDefs
                                                 : nullptr;
                                         if (!sType) {
-                                                StructChannelPayload sp{};
-                                                snprintf(sp.device, sizeof(sp.device), "%s", devLabel);
+                                                auto sp      = std::make_unique<StructChannelPayload>();
+                                                sp->writable = memberWritable;
+                                                snprintf(sp->device, sizeof(sp->device), "%s", devLabel);
                                                 if (!shmRegionName.empty())
-                                                        snprintf(sp.shmName, sizeof(sp.shmName), "%s", shmRegionName.c_str());
-                                                flattenForStructPayload(dwarfInfo_, memberPath, memberAddr, m.type, sp, memOvr);
-                                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
+                                                        snprintf(sp->shmName, sizeof(sp->shmName), "%s", shmRegionName.c_str());
+                                                flattenForStructPayload(
+                                                    dwarfInfo_, memberPath, memberAddr, m.type, *sp, memOvr);
+                                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", sp.get(), sizeof(*sp));
                                         } else {
                                                 ChannelDropPayload p{};
+                                                p.writable = memberWritable;
                                                 snprintf(p.name, sizeof(p.name), "%s", memberPath.c_str());
                                                 p.addr = memberAddr;
                                                 snprintf(p.type, sizeof(p.type), "%s", sType);
                                                 snprintf(p.device, sizeof(p.device), "%s", devLabel);
                                                 if (!shmRegionName.empty())
                                                         snprintf(p.shmName, sizeof(p.shmName), "%s", shmRegionName.c_str());
-                                                p.numBytes  = (u8)typeSize(dwarfInfo_, m.type);
+                                                p.numBytes  = (u8)Parser::typeBytes(effectiveType);
                                                 p.typeOff   = m.type;
                                                 p.bitOffset = m.bitOffset;
                                                 p.bitSize   = m.bitSize;
@@ -3534,8 +3761,8 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         // Suppress the hover/active highlight on struct sub-items.
                         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
                         ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
-                        bool open = ImGui::TreeNodeEx(m.name.empty() ? "<anon>" : m.name.c_str(),
-                                                      nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
+                        const std::string memberLabel = displayName + "###member_" + memberPath;
+                        bool              open        = ImGui::TreeNodeEx(memberLabel.c_str(), nodeFlags);
                         ImGui::PopStyleColor(2);
                         if (isComplex && expSetM && open != wasOpenM) {
                                 if (open)
@@ -3546,9 +3773,25 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         }
 
                         {
-                                const dwarf::Type *mt           = resolveAlias(dwarfInfo_, m.type);
-                                const bool         isMemberEnum = mt && mt->kind == dwarf::TypeKind::ENUM;
+                                const dwarf::Type *mt = resolveAlias(dwarfInfo_, m.type);
+                                const bool         isMemberEnum =
+                                    mt && mt->kind == dwarf::TypeKind::ENUM && !(memberOverride && memberOverride->hasType);
                                 if (ImGui::BeginPopupContextItem()) {
+                                        if (ImGui::MenuItem(tr("Edit Properties...", "编辑属性...")))
+                                                beginMemberProperties(parentVarIdx,
+                                                                      memberPath,
+                                                                      defaultMemberAddr,
+                                                                      baseSType ? Parser::strToDataType(baseSType)
+                                                                                : DataType::UNKNOWN,
+                                                                      baseSType != nullptr,
+                                                                      parentWritable);
+                                        const u32 traceSize =
+                                            baseSType ? Parser::typeBytes(Parser::strToDataType(baseSType)) : 0;
+                                        if (port == PortType::JLINK && traceSize > 0 &&
+                                            ImGui::MenuItem(tr("Trace writes with DWT", "使用 DWT 跟踪写入"))) {
+                                                JLinkPort::instance().configureDwtWriteTrace(
+                                                    static_cast<u32>(memberAddr), traceSize, memberPath);
+                                        }
                                         if (ImGui::MenuItem(tr("Delete", "删除"))) {
                                                 if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
                                                         vars_[parentVarIdx].hiddenMembers.insert(memberPath);
@@ -3562,6 +3805,8 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                         }
                                         ImGui::EndPopup();
                                 }
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s\n0x%08llX", memberPath.c_str(), (unsigned long long)memberAddr);
                                 // (Monitor drag source now lives on the "=" grip — see above.)
                                 ImGui::TableSetColumnIndex(1);
                                 if (sType) {
@@ -3581,11 +3826,7 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                 ImGui::TextUnformatted(devLabel);
 
                                 ImGui::TableSetColumnIndex(5);
-                                bool parentWritable = true;
-                                if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
-                                        parentWritable = vars_[parentVarIdx].writable;
-                                }
-                                if (parentWritable)
+                                if (memberWritable)
                                         ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "RW");
                                 else
                                         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RO");
@@ -3605,9 +3846,28 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         std::string memberPath = fullPath + idxStr;
                         if (hidden && hidden->count(memberPath))
                                 continue;
-                        u64         memberAddr = addr + i * elemSize;
-                        const char *sType      = scalarPayloadType(dwarfInfo_, t->inner);
-                        bool        isComplex  = !sType;
+                        const u64   defaultMemberAddr = addr + i * elemSize;
+                        const char *baseSType         = scalarPayloadType(dwarfInfo_, t->inner);
+                        bool        parentWritable =
+                            parentVarIdx >= 0 && parentVarIdx < (int)vars_.size() ? vars_[parentVarIdx].writable : true;
+                        const VarEntry::MemberOverride *memberOverride = nullptr;
+                        if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
+                                auto oit = vars_[parentVarIdx].memberOverrides.find(memberPath);
+                                if (oit != vars_[parentVarIdx].memberOverrides.end())
+                                        memberOverride = &oit->second;
+                        }
+                        u64 memberAddr =
+                            memberOverride && memberOverride->hasAddress ? memberOverride->address : defaultMemberAddr;
+                        DataType effectiveType = baseSType ? Parser::strToDataType(baseSType) : DataType::UNKNOWN;
+                        if (baseSType && memberOverride && memberOverride->hasType)
+                                effectiveType = memberOverride->type;
+                        std::string effectiveTypeName = baseSType ? Parser::dataTypeToStr(effectiveType) : "";
+                        const char *sType             = baseSType ? effectiveTypeName.c_str() : nullptr;
+                        const bool  isComplex         = !sType;
+                        const bool  memberWritable =
+                            memberOverride && memberOverride->hasWritable ? memberOverride->writable : parentWritable;
+                        const std::string displayName =
+                            memberOverride && !memberOverride->alias.empty() ? memberOverride->alias : idxStr;
 
                         ImGui::TableNextRow();
                         ImGui::TableSetColumnIndex(0);
@@ -3622,22 +3882,24 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                                 ? &vars_[parentVarIdx].memberEnumDefs
                                                 : nullptr;
                                         if (!sType) {
-                                                StructChannelPayload sp{};
-                                                snprintf(sp.device, sizeof(sp.device), "%s", devLabel);
+                                                auto sp      = std::make_unique<StructChannelPayload>();
+                                                sp->writable = memberWritable;
+                                                snprintf(sp->device, sizeof(sp->device), "%s", devLabel);
                                                 if (!shmRegionName.empty())
-                                                        snprintf(sp.shmName, sizeof(sp.shmName), "%s", shmRegionName.c_str());
+                                                        snprintf(sp->shmName, sizeof(sp->shmName), "%s", shmRegionName.c_str());
                                                 flattenForStructPayload(
-                                                    dwarfInfo_, memberPath, memberAddr, t->inner, sp, memOvr);
-                                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", &sp, sizeof(sp));
+                                                    dwarfInfo_, memberPath, memberAddr, t->inner, *sp, memOvr);
+                                                ImGui::SetDragDropPayload("STRUCT_CHANNEL", sp.get(), sizeof(*sp));
                                         } else {
                                                 ChannelDropPayload p{};
+                                                p.writable = memberWritable;
                                                 snprintf(p.name, sizeof(p.name), "%s", memberPath.c_str());
                                                 p.addr = memberAddr;
                                                 snprintf(p.type, sizeof(p.type), "%s", sType);
                                                 snprintf(p.device, sizeof(p.device), "%s", devLabel);
                                                 if (!shmRegionName.empty())
                                                         snprintf(p.shmName, sizeof(p.shmName), "%s", shmRegionName.c_str());
-                                                p.numBytes = (u8)typeSize(dwarfInfo_, t->inner);
+                                                p.numBytes = (u8)Parser::typeBytes(effectiveType);
                                                 p.typeOff  = t->inner;
                                                 const std::vector<VarEntry::EnumDef> *leafOvr = nullptr;
                                                 if (memOvr) {
@@ -3667,7 +3929,8 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         // Suppress the hover/active highlight on struct/array sub-items.
                         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
                         ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
-                        bool open = ImGui::TreeNodeEx(idxStr.c_str(), nodeFlags & ~ImGuiTreeNodeFlags_SpanFullWidth);
+                        const std::string memberLabel = displayName + "###member_" + memberPath;
+                        bool              open        = ImGui::TreeNodeEx(memberLabel.c_str(), nodeFlags);
                         ImGui::PopStyleColor(2);
                         if (isComplex && expSetA && open != wasOpenA) {
                                 if (open)
@@ -3678,9 +3941,25 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         }
 
                         {
-                                const dwarf::Type *et2        = resolveAlias(dwarfInfo_, t->inner);
-                                const bool         isElemEnum = et2 && et2->kind == dwarf::TypeKind::ENUM;
+                                const dwarf::Type *et2 = resolveAlias(dwarfInfo_, t->inner);
+                                const bool         isElemEnum =
+                                    et2 && et2->kind == dwarf::TypeKind::ENUM && !(memberOverride && memberOverride->hasType);
                                 if (ImGui::BeginPopupContextItem()) {
+                                        if (ImGui::MenuItem(tr("Edit Properties...", "编辑属性...")))
+                                                beginMemberProperties(parentVarIdx,
+                                                                      memberPath,
+                                                                      defaultMemberAddr,
+                                                                      baseSType ? Parser::strToDataType(baseSType)
+                                                                                : DataType::UNKNOWN,
+                                                                      baseSType != nullptr,
+                                                                      parentWritable);
+                                        const u32 traceSize =
+                                            baseSType ? Parser::typeBytes(Parser::strToDataType(baseSType)) : 0;
+                                        if (port == PortType::JLINK && traceSize > 0 &&
+                                            ImGui::MenuItem(tr("Trace writes with DWT", "使用 DWT 跟踪写入"))) {
+                                                JLinkPort::instance().configureDwtWriteTrace(
+                                                    static_cast<u32>(memberAddr), traceSize, memberPath);
+                                        }
                                         if (ImGui::MenuItem(tr("Delete", "删除"))) {
                                                 if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
                                                         vars_[parentVarIdx].hiddenMembers.insert(memberPath);
@@ -3694,6 +3973,8 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                         }
                                         ImGui::EndPopup();
                                 }
+                                if (ImGui::IsItemHovered())
+                                        ImGui::SetTooltip("%s\n0x%08llX", memberPath.c_str(), (unsigned long long)memberAddr);
                                 // (Monitor drag source now lives on the "=" grip — see above.)
                                 ImGui::TableSetColumnIndex(1);
                                 if (sType) {
@@ -3712,11 +3993,7 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                 ImGui::TextUnformatted(devLabel);
 
                                 ImGui::TableSetColumnIndex(5);
-                                bool parentWritable = true;
-                                if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
-                                        parentWritable = vars_[parentVarIdx].writable;
-                                }
-                                if (parentWritable)
+                                if (memberWritable)
                                         ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "RW");
                                 else
                                         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RO");
@@ -4003,6 +4280,28 @@ Variable::refreshDwarfMember(const std::string &memberPath)
         u8   buf[8]{};
         bool ok                       = JLinkPort::instance().readMem((u32)addr, sz, buf);
         memberValueCache_[memberPath] = ok ? decodeValue(buf, dt, 0, 0) : "ERR";
+}
+
+std::string
+Variable::resolveFunctionAddress(const u32 address) const
+{
+        std::lock_guard  lock(mtxElf_);
+        const ElfSymbol *best = nullptr;
+        for (const ElfSymbol &symbol : elfInfo_.symbols) {
+                if (symbol.type != 2 || symbol.addr > address)
+                        continue; // STT_FUNC
+                if (symbol.size > 0 && static_cast<u64>(address) >= symbol.addr + symbol.size)
+                        continue;
+                if (!best || symbol.addr > best->addr)
+                        best = &symbol;
+        }
+        if (!best)
+                return {};
+        char offset[32]{};
+        if (static_cast<u64>(address) > best->addr)
+                snprintf(
+                    offset, sizeof(offset), "+0x%llX", static_cast<unsigned long long>(static_cast<u64>(address) - best->addr));
+        return best->name + offset;
 }
 
 // Decode `fsz` bytes at `tmp` as the given scalar type into a float.

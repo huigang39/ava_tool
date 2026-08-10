@@ -175,13 +175,46 @@ Gui::Gui(const std::string &initialPath)
 
         ImPlot::CreateContext();
 
-        if (!initialPath.empty())
+        if (!initialPath.empty()) {
+                LOG_I("Startup session explicitly requested: %s", initialPath.c_str());
                 loadSession(initialPath);
-        else
-                loadSession();
+        } else {
+                std::error_code ec;
+                const bool      hasDefaultSession = std::filesystem::is_regular_file(currentSessionPath_, ec);
+                if (hasDefaultSession) {
+                        LOG_I("Startup auto-loading default session: %s", currentSessionPath_.c_str());
+                        loadSession();
+                } else {
+                        LOG_I(
+                            "Startup cold state: no default session at '%s' (ec=%d)", currentSessionPath_.c_str(), ec.value());
+                }
+        }
 
         if (motorProfiles_.empty())
                 motorProfiles_.push_back(MotorProfile{});
+
+        JLinkPort::instance().setTraceAddressResolver([this](const u32 address) {
+                for (const auto &variableWindow : vars_ | std::views::values) {
+                        std::string resolved = variableWindow->resolveFunctionAddress(address);
+                        if (!resolved.empty())
+                                return resolved;
+                }
+                return std::string{};
+        });
+        bkpSramDebugger_.setSymbolResolver([this](const std::string &name, std::uint32_t &address) {
+                for (const auto &variableWindow : vars_ | std::views::values) {
+                        if (variableWindow->findElfSymbolAddress(name, address))
+                                return true;
+                }
+                return false;
+        });
+        deviceManager_.setSymbolResolver([this](const std::string &name, std::uint32_t &address) {
+                for (const auto &variableWindow : vars_ | std::views::values) {
+                        if (variableWindow->findElfSymbolAddress(name, address))
+                                return true;
+                }
+                return false;
+        });
 
         TutorialGuide::instance().loadState(getAppDir());
 }
@@ -189,13 +222,18 @@ Gui::Gui(const std::string &initialPath)
 Gui::~Gui()
 {
         LOG_I("~Gui()");
+        JLinkPort::instance().setTraceAddressResolver({});
+        bkpSramDebugger_.setSymbolResolver({});
+        deviceManager_.setSymbolResolver({});
 
         // Hide window immediately to give user instant feedback
         if (window_) {
                 glfwHideWindow(window_);
         }
 
-        if (!skipAutoSave_ && (isModified_ || ImGui::GetIO().WantSaveIniSettings)) {
+        // imgui.ini owns ordinary window/dock layout persistence.  WantSaveIniSettings
+        // is not a session-data edit and must not create/overwrite a .ava file.
+        if (!skipAutoSave_ && isModified_) {
                 saveSession();
         }
 
@@ -367,9 +405,7 @@ Gui::saveSession(const std::string &path)
         };
 
         cJSON *jlink = cJSON_CreateObject();
-        cJSON_AddStringToObject(jlink, "device", JLinkPort::instance().deviceName().c_str());
-        cJSON_AddNumberToObject(jlink, "speedKHz", JLinkPort::instance().speed());
-        cJSON_AddNumberToObject(jlink, "hssPeriodUs", JLinkPort::instance().hssPeriodUs());
+        JLinkPort::instance().saveSession(jlink);
         cJSON_AddNumberToObject(jlink, "maxHssHz", g_maxHssHz.load(std::memory_order_relaxed));
         cJSON_AddItemToObject(root, "jlink", jlink);
 
@@ -531,13 +567,9 @@ Gui::saveSession(const std::string &path)
                 cJSON_AddStringToObject(pObj, "binPath", toRel(p->getBinPath()).c_str());
                 cJSON_AddStringToObject(pObj, "elfPath", toRel(p->getElfPath()).c_str());
                 p->save(pObj);
-                p->clearModified();
                 cJSON_AddItemToArray(VariableArr, pObj);
         }
         cJSON_AddItemToObject(root, "Variables", VariableArr);
-        for (const auto &m : monitors_ | std::views::values)
-                m->clearModified();
-        isModified_ = false;
 
         cJSON *motorsArr = cJSON_CreateArray();
         for (const auto &mp : motorProfiles_) {
@@ -559,8 +591,11 @@ Gui::saveSession(const std::string &path)
 
         // Tool page visibility
         cJSON_AddBoolToObject(root, "showBode", bode_.show_);
+        bode_.saveSession(root);
+        bkpSramDebugger_.saveSession(root);
         cJSON_AddBoolToObject(root, "showAsmViewer", asmViewer_.show_);
         cJSON_AddBoolToObject(root, "showSeqEditor", seqEditor_.isOpen());
+        midiTool_.save(root);
 
         // SDK panels
         const std::string sdkBaseDir = std::filesystem::path(targetPath).parent_path().string();
@@ -573,6 +608,13 @@ Gui::saveSession(const std::string &path)
         }
         cJSON_AddItemToObject(root, "sdkPanels", sdkArr);
 
+        // Device definitions, typed property values, and native-function
+        // bindings live with the session. External file paths are stored
+        // relative to the .ava file by DeviceManager.
+        cJSON *deviceManagerObj = cJSON_CreateObject();
+        deviceManager_.save(deviceManagerObj, sdkBaseDir);
+        cJSON_AddItemToObject(root, "deviceManager", deviceManagerObj);
+
         u64                   pStart = get_mono_ts_ms();
         char                 *out    = cJSON_Print(root); // formatted/pretty-printed for human readability
         u64                   pEnd   = get_mono_ts_ms();
@@ -580,10 +622,23 @@ Gui::saveSession(const std::string &path)
         std::ofstream         ofs(p);
         if (ofs && out) {
                 ofs << out;
-                currentSessionPath_ = targetPath;
-                isModified_         = false;
-                isFirstSave_        = false;
-                addRecent(targetPath);
+                if (ofs.good()) {
+                        for (const auto &v : vars_ | std::views::values)
+                                v->clearModified();
+                        for (const auto &m : monitors_ | std::views::values)
+                                m->clearModified();
+                        seqEditor_.clearModified();
+                        deviceManager_.clearModified();
+                        bode_.clearModified();
+                        bkpSramDebugger_.clearModified();
+                        for (const auto &panel : sdkPanels_)
+                                panel->clearModified();
+                        JLinkPort::instance().clearConfigModified();
+                        currentSessionPath_ = targetPath;
+                        isModified_         = false;
+                        isFirstSave_        = false;
+                        addRecent(targetPath);
+                }
         }
         size_t outLen = out ? strlen(out) : 0;
         cJSON_free(out);
@@ -637,6 +692,7 @@ Gui::loadSession(const std::string &path)
         u64 monitorStart = get_mono_ts_ms();
         monitors_.clear();
         vars_.clear();
+        bool sessionMigrated = false;
 
         // Resolve file paths that were stored relative to the .ava file back to
         // absolute paths. Already-absolute paths (old sessions) are used as-is.
@@ -658,12 +714,7 @@ Gui::loadSession(const std::string &path)
         std::vector<PendingImportSource> pendingImportSources;
 
         if (const cJSON *jlink = cJSON_GetObjectItem(root, "jlink")) {
-                if (const cJSON *dev = cJSON_GetObjectItem(jlink, "device"); cJSON_IsString(dev))
-                        JLinkPort::instance().setDeviceName(dev->valuestring);
-                if (const cJSON *spd = cJSON_GetObjectItem(jlink, "speedKHz"); cJSON_IsNumber(spd))
-                        JLinkPort::instance().setSpeed(spd->valueint);
-                if (const cJSON *p = cJSON_GetObjectItem(jlink, "hssPeriodUs"); cJSON_IsNumber(p))
-                        JLinkPort::instance().hssPeriodUs() = p->valueint;
+                JLinkPort::instance().loadSession(jlink);
                 if (const cJSON *hz = cJSON_GetObjectItem(jlink, "maxHssHz"); cJSON_IsNumber(hz))
                         g_maxHssHz.store(hz->valueint, std::memory_order_relaxed);
         }
@@ -720,8 +771,15 @@ Gui::loadSession(const std::string &path)
                         if (!cJSON_IsString(nameItem))
                                 continue;
                         std::string mName = nameItem->valuestring;
-                        monitors_[mName]  = std::make_shared<Monitor>(mName);
-                        Monitor *monitor  = monitors_[mName].get();
+                        if (mName.empty()) {
+                                size_t suffix = monitors_.size();
+                                do {
+                                        mName = "monitor_" + std::to_string(suffix++);
+                                } while (monitors_.find(mName) != monitors_.end());
+                                sessionMigrated = true;
+                        }
+                        monitors_[mName] = std::make_shared<Monitor>(mName);
+                        Monitor *monitor = monitors_[mName].get();
 
                         if (const cJSON *titleItem = cJSON_GetObjectItem(mItem, "title");
                             cJSON_IsString(titleItem) && titleItem->valuestring[0] != '\0') {
@@ -766,6 +824,15 @@ Gui::loadSession(const std::string &path)
                                 if (!cJSON_IsString(snItem))
                                         continue;
                                 std::string sName = snItem->valuestring;
+                                if (sName.empty()) {
+                                        size_t suffix = monitor->getScopes().size();
+                                        do {
+                                                sName = "scope_" + std::to_string(suffix++);
+                                        } while (monitor->getScopes().find(sName) != monitor->getScopes().end());
+                                        // Keep loading the legacy session instead of crashing or
+                                        // silently losing the scope and all of its channels.
+                                        sessionMigrated = true;
+                                }
                                 if (monitor->addScope(sName) != 0)
                                         continue;
                                 MonitorScope *scope = monitor->getScopes()[sName].get();
@@ -831,6 +898,13 @@ Gui::loadSession(const std::string &path)
                                         if (!cJSON_IsString(cnItem))
                                                 continue;
                                         std::string chName = cnItem->valuestring;
+                                        if (chName.empty()) {
+                                                size_t suffix = scope->getChannels().size();
+                                                do {
+                                                        chName = "channel_" + std::to_string(suffix++);
+                                                } while (scope->getChannels().find(chName) != scope->getChannels().end());
+                                                sessionMigrated = true;
+                                        }
                                         if (scope->addChannel(chName) != 0)
                                                 continue;
                                         MonitorChannel *ch = scope->findChannel(chName);
@@ -984,10 +1058,13 @@ Gui::loadSession(const std::string &path)
         // Tool page visibility
         if (const cJSON *v = cJSON_GetObjectItem(root, "showBode"); cJSON_IsBool(v))
                 bode_.show_ = cJSON_IsTrue(v);
+        bode_.loadSession(root);
+        bkpSramDebugger_.loadSession(root);
         if (const cJSON *v = cJSON_GetObjectItem(root, "showAsmViewer"); cJSON_IsBool(v))
                 asmViewer_.show_ = cJSON_IsTrue(v);
         if (const cJSON *v = cJSON_GetObjectItem(root, "showSeqEditor"); cJSON_IsBool(v))
                 seqEditor_.setOpen(cJSON_IsTrue(v));
+        midiTool_.load(root);
 
         // SDK panels
         sdkPanels_.clear();
@@ -1001,6 +1078,21 @@ Gui::loadSession(const std::string &path)
         // nextSdkWinId_ must be > any restored winId so new panels don't collide.
         if (const cJSON *n = cJSON_GetObjectItem(root, "nextSdkWinId"); cJSON_IsNumber(n))
                 nextSdkWinId_ = std::max(nextSdkWinId_, n->valueint);
+
+        bool deviceManagerLoaded = true;
+        if (const cJSON *dm = cJSON_GetObjectItem(root, "deviceManager"); cJSON_IsObject(dm))
+                deviceManagerLoaded = deviceManager_.load(dm, sdkBaseDir);
+        else
+                deviceManager_.clear();
+        deviceManager_.clearModified();
+        // Loading, compatibility migration and unavailable external bindings are not
+        // user edits.  Keep the loaded session clean; a later real edit will save the
+        // migrated representation naturally.
+        isModified_ = false;
+        if (!deviceManagerLoaded)
+                LOG_E("Device manager session data was only partially restored; session remains unmodified");
+        if (sessionMigrated)
+                LOG_I("Session compatibility migration applied in memory; session remains unmodified");
 
         for (auto &pair : monitors_)
                 pair.second->clearModified();
@@ -1044,6 +1136,8 @@ Gui::drawBar()
                         if (ImGui::MenuItem(tr("New Session", "新建会话"))) {
                                 monitors_.clear();
                                 vars_.clear();
+                                deviceManager_.clear();
+                                bkpSramDebugger_.resetSession();
                                 currentSessionPath_ = "session.ava";
                                 isModified_         = false;
                                 isFirstSave_        = true;
@@ -1123,9 +1217,19 @@ Gui::drawBar()
                 const bool toolsMenuOpen = ImGui::BeginMenu(tr("Tools", "工具"));
                 TutorialGuide::instance().mark("menu_tools");
                 if (toolsMenuOpen) {
+                        bool deviceManagerOpen = deviceManager_.isOpen();
+                        if (ImGui::MenuItem(tr("Device Manager", "设备管理器"), nullptr, &deviceManagerOpen))
+                                deviceManager_.setOpen(deviceManagerOpen);
                         ImGui::MenuItem(tr("Joint Calculator", "电机参数计算器"), nullptr, &showCalculator_);
                         ImGui::MenuItem(tr("Bode Plot", "伯德图"), nullptr, &bode_.show_);
                         ImGui::MenuItem(tr("Assembly Viewer", "汇编查看器"), nullptr, &asmViewer_.show_);
+                        if (ImGui::MenuItem(tr("SWO / ITM Trace", "SWO / ITM 跟踪")))
+                                JLinkPort::instance().openTraceWindow();
+                        if (ImGui::MenuItem(tr("BKP SRAM Capture", "BKP SRAM 实时采集")))
+                                bkpSramDebugger_.open();
+                        bool midiOpen = midiTool_.isOpen();
+                        if (ImGui::MenuItem(tr("MIDI Injection Parser", "MIDI 注入解析"), nullptr, &midiOpen))
+                                midiTool_.setOpen(midiOpen);
                         bool seqOpen = seqEditor_.isOpen();
                         if (ImGui::MenuItem(tr("Sequence Editor", "序列编辑器"), nullptr, &seqOpen)) {
                                 seqEditor_.setOpen(seqOpen);
@@ -1289,8 +1393,10 @@ Gui::drawBar()
                 {
                         int hssHz = g_maxHssHz.load(std::memory_order_relaxed);
                         ImGui::SetNextItemWidth(100);
-                        if (ImGui::SliderInt("##HssHz", &hssHz, 1, 50000, "%d Hz", ImGuiSliderFlags_Logarithmic))
+                        if (ImGui::SliderInt("##HssHz", &hssHz, 1, 50000, "%d Hz", ImGuiSliderFlags_Logarithmic)) {
                                 g_maxHssHz.store(hssHz, std::memory_order_relaxed);
+                                isModified_ = true;
+                        }
                         if (ImGui::IsItemDeactivatedAfterEdit())
                                 JLinkPort::instance().reqRestart();
                         if (ImGui::IsItemHovered())
@@ -1404,7 +1510,22 @@ Gui::loop()
                                         anyModified = true;
                                 }
                         }
-                        if (anyModified || isFirstSave_) {
+                        if (!anyModified && (JLinkPort::instance().isConfigModified() || bode_.isModified()))
+                                anyModified = true;
+                        if (!anyModified && deviceManager_.isModified())
+                                anyModified = true;
+                        if (!anyModified && bkpSramDebugger_.isModified())
+                                anyModified = true;
+                        if (!anyModified) {
+                                for (const auto &panel : sdkPanels_) {
+                                        if (panel->isModified()) {
+                                                anyModified = true;
+                                                break;
+                                        }
+                                }
+                        }
+                        LOG_I("Quit dirty check: modified=%d firstSave=%d", (int)anyModified, (int)isFirstSave_);
+                        if (anyModified) {
                                 glfwSetWindowShouldClose(window_, GLFW_FALSE);
                                 showQuitModal_ = true;
                         } else {
@@ -1436,6 +1557,7 @@ Gui::loop()
 
                         if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
                                 Monitor::clearAll();
+                                bkpSramDebugger_.requestClearData();
                                 LOG_I("Clear data triggered via Ctrl+R");
                         }
 
@@ -1465,6 +1587,11 @@ Gui::loop()
                 }
 
                 ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+
+                // Dockable J-Link tool windows must be submitted after their host
+                // dockspace. drawBar() only renders the toolbar controls.
+                JLinkPort::instance().drawWindows();
+                bkpSramDebugger_.draw();
 
                 // Kick off a one-time update check shortly after launch (throttled to
                 // once every 6h so repeated launches don't trip GitHub's rate limit).
@@ -1630,6 +1757,12 @@ Gui::loop()
                 bode_.updateDisplay();
                 asmViewer_.draw(this);
                 seqEditor_.draw();
+                deviceManager_.draw();
+                if (deviceManager_.consumeModified())
+                        isModified_ = true;
+                midiTool_.draw();
+                if (midiTool_.consumeModified())
+                        isModified_ = true;
 
                 // Draw SDK windows; prune closed ones.
                 for (auto &sp : sdkPanels_)
@@ -1644,12 +1777,24 @@ Gui::loop()
                 processPendingCsvImports();
 
                 for (const auto &file : sDroppedFiles_) {
-                        if (file.ends_with(".ava")) {
+                        std::string lowerFile = file;
+                        std::ranges::transform(
+                            lowerFile, lowerFile.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        const bool isNativeLibrary = lowerFile.ends_with(".dll") || lowerFile.ends_with(".so") ||
+                                                     lowerFile.ends_with(".dylib") ||
+                                                     lowerFile.find(".so.") != std::string::npos;
+                        const bool isNativeHeader = lowerFile.ends_with(".h") || lowerFile.ends_with(".hpp") ||
+                                                    lowerFile.ends_with(".hh") || lowerFile.ends_with(".hxx");
+
+                        if (lowerFile.ends_with(".ava")) {
                                 loadSession(file);
-                        } else if (file.ends_with(".dll") || file.ends_with(".h") || file.ends_with(".hpp")) {
+                        } else if (lowerFile.ends_with(".mid") || lowerFile.ends_with(".midi")) {
+                                midiTool_.loadFile(file);
+                        } else if (isNativeLibrary || isNativeHeader) {
                                 for (auto &sp : sdkPanels_)
                                         sp->pushDroppedFiles({file});
-                        } else if (file.ends_with(".csv") || file.ends_with(".CSV") || hasAudioExtension(file)) {
+                                deviceManager_.pushDroppedFiles({file});
+                        } else if (lowerFile.ends_with(".csv") || hasAudioExtension(file)) {
                                 const bool        isAudioImport = hasAudioExtension(file);
                                 std::error_code   absEc;
                                 const std::string importPath =
@@ -1864,6 +2009,23 @@ Gui::syncVariableProperties(Variable *var)
                                                 ch->setType(Parser::dataTypeToStr(v.type));
                                                 ch->setBitOffset(v.bitOffset);
                                                 ch->setBitSize(v.bitSize);
+                                        }
+
+                                        // Apply explicit sub-variable properties after the
+                                        // ELF-derived defaults, while retaining the canonical
+                                        // symbol path for future address re-resolution.
+                                        if (auto ovIt = v.memberOverrides.find(symbol); ovIt != v.memberOverrides.end()) {
+                                                const auto &ov = ovIt->second;
+                                                if (!ov.alias.empty())
+                                                        ch->setLabel(ov.alias);
+                                                if (ov.hasAddress) {
+                                                        ch->setAddr(ov.address);
+                                                        ch->setAddrUnknown(false);
+                                                }
+                                                if (ov.hasType)
+                                                        ch->setType(Parser::dataTypeToStr(ov.type));
+                                                if (ov.hasWritable)
+                                                        ch->setWritable(ov.writable);
                                         }
 
                                         const char *deviceName = "JLINK";
@@ -2248,7 +2410,8 @@ Gui::drawCalculator()
                 ImGui::TextUnformatted(tr("Refresh rate:", "刷新率:"));
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(100.0f);
-                ImGui::SliderInt("##effRefreshMs", &effRefreshMs, 10, 2000);
+                if (ImGui::SliderInt("##effRefreshMs", &effRefreshMs, 10, 2000))
+                        isModified_ = true;
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("Refresh (ms)", "刷新间隔(毫秒)"));
 

@@ -519,7 +519,8 @@ MonitorScope::tableDraw()
                         ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0, 0, 0, 0));
                         ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0, 0, 0, 0));
                         ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0, 0, 0, 0));
-                        bool open = ImGui::TreeNodeEx(label.c_str(), treeFlags);
+                        const char *treeLabel = label.empty() ? tr("Unnamed", "未命名") : label.c_str();
+                        bool        open      = ImGui::TreeNodeEx(treeLabel, treeFlags);
                         ImGui::PopStyleColor(3);
 
                         if (open != wasOpen) {
@@ -683,6 +684,13 @@ MonitorScope::drawTableRow(const std::string               &chName,
                 }
                 lastSelectedIndex_ = idx;
         }
+        // The visible row label is also a drop target. Requiring the cursor to
+        // land on the narrow "=" grip made adjacent downward drops easy to miss.
+        if (ImGui::BeginDragDropTarget()) {
+                if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE"))
+                        applyChannelMoveDrop(static_cast<ChannelMovePayload *>(mv->Data), chName);
+                ImGui::EndDragDropTarget();
+        }
         ImGui::PopStyleColor(3);
 
         if (ImGui::BeginPopupContextItem()) {
@@ -783,7 +791,6 @@ MonitorScope::drawTableRow(const std::string               &chName,
                         }
                 }
         }
-
         // 3. Type
         ImGui::TableNextColumn();
         ImGui::Text("%s", ch->getType().c_str());
@@ -1065,8 +1072,7 @@ MonitorScope::fftWorkerStep(std::mutex &monitorMtx)
 void
 MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode)
 {
-        bool isPaused = g_monitorPaused.load();
-        if (showFft_ && mode != MonitorViewMode::MANUAL && !isPaused) {
+        if (showFft_ && mode != MonitorViewMode::MANUAL) {
                 // We keep a single-shot auto-fit when NOT in manual mode?
                 // Actually the user said "NEVER align automatically even for the first time".
                 // But let's keep it linked to the mode. If they are in FOLLOW/FULL, it fits.
@@ -1095,7 +1101,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
 
                 // Add Y-axis margin in FULL mode by pushing style padding
                 bool pushedPadding = false;
-                if (mode == MonitorViewMode::FULL && !isPaused) {
+                if (mode == MonitorViewMode::FULL) {
                         ImPlot::PushStyleVar(ImPlotStyleVar_FitPadding, ImVec2(0, 0.1f)); // 10% vertical padding
                         pushedPadding = true;
                 }
@@ -1103,7 +1109,7 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                 if (showFft_) {
                         ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_None, ImPlotAxisFlags_None);
                 } else {
-                        yFlags = (mode == MonitorViewMode::FULL && !isPaused) ? ImPlotAxisFlags_AutoFit : ImPlotAxisFlags_None;
+                        yFlags = mode == MonitorViewMode::FULL ? ImPlotAxisFlags_AutoFit : ImPlotAxisFlags_None;
                         ImPlot::SetupAxes(nullptr, nullptr, ImPlotAxisFlags_None, yFlags);
                 }
 
@@ -1341,6 +1347,21 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 ImPlot::PlotLine(plotId.c_str(), (const f64 *)nullptr, (const f64 *)nullptr, 0);
                         }
 
+                        // Drag the legend label itself to move this channel to another
+                        // scope (including a scope owned by a different Monitor).
+                        if (ImPlot::BeginDragDropSourceItem(plotId.c_str())) {
+                                ChannelMovePayload payload{};
+                                payload.srcScope = this;
+                                payload.isGroup  = false;
+                                snprintf(payload.chName, sizeof(payload.chName), "%s", chName.c_str());
+                                ImGui::SetDragDropPayload("DND_CHANNEL_MOVE", &payload, sizeof(payload));
+                                ImPlot::ItemIcon(ImVec4(col[0], col[1], col[2], col[3]));
+                                ImGui::SameLine();
+                                ImGui::Text(ImGui::GetIO().KeyShift ? tr("Copy: %s", "复制: %s") : tr("Move: %s", "移动: %s"),
+                                            dispLabel.c_str());
+                                ImPlot::EndDragDropSource();
+                        }
+
                         // 4. Update Legend Toggle
                         if (ImPlotContext *gp = ImPlot::GetCurrentContext(); gp && gp->CurrentPlot) {
                                 if (ImPlotItem *item = gp->CurrentPlot->Items.GetItem(
@@ -1397,26 +1418,39 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 ImGui::Checkbox(tr("Markers", "标记点"), &ch->showMarkers());
                                 ImGui::Separator();
                                 ImGui::SetNextItemWidth(120);
-                                ImGui::DragFloat(tr("Gain##chg", "增益##chg"), &ch->getGain(), 0.001f, -1e6f, 1e6f, "%.4g");
+                                if (ImGui::DragFloat(tr("Gain##chg", "增益##chg"), &ch->getGain(), 0.001f, -1e6f, 1e6f, "%.4g"))
+                                        if (parent_)
+                                                parent_->setModified();
                                 if (ImGui::IsItemHovered())
                                         ImGui::SetTooltip("%s",
                                                           tr("Multiplier applied to all values (display & calculation)",
                                                              "所有数值的乘数（显示与计算均生效）"));
                                 ImGui::SameLine();
-                                if (ImGui::SmallButton(tr("Reset##gainrst", "重置##gainrst")))
+                                if (ImGui::SmallButton(tr("Reset##gainrst", "重置##gainrst"))) {
                                         ch->getGain() = 1.0f;
+                                        if (parent_)
+                                                parent_->setModified();
+                                }
                                 ImGui::SetNextItemWidth(120);
-                                ImGui::DragFloat(tr("Bias##chb", "偏置##chb"), &ch->getBias(), 0.001f, -1e6f, 1e6f, "%.4g");
+                                if (ImGui::DragFloat(tr("Bias##chb", "偏置##chb"), &ch->getBias(), 0.001f, -1e6f, 1e6f, "%.4g"))
+                                        if (parent_)
+                                                parent_->setModified();
                                 if (ImGui::IsItemHovered())
                                         ImGui::SetTooltip("%s",
                                                           tr("Offset added after gain (value * gain + bias)",
                                                              "增益之后叠加的偏置（数值 * 增益 + 偏置）"));
                                 ImGui::SameLine();
-                                if (ImGui::SmallButton(tr("Reset##biasrst", "重置##biasrst")))
+                                if (ImGui::SmallButton(tr("Reset##biasrst", "重置##biasrst"))) {
                                         ch->getBias() = 0.0f;
+                                        if (parent_)
+                                                parent_->setModified();
+                                }
                                 ImGui::SameLine();
-                                if (ImGui::SmallButton(tr("Zero##biaszero", "置零##biaszero")))
+                                if (ImGui::SmallButton(tr("Zero##biaszero", "置零##biaszero"))) {
                                         ch->getBias() -= ch->getDispVal();
+                                        if (parent_)
+                                                parent_->setModified();
+                                }
                                 if (ImGui::IsItemHovered())
                                         ImGui::SetTooltip("%s",
                                                           tr("Set bias so the current reading displays as 0",
@@ -1452,6 +1486,19 @@ MonitorScope::plotDraw(double *linkXMin, double *linkXMax, u32 maxDisplayPoints,
                                 }
 
                                 ImPlot::EndLegendPopup();
+                        }
+
+                        // Keep the channel swatch/curve color unchanged. Only highlight
+                        // the legend label when gain or bias differs from its default.
+                        if (ImPlotContext *gp = ImPlot::GetCurrentContext(); gp && gp->CurrentPlot) {
+                                if (ImPlotItem *item = gp->CurrentPlot->Items.GetItem(
+                                        ImPlot::GetCurrentPlot()->Items.GetItemID(plotId.c_str()))) {
+                                        const bool transformed =
+                                            std::abs(ch->getGain() - 1.0f) > 1e-6f || std::abs(ch->getBias()) > 1e-6f;
+                                        ImPlot::SetLegendTextColor(
+                                            item->ID,
+                                            transformed ? ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 0.82f, 0.20f, 1.0f)) : 0);
+                                }
                         }
                 }
                 ImPlot::EndPlot();
@@ -1576,8 +1623,10 @@ MonitorScope::reorderChannelTo(const std::string &src, const std::string &dst)
 
         std::string moved = keys[sidx];
         keys.erase(keys.begin() + sidx);
-        if (didx > sidx)
-                --didx;
+        // didx is the destination row in the original list. After removing an
+        // earlier source, inserting at that same numeric index places the item
+        // after the destination row, which is the expected one-step downward
+        // swap. Decrementing didx here would put adjacent items back unchanged.
         keys.insert(keys.begin() + didx, moved);
 
         for (int i = 0; i < (int)keys.size(); ++i)
@@ -1660,6 +1709,8 @@ MonitorScope::reorderGroupBefore(const std::string &srcGroup, const std::string 
 int
 MonitorScope::addChannel(const std::string &chName)
 {
+        if (chName.empty())
+                return -1;
         if (chs_.find(chName) != chs_.end())
                 return -1;
         auto ch = std::make_shared<MonitorChannel>(chName);
@@ -1718,7 +1769,10 @@ MonitorScope::dropTarget()
                         return;
         }
 
-        if (ImGui::BeginDragDropTarget()) {
+        ImGuiWindow  *window = ImGui::GetCurrentWindow();
+        const ImRect  targetRect(window->InnerRect.Min, window->InnerRect.Max);
+        const ImGuiID targetId = window->GetID("##scope_channel_drop_target");
+        if (ImGui::BeginDragDropTargetCustom(targetRect, targetId)) {
                 if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("CHANNEL")) {
                         if (payload->DataSize == sizeof(ChannelDropPayload)) {
                                 auto *chPayload = static_cast<ChannelDropPayload *>(payload->Data);
@@ -1809,17 +1863,18 @@ MonitorScope::dropTarget()
                 }
 
                 if (const ImGuiPayload *payload = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE"))
-                        moveChannelsFrom(static_cast<ChannelMovePayload *>(payload->Data));
+                        moveChannelsFrom(static_cast<ChannelMovePayload *>(payload->Data), ImGui::GetIO().KeyShift);
                 ImGui::EndDragDropTarget();
         }
 }
 
-void
-MonitorScope::moveChannelsFrom(ChannelMovePayload *data)
+bool
+MonitorScope::moveChannelsFrom(ChannelMovePayload *data, bool copy)
 {
         if (!data || data->srcScope == this)
-                return;
-        auto &src = data->srcScope->getChannels();
+                return false;
+        auto &src      = data->srcScope->getChannels();
+        bool  movedAny = false;
         if (data->isGroup) {
                 // Move every channel under the group: key == prefix or "prefix.".
                 const std::string        exact  = data->chName;
@@ -1828,22 +1883,43 @@ MonitorScope::moveChannelsFrom(ChannelMovePayload *data)
                 for (auto &[k, _] : src)
                         if (k == exact || k.rfind(prefix, 0) == 0)
                                 toMove.push_back(k);
+                std::sort(toMove.begin(), toMove.end(), [&](const std::string &a, const std::string &b) {
+                        const i64 oa = src[a]->getOrder(), ob = src[b]->getOrder();
+                        return oa != ob ? oa < ob : a < b;
+                });
                 for (auto &k : toMove) {
                         auto it = src.find(k);
-                        if (it != src.end()) {
-                                this->getChannels()[k] = std::move(it->second);
-                                src.erase(it);
+                        if (it != src.end() && chs_.find(k) == chs_.end()) {
+                                auto channel = copy ? it->second->cloneWithHistory() : std::move(it->second);
+                                channel->setOrder(nextChannelOrder_++);
+                                if (copy && channel->getDevice() == "SHM")
+                                        shmInit(*channel);
+                                this->getChannels()[k] = std::move(channel);
+                                if (!copy)
+                                        src.erase(it);
+                                movedAny = true;
                         }
                 }
         } else {
                 auto it = src.find(data->chName);
-                if (it != src.end()) {
-                        this->getChannels()[data->chName] = std::move(it->second);
-                        src.erase(it);
+                if (it != src.end() && chs_.find(data->chName) == chs_.end()) {
+                        auto channel = copy ? it->second->cloneWithHistory() : std::move(it->second);
+                        channel->setOrder(nextChannelOrder_++);
+                        if (copy && channel->getDevice() == "SHM")
+                                shmInit(*channel);
+                        this->getChannels()[data->chName] = std::move(channel);
+                        if (!copy)
+                                src.erase(it);
+                        movedAny = true;
                 }
         }
+        if (!movedAny)
+                return false;
+        if (!copy && data->srcScope->parent_)
+                data->srcScope->parent_->setModified();
         if (parent_)
                 parent_->setModified();
+        return true;
 }
 
 void
@@ -1852,6 +1928,8 @@ MonitorScope::applyChannelMoveDrop(ChannelMovePayload *data, const std::string &
         if (!data)
                 return;
         if (data->srcScope == this) {
+                if (ImGui::GetIO().KeyShift)
+                        return; // same scope already contains the channel; copying would collide by name
                 if (data->isGroup)
                         reorderGroupBefore(data->chName, dst);
                 else
@@ -1860,7 +1938,8 @@ MonitorScope::applyChannelMoveDrop(ChannelMovePayload *data, const std::string &
         }
         const bool        movedGroup = data->isGroup;
         const std::string movedName  = data->chName;
-        moveChannelsFrom(data);
+        if (!moveChannelsFrom(data, ImGui::GetIO().KeyShift))
+                return;
         if (movedGroup)
                 reorderGroupBefore(movedName, dst);
         else
@@ -1909,6 +1988,11 @@ Monitor::menu()
 int
 Monitor::addScope(const std::string &scopeName)
 {
+        // Scope names are also used by persistence and drag/drop.  Never admit an
+        // empty key: old/corrupt sessions used to pass it to ImGui::BeginChild("")
+        // and trip ImGui's empty-root-ID assertion during application startup.
+        if (scopeName.empty())
+                return -1;
         if (scopes_.find(scopeName) != scopes_.end())
                 return -1;
         auto scope = std::make_shared<MonitorScope>(scopeName);
@@ -1937,7 +2021,9 @@ Monitor::updateDisplay()
         bool open = true;
         // "VisibleTitle###name_": the visible label tracks the user-editable title
         // while the trailing id keeps the ImGui window id (and dock layout) stable.
-        const std::string winLabel = getTitle() + "###" + name_;
+        const std::string stableName   = name_.empty() ? "monitor_" + std::to_string(reinterpret_cast<uintptr_t>(this)) : name_;
+        const std::string visibleTitle = getTitle().empty() ? tr("Variable Monitor", "变量监视器") : getTitle();
+        const std::string winLabel     = visibleTitle + "###" + stableName;
         if (ImGui::Begin(winLabel.c_str(), &open, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
                 if (!open)
                         markPendingDelete();
@@ -2178,8 +2264,10 @@ Monitor::updateDisplay()
                 tbFlow(120);
                 ImGui::SetNextItemWidth(120);
                 f32 h = historySeconds_;
-                if (ImGui::SliderFloat("##History", &h, 0.0f, 3600.0f, "%.1f s", ImGuiSliderFlags_Logarithmic))
+                if (ImGui::SliderFloat("##History", &h, 0.0f, 3600.0f, "%.1f s", ImGuiSliderFlags_Logarithmic)) {
                         historySeconds_ = h;
+                        isModified_     = true;
+                }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("History(s)", "历史时长(秒)"));
                 // Sync to all channels every frame to ensure newly added channels inherit the setting immediately
@@ -2190,8 +2278,10 @@ Monitor::updateDisplay()
                 tbFlow(120);
                 ImGui::SetNextItemWidth(120);
                 i32 maxPts = static_cast<i32>(maxDisplayPoints_);
-                if (ImGui::SliderInt("##MaxPts", &maxPts, 100, 100000, "%d pts", ImGuiSliderFlags_Logarithmic))
+                if (ImGui::SliderInt("##MaxPts", &maxPts, 100, 100000, "%d pts", ImGuiSliderFlags_Logarithmic)) {
                         maxDisplayPoints_ = static_cast<u32>(maxPts);
+                        isModified_       = true;
+                }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s", tr("Max Pts", "最大显示点数"));
 
@@ -2200,7 +2290,8 @@ Monitor::updateDisplay()
                 if (samplingMode_ == SamplingMode::POLL) {
                         tbFlow(120);
                         ImGui::SetNextItemWidth(120);
-                        ImGui::SliderInt("##MaxHz", &maxSampleHz_, 1, 50000, "%d Hz", ImGuiSliderFlags_Logarithmic);
+                        if (ImGui::SliderInt("##MaxHz", &maxSampleHz_, 1, 50000, "%d Hz", ImGuiSliderFlags_Logarithmic))
+                                isModified_ = true;
                         if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("%s",
                                                   tr("POLL sample rate (Hz). Limited by USB latency (~1-2 kHz).",
@@ -2340,20 +2431,21 @@ Monitor::updateDisplay()
 
                 // Drive linkXMin_ / linkXMax_ from the view mode (also once per frame).
                 if (viewMode_ == MonitorViewMode::FULL) {
-                        if (!isPaused) {
-                                if (hasData) {
-                                        if (latest < dataStartTime_)
-                                                latest = dataStartTime_;
-                                        linkXMin_ = earliest;
-                                        linkXMax_ = latest;
-                                        if (linkXMax_ - linkXMin_ < 1.0)
-                                                linkXMax_ = linkXMin_ + 1.0;
-                                } else {
-                                        linkXMin_ = dataStartTime_;
-                                        linkXMax_ = dataStartTime_ + 1.0;
-                                }
-                                lastNow_ = now;
+                        // FULL is a view operation, so it must remain available while
+                        // display publishing is paused. In that state read_ is already
+                        // frozen; recomputing its bounds changes only the viewport.
+                        if (hasData) {
+                                if (latest < dataStartTime_)
+                                        latest = dataStartTime_;
+                                linkXMin_ = earliest;
+                                linkXMax_ = latest;
+                                if (linkXMax_ - linkXMin_ < 1.0)
+                                        linkXMax_ = linkXMin_ + 1.0;
+                        } else {
+                                linkXMin_ = dataStartTime_;
+                                linkXMax_ = dataStartTime_ + 1.0;
                         }
+                        lastNow_ = now;
                 } else if (!isPaused && (JLinkPort::instance().isHssRunning() || samplingMode_ == SamplingMode::POLL)) {
                         // FOLLOW mode: don't auto-update while the user is interacting with the plot.
                         if (viewMode_ == MonitorViewMode::FOLLOW && !ImGui::IsMouseDown(ImGuiMouseButton_Left) &&
@@ -2384,7 +2476,11 @@ Monitor::updateDisplay()
 
                                 float childHeight =
                                     scope->isHidden() ? (ImGui::GetFrameHeightWithSpacing() + 15.0f) : scope->getHeight();
-                                if (ImGui::BeginChild(keys[i].c_str(), ImVec2(innerW, childHeight), true)) {
+                                // The visible scope name must not be the child-window ID.  Besides
+                                // allowing legacy empty names to crash, renaming a scope discarded
+                                // its ImGui state.  The scope object has a stable lifetime/address.
+                                ImGui::PushID(static_cast<const void *>(scope.get()));
+                                if (ImGui::BeginChild("##scope", ImVec2(innerW, childHeight), true)) {
                                         scope->menu();
 
                                         if (!scope->isHidden()) {
@@ -2395,8 +2491,26 @@ Monitor::updateDisplay()
                                                 }
                                         }
                                         scope->dropTarget();
+
+                                        // Scope-level pause is independent from the monitor
+                                        // master pause. Highlight only this scope's child area.
+                                        if (scope->isPaused()) {
+                                                ImGuiWindow *scopeWindow = ImGui::GetCurrentWindow();
+                                                ImRect       scopeRect(scopeWindow->Pos,
+                                                                 ImVec2(scopeWindow->Pos.x + scopeWindow->Size.x,
+                                                                        scopeWindow->Pos.y + scopeWindow->Size.y));
+                                                scopeRect.Expand(-1.5f);
+                                                ImGui::GetForegroundDrawList(scopeWindow->Viewport)
+                                                    ->AddRect(scopeRect.Min,
+                                                              scopeRect.Max,
+                                                              ImGui::GetColorU32(ImVec4(1.0f, 0.78f, 0.18f, 1.0f)),
+                                                              1.5f,
+                                                              0,
+                                                              3.0f);
+                                        }
                                 }
                                 ImGui::EndChild();
+                                ImGui::PopID();
 
                                 if (i + 1 < keys.size()) {
                                         ImGui::PushID(static_cast<i32>(i));
@@ -2474,6 +2588,20 @@ Monitor::updateDisplay()
                         needsLayout_ = true;
                         for (auto &pair : scopes_)
                                 pair.second->setManual(false);
+                }
+
+                // Match BKP SRAM: pausing the shared monitor stream highlights
+                // the complete leaf dock (including the tab bar), while normal
+                // sampling has no persistent border.
+                if (g_monitorPaused.load(std::memory_order_acquire) || isSamplingPaused()) {
+                        ImGuiWindow *window = ImGui::GetCurrentWindow();
+                        ImRect       rect =
+                            window->DockNode
+                                      ? window->DockNode->Rect()
+                                      : ImRect(window->Pos, ImVec2(window->Pos.x + window->Size.x, window->Pos.y + window->Size.y));
+                        rect.Expand(-1.5f);
+                        ImGui::GetForegroundDrawList(window->Viewport)
+                            ->AddRect(rect.Min, rect.Max, ImGui::GetColorU32(ImVec4(1.0f, 0.78f, 0.18f, 1.0f)), 1.5f, 0, 3.0f);
                 }
         }
         ImGui::End();

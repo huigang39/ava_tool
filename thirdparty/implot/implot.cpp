@@ -626,6 +626,12 @@ int LegendSortingComp(const void* _a, const void* _b) {
     return strcmp(label_a,label_b);
 }
 
+static ImGuiStorage GImPlotLegendTextColors;
+
+void SetLegendTextColor(ImGuiID item_id, ImU32 color) {
+    GImPlotLegendTextColors.SetInt(item_id, static_cast<int>(color));
+}
+
 bool ShowLegendEntries(ImPlotItemGroup& items, const ImRect& legend_bb, bool hovered, const ImVec2& pad, const ImVec2& spacing, bool vertical, ImDrawList& DrawList) {
     // vars
     const float txt_ht      = ImGui::GetTextLineHeight();
@@ -668,6 +674,9 @@ bool ShowLegendEntries(ImPlotItemGroup& items, const ImRect& legend_bb, bool hov
         label_bb.Max = top_left + ImVec2(label_width + icon_size, icon_size);
         ImU32 col_txt_hl;
         ImU32 col_item = ImAlphaU32(item->Color,1);
+        const ImU32 legend_text_color = static_cast<ImU32>(GImPlotLegendTextColors.GetInt(item->ID, 0));
+        ImU32 col_item_txt = legend_text_color != 0 ? legend_text_color : col_txt;
+        ImU32 col_item_txt_dis = ImAlphaU32(col_item_txt, 0.25f);
 
         ImRect button_bb(icon_bb.Min, label_bb.Max);
 
@@ -691,11 +700,11 @@ bool ShowLegendEntries(ImPlotItemGroup& items, const ImRect& legend_bb, bool hov
             item->LegendHoverRect.Min = icon_bb.Min;
             item->LegendHoverRect.Max = label_bb.Max;
             item->LegendHovered = true;
-            col_txt_hl = ImMixU32(col_txt, col_item, 64);
+            col_txt_hl = ImMixU32(col_item_txt, col_item, 64);
             any_item_hovered = true;
         }
         else {
-            col_txt_hl = ImGui::GetColorU32(col_txt);
+            col_txt_hl = ImGui::GetColorU32(col_item_txt);
         }
         ImU32 col_icon;
         if (item_hld)
@@ -708,7 +717,7 @@ bool ShowLegendEntries(ImPlotItemGroup& items, const ImRect& legend_bb, bool hov
         DrawList.AddRectFilled(icon_bb.Min, icon_bb.Max, col_icon);
         const char* text_display_end = ImGui::FindRenderedTextEnd(label, nullptr);
         if (label != text_display_end)
-            DrawList.AddText(top_left + ImVec2(icon_size, 0), item->Show ? col_txt_hl  : col_txt_dis, label, text_display_end);
+            DrawList.AddText(top_left + ImVec2(icon_size, 0), item->Show ? col_txt_hl : col_item_txt_dis, label, text_display_end);
     }
     return hovered && !any_item_hovered;
 }

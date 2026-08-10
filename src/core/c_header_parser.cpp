@@ -177,8 +177,8 @@ static const std::unordered_map<std::string, CType> kTypeTable = {
     {"int32_t", CType::I32},
     {"signed", CType::I32},
     {"signed int", CType::I32},
-    {"long", CType::I32},
-    {"long int", CType::I32},
+    {"long", sizeof(long) == 8 ? CType::I64 : CType::I32},
+    {"long int", sizeof(long) == 8 ? CType::I64 : CType::I32},
     {"long long", CType::I64},
     {"long long int", CType::I64},
     {"int64_t", CType::I64},
@@ -192,8 +192,8 @@ static const std::unordered_map<std::string, CType> kTypeTable = {
     {"unsigned", CType::U32},
     {"unsigned int", CType::U32},
     {"uint32_t", CType::U32},
-    {"unsigned long", CType::U32},
-    {"unsigned long int", CType::U32},
+    {"unsigned long", sizeof(unsigned long) == 8 ? CType::U64 : CType::U32},
+    {"unsigned long int", sizeof(unsigned long) == 8 ? CType::U64 : CType::U32},
     {"unsigned long long", CType::U64},
     {"unsigned long long int", CType::U64},
     {"uint64_t", CType::U64},
@@ -275,11 +275,18 @@ splitReturnAndName(const std::string &s, std::string &retRaw, std::string &name)
 // ─── parameter list ────────────────────────────────────────────────────────────
 
 static std::vector<CParam>
-parseParams(const std::string &paramStr)
+parseParams(const std::string &paramStr, bool *isVariadic = nullptr)
 {
         std::vector<CParam> out;
         std::string         s = trim(paramStr);
-        if (s.empty() || s == "void" || s == "...")
+        if (isVariadic)
+                *isVariadic = false;
+        if (s == "...") {
+                if (isVariadic)
+                        *isVariadic = true;
+                return out;
+        }
+        if (s.empty() || s == "void")
                 return out;
 
         std::vector<std::string> parts;
@@ -300,8 +307,13 @@ parseParams(const std::string &paramStr)
         }
 
         for (auto &p : parts) {
-                if (p.empty() || p == "...")
+                if (p.empty())
                         continue;
+                if (p == "...") {
+                        if (isVariadic)
+                                *isVariadic = true;
+                        continue;
+                }
                 CParam      param;
                 std::string retRaw, pname;
                 if (splitReturnAndName(p, retRaw, pname)) {
@@ -401,7 +413,7 @@ parseHeader(const std::string &src)
                 fd.name    = std::move(funcName);
                 fd.retRaw  = retRaw;
                 fd.retType = normalizeType(retRaw);
-                fd.params  = parseParams(paramStr);
+                fd.params  = parseParams(paramStr, &fd.isVariadic);
                 result.push_back(std::move(fd));
         }
         return result;
@@ -1418,7 +1430,7 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
                                         fd.name    = std::move(funcName);
                                         fd.retRaw  = retRaw;
                                         fd.retType = normalizeTypeCpp(retRaw);
-                                        fd.params  = parseParams(ps);
+                                        fd.params  = parseParams(ps, &fd.isVariadic);
                                         result.functions.push_back(std::move(fd));
                                 }
                         }
@@ -1574,7 +1586,7 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
                                 fd.name    = std::move(funcName);
                                 fd.retRaw  = retRaw;
                                 fd.retType = normalizeTypeCpp(retRaw);
-                                fd.params  = parseParams(ps);
+                                fd.params  = parseParams(ps, &fd.isVariadic);
                                 result.functions.push_back(std::move(fd));
                         }
                 }

@@ -2,18 +2,23 @@
  * @file  jlink_port.hpp
  * @brief JLinkPort — SEGGER J-Link debug probe communication port.
  *
- * Singleton that wraps the J-Link SDK for memory read/write and HSS
- * (High-Speed Sampling) streaming. All J-Link API calls are serialised
- * through a FairMutex to avoid USB contention.
+ * Singleton that wraps the J-Link SDK for memory read/write, HSS
+ * (High-Speed Sampling), and SEGGER RTT. All J-Link API calls
+ * are
+ * serialised through a FairMutex to avoid USB contention.
  */
 #ifndef JLINK_PORT_HPP
 #define JLINK_PORT_HPP
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "module.h"
@@ -72,8 +77,9 @@ class JLinkPort
 
         static JLinkPort &instance();
 
-        bool isOpen() const { return isOpen_; }
-        bool isConnected() const { return isConnected_; }
+        bool isOpen() const { return isOpen_.load(std::memory_order_acquire); }
+        bool isConnected() const { return isConnected_.load(std::memory_order_acquire); }
+        u64  targetEpoch() const { return targetEpoch_.load(std::memory_order_acquire); }
 
         bool open();
         void close();
@@ -88,6 +94,9 @@ class JLinkPort
         bool isBusy() const { return busy_.load(std::memory_order_acquire); }
         bool readMem(u32 addr, u32 numBytes, void *dst);
         bool writeMem(u32 addr, u32 numBytes, const void *src);
+        // Atomically with respect to other host-side J-Link operations, preserve
+        // every bit outside [bitOffset, bitOffset + bitSize) in the storage unit.
+        bool writeMemBitfield(u32 addr, u32 numBytes, const void *encodedValue, u32 bitOffset, u32 bitSize);
 
         u32  readReg(u32 regIndex);
         bool isHalted();
@@ -119,14 +128,29 @@ class JLinkPort
         void setDeviceName(const std::string &n)
         {
                 std::lock_guard lk(cfgMtx_);
-                deviceName_ = n;
+                if (deviceName_ != n) {
+                        deviceName_ = n;
+                        configModified_.store(true, std::memory_order_release);
+                }
         }
-        int         speed() const { return speedKHz_.load(std::memory_order_relaxed); }
-        void        setSpeed(int s) { speedKHz_.store(s, std::memory_order_relaxed); }
+        int  speed() const { return speedKHz_.load(std::memory_order_relaxed); }
+        void setSpeed(int s)
+        {
+                if (speedKHz_.exchange(s, std::memory_order_relaxed) != s)
+                        configModified_.store(true, std::memory_order_release);
+        }
         int        &hssPeriodUs() { return hssPeriodUs_; }
         std::string lastError() const;
 
         void drawUI();
+        void drawWindows();
+        void openTraceWindow();
+        void configureDwtWriteTrace(u32 address, u32 size, const std::string &name);
+        void setTraceAddressResolver(std::function<std::string(u32)> resolver);
+        void saveSession(void *node) const;
+        void loadSession(const void *node);
+        bool isConfigModified() const { return configModified_.load(std::memory_order_acquire); }
+        void clearConfigModified() { configModified_.store(false, std::memory_order_release); }
 
       private:
         JLinkPort() = default;
@@ -135,14 +159,25 @@ class JLinkPort
         mutable FairMutex  mtx_{};       // serialises J-Link SDK I/O (held during slow reads)
         mutable std::mutex cfgMtx_{};    // guards deviceName_ only (never held during I/O)
         std::atomic<bool>  busy_{false}; // an async connect/disconnect/reset is in flight
-        bool               isOpen_{false};
-        bool               isConnected_{false};
-        std::string        deviceName_{""};
-        std::atomic<int>   speedKHz_{4000};
-        std::string        lastErr_{};
+        std::atomic<bool>  isOpen_{false};
+        std::atomic<bool>  isConnected_{false};
+        // Incremented after every successful target connection/reset. Clients
+        // whose target-side control blocks live in volatile RAM use this to
+        // re-submit their configuration after the MCU has restarted.
+        std::atomic<u64>  targetEpoch_{0};
+        std::string       deviceName_{""};
+        std::atomic<int>  speedKHz_{4000};
+        std::atomic<bool> configModified_{false};
+        std::string       lastErr_{};
 
         static constexpr int kMaxReadFails = 10;
         std::atomic<int>     readFailCount_{0};
+        // The public flags can be cleared after a USB/firmware-update failure
+        // while the J-Link DLL still owns its old USB session. The next connect
+        // must close that SDK session even though isOpen_ is already false.
+        std::atomic<bool> sdkSessionDirty_{false};
+
+        void recordTransportResultLocked(bool success, const char *operation);
 
         bool              hssRunning_{false};
         int               hssPeriodUs_{1000};
@@ -151,27 +186,129 @@ class JLinkPort
         std::atomic<u64>  totalPoints_{0};
         std::atomic<bool> hssReqRestart_{false};
 
-        char                     vcomPort_[32]{"COM3"};
-        char                     vcomTxBuf_[512]{};
-        std::atomic<int>         vcomBaud_{115200};
-        std::atomic<bool>        vcomOpen_{false};
-        std::atomic<bool>        vcomReaderRunning_{false};
-        void                    *vcomHandle_{nullptr};
-        std::thread              vcomThread_{};
-        mutable std::mutex       vcomMtx_{};
-        mutable std::mutex       vcomRxMtx_{};
-        std::string              vcomRxLog_{};
-        std::vector<std::string> vcomPortList_{};
-        std::vector<std::string> vcomPortLabels_{};
-        int                      vcomSelectedPort_{-1};
+        enum class RttStatus { Stopped, Searching, Running, UpChannelUnavailable, Disconnected, Error };
 
-        bool        vcomOpen();
-        bool        vcomRefreshPorts(bool preferJLink = true);
-        void        vcomClose();
-        bool        vcomSend(const char *text);
-        std::string vcomRxSnapshot() const;
-        void        vcomClearRx();
-        void        drawVComPopup();
+        char                    rttControlBlock_[32]{};
+        char                    rttTxBuf_[512]{};
+        int                     rttUpChannel_{0};
+        int                     rttDownChannel_{0};
+        bool                    rttAppendNewline_{true};
+        bool                    rttWindowOpen_{false};
+        bool                    rttWindowFocusRequested_{false};
+        bool                    rttAutoScroll_{true};
+        float                   rttLastScrollY_{0.0f};
+        std::atomic<bool>       rttActive_{false};
+        std::atomic<bool>       rttReaderRunning_{false};
+        std::atomic<RttStatus>  rttStatus_{RttStatus::Stopped};
+        std::atomic<int>        rttUpBufferCount_{-1};
+        std::atomic<int>        rttDownBufferCount_{-1};
+        std::atomic<u64>        rttRxBytes_{0};
+        std::atomic<u64>        rttTxBytes_{0};
+        std::thread             rttThread_{};
+        mutable std::mutex      rttLifecycleMtx_{};
+        mutable std::mutex      rttDataMtx_{};
+        mutable std::mutex      rttWakeMtx_{};
+        std::condition_variable rttWakeCv_{};
+        std::string             rttRxLog_{};
+        std::string             rttTxPending_{};
+        std::string             rttError_{};
+
+        bool        rttStart();
+        void        rttStop();
+        void        rttStopImpl(); // caller holds rttLifecycleMtx_
+        void        rttReaderLoop();
+        bool        rttSend(const char *data, usize size);
+        std::string rttRxSnapshot() const;
+        std::string rttErrorSnapshot() const;
+        usize       rttTxPendingBytes() const;
+        void        rttClearRx();
+        void        setRttError(const std::string &error);
+        void        drawRttWindow();
+
+        enum class SwoStatus { Stopped, Running, Disconnected, Error };
+        enum class TraceEventKind { PcSample, Exception, DataWrite };
+
+        struct TraceEvent {
+                TraceEventKind kind{TraceEventKind::Exception};
+                double         timeUs{0.0};
+                u32            pc{0};
+                u64            value{0};
+                u16            exceptionNumber{0};
+                u8             action{0};
+                u8             valueSize{0};
+        };
+
+        // Avoid J-Link's blocking CPU-clock auto measurement on STM32H7.
+        int                                   swoCpuMHz_{200};
+        int                                   swoSpeedKHz_{1000};
+        int                                   swoItmPort_{0};
+        int                                   swoActivePort_{0};
+        bool                                  swoExceptionTrace_{true};
+        bool                                  swoPcSampling_{true};
+        int                                   swoPcSampleRate_{1};
+        bool                                  swoWatchWrite_{false};
+        char                                  swoWatchAddress_[24]{"0x20000000"};
+        char                                  swoWatchName_[128]{};
+        int                                   swoWatchSize_{4};
+        bool                                  swoWindowOpen_{false};
+        bool                                  swoWindowFocusRequested_{false};
+        bool                                  swoAutoScroll_{true};
+        float                                 swoLastScrollY_{0.0f};
+        bool                                  swoTimelineFollow_{true};
+        int                                   swoTimelineScrollFrames_{3};
+        std::atomic<bool>                     swoActive_{false};
+        std::atomic<bool>                     swoReaderRunning_{false};
+        std::atomic<SwoStatus>                swoStatus_{SwoStatus::Stopped};
+        std::atomic<u64>                      swoRxBytes_{0};
+        std::atomic<u64>                      swoOverflowPackets_{0};
+        std::thread                           swoThread_{};
+        mutable std::mutex                    swoLifecycleMtx_{};
+        mutable std::mutex                    swoDataMtx_{};
+        mutable std::mutex                    swoWakeMtx_{};
+        std::condition_variable               swoWakeCv_{};
+        std::string                           swoTextLog_{};
+        std::vector<u8>                       swoDecodePending_{};
+        std::deque<TraceEvent>                swoEvents_{};
+        std::vector<TraceEvent>               swoTimelineView_{};
+        std::unordered_map<u32, u64>          swoPcSamples_{};
+        u64                                   swoPcSampleTotal_{0};
+        u32                                   swoLastWatchPc_{0};
+        double                                swoLastTimelineUs_{0.0};
+        std::chrono::steady_clock::time_point swoStartTime_{};
+        std::string                           swoError_{};
+        std::function<std::string(u32)>       traceAddressResolver_{};
+
+        bool swoTargetStateSaved_{false};
+        bool swoWatchStateSaved_{false};
+        bool swoUsesStm32H7SystemSwo_{false};
+        u32  swoSavedDemcr_{0};
+        u32  swoSavedDwtCtrl_{0};
+        u32  swoSavedDwtCyccnt_{0};
+        u32  swoSavedItmTcr_{0};
+        u32  swoSavedTpiuAcpr_{0};
+        u32  swoSavedTpiuSppr_{0};
+        u32  swoSavedTpiuFfcr_{0};
+        u32  swoSavedH7DbgMcuCr_{0};
+        u32  swoSavedH7SwoCodr_{0};
+        u32  swoSavedH7SwoSppr_{0};
+        u32  swoSavedH7SwtfCtrl_{0};
+        u32  swoSavedDwtComp0_{0};
+        u32  swoSavedDwtMask0_{0};
+        u32  swoSavedDwtFunction0_{0};
+
+        bool        swoStart();
+        void        swoStop();
+        void        swoStopImpl(); // caller holds swoLifecycleMtx_
+        void        swoReaderLoop();
+        void        swoConsumeRaw(const u8 *data, usize size);
+        bool        swoConfigureHardwareLocked();
+        void        swoRestoreHardwareLocked();
+        std::string resolveTraceAddress(u32 address) const;
+        std::string swoTextSnapshot() const;
+        std::string swoErrorSnapshot() const;
+        void        swoClear();
+        void        setSwoError(const std::string &error);
+        void        drawSwoTraceWindow();
 
       public:
         void reqRestart() { hssReqRestart_.store(true); }

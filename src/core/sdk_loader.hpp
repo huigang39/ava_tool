@@ -32,7 +32,8 @@ class SdkLoader
 
         // ── C function call ──────────────────────────────────────────────────
         // argStrs[i] corresponds to decl.params[i].
-        CallResult call(const CFuncDecl &decl, const std::vector<std::string> &argStrs);
+        CallResult
+        call(const CFuncDecl &decl, const std::vector<std::string> &argStrs, const std::vector<void *> &pointerOverrides = {});
 
         // ── C++ method call ──────────────────────────────────────────────────
         // thisPtr    : pointer to the class instance (nullptr for static/ctor)

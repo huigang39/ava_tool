@@ -4,24 +4,16 @@
  */
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <limits>
 #include <thread>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-
-#include <devguid.h>
-#include <setupapi.h>
-#endif
-
+#include "cJSON.h"
 #include "imgui.h"
 
 #include "app_log.hpp"
@@ -39,7 +31,8 @@ JLinkPort::instance()
 
 JLinkPort::~JLinkPort()
 {
-        vcomClose();
+        swoStop();
+        rttStop();
 }
 
 bool
@@ -53,14 +46,23 @@ JLinkPort::open()
         if (err && err[0]) {
                 lastErr_ = err;
                 isOpen_  = false;
+                // Open() may have created a partial SDK session before failing
+                // (notably while a probe firmware update is re-enumerating USB).
+                JLINKARM_Close();
+                sdkSessionDirty_.store(false, std::memory_order_release);
                 LOG_E("JLinkPort::open() FAILED: %s", err);
                 return false;
         }
         isOpen_ = JLINKARM_IsOpen() != 0;
         if (!isOpen_) {
                 lastErr_ = "JLINKARM_Open returned but IsOpen is false";
+                // Treat this as a partial open as well. Leaving it alive makes
+                // every later Open() observe the same stale SDK state.
+                JLINKARM_Close();
+                sdkSessionDirty_.store(false, std::memory_order_release);
                 LOG_E("JLinkPort::open() FAILED: IsOpen is false");
         } else {
+                sdkSessionDirty_.store(false, std::memory_order_release);
                 LOG_I("JLinkPort::open() SUCCEEDED");
         }
         return isOpen_;
@@ -69,37 +71,38 @@ JLinkPort::open()
 void
 JLinkPort::close()
 {
+        // RTT uses the same J-Link DLL session. Keep its lifecycle lock until the
+        // probe is closed so a GUI START cannot race between RTT STOP and Close().
+        std::unique_lock rttLifecycle(rttLifecycleMtx_);
+        rttStopImpl();
+        std::unique_lock swoLifecycle(swoLifecycleMtx_);
+        swoStopImpl();
+
         std::lock_guard lk(mtx_);
 
         // Flip state flags BEFORE any J-Link API calls so a concurrent isConnected()
         // / isOpen() check from the sampler sees the new state immediately.
         const bool wasOpen      = isOpen_;
-        const bool wasConnected = isConnected_;
+        const bool sessionDirty = sdkSessionDirty_.exchange(false, std::memory_order_acq_rel);
         isConnected_            = false;
         isOpen_                 = false;
+        rttStatus_.store(RttStatus::Disconnected, std::memory_order_release);
 
         if (hssRunning_) {
                 LOG_I("Stopping HSS...");
-                JLINK_HSS_Stop();
+                // Do not send more commands over a known-dead USB session.
+                if (!sessionDirty && wasOpen)
+                        JLINK_HSS_Stop();
                 hssRunning_   = false;
                 hssFrameSize_ = 0;
                 hssActualHz_.store(0.0f, std::memory_order_relaxed);
         }
-        if (wasOpen) {
+        if (wasOpen || sessionDirty) {
                 LOG_I("Closing JLink connection...");
-                // Best-effort C_DEBUGEN detach. Skipped when the link looks dead —
-                // touching MCU memory on a stalled USB connection can hang inside
-                // the SDK and leave it in a state where re-Open() permanently
-                // returns a stale handle (requires app restart to recover).
-                if (wasConnected && JLINKARM_IsOpen()) {
-                        if (JLINKARM_IsHalted()) {
-                                LOG_I("JLinkPort::close(): Target was halted, resuming before close...");
-                                JLINKARM_Go();
-                        }
-                        u32 dhcsr = 0xA05F0000;
-                        JLINKARM_WriteMemEx(0xE000EDF0, 4, &dhcsr, 0);
-                        LOG_I("JLinkPort::close(): Cleared C_DEBUGEN in DHCSR.");
-                }
+                // JLINKARM_Close owns the target detach sequence. Manually
+                // clearing C_DEBUGEN here leaves some dual-core Cortex-M7
+                // targets in a state where the next SWO_EnableTarget cannot
+                // resume the core after its temporary halt.
                 JLINKARM_Close();
                 // Give the SDK time to release the USB handle. Without this, an
                 // immediately-following Open() sometimes returns a stale handle
@@ -107,6 +110,7 @@ JLinkPort::close()
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
                 LOG_I("JLink closed.");
         }
+        readFailCount_.store(0, std::memory_order_relaxed);
 }
 
 bool
@@ -128,6 +132,7 @@ JLinkPort::connect()
         // after the user unplugs and replugs the J-Link — until the app restarts.
         auto resetSdk = [&]() {
                 JLINKARM_Close();
+                sdkSessionDirty_.store(false, std::memory_order_release);
                 isOpen_      = false;
                 isConnected_ = false;
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -182,7 +187,9 @@ JLinkPort::connect()
         }
 
         readFailCount_.store(0, std::memory_order_relaxed);
+        sdkSessionDirty_.store(false, std::memory_order_release);
         isConnected_ = true;
+        targetEpoch_.fetch_add(1u, std::memory_order_acq_rel);
         LOG_I("JLinkPort::connect() SUCCEEDED");
         return true;
 }
@@ -199,6 +206,10 @@ JLinkPort::resetTarget()
         JLINKARM_SetResetType(0);
         JLINKARM_Reset();
         JLINKARM_Go();
+        // Let C runtime initialization clear/initialize volatile DTCM control
+        // blocks before clients observe the new epoch and restore configuration.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        targetEpoch_.fetch_add(1u, std::memory_order_acq_rel);
 
         return true;
 }
@@ -211,14 +222,24 @@ JLinkPort::connectAsync()
                 return; // already busy
         std::thread([this]() {
                 // Always do a full close+open+connect cycle.
-                // This handles the case where the MCU lost power and the
-                // old SDK state is stale ("cpu is halt" on reconnect).
-                if (isConnected_ || isOpen_)
-                        close();
-                if (!isOpen_)
-                        open();
-                if (isOpen_)
-                        connect();
+                // In particular, do not trust isOpen_: transport failures clear
+                // the UI state before the SDK's stale USB handle can be closed.
+                close();
+
+                // A firmware update makes the probe disappear and re-enumerate.
+                // Give that process one short retry without requiring another
+                // click (or an application restart).
+                constexpr int kConnectAttempts = 2;
+                for (int attempt = 0; attempt < kConnectAttempts; ++attempt) {
+                        if (attempt > 0)
+                                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                        if (open() && connect())
+                                break;
+                        if (attempt + 1 < kConnectAttempts) {
+                                LOG_W("J-Link reconnect attempt failed; resetting SDK before retry");
+                                close();
+                        }
+                }
                 busy_.store(false, std::memory_order_release);
         }).detach();
 }
@@ -254,16 +275,7 @@ JLinkPort::readMem(const u32 addr, const u32 numBytes, void *dst)
         if (!isOpen_ || !isConnected_)
                 return false;
         bool ok = JLINKARM_ReadMemEx(addr, numBytes, dst, 0) >= 0;
-        if (!ok) {
-                int fc = readFailCount_.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (fc >= kMaxReadFails) {
-                        LOG_E("JLinkPort::readMem() %d consecutive failures — auto-disconnecting", fc);
-                        isConnected_ = false;
-                        isOpen_      = false;
-                }
-        } else {
-                readFailCount_.store(0, std::memory_order_relaxed);
-        }
+        recordTransportResultLocked(ok, "readMem");
         return ok;
 }
 
@@ -273,7 +285,65 @@ JLinkPort::writeMem(const u32 addr, const u32 numBytes, const void *src)
         std::lock_guard lk(mtx_);
         if (!isOpen_ || !isConnected_)
                 return false;
-        return JLINKARM_WriteMemEx(addr, numBytes, src, 0) >= 0;
+        const bool ok = JLINKARM_WriteMemEx(addr, numBytes, src, 0) >= 0;
+        recordTransportResultLocked(ok, "writeMem");
+        return ok;
+}
+
+bool
+JLinkPort::writeMemBitfield(
+    const u32 addr, const u32 numBytes, const void *encodedValue, const u32 bitOffset, const u32 bitSize)
+{
+        if (!encodedValue || numBytes == 0 || numBytes > sizeof(u64) || bitSize == 0 || bitSize > 64 ||
+            bitOffset >= numBytes * 8 || bitSize > numBytes * 8 - bitOffset)
+                return false;
+
+        std::lock_guard lk(mtx_);
+        if (!isOpen_ || !isConnected_)
+                return false;
+
+        u64  current = 0;
+        u64  desired = 0;
+        bool ok      = JLINKARM_ReadMemEx(addr, numBytes, &current, 0) >= 0;
+        if (!ok) {
+                recordTransportResultLocked(false, "writeMemBitfield/read");
+                return false;
+        }
+        std::memcpy(&desired, encodedValue, numBytes);
+
+        const u64 valueMask = bitSize == 64 ? ~u64{0} : ((u64{1} << bitSize) - 1);
+        const u64 fieldMask = valueMask << bitOffset;
+        current             = (current & ~fieldMask) | ((desired & valueMask) << bitOffset);
+
+        ok = JLINKARM_WriteMemEx(addr, numBytes, &current, 0) >= 0;
+        recordTransportResultLocked(ok, "writeMemBitfield/write");
+        return ok;
+}
+
+void
+JLinkPort::recordTransportResultLocked(const bool success, const char *operation)
+{
+        if (success) {
+                readFailCount_.store(0, std::memory_order_relaxed);
+                return;
+        }
+
+        const int failures = readFailCount_.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (failures < kMaxReadFails)
+                return;
+
+        LOG_E("JLinkPort::%s() %d consecutive failures — invalidating SDK session", operation, failures);
+        lastErr_ = "J-Link communication lost; reconnecting will reset the USB session";
+        // We already hold mtx_, so close() cannot be called here. Remember that
+        // the DLL still needs JLINKARM_Close() after publishing disconnected UI
+        // state; connectAsync() will perform that reset before its next Open().
+        sdkSessionDirty_.store(true, std::memory_order_release);
+        isConnected_.store(false, std::memory_order_release);
+        isOpen_.store(false, std::memory_order_release);
+        hssRunning_   = false;
+        hssFrameSize_ = 0;
+        hssActualHz_.store(0.0f, std::memory_order_relaxed);
+        rttStatus_.store(RttStatus::Disconnected, std::memory_order_release);
 }
 
 u32
@@ -385,371 +455,1694 @@ JLinkPort::hssRead(void *buf, const u32 bufSize)
         std::lock_guard lk(mtx_);
         if (!hssRunning_)
                 return 0;
-        return JLINK_HSS_Read(buf, bufSize);
+        const i32 result = JLINK_HSS_Read(buf, bufSize);
+        // Zero means no frame is currently available and is not an error.
+        recordTransportResultLocked(result >= 0, "hssRead");
+        return result;
 }
 
-#ifdef _WIN32
-static HANDLE
-vcomHandleFromVoid(void *h)
+namespace
 {
-        return reinterpret_cast<HANDLE>(h);
-}
-#endif
+constexpr size_t kRttMaxLogBytes          = 256u * 1024u;
+constexpr size_t kRttMaxPendingBytes      = 256u * 1024u;
+constexpr size_t kRttIoChunkBytes         = 1024u;
+constexpr int    kRttControlBlockNotFound = -2;
 
-#ifdef _WIN32
-static std::string
-lowerAscii(std::string s)
+std::string
+rttApiError(const char *operation, int result)
 {
-        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return s;
+        char message[128];
+        snprintf(message, sizeof(message), "RTT: %s failed (error %d)", operation, result);
+        return message;
 }
-
-static bool
-extractComName(const std::string &text, std::string &out)
-{
-        size_t pos = text.find("COM");
-        while (pos != std::string::npos) {
-                size_t i = pos + 3;
-                if (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i]))) {
-                        while (i < text.size() && std::isdigit(static_cast<unsigned char>(text[i])))
-                                ++i;
-                        out = text.substr(pos, i - pos);
-                        return true;
-                }
-                pos = text.find("COM", pos + 3);
-        }
-        return false;
-}
-
-static std::string
-setupDiStringProperty(HDEVINFO info, SP_DEVINFO_DATA &devInfo, DWORD prop)
-{
-        char  buf[512] = {};
-        DWORD type     = 0;
-        if (!SetupDiGetDeviceRegistryPropertyA(info, &devInfo, prop, &type, reinterpret_cast<PBYTE>(buf), sizeof(buf), nullptr))
-                return {};
-        return buf;
-}
-#endif
 
 bool
-JLinkPort::vcomRefreshPorts(bool preferJLink)
+parseRttControlBlockAddress(const char *text, u32 &address, bool &hasAddress, std::string &error)
 {
-#ifdef _WIN32
-        if (vcomOpen_.load(std::memory_order_acquire)) {
-                lastErr_ = "VCOM: close port before refresh";
-                return false;
-        }
+        hasAddress = false;
+        address    = 0;
+        error.clear();
 
-        HDEVINFO info = SetupDiGetClassDevsA(&GUID_DEVCLASS_PORTS, nullptr, nullptr, DIGCF_PRESENT);
-        if (info == INVALID_HANDLE_VALUE) {
-                lastErr_ = "VCOM: SetupDiGetClassDevs failed";
-                return false;
-        }
-
-        std::vector<std::string> ports;
-        std::vector<std::string> labels;
-        int                      jlinkIdx = -1;
-        for (DWORD idx = 0;; ++idx) {
-                SP_DEVINFO_DATA devInfo = {};
-                devInfo.cbSize          = sizeof(devInfo);
-                if (!SetupDiEnumDeviceInfo(info, idx, &devInfo))
-                        break;
-
-                std::string friendly = setupDiStringProperty(info, devInfo, SPDRP_FRIENDLYNAME);
-                std::string desc     = setupDiStringProperty(info, devInfo, SPDRP_DEVICEDESC);
-                std::string mfg      = setupDiStringProperty(info, devInfo, SPDRP_MFG);
-                std::string com;
-                if (!extractComName(friendly, com) && !extractComName(desc, com))
-                        continue;
-
-                std::string name    = !friendly.empty() ? friendly : (!desc.empty() ? desc : com);
-                std::string hay     = lowerAscii(friendly + " " + desc + " " + mfg);
-                bool        isJLink = hay.find("j-link") != std::string::npos || hay.find("jlink") != std::string::npos ||
-                               hay.find("segger") != std::string::npos;
-
-                ports.push_back(com);
-                labels.push_back(com + " - " + name + (isJLink ? "  [J-Link]" : ""));
-                if (isJLink && jlinkIdx < 0)
-                        jlinkIdx = static_cast<int>(ports.size()) - 1;
-        }
-        SetupDiDestroyDeviceInfoList(info);
-
-        if (ports.empty()) {
-                vcomPortList_.clear();
-                vcomPortLabels_.clear();
-                vcomSelectedPort_ = -1;
-                lastErr_          = "VCOM: no COM ports found";
-                return false;
-        }
-
-        int selected = -1;
-        if (preferJLink && jlinkIdx >= 0) {
-                selected = jlinkIdx;
-        } else {
-                for (int i = 0; i < static_cast<int>(ports.size()); ++i) {
-                        if (_stricmp(ports[i].c_str(), vcomPort_) == 0) {
-                                selected = i;
-                                break;
-                        }
-                }
-                if (selected < 0)
-                        selected = 0;
-        }
-
-        vcomPortList_     = std::move(ports);
-        vcomPortLabels_   = std::move(labels);
-        vcomSelectedPort_ = selected;
-        snprintf(vcomPort_, sizeof(vcomPort_), "%s", vcomPortList_[selected].c_str());
-        lastErr_.clear();
-        LOG_I("JLink VCOM ports refreshed: count=%zu selected=%s", vcomPortList_.size(), vcomPort_);
-        return true;
-#else
-        (void)preferJLink;
-        lastErr_ = "VCOM: refresh only supported on Windows";
-        return false;
-#endif
-}
-bool
-JLinkPort::vcomOpen()
-{
-#ifdef _WIN32
-        std::lock_guard lk(vcomMtx_);
-        if (vcomOpen_.load(std::memory_order_acquire))
+        if (!text)
+                return true;
+        while (*text != '\0' && std::isspace(static_cast<unsigned char>(*text)))
+                ++text;
+        if (*text == '\0')
                 return true;
 
-        std::string port = vcomPort_;
-        if (port.empty()) {
-                lastErr_ = "VCOM: empty COM port";
+        errno                    = 0;
+        char              *end   = nullptr;
+        unsigned long long value = std::strtoull(text, &end, 16);
+        if (end == text || errno == ERANGE || value == 0 || value > std::numeric_limits<u32>::max()) {
+                error = "RTT: invalid control block address";
                 return false;
         }
-        std::string path = port;
-        if (path.rfind("\\\\.\\", 0) != 0)
-                path = "\\\\.\\" + path;
-
-        HANDLE h =
-            CreateFileA(path.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (h == INVALID_HANDLE_VALUE) {
-                char msg[128];
-                snprintf(msg, sizeof(msg), "VCOM: failed to open %s (err=%lu)", port.c_str(), GetLastError());
-                lastErr_ = msg;
+        while (*end != '\0' && std::isspace(static_cast<unsigned char>(*end)))
+                ++end;
+        if (*end != '\0') {
+                error = "RTT: control block address must be hexadecimal";
                 return false;
         }
 
-        DCB dcb       = {};
-        dcb.DCBlength = sizeof(dcb);
-        if (!GetCommState(h, &dcb)) {
-                CloseHandle(h);
-                lastErr_ = "VCOM: GetCommState failed";
-                return false;
-        }
-        dcb.BaudRate    = static_cast<DWORD>(vcomBaud_.load(std::memory_order_relaxed));
-        dcb.ByteSize    = 8;
-        dcb.Parity      = NOPARITY;
-        dcb.StopBits    = ONESTOPBIT;
-        dcb.fBinary     = TRUE;
-        dcb.fDtrControl = DTR_CONTROL_ENABLE;
-        dcb.fRtsControl = RTS_CONTROL_ENABLE;
-        if (!SetCommState(h, &dcb)) {
-                CloseHandle(h);
-                lastErr_ = "VCOM: SetCommState failed";
-                return false;
-        }
-
-        COMMTIMEOUTS timeouts                = {};
-        timeouts.ReadIntervalTimeout         = 20;
-        timeouts.ReadTotalTimeoutConstant    = 20;
-        timeouts.ReadTotalTimeoutMultiplier  = 1;
-        timeouts.WriteTotalTimeoutConstant   = 200;
-        timeouts.WriteTotalTimeoutMultiplier = 2;
-        SetCommTimeouts(h, &timeouts);
-        PurgeComm(h, PURGE_RXCLEAR | PURGE_TXCLEAR);
-
-        vcomHandle_ = h;
-        vcomReaderRunning_.store(true, std::memory_order_release);
-        vcomOpen_.store(true, std::memory_order_release);
-        lastErr_.clear();
-        vcomThread_ = std::thread([this]() {
-                char buf[256];
-                while (vcomReaderRunning_.load(std::memory_order_acquire)) {
-                        HANDLE rh = nullptr;
-                        {
-                                std::lock_guard lk(vcomMtx_);
-                                rh = vcomHandleFromVoid(vcomHandle_);
-                        }
-                        if (!rh || rh == INVALID_HANDLE_VALUE)
-                                break;
-
-                        DWORD nr = 0;
-                        if (ReadFile(rh, buf, sizeof(buf), &nr, nullptr) && nr > 0) {
-                                std::lock_guard rx(vcomRxMtx_);
-                                vcomRxLog_.append(buf, buf + nr);
-                                static constexpr size_t kMaxLog = 64 * 1024;
-                                if (vcomRxLog_.size() > kMaxLog)
-                                        vcomRxLog_.erase(0, vcomRxLog_.size() - kMaxLog);
-                        } else {
-                                std::this_thread::sleep_for(std::chrono::milliseconds(5));
-                        }
-                }
-        });
+        address    = static_cast<u32>(value);
+        hasAddress = true;
         return true;
-#else
-        lastErr_ = "VCOM: only supported on Windows";
-        return false;
-#endif
+}
+} // namespace
+
+bool
+JLinkPort::rttStart()
+{
+        std::lock_guard lifecycle(rttLifecycleMtx_);
+        if (rttActive_.load(std::memory_order_acquire))
+                return true;
+
+        rttReaderRunning_.store(false, std::memory_order_release);
+        rttWakeCv_.notify_all();
+        if (rttThread_.joinable())
+                rttThread_.join();
+
+        u32         controlBlock = 0;
+        bool        hasAddress   = false;
+        std::string parseError;
+        if (!parseRttControlBlockAddress(rttControlBlock_, controlBlock, hasAddress, parseError)) {
+                setRttError(parseError);
+                rttStatus_.store(RttStatus::Stopped, std::memory_order_release);
+                return false;
+        }
+
+        int startResult = -1;
+        int upCount     = -1;
+        int downCount   = -1;
+        {
+                std::lock_guard io(mtx_);
+                if (!isOpen_.load(std::memory_order_acquire) || !isConnected_.load(std::memory_order_acquire)) {
+                        setRttError("RTT: connect J-Link to the target first");
+                        rttStatus_.store(RttStatus::Disconnected, std::memory_order_release);
+                        return false;
+                }
+
+                struct RttStartConfig {
+                        u32 ConfigBlockAddress;
+                        u32 Reserved[3];
+                } startConfig{controlBlock, {0, 0, 0}};
+                static_assert(sizeof(RttStartConfig) == 16, "J-Link RTT START ABI requires 16 bytes");
+                void *startParam = hasAddress ? static_cast<void *>(&startConfig) : nullptr;
+                startResult      = JLINK_RTTERMINAL_Control(JLINKARM_RTTERMINAL_CMD_START, startParam);
+                if (startResult >= 0) {
+                        u32 direction = JLINKARM_RTTERMINAL_DIRECTION_UP;
+                        upCount       = JLINK_RTTERMINAL_Control(JLINKARM_RTTERMINAL_CMD_GETNUMBUF, &direction);
+                        direction     = JLINKARM_RTTERMINAL_DIRECTION_DOWN;
+                        downCount     = JLINK_RTTERMINAL_Control(JLINKARM_RTTERMINAL_CMD_GETNUMBUF, &direction);
+                }
+        }
+
+        if (startResult < 0) {
+                setRttError("RTT: failed to start terminal");
+                rttStatus_.store(RttStatus::Stopped, std::memory_order_release);
+                return false;
+        }
+
+        {
+                std::lock_guard data(rttDataMtx_);
+                rttTxPending_.clear();
+                rttError_.clear();
+        }
+        rttUpBufferCount_.store(upCount, std::memory_order_release);
+        rttDownBufferCount_.store(downCount, std::memory_order_release);
+        if (upCount == kRttControlBlockNotFound || downCount == kRttControlBlockNotFound) {
+                rttStatus_.store(RttStatus::Searching, std::memory_order_release);
+        } else if (upCount < 0 || downCount < 0) {
+                const int error = upCount < 0 ? upCount : downCount;
+                setRttError(rttApiError("GETNUMBUF", error));
+                rttStatus_.store(RttStatus::Error, std::memory_order_release);
+        } else if (rttUpChannel_ >= upCount) {
+                rttStatus_.store(RttStatus::UpChannelUnavailable, std::memory_order_release);
+        } else {
+                rttStatus_.store(RttStatus::Running, std::memory_order_release);
+        }
+        rttActive_.store(true, std::memory_order_release);
+        rttReaderRunning_.store(true, std::memory_order_release);
+        try {
+                rttThread_ = std::thread(&JLinkPort::rttReaderLoop, this);
+        } catch (const std::exception &e) {
+                rttReaderRunning_.store(false, std::memory_order_release);
+                rttActive_.store(false, std::memory_order_release);
+                {
+                        std::lock_guard io(mtx_);
+                        if (isOpen_.load(std::memory_order_acquire))
+                                JLINK_RTTERMINAL_Control(JLINKARM_RTTERMINAL_CMD_STOP, nullptr);
+                }
+                setRttError(std::string("RTT: failed to create reader thread: ") + e.what());
+                rttStatus_.store(RttStatus::Stopped, std::memory_order_release);
+                return false;
+        }
+
+        LOG_I("JLink RTT started: up=%d/%d down=%d/%d%s",
+              rttUpChannel_,
+              upCount,
+              rttDownChannel_,
+              downCount,
+              hasAddress ? " (fixed control block)" : "");
+        return true;
 }
 
 void
-JLinkPort::vcomClose()
+JLinkPort::rttStop()
 {
-#ifdef _WIN32
-        vcomReaderRunning_.store(false, std::memory_order_release);
-        HANDLE h = nullptr;
-        {
-                std::lock_guard lk(vcomMtx_);
-                h = vcomHandleFromVoid(vcomHandle_);
-                if (h && h != INVALID_HANDLE_VALUE)
-                        CancelIoEx(h, nullptr);
+        std::lock_guard lifecycle(rttLifecycleMtx_);
+        rttStopImpl();
+}
+
+void
+JLinkPort::rttStopImpl()
+{
+        rttReaderRunning_.store(false, std::memory_order_release);
+        rttWakeCv_.notify_all();
+        if (rttThread_.joinable())
+                rttThread_.join();
+
+        const bool wasActive = rttActive_.exchange(false, std::memory_order_acq_rel);
+        if (wasActive) {
+                std::lock_guard io(mtx_);
+                if (isOpen_.load(std::memory_order_acquire))
+                        JLINK_RTTERMINAL_Control(JLINKARM_RTTERMINAL_CMD_STOP, nullptr);
         }
-        if (vcomThread_.joinable())
-                vcomThread_.join();
+
         {
-                std::lock_guard lk(vcomMtx_);
-                h = vcomHandleFromVoid(vcomHandle_);
-                if (h && h != INVALID_HANDLE_VALUE)
-                        CloseHandle(h);
-                vcomHandle_ = nullptr;
+                std::lock_guard data(rttDataMtx_);
+                rttTxPending_.clear();
         }
-#endif
-        vcomOpen_.store(false, std::memory_order_release);
+        rttUpBufferCount_.store(-1, std::memory_order_release);
+        rttDownBufferCount_.store(-1, std::memory_order_release);
+        rttStatus_.store(isConnected_.load(std::memory_order_acquire) ? RttStatus::Stopped : RttStatus::Disconnected,
+                         std::memory_order_release);
+}
+
+void
+JLinkPort::rttReaderLoop()
+{
+        char rxBuffer[kRttIoChunkBytes];
+        auto nextProbe = std::chrono::steady_clock::now();
+
+        while (rttReaderRunning_.load(std::memory_order_acquire)) {
+                if (!isOpen_.load(std::memory_order_acquire) || !isConnected_.load(std::memory_order_acquire)) {
+                        setRttError("RTT: J-Link target disconnected");
+                        rttStatus_.store(RttStatus::Disconnected, std::memory_order_release);
+                        rttActive_.store(false, std::memory_order_release);
+                        break;
+                }
+
+                auto now = std::chrono::steady_clock::now();
+                if (now >= nextProbe) {
+                        int upCount   = -1;
+                        int downCount = -1;
+                        {
+                                std::lock_guard io(mtx_);
+                                if (isOpen_.load(std::memory_order_acquire) && isConnected_.load(std::memory_order_acquire)) {
+                                        u32 direction = JLINKARM_RTTERMINAL_DIRECTION_UP;
+                                        upCount       = JLINK_RTTERMINAL_Control(JLINKARM_RTTERMINAL_CMD_GETNUMBUF, &direction);
+                                        direction     = JLINKARM_RTTERMINAL_DIRECTION_DOWN;
+                                        downCount     = JLINK_RTTERMINAL_Control(JLINKARM_RTTERMINAL_CMD_GETNUMBUF, &direction);
+                                }
+                        }
+                        rttUpBufferCount_.store(upCount, std::memory_order_release);
+                        rttDownBufferCount_.store(downCount, std::memory_order_release);
+                        const RttStatus previousStatus = rttStatus_.load(std::memory_order_acquire);
+                        if (upCount == kRttControlBlockNotFound || downCount == kRttControlBlockNotFound) {
+                                rttStatus_.store(RttStatus::Searching, std::memory_order_release);
+                        } else if (upCount < 0 || downCount < 0) {
+                                const int error = upCount < 0 ? upCount : downCount;
+                                setRttError(rttApiError("GETNUMBUF", error));
+                                rttStatus_.store(RttStatus::Error, std::memory_order_release);
+                        } else if (rttUpChannel_ >= upCount) {
+                                rttStatus_.store(RttStatus::UpChannelUnavailable, std::memory_order_release);
+                        } else {
+                                if (previousStatus == RttStatus::Error)
+                                        setRttError({});
+                                rttStatus_.store(RttStatus::Running, std::memory_order_release);
+                        }
+                        nextProbe = now + std::chrono::milliseconds(250);
+                }
+
+                bool      didIo   = false;
+                const int upCount = rttUpBufferCount_.load(std::memory_order_acquire);
+                if (rttUpChannel_ >= 0 && rttUpChannel_ < upCount) {
+                        int readBytes = -1;
+                        {
+                                std::lock_guard io(mtx_);
+                                if (isOpen_.load(std::memory_order_acquire) && isConnected_.load(std::memory_order_acquire)) {
+                                        readBytes = JLINK_RTTERMINAL_Read(
+                                            static_cast<u32>(rttUpChannel_), rxBuffer, static_cast<u32>(sizeof(rxBuffer)));
+                                }
+                        }
+                        if (readBytes > 0) {
+                                size_t count = std::min(static_cast<size_t>(readBytes), sizeof(rxBuffer));
+                                {
+                                        std::lock_guard data(rttDataMtx_);
+                                        rttRxLog_.append(rxBuffer, count);
+                                        if (rttRxLog_.size() > kRttMaxLogBytes)
+                                                rttRxLog_.erase(0, rttRxLog_.size() - kRttMaxLogBytes);
+                                }
+                                rttRxBytes_.fetch_add(count, std::memory_order_relaxed);
+                                didIo = true;
+                        } else if (readBytes < 0) {
+                                rttUpBufferCount_.store(-1, std::memory_order_release);
+                                if (readBytes == kRttControlBlockNotFound) {
+                                        rttStatus_.store(RttStatus::Searching, std::memory_order_release);
+                                } else {
+                                        setRttError(rttApiError("READ", readBytes));
+                                        rttStatus_.store(RttStatus::Error, std::memory_order_release);
+                                }
+                                nextProbe = std::chrono::steady_clock::now();
+                        }
+                }
+
+                std::string txChunk;
+                {
+                        std::lock_guard data(rttDataMtx_);
+                        if (!rttTxPending_.empty())
+                                txChunk.assign(rttTxPending_.data(), std::min(rttTxPending_.size(), kRttIoChunkBytes));
+                }
+                const int downCount = rttDownBufferCount_.load(std::memory_order_acquire);
+                if (!txChunk.empty() && rttDownChannel_ >= 0 && rttDownChannel_ < downCount) {
+                        int written = -1;
+                        {
+                                std::lock_guard io(mtx_);
+                                if (isOpen_.load(std::memory_order_acquire) && isConnected_.load(std::memory_order_acquire)) {
+                                        written = JLINK_RTTERMINAL_Write(static_cast<u32>(rttDownChannel_),
+                                                                         txChunk.data(),
+                                                                         static_cast<u32>(txChunk.size()));
+                                }
+                        }
+                        if (written > 0) {
+                                size_t consumed = std::min(static_cast<size_t>(written), txChunk.size());
+                                {
+                                        std::lock_guard data(rttDataMtx_);
+                                        rttTxPending_.erase(0, std::min(consumed, rttTxPending_.size()));
+                                }
+                                rttTxBytes_.fetch_add(consumed, std::memory_order_relaxed);
+                                didIo = true;
+                        } else if (written < 0) {
+                                rttDownBufferCount_.store(-1, std::memory_order_release);
+                                if (written != kRttControlBlockNotFound) {
+                                        setRttError(rttApiError("WRITE", written));
+                                        rttStatus_.store(RttStatus::Error, std::memory_order_release);
+                                }
+                                nextProbe = std::chrono::steady_clock::now();
+                        }
+                }
+
+                std::unique_lock wake(rttWakeMtx_);
+                rttWakeCv_.wait_for(wake, didIo ? std::chrono::milliseconds(1) : std::chrono::milliseconds(10), [this] {
+                        return !rttReaderRunning_.load(std::memory_order_acquire);
+                });
+        }
+
+        rttReaderRunning_.store(false, std::memory_order_release);
 }
 
 bool
-JLinkPort::vcomSend(const char *text)
+JLinkPort::rttSend(const char *data, usize size)
 {
-#ifdef _WIN32
-        if (!text || !text[0])
+        if (!data || size == 0)
                 return true;
-        std::lock_guard lk(vcomMtx_);
-        HANDLE          h = vcomHandleFromVoid(vcomHandle_);
-        if (!vcomOpen_.load(std::memory_order_acquire) || !h || h == INVALID_HANDLE_VALUE) {
-                lastErr_ = "VCOM: not open";
+
+        // Serialize queueing with STOP/close so a sender cannot append after
+        // rttStopImpl() has cleared the pending queue.
+        std::lock_guard lifecycle(rttLifecycleMtx_);
+        if (!rttActive_.load(std::memory_order_acquire)) {
+                setRttError("RTT: terminal is not running");
                 return false;
         }
-        DWORD len = static_cast<DWORD>(strlen(text));
-        DWORD nw  = 0;
-        if (!WriteFile(h, text, len, &nw, nullptr) || nw != len) {
-                lastErr_ = "VCOM: write failed";
+
+        const int downCount = rttDownBufferCount_.load(std::memory_order_acquire);
+        if (downCount >= 0 && (rttDownChannel_ < 0 || rttDownChannel_ >= downCount)) {
+                setRttError("RTT: selected down channel is unavailable");
                 return false;
         }
+
+        bool queued = false;
+        {
+                std::lock_guard lock(rttDataMtx_);
+                size_t          used = std::min(rttTxPending_.size(), kRttMaxPendingBytes);
+                if (size <= kRttMaxPendingBytes - used) {
+                        rttTxPending_.append(data, size);
+                        queued = true;
+                }
+        }
+        if (!queued) {
+                setRttError("RTT: transmit queue is full");
+                return false;
+        }
+
+        rttWakeCv_.notify_all();
         return true;
-#else
-        (void)text;
-        lastErr_ = "VCOM: only supported on Windows";
-        return false;
-#endif
 }
 
 std::string
-JLinkPort::vcomRxSnapshot() const
+JLinkPort::rttRxSnapshot() const
 {
-        std::lock_guard lk(vcomRxMtx_);
-        return vcomRxLog_;
+        std::lock_guard lock(rttDataMtx_);
+        return rttRxLog_;
+}
+
+std::string
+JLinkPort::rttErrorSnapshot() const
+{
+        std::lock_guard lock(rttDataMtx_);
+        return rttError_;
+}
+
+usize
+JLinkPort::rttTxPendingBytes() const
+{
+        std::lock_guard lock(rttDataMtx_);
+        return rttTxPending_.size();
 }
 
 void
-JLinkPort::vcomClearRx()
+JLinkPort::rttClearRx()
 {
-        std::lock_guard lk(vcomRxMtx_);
-        vcomRxLog_.clear();
+        std::lock_guard lock(rttDataMtx_);
+        rttRxLog_.clear();
+        rttRxBytes_.store(0, std::memory_order_relaxed);
 }
 
 void
-JLinkPort::drawVComPopup()
+JLinkPort::setRttError(const std::string &error)
 {
-        if (!ImGui::BeginPopup("JLinkVComPopup"))
+        std::lock_guard lock(rttDataMtx_);
+        rttError_ = error;
+}
+
+void
+JLinkPort::drawRttWindow()
+{
+        if (!rttWindowOpen_)
                 return;
 
-        ImGui::TextUnformatted(tr("J-Link Virtual COM", "J-Link 虚拟串口"));
-        ImGui::Separator();
+        ImGui::SetNextWindowSize(ImVec2(640.0f, 440.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(560.0f, 320.0f),
+                                            ImVec2(std::numeric_limits<float>::max(), std::numeric_limits<float>::max()));
+        if (rttWindowFocusRequested_)
+                ImGui::SetNextWindowFocus();
+        rttWindowFocusRequested_ = false;
 
-        if (vcomPortList_.empty() && !vcomOpen_.load(std::memory_order_acquire))
-                vcomRefreshPorts(true);
+        if (!ImGui::Begin(tr("J-Link RTT Terminal###JLinkRttWindow", "J-Link RTT 终端###JLinkRttWindow"), &rttWindowOpen_)) {
+                ImGui::End();
+                return;
+        }
 
-        ImGui::SetNextItemWidth(260.0f);
-        if (vcomPortLabels_.empty()) {
-                ImGui::InputText("##jlink_vcom_port", vcomPort_, sizeof(vcomPort_));
-        } else {
-                const char *preview = (vcomSelectedPort_ >= 0 && vcomSelectedPort_ < static_cast<int>(vcomPortLabels_.size()))
-                                          ? vcomPortLabels_[vcomSelectedPort_].c_str()
-                                          : vcomPort_;
-                if (ImGui::BeginCombo("##jlink_vcom_port_combo", preview)) {
-                        for (int i = 0; i < static_cast<int>(vcomPortLabels_.size()); ++i) {
-                                bool selected = i == vcomSelectedPort_;
-                                if (ImGui::Selectable(vcomPortLabels_[i].c_str(), selected)) {
-                                        vcomSelectedPort_ = i;
-                                        snprintf(vcomPort_, sizeof(vcomPort_), "%s", vcomPortList_[i].c_str());
-                                }
-                                if (selected)
-                                        ImGui::SetItemDefaultFocus();
-                        }
-                        ImGui::EndCombo();
-                }
+        bool      active = rttActive_.load(std::memory_order_acquire);
+        RttStatus status = rttStatus_.load(std::memory_order_acquire);
+
+        ImGui::BeginDisabled(active);
+        ImGui::TextUnformatted(tr("Control Block", "控制块"));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(150.0f);
+        if (ImGui::InputTextWithHint("##jlink_rtt_cb", "Auto / 0x20000000", rttControlBlock_, sizeof(rttControlBlock_)))
+                configModified_.store(true, std::memory_order_release);
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s",
+                                  tr("Optional RTT control block address (hex). Leave empty for automatic search.",
+                                     "可选 RTT 控制块地址（十六进制），留空自动搜索。"));
+        ImGui::SameLine();
+        ImGui::TextUnformatted("Up");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70.0f);
+        if (ImGui::InputInt("##jlink_rtt_up", &rttUpChannel_, 0, 0)) {
+                rttUpChannel_ = std::max(rttUpChannel_, 0);
+                configModified_.store(true, std::memory_order_release);
         }
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", tr("COM port", "串口号"));
+                ImGui::SetTooltip("%s", tr("RTT up-buffer index", "RTT 上行缓冲区编号"));
         ImGui::SameLine();
-        if (!vcomOpen_.load(std::memory_order_acquire)) {
-                if (ui::SmallButton(tr("Refresh", "刷新"), ui::BtnStyle::Muted))
-                        vcomRefreshPorts(false);
-                ImGui::SameLine();
-        }
-        int baud = vcomBaud_.load(std::memory_order_relaxed);
-        ImGui::SetNextItemWidth(110.0f);
-        if (ImGui::InputInt("##jlink_vcom_baud", &baud, 0, 0)) {
-                if (baud < 1200)
-                        baud = 1200;
-                vcomBaud_.store(baud, std::memory_order_relaxed);
+        ImGui::TextUnformatted("Down");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70.0f);
+        if (ImGui::InputInt("##jlink_rtt_down", &rttDownChannel_, 0, 0)) {
+                rttDownChannel_ = std::max(rttDownChannel_, 0);
+                configModified_.store(true, std::memory_order_release);
         }
         if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", tr("Baud rate", "波特率"));
+                ImGui::SetTooltip("%s", tr("RTT down-buffer index", "RTT 下行缓冲区编号"));
+        ImGui::EndDisabled();
 
-        ImGui::SameLine();
-        if (vcomOpen_.load(std::memory_order_acquire)) {
-                if (ui::SmallButton(tr("CLOSE", "关闭"), ui::BtnStyle::Danger))
-                        vcomClose();
+        const char *statusText = tr("Stopped", "已停止");
+        switch (status) {
+                case RttStatus::Searching:
+                        statusText = tr("Searching for RTT control block", "正在搜索 RTT 控制块");
+                        break;
+                case RttStatus::Running:
+                        statusText = tr("Running", "运行中");
+                        break;
+                case RttStatus::UpChannelUnavailable:
+                        statusText = tr("Selected up channel is unavailable", "所选上行通道不可用");
+                        break;
+                case RttStatus::Disconnected:
+                        statusText = tr("J-Link disconnected", "J-Link 未连接");
+                        break;
+                case RttStatus::Error:
+                        statusText = tr("RTT I/O error", "RTT 输入输出错误");
+                        break;
+                case RttStatus::Stopped:
+                        break;
+        }
+        const int  downBufferCount = rttDownBufferCount_.load(std::memory_order_relaxed);
+        const bool downUnavailable =
+            active && downBufferCount >= 0 && (rttDownChannel_ < 0 || rttDownChannel_ >= downBufferCount);
+        ImGui::Text("%s | Up: %d | Down: %d | RX: %llu | TX: %llu | Queue: %zu",
+                    statusText,
+                    rttUpBufferCount_.load(std::memory_order_relaxed),
+                    rttDownBufferCount_.load(std::memory_order_relaxed),
+                    static_cast<unsigned long long>(rttRxBytes_.load(std::memory_order_relaxed)),
+                    static_cast<unsigned long long>(rttTxBytes_.load(std::memory_order_relaxed)),
+                    rttTxPendingBytes());
+        if (downUnavailable) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.65f, 0.2f, 1.0f));
+                ImGui::TextUnformatted(
+                    tr("Selected down channel is unavailable; sending is disabled.", "所选下行通道不可用，发送已禁用。"));
+                ImGui::PopStyleColor();
+        }
+
+        if (active) {
+                if (ui::SmallButton(tr("STOP RTT", "停止 RTT"), ui::BtnStyle::Danger))
+                        rttStop();
         } else {
-                if (ui::SmallButton(tr("OPEN", "打开"), ui::BtnStyle::Success))
-                        vcomOpen();
+                ImGui::BeginDisabled(!isConnected_.load(std::memory_order_acquire) || busy_.load(std::memory_order_acquire));
+                if (ui::SmallButton(tr("START RTT", "启动 RTT"), ui::BtnStyle::Success))
+                        rttStart();
+                ImGui::EndDisabled();
         }
         ImGui::SameLine();
         if (ImGui::SmallButton(tr("Clear", "清空")))
-                vcomClearRx();
+                rttClearRx();
 
-        std::string       rx = vcomRxSnapshot();
-        std::vector<char> rxBuf(rx.begin(), rx.end());
-        rxBuf.push_back('\0');
-        ImGui::InputTextMultiline(
-            "##jlink_vcom_rx", rxBuf.data(), rxBuf.size(), ImVec2(520.0f, 220.0f), ImGuiInputTextFlags_ReadOnly);
+        std::string error = rttErrorSnapshot();
+        if (!error.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+                ImGui::TextWrapped("%s", error.c_str());
+                ImGui::PopStyleColor();
+        }
 
-        ImGui::SetNextItemWidth(430.0f);
-        bool sendNow =
-            ImGui::InputText("##jlink_vcom_tx", vcomTxBuf_, sizeof(vcomTxBuf_), ImGuiInputTextFlags_EnterReturnsTrue);
+        std::string rx       = rttRxSnapshot();
+        const float rxHeight = std::max(120.0f, ImGui::GetContentRegionAvail().y - ImGui::GetFrameHeightWithSpacing());
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+        if (ImGui::BeginChild(
+                "##jlink_rtt_rx", ImVec2(-1.0f, rxHeight), ImGuiChildFlags_Borders, ImGuiWindowFlags_HorizontalScrollbar)) {
+                const float scrollY        = ImGui::GetScrollY();
+                const float scrollMaxY     = ImGui::GetScrollMaxY();
+                const bool  atBottom       = scrollMaxY <= 1.0f || scrollY >= scrollMaxY - 1.0f;
+                const bool  hovered        = ImGui::IsWindowHovered();
+                const bool  focused        = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+                const bool  scrollMoved    = scrollY > rttLastScrollY_ + 0.5f || scrollY + 0.5f < rttLastScrollY_;
+                const bool  draggingScroll = hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left) && scrollMoved;
+                const bool  keyboardScrollUp =
+                    focused && (ImGui::IsKeyPressed(ImGuiKey_PageUp) || ImGui::IsKeyPressed(ImGuiKey_Home) ||
+                                ImGui::IsKeyPressed(ImGuiKey_UpArrow));
+
+                // Scrolling upward is an explicit request to inspect history. Keep
+                // that position even while new RTT data arrives. Dragging the
+                // scrollbar or using keyboard navigation has the same effect.
+                const bool userLeftBottom =
+                    (hovered && ImGui::GetIO().MouseWheel > 0.0f) || (draggingScroll && !atBottom) || keyboardScrollUp;
+                if (userLeftBottom)
+                        rttAutoScroll_ = false;
+                else if (!rttAutoScroll_ && atBottom)
+                        rttAutoScroll_ = true;
+
+                ImGui::TextUnformatted(rx.data(), rx.data() + rx.size());
+
+                // Issue this after the text so it targets data appended in this frame.
+                if (rttAutoScroll_)
+                        ImGui::SetScrollHereY(1.0f);
+
+                rttLastScrollY_ = scrollY;
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+
+        ImGui::BeginDisabled(!active || downUnavailable || !isConnected_.load(std::memory_order_acquire));
+        ImGui::SetNextItemWidth(std::max(120.0f, ImGui::GetContentRegionAvail().x - 185.0f));
+        bool sendNow = ImGui::InputText("##jlink_rtt_tx", rttTxBuf_, sizeof(rttTxBuf_), ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SameLine();
         if (ui::SmallButton(tr("SEND", "发送"), ui::BtnStyle::Success))
                 sendNow = true;
-        if (sendNow) {
-                vcomSend(vcomTxBuf_);
-                vcomTxBuf_[0] = '\0';
+        ImGui::SameLine();
+        if (ImGui::Checkbox(tr("Append LF", "追加换行"), &rttAppendNewline_))
+                configModified_.store(true, std::memory_order_release);
+        if (sendNow && rttTxBuf_[0] != '\0') {
+                std::string message(rttTxBuf_);
+                if (rttAppendNewline_)
+                        message.push_back('\n');
+                if (rttSend(message.data(), message.size()))
+                        rttTxBuf_[0] = '\0';
+        }
+        ImGui::EndDisabled();
+
+        ImGui::End();
+}
+
+namespace
+{
+constexpr usize kSwoMaxTextBytes    = 512u * 1024u;
+constexpr usize kSwoReadBufferBytes = 1024u * 1024u;
+constexpr usize kSwoMaxEvents       = 4096u;
+
+constexpr u32 kDemcrAddress        = 0xE000EDFCu;
+constexpr u32 kItmTcrAddress       = 0xE0000E80u;
+constexpr u32 kItmLarAddress       = 0xE0000FB0u;
+constexpr u32 kDwtCtrlAddress      = 0xE0001000u;
+constexpr u32 kDwtCyccntAddress    = 0xE0001004u;
+constexpr u32 kDwtLarAddress       = 0xE0001FB0u;
+constexpr u32 kTpiuAcprAddress     = 0xE0040010u;
+constexpr u32 kTpiuSpprAddress     = 0xE00400F0u;
+constexpr u32 kTpiuFfcrAddress     = 0xE0040304u;
+constexpr u32 kH7DbgMcuCrAddress   = 0x5C001004u;
+constexpr u32 kH7SwoCodrAddress    = 0x5C003010u;
+constexpr u32 kH7SwoSpprAddress    = 0x5C0030F0u;
+constexpr u32 kH7SwoLarAddress     = 0x5C003FB0u;
+constexpr u32 kH7SwtfCtrlAddress   = 0x5C004000u;
+constexpr u32 kH7SwtfLarAddress    = 0x5C004FB0u;
+constexpr u32 kH7TraceClockMask    = 0x00700000u; // TRACECLKEN, D1DBGCKEN, D3DBGCKEN
+constexpr u32 kDwtComp0Address     = 0xE0001020u;
+constexpr u32 kDwtMask0Address     = 0xE0001024u;
+constexpr u32 kDwtFunction0Address = 0xE0001028u;
+constexpr u32 kCoreSightUnlockKey  = 0xC5ACCE55u;
+
+u32
+traceWatchMask(const int size)
+{
+        if (size >= 4)
+                return 2;
+        if (size >= 2)
+                return 1;
+        return 0;
+}
+
+std::vector<int>
+swoSpeedLevels(const int cpuMHz)
+{
+        if (cpuMHz <= 0)
+                return {1000};
+
+        const u64 cpuKHz = static_cast<u64>(cpuMHz) * 1000u;
+        // Generate a small set of useful bands. Each selected frequency is an
+        // exact CPU-clock divisor and therefore maps to an integer TPIU divider.
+        constexpr int    targetKHz[] = {50000, 40000, 25000, 20000, 16000, 12000, 10000, 8000, 4000, 2000, 1000, 500, 250, 125};
+        std::vector<int> levels;
+        levels.reserve(IM_ARRAYSIZE(targetKHz));
+        for (const int target : targetKHz) {
+                u64 divider = std::max<u64>(1u, (cpuKHz + static_cast<u64>(target) - 1u) / static_cast<u64>(target));
+                for (; divider <= 8192u; ++divider) {
+                        if (cpuKHz % divider != 0)
+                                continue;
+                        const u64 speedKHz = cpuKHz / divider;
+                        if (speedKHz <= 50000u && speedKHz <= static_cast<u64>(std::numeric_limits<int>::max())) {
+                                const int speed = static_cast<int>(speedKHz);
+                                if (levels.empty() || levels.back() != speed)
+                                        levels.push_back(speed);
+                        }
+                        break;
+                }
+        }
+        if (levels.empty())
+                levels.push_back(1);
+        else
+                std::reverse(levels.begin(), levels.end());
+        return levels;
+}
+} // namespace
+
+void
+JLinkPort::openTraceWindow()
+{
+        if (!swoWindowOpen_)
+                configModified_.store(true, std::memory_order_release);
+        swoWindowOpen_           = true;
+        swoWindowFocusRequested_ = true;
+}
+
+void
+JLinkPort::configureDwtWriteTrace(const u32 address, const u32 size, const std::string &name)
+{
+        const u32 supportedSize = size >= 4 ? 4u : (size >= 2 ? 2u : 1u);
+        snprintf(swoWatchAddress_, sizeof(swoWatchAddress_), "0x%08X", address);
+        snprintf(swoWatchName_, sizeof(swoWatchName_), "%s", name.c_str());
+        swoWatchSize_            = static_cast<int>(supportedSize);
+        swoWatchWrite_           = true;
+        swoWindowOpen_           = true;
+        swoWindowFocusRequested_ = true;
+        if (swoActive_.load(std::memory_order_acquire))
+                setSwoError("DWT: stop and restart Trace to apply the new variable watch");
+}
+
+void
+JLinkPort::setTraceAddressResolver(std::function<std::string(u32)> resolver)
+{
+        traceAddressResolver_ = std::move(resolver);
+}
+
+std::string
+JLinkPort::resolveTraceAddress(const u32 address) const
+{
+        if (traceAddressResolver_) {
+                std::string result = traceAddressResolver_(address);
+                if (!result.empty())
+                        return result;
+        }
+        char text[24];
+        snprintf(text, sizeof(text), "0x%08X", address);
+        return text;
+}
+
+bool
+JLinkPort::swoConfigureHardwareLocked()
+{
+        swoTargetStateSaved_     = false;
+        swoWatchStateSaved_      = false;
+        const std::string device = deviceName();
+        swoUsesStm32H7SystemSwo_ = device.starts_with("STM32H745") || device.starts_with("STM32H747") ||
+                                   device.starts_with("STM32H755") || device.starts_with("STM32H757");
+
+        auto readU32 = [](const u32 address, u32 &value) { return JLINKARM_ReadMemEx(address, sizeof(value), &value, 0) >= 0; };
+        auto writeU32 = [](const u32 address, const u32 value) {
+                return JLINKARM_WriteMemEx(address, sizeof(value), &value, 0) >= 0;
+        };
+
+        const bool coreStateRead = readU32(kDemcrAddress, swoSavedDemcr_) && readU32(kDwtCtrlAddress, swoSavedDwtCtrl_) &&
+                                   readU32(kDwtCyccntAddress, swoSavedDwtCyccnt_) && readU32(kItmTcrAddress, swoSavedItmTcr_);
+        const bool outputStateRead =
+            swoUsesStm32H7SystemSwo_
+                ? (readU32(kH7DbgMcuCrAddress, swoSavedH7DbgMcuCr_) && readU32(kH7SwoCodrAddress, swoSavedH7SwoCodr_) &&
+                   readU32(kH7SwoSpprAddress, swoSavedH7SwoSppr_) && readU32(kH7SwtfCtrlAddress, swoSavedH7SwtfCtrl_))
+                : (readU32(kTpiuAcprAddress, swoSavedTpiuAcpr_) && readU32(kTpiuSpprAddress, swoSavedTpiuSppr_) &&
+                   readU32(kTpiuFfcrAddress, swoSavedTpiuFfcr_));
+        if (!coreStateRead || !outputStateRead) {
+                setSwoError("DWT: this target does not expose the required CoreSight registers");
+                return false;
+        }
+        swoTargetStateSaved_ = true;
+
+        // Cortex-M7 implements lock access registers for ITM and DWT. A debug
+        // memory write can report success while the protected register write is
+        // silently ignored, so unlock both blocks before changing their state.
+        if (!writeU32(kItmLarAddress, kCoreSightUnlockKey) || !writeU32(kDwtLarAddress, kCoreSightUnlockKey)) {
+                setSwoError("DWT: failed to unlock the Cortex-M7 ITM/DWT blocks");
+                return false;
         }
 
-        ImGui::EndPopup();
+        if (!writeU32(kDemcrAddress, swoSavedDemcr_ | (1u << 24u))) {
+                setSwoError("DWT: failed to enable CoreSight tracing");
+                return false;
+        }
+
+        const u64 cpuHz   = static_cast<u64>(swoCpuMHz_) * 1000000u;
+        const u64 swoHz   = static_cast<u64>(swoSpeedKHz_) * 1000u;
+        const u64 divider = cpuHz / swoHz;
+        // Dual-core STM32H745/747/755/757 route M7 ITM through ST's system
+        // SWO trace funnel, not through the Cortex-M TPIU window at E0040000.
+        bool outputConfigured = false;
+        if (swoUsesStm32H7SystemSwo_) {
+                outputConfigured =
+                    writeU32(kItmTcrAddress, 0u) && writeU32(kH7DbgMcuCrAddress, swoSavedH7DbgMcuCr_ | kH7TraceClockMask) &&
+                    writeU32(kH7SwoLarAddress, kCoreSightUnlockKey) && writeU32(kH7SwtfLarAddress, kCoreSightUnlockKey) &&
+                    writeU32(kH7SwoSpprAddress, 2u) && writeU32(kH7SwoCodrAddress, static_cast<u32>(divider - 1u)) &&
+                    writeU32(kH7SwtfCtrlAddress, swoSavedH7SwtfCtrl_ | 1u); // M7 ITM input
+        } else {
+                // SPPR=2 selects asynchronous NRZ (UART) SWO.
+                outputConfigured = writeU32(kItmTcrAddress, 0u) && writeU32(kTpiuSpprAddress, 2u) &&
+                                   writeU32(kTpiuAcprAddress, static_cast<u32>(divider - 1u)) &&
+                                   writeU32(kTpiuFfcrAddress, swoSavedTpiuFfcr_ | (1u << 8u));
+        }
+        if (!outputConfigured) {
+                setSwoError("SWO: failed to configure the target TPIU UART output");
+                return false;
+        }
+
+        // ITMENA routes ITM packets and DWTENA routes hardware packets from DWT
+        // through the same TPIU/SWO stream.
+        if (!writeU32(kItmTcrAddress, swoSavedItmTcr_ | (1u << 0u) | (1u << 3u))) {
+                setSwoError("DWT: failed to enable the ITM hardware packet path");
+                return false;
+        }
+
+        u32 dwtCtrl = swoSavedDwtCtrl_;
+        if (swoExceptionTrace_)
+                dwtCtrl |= 1u << 16u; // EXCTRCENA
+        if (swoPcSampling_) {
+                if ((dwtCtrl & (1u << 25u)) != 0) {
+                        setSwoError("DWT: PC sampling is unavailable because this core has no cycle counter");
+                } else {
+                        dwtCtrl              |= (1u << 0u) | (1u << 12u); // CYCCNTENA + PCSAMPLENA
+                        dwtCtrl              &= ~((0xFu << 1u) | (0xFu << 5u) | (1u << 9u));
+                        const u32 postPreset  = swoPcSampleRate_ >= 2 ? 15u : 3u;
+                        dwtCtrl              |= (postPreset << 1u) | (postPreset << 5u);
+                        if (swoPcSampleRate_ >= 1)
+                                dwtCtrl |= 1u << 9u; // use CYCCNT bit 10 instead of bit 6
+                }
+        }
+        if (!writeU32(kDwtCtrlAddress, dwtCtrl)) {
+                setSwoError("DWT: failed to configure exception/PC sampling");
+                return false;
+        }
+
+        u32       itmTcrReadback     = 0;
+        u32       dwtCtrlReadback    = 0;
+        u32       tpiuAcprReadback   = 0;
+        u32       tpiuSpprReadback   = 0;
+        u32       h7SwoCodrReadback  = 0;
+        u32       h7SwoSpprReadback  = 0;
+        u32       h7SwtfCtrlReadback = 0;
+        const u32 requiredDwtBits =
+            (swoExceptionTrace_ ? (1u << 16u) : 0u) | (swoPcSampling_ ? ((1u << 0u) | (1u << 12u)) : 0u);
+        const bool outputVerified = swoUsesStm32H7SystemSwo_
+                                        ? (readU32(kH7SwoSpprAddress, h7SwoSpprReadback) && h7SwoSpprReadback == 2u &&
+                                           readU32(kH7SwoCodrAddress, h7SwoCodrReadback) && h7SwoCodrReadback == divider - 1u &&
+                                           readU32(kH7SwtfCtrlAddress, h7SwtfCtrlReadback) && (h7SwtfCtrlReadback & 1u) != 0u)
+                                        : (readU32(kTpiuSpprAddress, tpiuSpprReadback) && tpiuSpprReadback == 2u &&
+                                           readU32(kTpiuAcprAddress, tpiuAcprReadback) && tpiuAcprReadback == divider - 1u);
+        if (!readU32(kItmTcrAddress, itmTcrReadback) ||
+            (itmTcrReadback & ((1u << 0u) | (1u << 3u))) != ((1u << 0u) | (1u << 3u)) ||
+            !readU32(kDwtCtrlAddress, dwtCtrlReadback) || (dwtCtrlReadback & requiredDwtBits) != requiredDwtBits ||
+            !outputVerified) {
+                setSwoError("SWO: Cortex-M7 rejected the ITM/DWT/TPIU configuration");
+                return false;
+        }
+
+        if (swoWatchWrite_) {
+                char     *end          = nullptr;
+                const u64 watchAddress = std::strtoull(swoWatchAddress_, &end, 0);
+                while (end && *end != '\0' && std::isspace(static_cast<unsigned char>(*end)))
+                        ++end;
+                if (!end || end == swoWatchAddress_ || *end != '\0' || watchAddress > std::numeric_limits<u32>::max()) {
+                        setSwoError("DWT: invalid variable address");
+                        return false;
+                }
+                swoWatchSize_ = swoWatchSize_ >= 4 ? 4 : (swoWatchSize_ >= 2 ? 2 : 1);
+                if ((watchAddress & static_cast<u64>(swoWatchSize_ - 1)) != 0) {
+                        setSwoError("DWT: the watched address must be aligned to its data size");
+                        return false;
+                }
+                const u32 comparatorCount = (swoSavedDwtCtrl_ >> 28u) & 0xFu;
+                if (comparatorCount == 0) {
+                        setSwoError("DWT: this core has no hardware watchpoint comparator");
+                        return false;
+                }
+                if (!readU32(kDwtComp0Address, swoSavedDwtComp0_) || !readU32(kDwtMask0Address, swoSavedDwtMask0_) ||
+                    !readU32(kDwtFunction0Address, swoSavedDwtFunction0_)) {
+                        setSwoError("DWT: failed to save comparator 0");
+                        return false;
+                }
+                swoWatchStateSaved_ = true;
+                // FUNCTION=0xA: data-address write match with PC and data-value
+                // trace packets on Armv7-M DWT. Disable before changing COMP/MASK.
+                if (!writeU32(kDwtFunction0Address, 0) || !writeU32(kDwtComp0Address, static_cast<u32>(watchAddress)) ||
+                    !writeU32(kDwtMask0Address, traceWatchMask(swoWatchSize_)) || !writeU32(kDwtFunction0Address, 0xAu)) {
+                        setSwoError("DWT: failed to configure write-access tracing");
+                        return false;
+                }
+        }
+        return true;
 }
+
+void
+JLinkPort::swoRestoreHardwareLocked()
+{
+        auto writeU32 = [](const u32 address, const u32 value) {
+                return JLINKARM_WriteMemEx(address, sizeof(value), &value, 0) >= 0;
+        };
+        if (swoWatchStateSaved_) {
+                writeU32(kDwtFunction0Address, 0);
+                writeU32(kDwtComp0Address, swoSavedDwtComp0_);
+                writeU32(kDwtMask0Address, swoSavedDwtMask0_);
+                writeU32(kDwtFunction0Address, swoSavedDwtFunction0_);
+        }
+        if (swoTargetStateSaved_) {
+                writeU32(kDwtCtrlAddress, swoSavedDwtCtrl_);
+                writeU32(kDwtCyccntAddress, swoSavedDwtCyccnt_);
+                writeU32(kItmTcrAddress, 0u);
+                if (swoUsesStm32H7SystemSwo_) {
+                        writeU32(kH7SwtfCtrlAddress, swoSavedH7SwtfCtrl_);
+                        writeU32(kH7SwoCodrAddress, swoSavedH7SwoCodr_);
+                        writeU32(kH7SwoSpprAddress, swoSavedH7SwoSppr_);
+                        // Keep D1DBGCKEN/D3DBGCKEN enabled for the lifetime of
+                        // the open J-Link session. Clearing them here gates the
+                        // dual-core debug infrastructure and makes the next
+                        // CoreSight access fail until the probe reconnects.
+                } else {
+                        writeU32(kTpiuAcprAddress, swoSavedTpiuAcpr_);
+                        writeU32(kTpiuSpprAddress, swoSavedTpiuSppr_);
+                        writeU32(kTpiuFfcrAddress, swoSavedTpiuFfcr_);
+                }
+                writeU32(kItmTcrAddress, swoSavedItmTcr_);
+                writeU32(kDemcrAddress, swoSavedDemcr_);
+        }
+        swoWatchStateSaved_  = false;
+        swoTargetStateSaved_ = false;
+}
+
+bool
+JLinkPort::swoStart()
+{
+        std::lock_guard lifecycle(swoLifecycleMtx_);
+        if (swoActive_.load(std::memory_order_acquire))
+                return true;
+
+        swoReaderRunning_.store(false, std::memory_order_release);
+        swoWakeCv_.notify_all();
+        if (swoThread_.joinable())
+                swoThread_.join();
+        setSwoError({});
+
+        swoItmPort_  = std::clamp(swoItmPort_, 0, 31);
+        swoCpuMHz_   = std::max(swoCpuMHz_, 0);
+        swoSpeedKHz_ = std::max(swoSpeedKHz_, 0);
+        // The SDK documents CPUSpeed=0 as automatic measurement, but some
+        // probe/STM32H7 combinations never return from SWO_EnableTarget.
+        // Reject it before entering that synchronous SDK call and holding the
+        // shared J-Link I/O lock.
+        if (swoCpuMHz_ == 0) {
+                setSwoError("SWO: CPU MHz must be specified; automatic clock measurement can hang on STM32H7");
+                swoStatus_.store(SwoStatus::Error, std::memory_order_release);
+                return false;
+        }
+        if (swoSpeedKHz_ == 0) {
+                setSwoError("SWO: SWO kHz must be specified so the target TPIU divider can be configured");
+                swoStatus_.store(SwoStatus::Error, std::memory_order_release);
+                return false;
+        }
+        const u32 portMask = 1u << static_cast<u32>(swoItmPort_);
+        const u32 cpuHz =
+            static_cast<u32>(std::min<u64>(static_cast<u64>(swoCpuMHz_) * 1000000u, std::numeric_limits<u32>::max()));
+        const u32 swoHz =
+            static_cast<u32>(std::min<u64>(static_cast<u64>(swoSpeedKHz_) * 1000u, std::numeric_limits<u32>::max()));
+        const u64 divider = static_cast<u64>(cpuHz) / swoHz;
+        if (static_cast<u64>(cpuHz) % swoHz != 0 || divider == 0 || divider > 8192u) {
+                setSwoError("SWO: CPU MHz must be an exact multiple of SWO kHz (TPIU divider range 1..8192)");
+                swoStatus_.store(SwoStatus::Error, std::memory_order_release);
+                return false;
+        }
+
+        int result = -1;
+        {
+                std::lock_guard io(mtx_);
+                if (!isOpen_.load(std::memory_order_acquire) || !isConnected_.load(std::memory_order_acquire)) {
+                        setSwoError("SWO: connect J-Link to the target first");
+                        swoStatus_.store(SwoStatus::Disconnected, std::memory_order_release);
+                        return false;
+                }
+                // A previous target disconnect can leave the DLL's host-side
+                // SWO receiver marked as started even after a new J-Link
+                // connection has been established. STOP is host-side only and
+                // is safe when no receiver is active.
+                JLINKARM_SWO_Control(JLINKARM_SWO_CMD_STOP, nullptr);
+                result = JLINKARM_SWO_EnableTarget(cpuHz, swoHz, JLINKARM_SWO_IF_UART, portMask);
+                if (result >= 0 && !swoConfigureHardwareLocked()) {
+                        swoRestoreHardwareLocked();
+                        JLINKARM_SWO_Control(JLINKARM_SWO_CMD_STOP, nullptr);
+                        JLINKARM_SWO_DisableTarget(portMask);
+                        result = -1;
+                } else if (result < 0) {
+                        // EnableTarget may have started the host receiver before
+                        // failing to resume/configure the CPU. Do not carry that
+                        // partial state into reconnect or application shutdown.
+                        JLINKARM_SWO_Control(JLINKARM_SWO_CMD_STOP, nullptr);
+                }
+        }
+        if (result < 0) {
+                if (swoErrorSnapshot().empty()) {
+                        char message[160];
+                        snprintf(message,
+                                 sizeof(message),
+                                 "SWO: failed to enable target (error %d). Check the CPU clock and SWO wiring.",
+                                 result);
+                        setSwoError(message);
+                }
+                swoStatus_.store(SwoStatus::Error, std::memory_order_release);
+                return false;
+        }
+
+        {
+                std::lock_guard data(swoDataMtx_);
+                swoDecodePending_.clear();
+                swoEvents_.clear();
+                swoTimelineView_.clear();
+                swoPcSamples_.clear();
+                swoPcSampleTotal_        = 0;
+                swoLastWatchPc_          = 0;
+                swoLastTimelineUs_       = 0.0;
+                swoTimelineFollow_       = true;
+                swoTimelineScrollFrames_ = 3;
+        }
+        swoStartTime_  = std::chrono::steady_clock::now();
+        swoActivePort_ = swoItmPort_;
+        swoStatus_.store(SwoStatus::Running, std::memory_order_release);
+        swoActive_.store(true, std::memory_order_release);
+        swoReaderRunning_.store(true, std::memory_order_release);
+        try {
+                swoThread_ = std::thread(&JLinkPort::swoReaderLoop, this);
+        } catch (const std::exception &e) {
+                swoReaderRunning_.store(false, std::memory_order_release);
+                swoActive_.store(false, std::memory_order_release);
+                {
+                        std::lock_guard io(mtx_);
+                        if (isOpen_.load(std::memory_order_acquire)) {
+                                JLINKARM_SWO_Control(JLINKARM_SWO_CMD_STOP, nullptr);
+                                JLINKARM_SWO_DisableTarget(portMask);
+                        }
+                }
+                setSwoError(std::string("SWO: failed to create reader thread: ") + e.what());
+                swoStatus_.store(SwoStatus::Error, std::memory_order_release);
+                return false;
+        }
+
+        LOG_I("J-Link SWO started: CPU=%dMHz SWO=%dkHz ITM port=%d", swoCpuMHz_, swoSpeedKHz_, swoActivePort_);
+        return true;
+}
+
+void
+JLinkPort::swoStop()
+{
+        std::lock_guard lifecycle(swoLifecycleMtx_);
+        swoStopImpl();
+}
+
+void
+JLinkPort::swoStopImpl()
+{
+        swoReaderRunning_.store(false, std::memory_order_release);
+        swoWakeCv_.notify_all();
+        if (swoThread_.joinable())
+                swoThread_.join();
+
+        const bool wasActive = swoActive_.exchange(false, std::memory_order_acq_rel);
+        if (wasActive) {
+                const u32       portMask = 1u << static_cast<u32>(std::clamp(swoActivePort_, 0, 31));
+                std::lock_guard io(mtx_);
+                if (isOpen_.load(std::memory_order_acquire)) {
+                        // Stop the host capture before touching target CoreSight
+                        // state. This also prevents JLINKARM_Close from waiting
+                        // on a receiver left over from the previous connection.
+                        JLINKARM_SWO_Control(JLINKARM_SWO_CMD_STOP, nullptr);
+                        if (isConnected_.load(std::memory_order_acquire))
+                                swoRestoreHardwareLocked();
+                        JLINKARM_SWO_DisableTarget(portMask);
+                }
+        }
+
+        {
+                std::lock_guard data(swoDataMtx_);
+                swoDecodePending_.clear();
+        }
+        swoStatus_.store(isConnected_.load(std::memory_order_acquire) ? SwoStatus::Stopped : SwoStatus::Disconnected,
+                         std::memory_order_release);
+}
+
+void
+JLinkPort::swoConsumeRaw(const u8 *data, const usize size)
+{
+        if (!data || size == 0)
+                return;
+
+        std::lock_guard lock(swoDataMtx_);
+        swoDecodePending_.insert(swoDecodePending_.end(), data, data + size);
+
+        // USB delivers SWO in batches. Reusing the host receive timestamp for
+        // every packet makes fast interrupt events appear simultaneous. Anchor
+        // the batch to host time, then distribute packets by their UART wire
+        // position (8 data + start/stop = 10 bits per byte).
+        const double batchEndUs =
+            std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - swoStartTime_).count();
+        const double byteTimeUs = 10000.0 / static_cast<double>(std::max(swoSpeedKHz_, 1));
+        const double batchStartUs =
+            std::max(swoLastTimelineUs_, batchEndUs - byteTimeUs * static_cast<double>(swoDecodePending_.size()));
+
+        const auto packetTimeUs = [&](const usize packetEnd) {
+                return batchStartUs + byteTimeUs * static_cast<double>(packetEnd);
+        };
+
+        usize pos = 0;
+        while (pos < swoDecodePending_.size()) {
+                const usize packetStart = pos;
+                const u8    header      = swoDecodePending_[pos++];
+
+                // ITM source packet: bits[1:0] encode a 1/2/4-byte payload,
+                // bit 2 selects hardware (DWT) versus software stimulus.
+                if ((header & 0x03u) != 0) {
+                        const usize payloadSize = usize{1} << static_cast<unsigned>((header & 0x03u) - 1u);
+                        if (swoDecodePending_.size() - pos < payloadSize) {
+                                pos = packetStart;
+                                break;
+                        }
+                        const bool isHardwarePacket = (header & 0x04u) != 0;
+                        const int  port             = static_cast<int>(header >> 3u);
+                        if (isHardwarePacket) {
+                                u64 value = 0;
+                                for (usize i = 0; i < payloadSize; ++i)
+                                        value |= static_cast<u64>(swoDecodePending_[pos + i]) << (i * 8u);
+
+                                const double eventTimeUs = packetTimeUs(pos + payloadSize);
+                                if (port == 1 && payloadSize >= 2) {
+                                        TraceEvent event;
+                                        event.kind            = TraceEventKind::Exception;
+                                        event.timeUs          = eventTimeUs;
+                                        event.exceptionNumber = static_cast<u16>(value & 0x1FFu);
+                                        event.action          = static_cast<u8>((value >> 12u) & 0x3u);
+                                        swoEvents_.push_back(event);
+                                } else if (port == 2) {
+                                        // A four-byte packet contains a sampled PC. A short
+                                        // packet denotes sleep/no executable PC.
+                                        const u32 pc = payloadSize == 4 ? static_cast<u32>(value) : 0xFFFFFFFFu;
+                                        ++swoPcSamples_[pc];
+                                        ++swoPcSampleTotal_;
+                                        TraceEvent event;
+                                        event.kind   = TraceEventKind::PcSample;
+                                        event.timeUs = eventTimeUs;
+                                        event.pc     = pc;
+                                        swoEvents_.push_back(event);
+                                } else if (port == 8 && payloadSize == 4) {
+                                        // Comparator 0 data-trace PC packet.
+                                        swoLastWatchPc_ = static_cast<u32>(value);
+                                } else if (port == 9) {
+                                        TraceEvent event;
+                                        event.kind      = TraceEventKind::DataWrite;
+                                        event.timeUs    = eventTimeUs;
+                                        event.pc        = swoLastWatchPc_;
+                                        event.value     = value;
+                                        event.valueSize = static_cast<u8>(payloadSize);
+                                        swoEvents_.push_back(event);
+                                }
+                                while (swoEvents_.size() > kSwoMaxEvents)
+                                        swoEvents_.pop_front();
+                                swoLastTimelineUs_ = std::max(swoLastTimelineUs_, eventTimeUs);
+                        } else if (port == swoActivePort_) {
+                                for (usize i = 0; i < payloadSize; ++i) {
+                                        const u8 ch = swoDecodePending_[pos + i];
+                                        // Keep UTF-8 bytes and normal terminal controls. Replace
+                                        // embedded NUL/other controls so ImGui cannot truncate text.
+                                        if (ch == '\n' || ch == '\r' || ch == '\t' || ch >= 0x20u)
+                                                swoTextLog_.push_back(static_cast<char>(ch));
+                                        else
+                                                swoTextLog_.push_back('.');
+                                }
+                        }
+                        pos += payloadSize;
+                        continue;
+                }
+
+                if (header == 0x70u) {
+                        swoOverflowPackets_.fetch_add(1, std::memory_order_relaxed);
+                        continue;
+                }
+                if (header == 0x00u || header == 0x80u)
+                        continue; // synchronization padding
+
+                // Timestamp/extension packets use continuation bytes. We do not
+                // display them in the text view, but must consume the full packet
+                // to keep subsequent ITM stimulus packets aligned.
+                bool more = (header & 0x80u) != 0;
+                while (more) {
+                        if (pos >= swoDecodePending_.size()) {
+                                pos = packetStart;
+                                break;
+                        }
+                        more = (swoDecodePending_[pos++] & 0x80u) != 0;
+                }
+                if (pos == packetStart)
+                        break;
+        }
+
+        if (pos > 0)
+                swoDecodePending_.erase(swoDecodePending_.begin(), swoDecodePending_.begin() + pos);
+        // Corrupt/noisy SWO input must not grow the partial-packet buffer forever.
+        if (swoDecodePending_.size() > 64u)
+                swoDecodePending_.clear();
+        if (swoTextLog_.size() > kSwoMaxTextBytes)
+                swoTextLog_.erase(0, swoTextLog_.size() - kSwoMaxTextBytes);
+}
+
+void
+JLinkPort::swoReaderLoop()
+{
+        std::vector<u8> buffer(kSwoReadBufferBytes);
+        int             consecutiveErrors = 0;
+
+        while (swoReaderRunning_.load(std::memory_order_acquire)) {
+                if (!isOpen_.load(std::memory_order_acquire) || !isConnected_.load(std::memory_order_acquire)) {
+                        setSwoError("SWO: J-Link target disconnected");
+                        swoStatus_.store(SwoStatus::Disconnected, std::memory_order_release);
+                        swoActive_.store(false, std::memory_order_release);
+                        break;
+                }
+
+                u32 numBytes = static_cast<u32>(buffer.size());
+                int result   = -1;
+                {
+                        std::lock_guard io(mtx_);
+                        if (isOpen_.load(std::memory_order_acquire) && isConnected_.load(std::memory_order_acquire)) {
+                                result = JLINKARM_SWO_Read(buffer.data(), 0, &numBytes);
+                                // SWO_Read uses an offset into the host buffer; it
+                                // does not consume those bytes. Flush exactly the
+                                // copied range so the next iteration reads new
+                                // data instead of replaying the same packet.
+                                if (result >= 0 && numBytes > 0) {
+                                        u32       flushBytes  = numBytes;
+                                        const int flushResult = JLINKARM_SWO_Control(JLINKARM_SWO_CMD_FLUSH, &flushBytes);
+                                        if (flushResult < 0)
+                                                result = flushResult;
+                                }
+                        }
+                }
+
+                if (result < 0) {
+                        if (++consecutiveErrors >= 3) {
+                                char message[128];
+                                snprintf(message, sizeof(message), "SWO: read failed (error %d)", result);
+                                setSwoError(message);
+                                swoStatus_.store(SwoStatus::Error, std::memory_order_release);
+                        }
+                        numBytes = 0;
+                } else {
+                        consecutiveErrors = 0;
+                        if (numBytes > buffer.size())
+                                numBytes = static_cast<u32>(buffer.size());
+                        if (numBytes > 0) {
+                                swoRxBytes_.fetch_add(numBytes, std::memory_order_relaxed);
+                                swoConsumeRaw(buffer.data(), numBytes);
+                        }
+                }
+
+                std::unique_lock wake(swoWakeMtx_);
+                swoWakeCv_.wait_for(wake, numBytes > 0 ? std::chrono::milliseconds(1) : std::chrono::milliseconds(10), [this] {
+                        return !swoReaderRunning_.load(std::memory_order_acquire);
+                });
+        }
+
+        swoReaderRunning_.store(false, std::memory_order_release);
+}
+
+std::string
+JLinkPort::swoTextSnapshot() const
+{
+        std::lock_guard lock(swoDataMtx_);
+        return swoTextLog_;
+}
+
+std::string
+JLinkPort::swoErrorSnapshot() const
+{
+        std::lock_guard lock(swoDataMtx_);
+        return swoError_;
+}
+
+void
+JLinkPort::swoClear()
+{
+        std::lock_guard lock(swoDataMtx_);
+        swoTextLog_.clear();
+        swoDecodePending_.clear();
+        swoEvents_.clear();
+        swoPcSamples_.clear();
+        swoPcSampleTotal_ = 0;
+        swoLastWatchPc_   = 0;
+        swoRxBytes_.store(0, std::memory_order_relaxed);
+        swoOverflowPackets_.store(0, std::memory_order_relaxed);
+}
+
+void
+JLinkPort::setSwoError(const std::string &error)
+{
+        std::lock_guard lock(swoDataMtx_);
+        swoError_ = error;
+}
+
+void
+JLinkPort::drawSwoTraceWindow()
+{
+        if (!swoWindowOpen_)
+                return;
+
+        ImGui::SetNextWindowSize(ImVec2(680.0f, 460.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(560.0f, 320.0f),
+                                            ImVec2(std::numeric_limits<float>::max(), std::numeric_limits<float>::max()));
+        if (swoWindowFocusRequested_)
+                ImGui::SetNextWindowFocus();
+        swoWindowFocusRequested_ = false;
+
+        if (!ImGui::Begin(tr("SWO / ITM Trace###SwoItmTraceWindow", "SWO / ITM 跟踪###SwoItmTraceWindow"), &swoWindowOpen_)) {
+                ImGui::End();
+                return;
+        }
+
+        const bool active = swoActive_.load(std::memory_order_acquire);
+        ImGui::BeginDisabled(active);
+        ImGui::SetNextItemWidth(115.0f);
+        if (ImGui::InputInt(tr("CPU MHz", "CPU MHz"), &swoCpuMHz_, 0, 0))
+                configModified_.store(true, std::memory_order_release);
+        swoCpuMHz_ = std::max(swoCpuMHz_, 0);
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s",
+                                  tr("Enter the actual core clock; automatic measurement is disabled because it can hang",
+                                     "请输入实际内核时钟；自动测量可能卡死，因此已禁用"));
+        ImGui::SameLine();
+        const std::vector<int> swoLevels = swoSpeedLevels(swoCpuMHz_);
+        int                    swoLevel  = 0;
+        for (int i = 1; i < static_cast<int>(swoLevels.size()); ++i) {
+                if (std::abs(swoLevels[static_cast<usize>(i)] - swoSpeedKHz_) <
+                    std::abs(swoLevels[static_cast<usize>(swoLevel)] - swoSpeedKHz_))
+                        swoLevel = i;
+        }
+        // CPU clock edits immediately snap SWO to the nearest legal level.
+        swoSpeedKHz_ = swoLevels[static_cast<usize>(swoLevel)];
+        char swoLevelText[32];
+        snprintf(swoLevelText, sizeof(swoLevelText), "%d kHz", swoSpeedKHz_);
+        ImGui::SetNextItemWidth(180.0f);
+        if (ImGui::SliderInt(tr("SWO kHz", "SWO kHz"),
+                             &swoLevel,
+                             0,
+                             static_cast<int>(swoLevels.size()) - 1,
+                             swoLevelText,
+                             ImGuiSliderFlags_AlwaysClamp)) {
+                swoSpeedKHz_ = swoLevels[static_cast<usize>(swoLevel)];
+                configModified_.store(true, std::memory_order_release);
+        }
+        if (ImGui::IsItemHovered()) {
+                std::string levelTip = tr("Exact divider levels: ", "可整除档位：");
+                for (usize i = 0; i < swoLevels.size(); ++i) {
+                        if (i != 0)
+                                levelTip += " / ";
+                        levelTip += std::to_string(swoLevels[i]);
+                }
+                levelTip += " kHz";
+                ImGui::SetTooltip("%s", levelTip.c_str());
+        }
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::SliderInt(tr("ITM Port", "ITM 端口"), &swoItmPort_, 0, 31, "%d", ImGuiSliderFlags_AlwaysClamp))
+                configModified_.store(true, std::memory_order_release);
+        if (ImGui::Checkbox(tr("Exception trace", "异常/中断跟踪"), &swoExceptionTrace_))
+                configModified_.store(true, std::memory_order_release);
+        ImGui::SameLine();
+        if (ImGui::Checkbox(tr("PC sampling", "PC 采样"), &swoPcSampling_))
+                configModified_.store(true, std::memory_order_release);
+        if (swoPcSampling_) {
+                ImGui::SameLine();
+                const char *rates[] = {tr("Fast", "快速"), tr("Normal", "普通"), tr("Slow", "低速")};
+                ImGui::SetNextItemWidth(90.0f);
+                if (ImGui::Combo("##swo_pc_rate", &swoPcSampleRate_, rates, IM_ARRAYSIZE(rates)))
+                        configModified_.store(true, std::memory_order_release);
+        }
+        if (ImGui::Checkbox(tr("Trace variable writes", "跟踪变量写入"), &swoWatchWrite_))
+                configModified_.store(true, std::memory_order_release);
+        if (swoWatchWrite_) {
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(130.0f);
+                if (ImGui::InputText("##swo_watch_address", swoWatchAddress_, sizeof(swoWatchAddress_)))
+                        configModified_.store(true, std::memory_order_release);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(130.0f);
+                if (ImGui::InputTextWithHint(
+                        "##swo_watch_name", tr("Variable name", "变量名称"), swoWatchName_, sizeof(swoWatchName_)))
+                        configModified_.store(true, std::memory_order_release);
+                ImGui::SameLine();
+                const char *sizes[] = {"1 byte", "2 bytes", "4 bytes"};
+                int         sizeIdx = swoWatchSize_ >= 4 ? 2 : (swoWatchSize_ >= 2 ? 1 : 0);
+                ImGui::SetNextItemWidth(85.0f);
+                if (ImGui::Combo("##swo_watch_size", &sizeIdx, sizes, IM_ARRAYSIZE(sizes))) {
+                        swoWatchSize_ = 1 << sizeIdx;
+                        configModified_.store(true, std::memory_order_release);
+                }
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s",
+                                          tr("Temporarily uses DWT comparator 0 and restores it when Trace stops.",
+                                             "临时占用 DWT 比较器 0，停止跟踪时恢复原设置。"));
+        }
+        ImGui::EndDisabled();
+        ImGui::TextDisabled("%s",
+                            tr("SWO pin required. Exception, PC and DWT write trace need no firmware instrumentation.",
+                               "需要连接 SWO 引脚；异常、PC 和 DWT 写入跟踪不需要修改固件。"));
+
+        const SwoStatus status     = swoStatus_.load(std::memory_order_acquire);
+        const char     *statusText = tr("Stopped", "已停止");
+        switch (status) {
+                case SwoStatus::Running:
+                        statusText = tr("Running", "运行中");
+                        break;
+                case SwoStatus::Disconnected:
+                        statusText = tr("J-Link disconnected", "J-Link 未连接");
+                        break;
+                case SwoStatus::Error:
+                        statusText = tr("Trace error", "跟踪错误");
+                        break;
+                case SwoStatus::Stopped:
+                        break;
+        }
+        ImGui::Text("%s | %s: %llu | %s: %llu",
+                    statusText,
+                    tr("Raw bytes", "原始字节"),
+                    static_cast<unsigned long long>(swoRxBytes_.load(std::memory_order_relaxed)),
+                    tr("Overflow", "溢出"),
+                    static_cast<unsigned long long>(swoOverflowPackets_.load(std::memory_order_relaxed)));
+
+        if (active) {
+                if (ui::SmallButton(tr("STOP TRACE", "停止跟踪"), ui::BtnStyle::Danger))
+                        swoStop();
+        } else {
+                ImGui::BeginDisabled(!isConnected_.load(std::memory_order_acquire) || busy_.load(std::memory_order_acquire));
+                if (ui::SmallButton(tr("START TRACE", "开始跟踪"), ui::BtnStyle::Success))
+                        swoStart();
+                ImGui::EndDisabled();
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton(tr("Clear", "清空")))
+                swoClear();
+
+        const std::string error = swoErrorSnapshot();
+        if (!error.empty()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
+                ImGui::TextWrapped("%s", error.c_str());
+                ImGui::PopStyleColor();
+        }
+
+        std::vector<TraceEvent>          events;
+        std::vector<std::pair<u32, u64>> profile;
+        u64                              profileTotal = 0;
+        {
+                std::lock_guard data(swoDataMtx_);
+                events.assign(swoEvents_.begin(), swoEvents_.end());
+                profile.assign(swoPcSamples_.begin(), swoPcSamples_.end());
+                profileTotal = swoPcSampleTotal_;
+        }
+        std::sort(profile.begin(), profile.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+
+        if (ImGui::BeginTabBar("##swo_trace_tabs")) {
+                if (ImGui::BeginTabItem(tr("Timeline", "时间线"))) {
+                        if (swoTimelineFollow_)
+                                swoTimelineView_ = events;
+                        const std::vector<TraceEvent> &timelineEvents = swoTimelineView_;
+                        if (ImGui::BeginTable("##swo_timeline",
+                                              4,
+                                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                                  ImGuiTableFlags_Resizable,
+                                              ImVec2(-1.0f, -1.0f))) {
+                                ImGui::TableSetupColumn(tr("Time (us)", "时间 (us)"), ImGuiTableColumnFlags_WidthFixed, 115.0f);
+                                ImGui::TableSetupColumn(tr("Type", "类型"), ImGuiTableColumnFlags_WidthFixed, 135.0f);
+                                ImGui::TableSetupColumn(tr("Event", "事件"), ImGuiTableColumnFlags_WidthStretch);
+                                ImGui::TableSetupColumn(tr("Value", "数值"), ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                                ImGui::TableHeadersRow();
+
+                                const float timelineScrollY    = ImGui::GetScrollY();
+                                const float timelineScrollMaxY = ImGui::GetScrollMaxY();
+                                const bool  timelineAtBottom =
+                                    timelineScrollMaxY <= 1.0f || timelineScrollY >= timelineScrollMaxY - 1.0f;
+                                const bool timelineHovered  = ImGui::IsWindowHovered();
+                                const bool timelineFocused  = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+                                const bool keyboardScrollUp = timelineFocused && (ImGui::IsKeyPressed(ImGuiKey_PageUp) ||
+                                                                                  ImGui::IsKeyPressed(ImGuiKey_Home) ||
+                                                                                  ImGui::IsKeyPressed(ImGuiKey_UpArrow));
+
+                                // The scroll position is the only follow control. Moving away from
+                                // the bottom freezes this snapshot; returning to the bottom resumes
+                                // display updates and catches up with newly captured events.
+                                if (swoTimelineScrollFrames_ <= 0 &&
+                                    ((timelineHovered && ImGui::GetIO().MouseWheel > 0.0f) || keyboardScrollUp ||
+                                     (swoTimelineFollow_ && !timelineAtBottom))) {
+                                        swoTimelineFollow_ = false;
+                                } else if (!swoTimelineFollow_ && timelineAtBottom) {
+                                        swoTimelineFollow_ = true;
+                                        swoTimelineView_   = events;
+                                }
+
+                                ImGuiListClipper clipper;
+                                clipper.Begin(static_cast<int>(timelineEvents.size()));
+                                if (swoTimelineFollow_ && !timelineEvents.empty())
+                                        clipper.IncludeItemByIndex(static_cast<int>(timelineEvents.size()) - 1);
+                                while (clipper.Step()) {
+                                        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                                                const TraceEvent &event = timelineEvents[static_cast<usize>(row)];
+                                                ImGui::TableNextRow();
+                                                ImGui::TableSetColumnIndex(0);
+                                                ImGui::Text("%.1f", event.timeUs);
+                                                ImGui::TableSetColumnIndex(1);
+                                                if (event.kind == TraceEventKind::PcSample)
+                                                        ImGui::TextUnformatted("PC");
+                                                else if (event.kind == TraceEventKind::Exception)
+                                                        ImGui::TextUnformatted(tr("Interrupt / exception", "中断/异常事件"));
+                                                else
+                                                        ImGui::TextUnformatted(tr("Data write", "变量写入"));
+                                                ImGui::TableSetColumnIndex(2);
+                                                if (event.kind == TraceEventKind::PcSample) {
+                                                        ImGui::TextUnformatted(event.pc == 0xFFFFFFFFu
+                                                                                   ? tr("CPU sleeping", "CPU 休眠")
+                                                                                   : resolveTraceAddress(event.pc).c_str());
+                                                } else if (event.kind == TraceEventKind::Exception) {
+                                                        std::string exceptionName;
+                                                        switch (event.exceptionNumber) {
+                                                                case 0:
+                                                                        exceptionName = tr("Thread mode", "线程模式");
+                                                                        break;
+                                                                case 2:
+                                                                        exceptionName = "NMI";
+                                                                        break;
+                                                                case 3:
+                                                                        exceptionName = "HardFault";
+                                                                        break;
+                                                                case 4:
+                                                                        exceptionName = "MemManage";
+                                                                        break;
+                                                                case 5:
+                                                                        exceptionName = "BusFault";
+                                                                        break;
+                                                                case 6:
+                                                                        exceptionName = "UsageFault";
+                                                                        break;
+                                                                case 11:
+                                                                        exceptionName = "SVCall";
+                                                                        break;
+                                                                case 12:
+                                                                        exceptionName = "DebugMonitor";
+                                                                        break;
+                                                                case 14:
+                                                                        exceptionName = "PendSV";
+                                                                        break;
+                                                                case 15:
+                                                                        exceptionName = "SysTick";
+                                                                        break;
+                                                                default:
+                                                                        if (event.exceptionNumber >= 16)
+                                                                                exceptionName =
+                                                                                    "IRQ" +
+                                                                                    std::to_string(event.exceptionNumber - 16);
+                                                                        else
+                                                                                exceptionName =
+                                                                                    "Exception " +
+                                                                                    std::to_string(event.exceptionNumber);
+                                                                        break;
+                                                        }
+                                                        const char *action = event.action == 1   ? tr("enter", "进入")
+                                                                             : event.action == 2 ? tr("exit", "退出")
+                                                                             : event.action == 3 ? tr("return", "返回")
+                                                                                                 : tr("unknown", "未知");
+                                                        ImGui::Text("%s — %s", exceptionName.c_str(), action);
+                                                } else {
+                                                        ImGui::Text("%s @ %s",
+                                                                    swoWatchName_[0] ? swoWatchName_
+                                                                                     : tr("watched address", "监视地址"),
+                                                                    event.pc ? resolveTraceAddress(event.pc).c_str()
+                                                                             : tr("PC unavailable", "PC 不可用"));
+                                                }
+                                                ImGui::TableSetColumnIndex(3);
+                                                if (event.kind == TraceEventKind::DataWrite)
+                                                        ImGui::Text("0x%0*llX",
+                                                                    static_cast<int>(event.valueSize) * 2,
+                                                                    static_cast<unsigned long long>(event.value));
+                                                else if (event.kind == TraceEventKind::Exception)
+                                                        ImGui::Text("%u", event.exceptionNumber);
+                                                else
+                                                        ImGui::Text("0x%08X", event.pc);
+                                                if (swoTimelineFollow_ && row + 1 == static_cast<int>(timelineEvents.size()))
+                                                        ImGui::SetScrollHereY(1.0f);
+                                        }
+                                }
+                                if (swoTimelineScrollFrames_ > 0 && timelineScrollMaxY > 1.0f && timelineAtBottom)
+                                        --swoTimelineScrollFrames_;
+                                ImGui::EndTable();
+                        }
+                        ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem(tr("CPU Profile", "CPU 占用"))) {
+                        ImGui::Text(tr("Samples: %llu", "采样数: %llu"), static_cast<unsigned long long>(profileTotal));
+                        if (ImGui::BeginTable("##swo_profile",
+                                              4,
+                                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                                  ImGuiTableFlags_Resizable,
+                                              ImVec2(-1.0f, -1.0f))) {
+                                ImGui::TableSetupColumn(tr("Function / Address", "函数 / 地址"));
+                                ImGui::TableSetupColumn(tr("Address", "地址"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                                ImGui::TableSetupColumn(tr("Samples", "采样数"), ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                                ImGui::TableSetupColumn(tr("CPU %", "CPU %"), ImGuiTableColumnFlags_WidthFixed, 75.0f);
+                                ImGui::TableHeadersRow();
+                                ImGuiListClipper clipper;
+                                clipper.Begin(static_cast<int>(profile.size()));
+                                while (clipper.Step()) {
+                                        for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                                                const auto &[pc, count] = profile[static_cast<usize>(row)];
+                                                ImGui::TableNextRow();
+                                                ImGui::TableSetColumnIndex(0);
+                                                ImGui::TextUnformatted(pc == 0xFFFFFFFFu ? tr("CPU sleeping", "CPU 休眠")
+                                                                                         : resolveTraceAddress(pc).c_str());
+                                                ImGui::TableSetColumnIndex(1);
+                                                if (pc == 0xFFFFFFFFu)
+                                                        ImGui::TextUnformatted("-");
+                                                else
+                                                        ImGui::Text("0x%08X", pc);
+                                                ImGui::TableSetColumnIndex(2);
+                                                ImGui::Text("%llu", static_cast<unsigned long long>(count));
+                                                ImGui::TableSetColumnIndex(3);
+                                                ImGui::Text("%.2f",
+                                                            profileTotal ? 100.0 * static_cast<double>(count) /
+                                                                               static_cast<double>(profileTotal)
+                                                                         : 0.0);
+                                        }
+                                }
+                                ImGui::EndTable();
+                        }
+                        ImGui::EndTabItem();
+                }
+
+                if (ImGui::BeginTabItem(tr("ITM Console", "ITM 控制台"))) {
+                        const std::string textLog = swoTextSnapshot();
+                        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+                        if (ImGui::BeginChild("##swo_itm_text",
+                                              ImVec2(-1.0f, -1.0f),
+                                              ImGuiChildFlags_Borders,
+                                              ImGuiWindowFlags_HorizontalScrollbar)) {
+                                const float scrollY     = ImGui::GetScrollY();
+                                const float scrollMaxY  = ImGui::GetScrollMaxY();
+                                const bool  atBottom    = scrollMaxY <= 1.0f || scrollY >= scrollMaxY - 1.0f;
+                                const bool  hovered     = ImGui::IsWindowHovered();
+                                const bool  focused     = ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows);
+                                const bool  scrollMoved = scrollY > swoLastScrollY_ + 0.5f || scrollY + 0.5f < swoLastScrollY_;
+                                const bool  draggingScroll =
+                                    hovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left) && scrollMoved;
+                                const bool keyboardScrollUp =
+                                    focused && (ImGui::IsKeyPressed(ImGuiKey_PageUp) || ImGui::IsKeyPressed(ImGuiKey_Home) ||
+                                                ImGui::IsKeyPressed(ImGuiKey_UpArrow));
+                                if ((hovered && ImGui::GetIO().MouseWheel > 0.0f) || (draggingScroll && !atBottom) ||
+                                    keyboardScrollUp)
+                                        swoAutoScroll_ = false;
+                                else if (!swoAutoScroll_ && atBottom)
+                                        swoAutoScroll_ = true;
+                                ImGui::TextUnformatted(textLog.data(), textLog.data() + textLog.size());
+                                if (swoAutoScroll_)
+                                        ImGui::SetScrollHereY(1.0f);
+                                swoLastScrollY_ = scrollY;
+                        }
+                        ImGui::EndChild();
+                        ImGui::PopStyleColor();
+                        ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+        }
+        ImGui::End();
+}
+
 std::string
 JLinkPort::lastError() const
 {
         std::lock_guard lk(mtx_);
         return lastErr_;
+}
+
+void
+JLinkPort::saveSession(void *node) const
+{
+        cJSON *jlink = static_cast<cJSON *>(node);
+        if (!cJSON_IsObject(jlink))
+                return;
+
+        cJSON_AddStringToObject(jlink, "device", deviceName().c_str());
+        cJSON_AddNumberToObject(jlink, "speedKHz", speed());
+        cJSON_AddNumberToObject(jlink, "hssPeriodUs", hssPeriodUs_);
+
+        cJSON *trace = cJSON_CreateObject();
+        cJSON_AddNumberToObject(trace, "cpuMHz", swoCpuMHz_);
+        cJSON_AddNumberToObject(trace, "swoKHz", swoSpeedKHz_);
+        cJSON_AddNumberToObject(trace, "itmPort", swoItmPort_);
+        cJSON_AddBoolToObject(trace, "exceptionTrace", swoExceptionTrace_);
+        cJSON_AddBoolToObject(trace, "pcSampling", swoPcSampling_);
+        cJSON_AddNumberToObject(trace, "pcSampleRate", swoPcSampleRate_);
+        cJSON_AddBoolToObject(trace, "watchWrite", swoWatchWrite_);
+        cJSON_AddStringToObject(trace, "watchAddress", swoWatchAddress_);
+        cJSON_AddStringToObject(trace, "watchName", swoWatchName_);
+        cJSON_AddNumberToObject(trace, "watchSize", swoWatchSize_);
+        cJSON_AddBoolToObject(trace, "windowOpen", swoWindowOpen_);
+        cJSON_AddItemToObject(jlink, "trace", trace);
+
+        cJSON *rtt = cJSON_CreateObject();
+        cJSON_AddStringToObject(rtt, "controlBlock", rttControlBlock_);
+        cJSON_AddNumberToObject(rtt, "upChannel", rttUpChannel_);
+        cJSON_AddNumberToObject(rtt, "downChannel", rttDownChannel_);
+        cJSON_AddBoolToObject(rtt, "appendNewline", rttAppendNewline_);
+        cJSON_AddBoolToObject(rtt, "windowOpen", rttWindowOpen_);
+        cJSON_AddItemToObject(jlink, "rtt", rtt);
+}
+
+void
+JLinkPort::loadSession(const void *node)
+{
+        const cJSON *jlink = static_cast<const cJSON *>(node);
+        if (!cJSON_IsObject(jlink))
+                return;
+
+        if (const cJSON *v = cJSON_GetObjectItem(jlink, "device"); cJSON_IsString(v))
+                setDeviceName(v->valuestring);
+        if (const cJSON *v = cJSON_GetObjectItem(jlink, "speedKHz"); cJSON_IsNumber(v))
+                setSpeed(std::clamp(v->valueint, 1, 50000));
+        if (const cJSON *v = cJSON_GetObjectItem(jlink, "hssPeriodUs"); cJSON_IsNumber(v))
+                hssPeriodUs_ = std::max(v->valueint, 1);
+
+        if (const cJSON *trace = cJSON_GetObjectItem(jlink, "trace"); cJSON_IsObject(trace)) {
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "cpuMHz"); cJSON_IsNumber(v))
+                        swoCpuMHz_ = std::max(v->valueint, 1);
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "swoKHz"); cJSON_IsNumber(v))
+                        swoSpeedKHz_ = std::max(v->valueint, 1);
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "itmPort"); cJSON_IsNumber(v))
+                        swoItmPort_ = std::clamp(v->valueint, 0, 31);
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "exceptionTrace"); cJSON_IsBool(v))
+                        swoExceptionTrace_ = cJSON_IsTrue(v);
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "pcSampling"); cJSON_IsBool(v))
+                        swoPcSampling_ = cJSON_IsTrue(v);
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "pcSampleRate"); cJSON_IsNumber(v))
+                        swoPcSampleRate_ = std::clamp(v->valueint, 0, 2);
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "watchWrite"); cJSON_IsBool(v))
+                        swoWatchWrite_ = cJSON_IsTrue(v);
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "watchAddress"); cJSON_IsString(v))
+                        snprintf(swoWatchAddress_, sizeof(swoWatchAddress_), "%s", v->valuestring);
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "watchName"); cJSON_IsString(v))
+                        snprintf(swoWatchName_, sizeof(swoWatchName_), "%s", v->valuestring);
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "watchSize"); cJSON_IsNumber(v))
+                        swoWatchSize_ = v->valueint >= 4 ? 4 : (v->valueint >= 2 ? 2 : 1);
+                if (const cJSON *v = cJSON_GetObjectItem(trace, "windowOpen"); cJSON_IsBool(v))
+                        swoWindowOpen_ = cJSON_IsTrue(v);
+        }
+
+        if (const cJSON *rtt = cJSON_GetObjectItem(jlink, "rtt"); cJSON_IsObject(rtt)) {
+                if (const cJSON *v = cJSON_GetObjectItem(rtt, "controlBlock"); cJSON_IsString(v))
+                        snprintf(rttControlBlock_, sizeof(rttControlBlock_), "%s", v->valuestring);
+                if (const cJSON *v = cJSON_GetObjectItem(rtt, "upChannel"); cJSON_IsNumber(v))
+                        rttUpChannel_ = std::max(v->valueint, 0);
+                if (const cJSON *v = cJSON_GetObjectItem(rtt, "downChannel"); cJSON_IsNumber(v))
+                        rttDownChannel_ = std::max(v->valueint, 0);
+                if (const cJSON *v = cJSON_GetObjectItem(rtt, "appendNewline"); cJSON_IsBool(v))
+                        rttAppendNewline_ = cJSON_IsTrue(v);
+                if (const cJSON *v = cJSON_GetObjectItem(rtt, "windowOpen"); cJSON_IsBool(v))
+                        rttWindowOpen_ = cJSON_IsTrue(v);
+        }
+        configModified_.store(false, std::memory_order_release);
 }
 
 void
@@ -773,7 +2166,10 @@ JLinkPort::drawUI()
                         JLINKARM_DEVICE_INFO dinfo;
                         dinfo.SizeOfStruct = sizeof(dinfo);
                         if (JLINKARM_DEVICE_GetInfo(devIdx, &dinfo) >= 0)
-                                setDeviceName(dinfo.sName);
+                                if (deviceName() != dinfo.sName) {
+                                        setDeviceName(dinfo.sName);
+                                        configModified_.store(true, std::memory_order_release);
+                                }
                 }
         }
         TutorialGuide::instance().mark("device_btn");
@@ -783,7 +2179,8 @@ JLinkPort::drawUI()
         ImGui::SetNextItemWidth(180.0f);
         // Logarithmic slider: SWD speeds span a wide range (kHz .. tens of MHz).
         int spd = speedKHz_.load(std::memory_order_relaxed);
-        ImGui::SliderInt("##jlinkSpeed", &spd, 5, 50000, "%d kHz", ImGuiSliderFlags_Logarithmic);
+        if (ImGui::SliderInt("##jlinkSpeed", &spd, 5, 50000, "%d kHz", ImGuiSliderFlags_Logarithmic))
+                configModified_.store(true, std::memory_order_release);
         TutorialGuide::instance().mark("speed_slider");
         const bool speedCommitted = ImGui::IsItemDeactivatedAfterEdit();
         if (spd < 1)
@@ -823,11 +2220,11 @@ JLinkPort::drawUI()
         }
 
         ImGui::SameLine();
-        if (ui::SmallButton(vcomOpen_.load(std::memory_order_acquire) ? tr("VCOM ON", "串口 ON") : "VCOM",
-                            vcomOpen_.load(std::memory_order_acquire) ? ui::BtnStyle::Success : ui::BtnStyle::Muted))
-                ImGui::OpenPopup("JLinkVComPopup");
-        drawVComPopup();
-
+        const bool rttActive = rttActive_.load(std::memory_order_acquire);
+        if (ui::SmallButton(rttActive ? "RTT ON" : "RTT", rttActive ? ui::BtnStyle::Success : ui::BtnStyle::Muted)) {
+                rttWindowOpen_           = true;
+                rttWindowFocusRequested_ = true;
+        }
         if (!lastErr_.empty()) {
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.4f, 0.4f, 1.0f));
@@ -839,4 +2236,11 @@ JLinkPort::drawUI()
                                "若出现 'Low on memory' 或 'Start failed'，请尝试降低采样频率 (Hz)。"));
                 ImGui::PopStyleColor();
         }
+}
+
+void
+JLinkPort::drawWindows()
+{
+        drawRttWindow();
+        drawSwoTraceWindow();
 }

@@ -138,6 +138,20 @@ SdkPanel::setStatus(const std::string &msg, bool isErr)
         statusIsErr_ = isErr;
 }
 
+bool
+SdkPanel::drawHistoryHeader(const char *id)
+{
+        ImGui::PushID(id);
+        ImGui::SetNextItemOpen(historyExpanded_, ImGuiCond_Always);
+        const bool expanded = ImGui::CollapsingHeader(tr("History", "调用历史"));
+        ImGui::PopID();
+        if (expanded != historyExpanded_) {
+                historyExpanded_ = expanded;
+                modified_        = true;
+        }
+        return historyExpanded_;
+}
+
 // ─── doLoadDll ────────────────────────────────────────────────────────────────
 
 void
@@ -1545,45 +1559,46 @@ SdkPanel::drawCFunctionsTab()
 
                 ImGui::Spacing();
                 ImGui::Separator();
-                ImGui::TextDisabled("%s", tr("History", "调用历史"));
-                float histH = ImGui::GetContentRegionAvail().y;
-                ImGui::BeginChild("##fhist", ImVec2(0, histH), true);
-                std::vector<HistEntry> histSnap;
-                {
-                        std::lock_guard<std::mutex> lk(histMtx_);
-                        histSnap = history_;
-                }
-                for (int i = (int)histSnap.size() - 1; i >= 0; --i) {
-                        const HistEntry &e = histSnap[i];
+                if (drawHistoryHeader("c_function")) {
+                        float histH = ImGui::GetContentRegionAvail().y;
+                        ImGui::BeginChild("##fhist", ImVec2(0, histH), true);
+                        std::vector<HistEntry> histSnap;
                         {
-                                std::time_t t   = (std::time_t)(e.tsMs / 1000);
-                                struct tm   tm_ = {};
-                                localtime_s(&tm_, &t);
-                                char ts[32];
-                                snprintf(ts,
-                                         sizeof(ts),
-                                         "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
-                                         tm_.tm_year + 1900,
-                                         tm_.tm_mon + 1,
-                                         tm_.tm_mday,
-                                         tm_.tm_hour,
-                                         tm_.tm_min,
-                                         tm_.tm_sec,
-                                         (int)(e.tsMs % 1000));
-                                ImGui::TextDisabled("%s", ts);
-                                ImGui::SameLine(0, 0);
+                                std::lock_guard<std::mutex> lk(histMtx_);
+                                histSnap = history_;
                         }
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                              e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f));
-                        ImGui::TextUnformatted(e.call.c_str());
-                        ImGui::PopStyleColor();
-                        ImGui::SameLine();
-                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                              e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
-                        ImGui::TextUnformatted(e.result.c_str());
-                        ImGui::PopStyleColor();
+                        for (int i = (int)histSnap.size() - 1; i >= 0; --i) {
+                                const HistEntry &e = histSnap[i];
+                                {
+                                        std::time_t t   = (std::time_t)(e.tsMs / 1000);
+                                        struct tm   tm_ = {};
+                                        localtime_s(&tm_, &t);
+                                        char ts[32];
+                                        snprintf(ts,
+                                                 sizeof(ts),
+                                                 "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                                                 tm_.tm_year + 1900,
+                                                 tm_.tm_mon + 1,
+                                                 tm_.tm_mday,
+                                                 tm_.tm_hour,
+                                                 tm_.tm_min,
+                                                 tm_.tm_sec,
+                                                 (int)(e.tsMs % 1000));
+                                        ImGui::TextDisabled("%s", ts);
+                                        ImGui::SameLine(0, 0);
+                                }
+                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                                      e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f));
+                                ImGui::TextUnformatted(e.call.c_str());
+                                ImGui::PopStyleColor();
+                                ImGui::SameLine();
+                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                                      e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
+                                ImGui::TextUnformatted(e.result.c_str());
+                                ImGui::PopStyleColor();
+                        }
+                        ImGui::EndChild();
                 }
-                ImGui::EndChild();
         }
         ImGui::EndChild();
 }
@@ -1938,43 +1953,46 @@ SdkPanel::drawCppClassesTab()
         // ── history ──
         ImGui::Spacing();
         ImGui::Separator();
-        ImGui::TextDisabled("%s", tr("History", "调用历史"));
-        float histH = ImGui::GetContentRegionAvail().y;
-        ImGui::BeginChild("##mhist", ImVec2(0, histH), true);
-        std::vector<HistEntry> histSnapM;
-        {
-                std::lock_guard<std::mutex> lk(histMtx_);
-                histSnapM = history_;
-        }
-        for (int i = (int)histSnapM.size() - 1; i >= 0; --i) {
-                const HistEntry &e = histSnapM[i];
+        if (drawHistoryHeader("cpp_method")) {
+                float histH = ImGui::GetContentRegionAvail().y;
+                ImGui::BeginChild("##mhist", ImVec2(0, histH), true);
+                std::vector<HistEntry> histSnapM;
                 {
-                        std::time_t t   = (std::time_t)(e.tsMs / 1000);
-                        struct tm   tm_ = {};
-                        localtime_s(&tm_, &t);
-                        char ts[32];
-                        snprintf(ts,
-                                 sizeof(ts),
-                                 "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
-                                 tm_.tm_year + 1900,
-                                 tm_.tm_mon + 1,
-                                 tm_.tm_mday,
-                                 tm_.tm_hour,
-                                 tm_.tm_min,
-                                 tm_.tm_sec,
-                                 (int)(e.tsMs % 1000));
-                        ImGui::TextDisabled("%s", ts);
-                        ImGui::SameLine(0, 0);
+                        std::lock_guard<std::mutex> lk(histMtx_);
+                        histSnapM = history_;
                 }
-                ImGui::PushStyleColor(ImGuiCol_Text, e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f));
-                ImGui::TextUnformatted(e.call.c_str());
-                ImGui::PopStyleColor();
-                ImGui::SameLine();
-                ImGui::PushStyleColor(ImGuiCol_Text, e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
-                ImGui::TextUnformatted(e.result.c_str());
-                ImGui::PopStyleColor();
+                for (int i = (int)histSnapM.size() - 1; i >= 0; --i) {
+                        const HistEntry &e = histSnapM[i];
+                        {
+                                std::time_t t   = (std::time_t)(e.tsMs / 1000);
+                                struct tm   tm_ = {};
+                                localtime_s(&tm_, &t);
+                                char ts[32];
+                                snprintf(ts,
+                                         sizeof(ts),
+                                         "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                                         tm_.tm_year + 1900,
+                                         tm_.tm_mon + 1,
+                                         tm_.tm_mday,
+                                         tm_.tm_hour,
+                                         tm_.tm_min,
+                                         tm_.tm_sec,
+                                         (int)(e.tsMs % 1000));
+                                ImGui::TextDisabled("%s", ts);
+                                ImGui::SameLine(0, 0);
+                        }
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                              e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f));
+                        ImGui::TextUnformatted(e.call.c_str());
+                        ImGui::PopStyleColor();
+                        ImGui::SameLine();
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                              e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
+                        ImGui::TextUnformatted(e.result.c_str());
+                        ImGui::PopStyleColor();
+                }
+                ImGui::EndChild();
         }
-        ImGui::EndChild();
 
         ImGui::EndChild(); // ##methcall
 }
@@ -2150,45 +2168,47 @@ SdkPanel::drawPythonTab()
 
                                 ImGui::Spacing();
                                 ImGui::Separator();
-                                ImGui::TextDisabled("%s", tr("History", "调用历史"));
-                                ImGui::BeginChild("##pyfhist", ImVec2(0, ImGui::GetContentRegionAvail().y), true);
-                                std::vector<HistEntry> snap;
-                                {
-                                        std::lock_guard<std::mutex> lk(histMtx_);
-                                        snap = history_;
-                                }
-                                for (int i = (int)snap.size() - 1; i >= 0; --i) {
-                                        const HistEntry &e = snap[i];
+                                if (drawHistoryHeader("python_function")) {
+                                        ImGui::BeginChild("##pyfhist", ImVec2(0, ImGui::GetContentRegionAvail().y), true);
+                                        std::vector<HistEntry> snap;
                                         {
-                                                std::time_t t   = (std::time_t)(e.tsMs / 1000);
-                                                struct tm   tm_ = {};
-                                                localtime_s(&tm_, &t);
-                                                char ts[32];
-                                                snprintf(ts,
-                                                         sizeof(ts),
-                                                         "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
-                                                         tm_.tm_year + 1900,
-                                                         tm_.tm_mon + 1,
-                                                         tm_.tm_mday,
-                                                         tm_.tm_hour,
-                                                         tm_.tm_min,
-                                                         tm_.tm_sec,
-                                                         (int)(e.tsMs % 1000));
-                                                ImGui::TextDisabled("%s", ts);
-                                                ImGui::SameLine(0, 0);
+                                                std::lock_guard<std::mutex> lk(histMtx_);
+                                                snap = history_;
                                         }
-                                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                                              e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f)
-                                                                   : ImVec4(1.f, 0.4f, 0.4f, 1.f));
-                                        ImGui::TextUnformatted(e.call.c_str());
-                                        ImGui::PopStyleColor();
-                                        ImGui::SameLine();
-                                        ImGui::PushStyleColor(
-                                            ImGuiCol_Text, e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
-                                        ImGui::TextUnformatted(e.result.c_str());
-                                        ImGui::PopStyleColor();
+                                        for (int i = (int)snap.size() - 1; i >= 0; --i) {
+                                                const HistEntry &e = snap[i];
+                                                {
+                                                        std::time_t t   = (std::time_t)(e.tsMs / 1000);
+                                                        struct tm   tm_ = {};
+                                                        localtime_s(&tm_, &t);
+                                                        char ts[32];
+                                                        snprintf(ts,
+                                                                 sizeof(ts),
+                                                                 "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                                                                 tm_.tm_year + 1900,
+                                                                 tm_.tm_mon + 1,
+                                                                 tm_.tm_mday,
+                                                                 tm_.tm_hour,
+                                                                 tm_.tm_min,
+                                                                 tm_.tm_sec,
+                                                                 (int)(e.tsMs % 1000));
+                                                        ImGui::TextDisabled("%s", ts);
+                                                        ImGui::SameLine(0, 0);
+                                                }
+                                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                                                      e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f)
+                                                                           : ImVec4(1.f, 0.4f, 0.4f, 1.f));
+                                                ImGui::TextUnformatted(e.call.c_str());
+                                                ImGui::PopStyleColor();
+                                                ImGui::SameLine();
+                                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                                                      e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f)
+                                                                           : ImVec4(1.f, 0.5f, 0.3f, 1.f));
+                                                ImGui::TextUnformatted(e.result.c_str());
+                                                ImGui::PopStyleColor();
+                                        }
+                                        ImGui::EndChild();
                                 }
-                                ImGui::EndChild();
                         }
                         ImGui::EndChild();
                 }
@@ -2363,45 +2383,47 @@ SdkPanel::drawPythonTab()
 
                                 ImGui::Spacing();
                                 ImGui::Separator();
-                                ImGui::TextDisabled("%s", tr("History", "调用历史"));
-                                ImGui::BeginChild("##pymhist", ImVec2(0, ImGui::GetContentRegionAvail().y), true);
-                                std::vector<HistEntry> snap;
-                                {
-                                        std::lock_guard<std::mutex> lk(histMtx_);
-                                        snap = history_;
-                                }
-                                for (int i = (int)snap.size() - 1; i >= 0; --i) {
-                                        const HistEntry &e = snap[i];
+                                if (drawHistoryHeader("python_method")) {
+                                        ImGui::BeginChild("##pymhist", ImVec2(0, ImGui::GetContentRegionAvail().y), true);
+                                        std::vector<HistEntry> snap;
                                         {
-                                                std::time_t t   = (std::time_t)(e.tsMs / 1000);
-                                                struct tm   tm_ = {};
-                                                localtime_s(&tm_, &t);
-                                                char ts[32];
-                                                snprintf(ts,
-                                                         sizeof(ts),
-                                                         "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
-                                                         tm_.tm_year + 1900,
-                                                         tm_.tm_mon + 1,
-                                                         tm_.tm_mday,
-                                                         tm_.tm_hour,
-                                                         tm_.tm_min,
-                                                         tm_.tm_sec,
-                                                         (int)(e.tsMs % 1000));
-                                                ImGui::TextDisabled("%s", ts);
-                                                ImGui::SameLine(0, 0);
+                                                std::lock_guard<std::mutex> lk(histMtx_);
+                                                snap = history_;
                                         }
-                                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                                              e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f)
-                                                                   : ImVec4(1.f, 0.4f, 0.4f, 1.f));
-                                        ImGui::TextUnformatted(e.call.c_str());
-                                        ImGui::PopStyleColor();
-                                        ImGui::SameLine();
-                                        ImGui::PushStyleColor(
-                                            ImGuiCol_Text, e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f));
-                                        ImGui::TextUnformatted(e.result.c_str());
-                                        ImGui::PopStyleColor();
+                                        for (int i = (int)snap.size() - 1; i >= 0; --i) {
+                                                const HistEntry &e = snap[i];
+                                                {
+                                                        std::time_t t   = (std::time_t)(e.tsMs / 1000);
+                                                        struct tm   tm_ = {};
+                                                        localtime_s(&tm_, &t);
+                                                        char ts[32];
+                                                        snprintf(ts,
+                                                                 sizeof(ts),
+                                                                 "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
+                                                                 tm_.tm_year + 1900,
+                                                                 tm_.tm_mon + 1,
+                                                                 tm_.tm_mday,
+                                                                 tm_.tm_hour,
+                                                                 tm_.tm_min,
+                                                                 tm_.tm_sec,
+                                                                 (int)(e.tsMs % 1000));
+                                                        ImGui::TextDisabled("%s", ts);
+                                                        ImGui::SameLine(0, 0);
+                                                }
+                                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                                                      e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f)
+                                                                           : ImVec4(1.f, 0.4f, 0.4f, 1.f));
+                                                ImGui::TextUnformatted(e.call.c_str());
+                                                ImGui::PopStyleColor();
+                                                ImGui::SameLine();
+                                                ImGui::PushStyleColor(ImGuiCol_Text,
+                                                                      e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f)
+                                                                           : ImVec4(1.f, 0.5f, 0.3f, 1.f));
+                                                ImGui::TextUnformatted(e.result.c_str());
+                                                ImGui::PopStyleColor();
+                                        }
+                                        ImGui::EndChild();
                                 }
-                                ImGui::EndChild();
                         }
                         ImGui::EndChild();
                 }
@@ -3604,6 +3626,7 @@ SdkPanel::save(void *node, const std::string & /*baseDir*/) const
         cJSON_AddStringToObject(obj, "dllPath", dllPath_);
         cJSON_AddStringToObject(obj, "headerPath", headerPath_);
         cJSON_AddStringToObject(obj, "pyPath", pyPath_);
+        cJSON_AddBoolToObject(obj, "historyExpanded", historyExpanded_);
 }
 
 void
@@ -3618,6 +3641,8 @@ SdkPanel::load(const void *node, const std::string &baseDir)
                 userLabel_[sizeof(userLabel_) - 1] = '\0';
                 snprintf(titleBuf_, sizeof(titleBuf_), "%s###SdkPanel%d", userLabel_, winId_);
         }
+        if (const cJSON *expanded = cJSON_GetObjectItem(obj, "historyExpanded"); cJSON_IsBool(expanded))
+                historyExpanded_ = cJSON_IsTrue(expanded);
 
         auto toAbs = [&](const char *stored) -> std::string {
                 if (!stored || !stored[0])
@@ -3655,4 +3680,5 @@ SdkPanel::load(const void *node, const std::string &baseDir)
                 pyPath_[sizeof(pyPath_) - 1] = '\0';
                 doLoadPy();
         }
+        modified_ = false;
 }

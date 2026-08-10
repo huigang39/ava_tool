@@ -36,17 +36,31 @@ mempool_t g_log_perf_mp;
 static u8 g_log_ops_mp_buf[2 * 1024 * 1024];  // 2MB
 static u8 g_log_perf_mp_buf[2 * 1024 * 1024]; // 2MB
 
-thread_local int        g_log_idx = -1;
-static std::mutex       g_log_idx_mtx;
-static std::vector<int> g_free_log_idx;
-static int              g_next_log_idx_val = 0;
+thread_local int g_log_idx = -1;
+
+// LogIdxReclaimer is thread-local and may run after namespace-scope objects
+// have already been destroyed by the CRT. Keep the shared index pool alive
+// until process termination so TLS cleanup can never lock a destroyed mutex.
+struct LogIdxPool {
+        std::mutex       mtx;
+        std::vector<int> freeIndices;
+        int              nextIndex{0};
+};
+
+static LogIdxPool &
+logIdxPool()
+{
+        static LogIdxPool *const pool = new LogIdxPool;
+        return *pool;
+}
 
 struct LogIdxReclaimer {
         ~LogIdxReclaimer()
         {
                 if (g_log_idx != -1) {
-                        std::lock_guard<std::mutex> lock(g_log_idx_mtx);
-                        g_free_log_idx.push_back(g_log_idx);
+                        LogIdxPool                 &pool = logIdxPool();
+                        std::lock_guard<std::mutex> lock(pool.mtx);
+                        pool.freeIndices.push_back(g_log_idx);
                         g_log_idx = -1;
                 }
         }
@@ -56,12 +70,13 @@ int
 get_log_idx()
 {
         if (g_log_idx == -1) {
-                std::lock_guard<std::mutex> lock(g_log_idx_mtx);
-                if (!g_free_log_idx.empty()) {
-                        g_log_idx = g_free_log_idx.back();
-                        g_free_log_idx.pop_back();
+                LogIdxPool                 &pool = logIdxPool();
+                std::lock_guard<std::mutex> lock(pool.mtx);
+                if (!pool.freeIndices.empty()) {
+                        g_log_idx = pool.freeIndices.back();
+                        pool.freeIndices.pop_back();
                 } else {
-                        g_log_idx = g_next_log_idx_val++;
+                        g_log_idx = pool.nextIndex++;
                 }
                 thread_local LogIdxReclaimer reclaimer;
         }

@@ -82,6 +82,16 @@
 #define JLINKARM_SWO_IF_MANCHESTER           1 // Not supported in current version
 #define JLINKARM_SWO_IF_TRACE                2 // Only used internally, in case SWO ITM data is merged into trace stream
 
+/* SEGGER RTT host API commands and buffer directions. */
+#define JLINKARM_RTTERMINAL_CMD_START        0
+#define JLINKARM_RTTERMINAL_CMD_STOP         1
+#define JLINKARM_RTTERMINAL_CMD_GETDESC      2
+#define JLINKARM_RTTERMINAL_CMD_GETNUMBUF    3
+#define JLINKARM_RTTERMINAL_CMD_GETSTAT      4
+
+#define JLINKARM_RTTERMINAL_DIRECTION_UP     0
+#define JLINKARM_RTTERMINAL_DIRECTION_DOWN   1
+
 #if defined(__cplusplus)
 extern "C" { // Make sure we have C-declarations in C++ programs
 #endif
@@ -261,6 +271,10 @@ int32_t JLINKARM_SetResetType(int32_t ResetType);
 int32_t JLINK_HSS_Start(JLINK_HSS_MEM_BLOCK_DESC *paDesc, int32_t NumBlocks, int32_t Period_us, int32_t Flags);
 int32_t JLINK_HSS_Stop(void);
 int32_t JLINK_HSS_Read(void *pBuffer, uint32_t BufferSize);
+
+int32_t JLINK_RTTERMINAL_Control(uint32_t Cmd, void *p);
+int32_t JLINK_RTTERMINAL_Read(uint32_t BufferIndex, char *pBuffer, uint32_t BufferSize);
+int32_t JLINK_RTTERMINAL_Write(uint32_t BufferIndex, const void *pBuffer, uint32_t BufferSize);
 
 int32_t JLINKARM_SWO_Control(uint32_t Cmd, void *pData);
 

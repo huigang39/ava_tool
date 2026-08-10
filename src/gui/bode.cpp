@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "cJSON.h"
 #include "imgui.h"
 #include "implot.h"
 
@@ -273,8 +274,10 @@ Bode::draw_()
                                 bool        sel  = (i == curIdx);
                                 std::string disp = varName(keys[i]);
                                 ImGui::PushID(i);
-                                if (ImGui::Selectable(disp.c_str(), sel, 0))
+                                if (ImGui::Selectable(disp.c_str(), sel, 0)) {
                                         std::snprintf(buf, bufSz, "%s", keys[i].c_str());
+                                        modified_ = true;
+                                }
                                 if (ImGui::IsItemHovered())
                                         ImGui::SetTooltip("%s", keys[i].c_str());
                                 if (sel)
@@ -290,16 +293,18 @@ Bode::draw_()
                 if (!ImPlot::BeginSubplots(
                         "##bodeSP", 2, 1, ImVec2(-1.0f, -1.0f), ImPlotSubplotFlags_LinkAllX | ImPlotSubplotFlags_NoTitle))
                         return;
-                auto legendPopup = [](const char *label, BodeCurveStyle &style) {
+                auto legendPopup = [this](const char *label, BodeCurveStyle &style) {
                         if (ImPlot::BeginLegendPopup(label)) {
                                 f32 colArr[4];
                                 memcpy(colArr, style.color, sizeof(colArr));
                                 if (ImGui::ColorEdit4(tr("Color", "颜色"), colArr, ImGuiColorEditFlags_NoInputs)) {
                                         style.useAutoColor = false;
                                         memcpy(style.color, colArr, sizeof(colArr));
+                                        modified_ = true;
                                 }
                                 ImGui::SameLine();
                                 if (ImGui::Checkbox(tr("Auto", "自动"), &style.useAutoColor)) {
+                                        modified_ = true;
                                         if (style.useAutoColor) {
                                                 static i32 bodeShuffleIdx = 0;
                                                 bodeShuffleIdx            = (bodeShuffleIdx + 1) % ImPlot::GetColormapSize();
@@ -308,10 +313,12 @@ Bode::draw_()
                                         }
                                 }
                                 ImGui::SetNextItemWidth(100);
-                                ImGui::SliderFloat("##LineWidth", &style.lineWeight, 0.5f, 5.0f, "%.1f");
+                                if (ImGui::SliderFloat("##LineWidth", &style.lineWeight, 0.5f, 5.0f, "%.1f"))
+                                        modified_ = true;
                                 if (ImGui::IsItemHovered())
                                         ImGui::SetTooltip("%s", tr("Width", "线宽"));
-                                ImGui::Checkbox(tr("Markers", "标记点"), &style.showMarkers);
+                                if (ImGui::Checkbox(tr("Markers", "标记点"), &style.showMarkers))
+                                        modified_ = true;
                                 ImPlot::EndLegendPopup();
                         }
                 };
@@ -357,8 +364,10 @@ Bode::draw_()
         const char *modeNames[] = {tr("Sweep", "扫频"), tr("From Data", "来自数据")};
         int         modeIdx     = static_cast<int>(bodeMode_);
         ImGui::SetNextItemWidth(100);
-        if (ImGui::Combo("##bodeMode", &modeIdx, modeNames, IM_ARRAYSIZE(modeNames)))
+        if (ImGui::Combo("##bodeMode", &modeIdx, modeNames, IM_ARRAYSIZE(modeNames))) {
                 bodeMode_ = static_cast<Mode>(modeIdx);
+                modified_ = true;
+        }
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s",
                                   tr("Sweep: drive a live swept-sine\nFrom Data: offline FFT of the displayed data",
@@ -373,7 +382,8 @@ Bode::draw_()
                 drawCombo("##bodeOut", tr("Output", "输出"), bodeOutputKey_, sizeof(bodeOutputKey_));
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(70);
-                ImGui::InputFloat("##bodeThr", &bodeOfflineThreshPct_, 0, 0, "%.2f");
+                if (ImGui::InputFloat("##bodeThr", &bodeOfflineThreshPct_, 0, 0, "%.2f"))
+                        modified_ = true;
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s",
                                           tr("Thresh%: keep only FFT bins where |Input| >= peak * this%",
@@ -412,31 +422,36 @@ Bode::draw_()
                 ImGui::BeginDisabled();
 
         ImGui::SetNextItemWidth(80);
-        ImGui::InputFloat("##bFS", &bodeFStart_, 0, 0, "%.3g");
+        if (ImGui::InputFloat("##bFS", &bodeFStart_, 0, 0, "%.3g"))
+                modified_ = true;
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tr("F Start(Hz)", "起始频率(Hz)"));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(80);
-        ImGui::InputFloat("##bFE", &bodeFStop_, 0, 0, "%.3g");
+        if (ImGui::InputFloat("##bFE", &bodeFStop_, 0, 0, "%.3g"))
+                modified_ = true;
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tr("F Stop(Hz)", "终止频率(Hz)"));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(70);
-        ImGui::InputFloat("##bSTP", &bodeFStep_, 0, 0, "%.3g");
+        if (ImGui::InputFloat("##bSTP", &bodeFStep_, 0, 0, "%.3g"))
+                modified_ = true;
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tr("Step(Hz)", "步进(Hz)"));
         if (bodeFStep_ <= 0.0f)
                 bodeFStep_ = 1.0f;
         ImGui::SameLine();
         ImGui::SetNextItemWidth(60);
-        ImGui::InputFloat("##bDw", &bodeDwellSec_, 0, 0, "%.2f");
+        if (ImGui::InputFloat("##bDw", &bodeDwellSec_, 0, 0, "%.2f"))
+                modified_ = true;
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tr("Dwell(s)", "驻留(秒)"));
         if (bodeDwellSec_ < 0.05f)
                 bodeDwellSec_ = 0.05f;
         ImGui::SameLine();
         ImGui::SetNextItemWidth(70);
-        ImGui::InputFloat("##bAmp", &bodeAmp_, 0, 0, "%.3g");
+        if (ImGui::InputFloat("##bAmp", &bodeAmp_, 0, 0, "%.3g"))
+                modified_ = true;
         if (ImGui::IsItemHovered())
                 ImGui::SetTooltip("%s", tr("Amp", "幅值"));
         if (bodeAmp_ < 0.0f)
@@ -573,4 +588,92 @@ Bode::updateDisplay()
         ImGui::End();
 
         advanceSweep_();
+}
+
+void
+Bode::saveSession(void *node) const
+{
+        cJSON *root = static_cast<cJSON *>(node);
+        if (!cJSON_IsObject(root))
+                return;
+
+        cJSON *bode = cJSON_CreateObject();
+        cJSON_AddStringToObject(bode, "writeKey", bodeWriteKey_);
+        cJSON_AddStringToObject(bode, "inputKey", bodeInputKey_);
+        cJSON_AddStringToObject(bode, "outputKey", bodeOutputKey_);
+        cJSON_AddNumberToObject(bode, "fStart", bodeFStart_);
+        cJSON_AddNumberToObject(bode, "fStop", bodeFStop_);
+        cJSON_AddNumberToObject(bode, "fStep", bodeFStep_);
+        cJSON_AddNumberToObject(bode, "dwellSec", bodeDwellSec_);
+        cJSON_AddNumberToObject(bode, "amplitude", bodeAmp_);
+        cJSON_AddNumberToObject(bode, "mode", static_cast<int>(bodeMode_));
+        cJSON_AddNumberToObject(bode, "offlineThresholdPct", bodeOfflineThreshPct_);
+
+        auto saveStyle = [](cJSON *parent, const char *name, const BodeCurveStyle &style) {
+                cJSON *item  = cJSON_CreateObject();
+                cJSON *color = cJSON_CreateArray();
+                for (float component : style.color)
+                        cJSON_AddItemToArray(color, cJSON_CreateNumber(component));
+                cJSON_AddItemToObject(item, "color", color);
+                cJSON_AddBoolToObject(item, "autoColor", style.useAutoColor);
+                cJSON_AddNumberToObject(item, "lineWeight", style.lineWeight);
+                cJSON_AddBoolToObject(item, "markers", style.showMarkers);
+                cJSON_AddItemToObject(parent, name, item);
+        };
+        saveStyle(bode, "magnitudeStyle", bodeMagStyle_);
+        saveStyle(bode, "phaseStyle", bodePhsStyle_);
+        cJSON_AddItemToObject(root, "bode", bode);
+}
+
+void
+Bode::loadSession(const void *node)
+{
+        const cJSON *root = static_cast<const cJSON *>(node);
+        const cJSON *bode = cJSON_GetObjectItem(root, "bode");
+        if (!cJSON_IsObject(bode)) {
+                modified_ = false;
+                return;
+        }
+
+        auto loadText = [bode](const char *name, char *dst, size_t size) {
+                if (const cJSON *v = cJSON_GetObjectItem(bode, name); cJSON_IsString(v))
+                        snprintf(dst, size, "%s", v->valuestring);
+        };
+        auto loadFloat = [bode](const char *name, float &dst) {
+                if (const cJSON *v = cJSON_GetObjectItem(bode, name); cJSON_IsNumber(v))
+                        dst = static_cast<float>(v->valuedouble);
+        };
+        loadText("writeKey", bodeWriteKey_, sizeof(bodeWriteKey_));
+        loadText("inputKey", bodeInputKey_, sizeof(bodeInputKey_));
+        loadText("outputKey", bodeOutputKey_, sizeof(bodeOutputKey_));
+        loadFloat("fStart", bodeFStart_);
+        loadFloat("fStop", bodeFStop_);
+        loadFloat("fStep", bodeFStep_);
+        loadFloat("dwellSec", bodeDwellSec_);
+        loadFloat("amplitude", bodeAmp_);
+        loadFloat("offlineThresholdPct", bodeOfflineThreshPct_);
+        if (const cJSON *v = cJSON_GetObjectItem(bode, "mode"); cJSON_IsNumber(v))
+                bodeMode_ = v->valueint == static_cast<int>(Mode::FromData) ? Mode::FromData : Mode::Sweep;
+
+        auto loadStyle = [](const cJSON *parent, const char *name, BodeCurveStyle &style) {
+                const cJSON *item = cJSON_GetObjectItem(parent, name);
+                if (!cJSON_IsObject(item))
+                        return false;
+                if (const cJSON *color = cJSON_GetObjectItem(item, "color"); cJSON_IsArray(color)) {
+                        for (int i = 0; i < 4; ++i)
+                                if (const cJSON *v = cJSON_GetArrayItem(color, i); cJSON_IsNumber(v))
+                                        style.color[i] = static_cast<float>(v->valuedouble);
+                }
+                if (const cJSON *v = cJSON_GetObjectItem(item, "autoColor"); cJSON_IsBool(v))
+                        style.useAutoColor = cJSON_IsTrue(v);
+                if (const cJSON *v = cJSON_GetObjectItem(item, "lineWeight"); cJSON_IsNumber(v))
+                        style.lineWeight = std::clamp(static_cast<float>(v->valuedouble), 0.5f, 5.0f);
+                if (const cJSON *v = cJSON_GetObjectItem(item, "markers"); cJSON_IsBool(v))
+                        style.showMarkers = cJSON_IsTrue(v);
+                return true;
+        };
+        const bool magLoaded = loadStyle(bode, "magnitudeStyle", bodeMagStyle_);
+        const bool phsLoaded = loadStyle(bode, "phaseStyle", bodePhsStyle_);
+        bodeStyleInit_       = magLoaded || phsLoaded;
+        modified_            = false;
 }

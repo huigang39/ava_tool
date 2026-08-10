@@ -297,6 +297,8 @@ threadFunc(Gui *gui)
                 std::string                     type;
                 std::string                     device;
                 f32                             wv;
+                u32                             bitOffset;
+                u32                             bitSize;
         };
         struct ShmTask {
                 std::shared_ptr<MonitorChannel> ch;
@@ -313,6 +315,8 @@ threadFunc(Gui *gui)
                 u32                             nb;
                 std::string                     type;
                 std::string                     device;
+                u32                             bitOffset;
+                u32                             bitSize;
         };
 
         // Task lists persist across iterations. They're refreshed under
@@ -405,8 +409,14 @@ threadFunc(Gui *gui)
                                                                                     ch->getBitOffset(),
                                                                                     ch->getBitSize()});
                                                                 if (ch->waveEnable_)
-                                                                        waveTasks.push_back(
-                                                                            {ch, monitor, 0, nb, ch->getType(), "SHM"});
+                                                                        waveTasks.push_back({ch,
+                                                                                             monitor,
+                                                                                             0,
+                                                                                             nb,
+                                                                                             ch->getType(),
+                                                                                             "SHM",
+                                                                                             ch->getBitOffset(),
+                                                                                             ch->getBitSize()});
                                                         } else if (dev == "JLINK" && ch->getAddr() != 0) {
                                                                 // Global "pause all J-Link sampling": drop read tasks so
                                                                 // HSS auto-stops (blocks become empty). Wave output below
@@ -440,7 +450,9 @@ threadFunc(Gui *gui)
                                                                                              static_cast<u32>(ch->getAddr()),
                                                                                              nb,
                                                                                              ch->getType(),
-                                                                                             "JLINK"});
+                                                                                             "JLINK",
+                                                                                             ch->getBitOffset(),
+                                                                                             ch->getBitSize()});
                                                         }
                                                 }
                                         }
@@ -472,7 +484,7 @@ threadFunc(Gui *gui)
                                         continue;
                                 f32 wv;
                                 if (t.ch->consumeWValDirty(wv))
-                                        wvalTasks.push_back({t.ch, t.addr, t.nb, t.type, "JLINK", wv});
+                                        wvalTasks.push_back({t.ch, t.addr, t.nb, t.type, "JLINK", wv, t.bitOffset, t.bitSize});
                         }
                 };
                 auto collectShmWVal = [&]() {
@@ -481,7 +493,7 @@ threadFunc(Gui *gui)
                                         continue;
                                 f32 wv;
                                 if (t.ch->consumeWValDirty(wv))
-                                        wvalTasks.push_back({t.ch, 0, t.nb, t.type, "SHM", wv});
+                                        wvalTasks.push_back({t.ch, 0, t.nb, t.type, "SHM", wv, t.bitOffset, t.bitSize});
                         }
                 };
                 collectJlinkWVal(tempChs);
@@ -510,7 +522,10 @@ threadFunc(Gui *gui)
                         if (wt.device == "JLINK") {
                                 if (!JLinkPort::instance().isConnected())
                                         continue;
-                                JLinkPort::instance().writeMem(wt.addr, wt.nb, wbuf);
+                                if (wt.bitSize > 0)
+                                        JLinkPort::instance().writeMemBitfield(wt.addr, wt.nb, wbuf, wt.bitOffset, wt.bitSize);
+                                else
+                                        JLinkPort::instance().writeMem(wt.addr, wt.nb, wbuf);
                         } else if (wt.device == "SHM") {
                                 shm_write(&wt.ch->getShm(), wbuf, wt.nb);
                                 wt.ch->setRVal(decodeAs(wbuf, wt.type, 0, 0), sessionTimeSec());
@@ -591,7 +606,13 @@ threadFunc(Gui *gui)
                                         if (wt.device == "JLINK") {
                                                 if (!JLinkPort::instance().isConnected())
                                                         continue;
-                                                JLinkPort::instance().writeMem(wt.addr, wt.nb, &outVal);
+                                                u8 wbuf[8] = {0};
+                                                encodeFromF32(outVal, wt.type, wbuf);
+                                                if (wt.bitSize > 0)
+                                                        JLinkPort::instance().writeMemBitfield(
+                                                            wt.addr, wt.nb, wbuf, wt.bitOffset, wt.bitSize);
+                                                else
+                                                        JLinkPort::instance().writeMem(wt.addr, wt.nb, wbuf);
                                         } else if (wt.device == "SHM") {
                                                 u8 wbuf[8] = {0};
                                                 encodeFromF32(outVal, wt.type, wbuf);

@@ -79,6 +79,18 @@ struct VarEntry {
 
         // Per-member enum overrides for struct/array sub-variables (keyed by full member path)
         std::unordered_map<std::string, std::vector<EnumDef>> memberEnumDefs;
+        struct MemberOverride {
+                std::string alias;
+                bool        hasAddress{false};
+                u64         address{0};
+                bool        hasType{false};
+                DataType    type{DataType::UNKNOWN};
+                bool        hasWritable{false};
+                bool        writable{true};
+        };
+        // Per-member display/access overrides, keyed by the canonical full
+        // DWARF path. The canonical key remains unchanged for ELF re-resolution.
+        std::unordered_map<std::string, MemberOverride> memberOverrides;
         // Paths of sub-variables hidden by the user (right-click → Delete)
         std::set<std::string> hiddenMembers;
         // Paths of struct/array nodes the user has expanded; persisted so the
@@ -183,6 +195,7 @@ class Variable
         bool                                         isModified_{false};
         std::unordered_map<std::string, std::string> memberValueCache_;
         std::unordered_map<u64, PollVal>             syncReadCache_;
+        std::unordered_map<u64, u32>                 memberPollReqs_; // expanded J-Link leaves, addr -> size
 
         char                     searchBuf_[128]{};
         std::vector<SearchEntry> searchResults_;
@@ -202,9 +215,22 @@ class Variable
         std::string enumSubEditMemberPath_;
         u64         enumSubEditMemberTypeOff_{0};
 
+        struct {
+                i32         parentIdx{-1};
+                std::string path;
+                char        alias[1024]{};
+                char        addrBuf[32]{};
+                DataType    type{DataType::UNKNOWN};
+                bool        scalar{false};
+                bool        writable{true};
+                u64         defaultAddr{0};
+                DataType    defaultType{DataType::UNKNOWN};
+                bool        defaultWritable{true};
+        } memberPropEdit_;
+
         i32 editPropIdx_{-1};
         struct {
-                char                               name[64]{};
+                char                               name[1024]{};
                 DataType                           type     = DataType::U32;
                 PortType                           port     = PortType::JLINK;
                 bool                               writable = true;
@@ -235,7 +261,7 @@ class Variable
 
         // Manual Variable Entry State
         struct {
-                char                               name[64]{};
+                char                               name[1024]{};
                 DataType                           type        = DataType::U32;
                 PortType                           port        = PortType::JLINK;
                 u64                                addr        = 0;
@@ -283,6 +309,9 @@ class Variable
         void drawEnumEditPopup();
         void drawSubEnumEditPopup();
         void drawEditPropertiesPopup();
+        void drawMemberPropertiesPopup();
+        void beginMemberProperties(
+            i32 parentIdx, const std::string &path, u64 defaultAddr, DataType defaultType, bool scalar, bool defaultWritable);
 
         // Export / import the whole watch list to a .var file (JSON).
         void exportVarFile(const std::string &path);
@@ -390,7 +419,9 @@ class Variable
                 return propertiesChanged_.compare_exchange_strong(expected, false);
         }
         const ElfInfo     &getElfInfo() const { return elfInfo_; }
+        bool               findElfSymbolAddress(const std::string &name, u32 &address) const;
         const dwarf::Info &getDwarfInfo() const { return dwarfInfo_; }
+        std::string        resolveFunctionAddress(u32 address) const;
         bool               isPendingDelete() const { return !open_; }
 };
 

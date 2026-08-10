@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <utility>
@@ -145,6 +146,64 @@ class MonitorChannel
         }
         MonitorChannel()  = default;
         ~MonitorChannel() = default;
+
+        // Explicit clone used by Shift+drag. MmapVector and atomics are not
+        // copyable, so rebuild an independent history buffer and copy settings.
+        std::shared_ptr<MonitorChannel> cloneWithHistory() const
+        {
+                auto out               = std::make_shared<MonitorChannel>(name_);
+                out->label_            = label_;
+                out->type_             = type_;
+                out->addr_             = addr_;
+                out->symbolName_       = symbolName_;
+                out->numBytes_         = numBytes_;
+                out->rVal_             = rVal_;
+                out->wVal_             = wVal_;
+                out->dispVal_          = dispVal_;
+                out->device_           = device_;
+                out->shmRegionName_    = shmRegionName_;
+                out->bitOffset_        = bitOffset_;
+                out->bitSize_          = bitSize_;
+                out->addrUnknown_      = addrUnknown_;
+                out->writable_         = writable_;
+                out->enums_            = enums_;
+                out->sampleHz_         = sampleHz_;
+                out->minKeepPoints_    = minKeepPoints_;
+                out->useAutoColor_     = useAutoColor_;
+                out->lineWeight_       = lineWeight_;
+                out->plotStyle_        = plotStyle_;
+                out->gain_             = gain_;
+                out->bias_             = bias_;
+                out->showMarkers_      = showMarkers_;
+                out->show_             = show_;
+                out->waveEnable_       = waveEnable_;
+                out->wave_             = wave_;
+                out->historySeconds_   = historySeconds_;
+                out->maxDisplayPoints_ = maxDisplayPoints_;
+                std::copy_n(color_, 4, out->color_);
+
+                out->waveCfgPending_.freq.store(waveCfgPending_.freq.load());
+                out->waveCfgPending_.amp.store(waveCfgPending_.amp.load());
+                out->waveCfgPending_.offset.store(waveCfgPending_.offset.load());
+                out->waveCfgPending_.duty.store(waveCfgPending_.duty.load());
+                out->waveCfgPending_.type.store(waveCfgPending_.type.load());
+                out->waveCfgPending_.dirty.store(waveCfgPending_.dirty.load());
+
+                // The GUI snapshot is the exact history currently visible to the
+                // user. Rebuild both writer and reader stores from that snapshot so
+                // the clone owns all memory and can continue sampling independently.
+                const usize n = read_.rawSize();
+                for (usize i = 0; i < n; ++i) {
+                        const f64 ts  = read_.rawTs(i);
+                        const f32 val = read_.rawVal(i);
+                        out->rTs_.push_back(ts);
+                        out->rVals_.push_back(val);
+                        out->read_.push(val, ts);
+                }
+                out->sampleCount_  = n;
+                out->publishedEnd_ = n;
+                return out;
+        }
 
         std::string       &getName() { return name_; }
         void               setName(const std::string &name) { name_ = name; }

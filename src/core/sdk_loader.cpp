@@ -255,7 +255,7 @@ marshalArg(const CParam &param, const std::string &str, ArgStore &store)
 // ─── call ─────────────────────────────────────────────────────────────────────
 
 CallResult
-SdkLoader::call(const CFuncDecl &decl, const std::vector<std::string> &argStrs)
+SdkLoader::call(const CFuncDecl &decl, const std::vector<std::string> &argStrs, const std::vector<void *> &pointerOverrides)
 {
         CallResult res;
 
@@ -289,7 +289,13 @@ SdkLoader::call(const CFuncDecl &decl, const std::vector<std::string> &argStrs)
         std::vector<ArgStore> stores(nArgs);
         std::vector<void *>   argPtrs(nArgs);
         for (size_t i = 0; i < nArgs; ++i) {
-                if (!marshalArg(decl.params[i], argStrs[i], stores[i])) {
+                if (i < pointerOverrides.size() && pointerOverrides[i] != nullptr) {
+                        if (decl.params[i].type != CType::Ptr) {
+                                res.error = "pointer override used for non-pointer arg " + std::to_string(i);
+                                return res;
+                        }
+                        stores[i].v.ptr = pointerOverrides[i];
+                } else if (!marshalArg(decl.params[i], argStrs[i], stores[i])) {
                         res.error = "failed to marshal arg " + std::to_string(i);
                         return res;
                 }

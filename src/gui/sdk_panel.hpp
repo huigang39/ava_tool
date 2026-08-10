@@ -115,6 +115,8 @@ class SdkPanel
         void        draw();
         const char *title() const { return titleBuf_; }
         int         getWinId() const { return winId_; }
+        bool        isModified() const { return modified_; }
+        void        clearModified() { modified_ = false; }
 
         // Called by Gui when OS-level file drops occur; panel applies them if hovered.
         void pushDroppedFiles(const std::vector<std::string> &paths)
@@ -244,6 +246,8 @@ class SdkPanel
         };
         std::vector<HistEntry> history_;
         std::mutex             histMtx_; // protects history_ (background thread writes)
+        bool                   historyExpanded_{true};
+        bool                   modified_{false};
 
         // ── sequence ──────────────────────────────────────────────────────────────
         std::vector<SdkSeqStep> seqSteps_;
@@ -276,6 +280,7 @@ class SdkPanel
         void selectFn(int idx);
         void selectMethod(int classIdx, int methodIdx);
         void setStatus(const std::string &msg, bool isErr);
+        bool drawHistoryHeader(const char *id);
         void pushHistory(const std::string &call, const std::string &result, bool ok, double tsSec);
         // Store a successful call's integer/float return value into the LOCAL variable
         // named `name` (no-op if name is empty or the variable does not exist).

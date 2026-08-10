@@ -14,8 +14,11 @@
 #include "core/updater.hpp"
 #include "gui/assembly_viewer.hpp"
 #include "gui/audio_input.hpp"
+#include "gui/bkp_sram_debugger.hpp"
 #include "gui/bode.hpp"
+#include "gui/device_manager.hpp"
 #include "gui/i18n.hpp"
+#include "gui/midi_tool.hpp"
 #include "gui/monitor.hpp"
 #include "gui/sdk_panel.hpp"
 #include "gui/variable.hpp"
@@ -101,10 +104,13 @@ class Gui
         std::vector<MotorProfile> motorProfiles_;
         int                       currentMotorProfile_ = 0;
 
-        bool           showCalculator_{false};
-        Bode           bode_{};
-        AssemblyViewer asmViewer_{};
-        SequenceEditor seqEditor_{};
+        bool            showCalculator_{false};
+        Bode            bode_{};
+        BkpSramDebugger bkpSramDebugger_{};
+        AssemblyViewer  asmViewer_{};
+        SequenceEditor  seqEditor_{};
+        DeviceManager   deviceManager_{};
+        MidiTool        midiTool_{};
 
         // SDK Debug — multi-instance windows
         std::vector<std::shared_ptr<SdkPanel>> sdkPanels_;

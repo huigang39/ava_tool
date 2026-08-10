@@ -142,7 +142,7 @@ class MonitorScope
         std::string groupAnchorKey(const std::string &groupPath) const;
         // Transfer the channel(s) described by a DND_CHANNEL_MOVE payload from another scope
         // into this one. No-op when the payload originates from this scope.
-        void moveChannelsFrom(ChannelMovePayload *data);
+        bool moveChannelsFrom(ChannelMovePayload *data, bool copy);
         // Accept a DND_CHANNEL_MOVE payload: reorder inside this scope, move across scopes.
         void applyChannelMoveDrop(ChannelMovePayload *data, const std::string &dst);
 
