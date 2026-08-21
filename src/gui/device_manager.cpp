@@ -1254,7 +1254,7 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
                 return;
         }
         if (method.kind == MethodKind::Discovery && headerFunction->retType != CType::I32) {
-                method.lastResult = tr("Discovery functions must return int32_t.", "发现函数必须返回 int32_t。");
+                method.lastResult = tr("Discovery functions must return int.", "发现函数必须返回 int。");
                 return;
         }
         if (headerFunction->isVariadic) {
@@ -3115,10 +3115,10 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
 
                                 if (method.kind == MethodKind::Discovery && function) {
                                         if (function->retType != CType::I32)
-                                                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.35f, 1.0f),
-                                                                   "%s",
-                                                                   tr("Discovery functions must return int32_t.",
-                                                                      "发现函数必须返回 int32_t。"));
+                                                ImGui::TextColored(
+                                                    ImVec4(1.0f, 0.4f, 0.35f, 1.0f),
+                                                    "%s",
+                                                    tr("Discovery functions must return int.", "发现函数必须返回 int。"));
                                         auto argumentCombo = [&](const char *label, int &selected, bool buffer) {
                                                 std::string previewText = tr("Not configured", "未配置");
                                                 if (selected >= 0 && selected < static_cast<int>(function->params.size())) {

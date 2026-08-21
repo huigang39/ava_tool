@@ -5,18 +5,18 @@
 extern "C" {
 #endif
 
-typedef enum errdef {
-        MOK,
-        MEINVAL,
-        MEBUSY,
-        MEACCES,
-        METIMEOUT,
-        MESYSERR,
-        MECREATE,
-        MEALLOC,
-        MEXIST,
-        MENULLPTR,
-} errdef_e;
+enum errdef {
+    MOK,
+    MEINVAL,
+    MEBUSY,
+    MEACCES,
+    METIMEOUT,
+    MESYSERR,
+    MECREATE,
+    MEALLOC,
+    MEXIST,
+    MENULLPTR,
+};
 
 #ifdef __cplusplus
 }

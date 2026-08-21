@@ -1,7 +1,9 @@
 #ifndef RLS_H
 #define RLS_H
+#include <stddef.h>
+#include <stdint.h>
 
-#include "typedef.h"
+#include "macrodef.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -17,47 +19,47 @@ extern "C" {
 /*                                  类型定义                                  */
 /* -------------------------------------------------------------------------- */
 
-typedef struct rlf_cfg {
-        u32 order;
-        f32 lambda;
-        f32 delta;
-} rls_cfg_t;
+struct rlf_cfg {
+    uint32_t  order;
+    float32_t lambda;
+    float32_t delta;
+};
 
-typedef struct rls_in {
-        f32 y;
-        f32 x[MAX_ORDER];
-} rls_in_t;
+struct rls_in {
+    float32_t y;
+    float32_t x[MAX_ORDER];
+};
 
-typedef struct rlf_out {
-        f32 w[MAX_ORDER];
-} rls_out_t;
+struct rlf_out {
+    float32_t w[MAX_ORDER];
+};
 
-typedef struct rls_lo {
-        f32 err;
-        f32 denom;
-        f32 y_hat;
-        f32 p[MAX_ORDER][MAX_ORDER];
-        f32 px[MAX_ORDER];
-        f32 k[MAX_ORDER];
-        f32 temp[MAX_ORDER][MAX_ORDER];
-        f32 xtp[MAX_ORDER];
-} rls_lo_t;
+struct rls_lo {
+    float32_t err;
+    float32_t denom;
+    float32_t y_hat;
+    float32_t p[MAX_ORDER][MAX_ORDER];
+    float32_t px[MAX_ORDER];
+    float32_t k[MAX_ORDER];
+    float32_t temp[MAX_ORDER][MAX_ORDER];
+    float32_t xtp[MAX_ORDER];
+};
 
-typedef struct rls_obs {
-        rls_cfg_t cfg;
-        rls_in_t  in;
-        rls_out_t out;
-        rls_lo_t  lo;
-} rls_obs_t;
+struct rls_obs {
+    struct rlf_cfg cfg;
+    struct rls_in  in;
+    struct rlf_out out;
+    struct rls_lo  lo;
+};
 
 /* -------------------------------------------------------------------------- */
 /*                                  接口定义                                  */
 /* -------------------------------------------------------------------------- */
 
-void rls_init(rls_obs_t *rls, rls_cfg_t rls_cfg);
-void rls_reset(rls_obs_t *rls);
-void rls_exec(rls_obs_t *rls);
-void rls_exec_in(rls_obs_t *rls, f32 ref, const f32 *x);
+void rls_init(struct rls_obs *rls, struct rlf_cfg rls_cfg);
+void rls_reset(struct rls_obs *rls);
+void rls_exec(struct rls_obs *rls);
+void rls_exec_in(struct rls_obs *rls, float32_t ref, const float32_t *x);
 
 #ifdef __cplusplus
 }

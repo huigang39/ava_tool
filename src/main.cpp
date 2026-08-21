@@ -107,7 +107,7 @@ module_init()
         log_cfg_t cfg_ops = {
             .e_mode     = LOG_MODE_ASYNC,
             .e_level    = LOG_LEVEL_INFO,
-            .e_format   = LOG_FORMAT_TEXT,
+            .e_format   = LOG_FORMAT_TXT,
             .mempool    = &g_log_ops_mp,
             .file_path  = logDirOps.c_str(),
             .fd         = NULL,

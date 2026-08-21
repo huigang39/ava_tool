@@ -220,13 +220,14 @@ class MonitorChannel
         void         setAddr(const usize addr) { addr_ = addr; }
         // Set when a reloaded ELF no longer defines this channel's symbol — the
         // address is then shown as "UNKNOWN" instead of a stale value.
-        bool         isAddrUnknown() const { return addrUnknown_; }
-        void         setAddrUnknown(bool u) { addrUnknown_ = u; }
-        std::string &getDevice() { return device_; }
-        void         setDevice(const std::string &device) { device_ = device; }
-        std::string &getShmRegionName() { return shmRegionName_; }
-        void         setShmRegionName(const std::string &n) { shmRegionName_ = n; }
-        shm_t       &getShm() { return shm_; }
+        bool               isAddrUnknown() const { return addrUnknown_; }
+        void               setAddrUnknown(bool u) { addrUnknown_ = u; }
+        std::string       &getDevice() { return device_; }
+        const std::string &getDevice() const { return device_; }
+        void               setDevice(const std::string &device) { device_ = device; }
+        std::string       &getShmRegionName() { return shmRegionName_; }
+        void               setShmRegionName(const std::string &n) { shmRegionName_ = n; }
+        shm_t             &getShm() { return shm_; }
 
         u32  getBitOffset() const { return bitOffset_; }
         void setBitOffset(u32 o) { bitOffset_ = o; }

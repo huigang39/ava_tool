@@ -12,6 +12,7 @@
 #include "gui/monitor_types.hpp"
 #include "module.h"
 
+#include <array>
 #include <atomic>
 #include <map>
 #include <memory>
@@ -24,6 +25,11 @@
 
 class Monitor;
 
+// GUI-thread bridge used by a LOCAL monitor channel to open the owning
+// Variable window's function-binding dialog.
+void        requestMonitorFunctionBinding(const std::string &variableName);
+std::string consumeMonitorFunctionBindingRequest();
+
 class MonitorScope
 {
       public:
@@ -33,20 +39,38 @@ class MonitorScope
                 TABLE,
         };
         using ChannelMapType = std::unordered_map<std::string, std::shared_ptr<MonitorChannel>>;
-        const std::string     &getName() const { return name_; }
-        const std::string     &getLabel() const { return label_.empty() ? name_ : label_; }
-        void                   setLabel(const std::string &l) { label_ = l; }
-        void                   setDraw(DrawEnum d) { e_draw = d; }
-        DrawEnum               getDraw() const { return e_draw; }
-        f32                   &getHeight() { return height_; }
-        bool                  &getShowFft() { return showFft_; }
-        bool                  &getFftBars() { return fftBars_; }
-        bool                  &getShowSidePanel() { return showSidePanel_; }
-        int                   &getFftPoints() { return fftPoints_; }
-        int                   &getFftPeakCount() { return fftPeakCount_; }
-        ChannelMapType        &getChannels() { return chs_; }
-        std::set<std::string> &getExpandedGroups() { return expandedGroups_; }
-        void                   reinitFft(int newPoints);
+        const std::string          &getName() const { return name_; }
+        const std::string          &getLabel() const { return label_.empty() ? name_ : label_; }
+        void                        setLabel(const std::string &l) { label_ = l; }
+        void                        setDraw(DrawEnum d) { e_draw = d; }
+        DrawEnum                    getDraw() const { return e_draw; }
+        f32                        &getHeight() { return height_; }
+        bool                       &getShowFft() { return showFft_; }
+        bool                       &getFftBars() { return fftBars_; }
+        bool                       &getShowSidePanel() { return showSidePanel_; }
+        int                        &getFftPoints() { return fftPoints_; }
+        int                        &getFftPeakCount() { return fftPeakCount_; }
+        ChannelMapType             &getChannels() { return chs_; }
+        std::set<std::string>      &getExpandedGroups() { return expandedGroups_; }
+        const std::array<float, 6> &getTableColumnWidths() const { return tableColumnWidths_; }
+        int                         getTableSortColumn() const { return tableSortColumn_; }
+        int                         getTableSortDirection() const { return tableSortDirection_; }
+        bool                        usesManualTableOrder() const { return forceManualTableOrder_; }
+        void setTableUiState(const std::array<float, 6> &widths, int sortColumn, int sortDirection, bool manualOrder)
+        {
+                tableColumnWidths_     = widths;
+                tableSortColumn_       = sortColumn;
+                tableSortDirection_    = sortDirection;
+                forceManualTableOrder_ = manualOrder || sortColumn < 0;
+                restoreTableWidths_    = true;
+                restoreTableSort_      = true;
+        }
+        void noteChannelOrder(i64 order)
+        {
+                if (order >= nextChannelOrder_)
+                        nextChannelOrder_ = order + 1;
+        }
+        void reinitFft(int newPoints);
 
       private:
         std::string           name_{};
@@ -74,6 +98,12 @@ class MonitorScope
         int                   lastSelectedIndex_{-1};
         std::set<std::string> selectedGroupPaths_{};
         bool                  forceManualTableOrder_{false};
+        std::array<float, 6>  tableColumnWidths_{};
+        bool                  tableWidthsInitialized_{false};
+        bool                  restoreTableWidths_{false};
+        int                   tableSortColumn_{-1};
+        int                   tableSortDirection_{1}; // ImGuiSortDirection_Ascending
+        bool                  restoreTableSort_{false};
         // Full paths (e.g. "foo.bar") of group nodes the user has expanded;
         // persisted across sessions via Gui save/load.
         bool                  hidden_{false};
@@ -104,6 +134,18 @@ class MonitorScope
         };
         std::map<std::string, Stats> channelStats_;
 
+        struct ChannelPropertyEdit {
+                std::string                            targetName;
+                char                                   name[256]{};
+                char                                   alias[256]{};
+                char                                   address[32]{};
+                char                                   shmName[64]{};
+                int                                    typeIndex{4};
+                int                                    deviceIndex{0};
+                bool                                   writable{true};
+                std::vector<MonitorChannel::EnumEntry> enums;
+        } channelPropertyEdit_;
+
         // FFT results published by the background FFT worker thread (fftWorkerStep)
         // and consumed by the GUI thread in plotDraw — so the expensive transform
         // no longer runs on the render thread and stops dragging down FPS.
@@ -122,6 +164,8 @@ class MonitorScope
 
         void tableDraw();
         void tableMenu();
+        void beginChannelProperties(const std::string &channelName);
+        void drawChannelPropertiesPopup();
 
         void plotDraw(f64 *linkXMin, f64 *linkXMax, u32 maxDisplayPoints, MonitorViewMode &mode);
         void plotMenu();

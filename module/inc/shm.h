@@ -13,7 +13,10 @@
 #endif
 
 #include "spsc.h"
-#include "typedef.h"
+#include <stddef.h>
+#include <stdint.h>
+
+#include "macrodef.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,41 +26,41 @@ extern "C" {
 /*                                  类型定义                                  */
 /* -------------------------------------------------------------------------- */
 
-typedef enum shm_access {
+enum shm_access {
 #if OS(POSIX)
-        SHM_READONLY  = PROT_READ,
-        SHM_WRITEONLY = PROT_WRITE,
-        SHM_READWRITE = SHM_READONLY | SHM_WRITEONLY,
+    SHM_READONLY  = PROT_READ,
+    SHM_WRITEONLY = PROT_WRITE,
+    SHM_READWRITE = SHM_READONLY | SHM_WRITEONLY,
 #elif OS(WIN)
-        SHM_READONLY  = PAGE_READONLY,
-        SHM_READWRITE = PAGE_READWRITE,
+    SHM_READONLY  = PAGE_READONLY,
+    SHM_READWRITE = PAGE_READWRITE,
 #elif OS(NONE)
-        SHM_READONLY,
-        SHM_READWRITE,
+    SHM_READONLY,
+    SHM_READWRITE,
 #endif
-} shm_access_e;
+};
 
-typedef struct shm_cfg {
-        const char  *name;
-        shm_access_e access;
-        usize        cap;
-} shm_cfg_t;
+struct shm_cfg {
+    const char     *name;
+    enum shm_access access;
+    size_t          cap;
+};
 
-typedef struct shm_lo {
+struct shm_lo {
 #if OS(POSIX)
-        int fd;
+    int fd;
 #elif OS(WIN)
-        HANDLE fd;
+    HANDLE fd;
 #endif
-        void   *addr;
-        u8      is_creator;
-        spsc_t *spsc;
-} shm_lo_t;
+    void        *addr;
+    uint8_t      is_creator;
+    struct spsc *spsc;
+};
 
-typedef struct shm {
-        shm_cfg_t cfg;
-        shm_lo_t  lo;
-} shm_t;
+struct shm {
+    struct shm_cfg cfg;
+    struct shm_lo  lo;
+};
 
 /* -------------------------------------------------------------------------- */
 /*                                  接口声明                                  */
@@ -70,7 +73,7 @@ typedef struct shm {
  * @param shm_cfg 共享内存配置
  * @return        int 状态码
  */
-int shm_init(shm_t *shm, shm_cfg_t shm_cfg);
+int shm_init(struct shm *shm, struct shm_cfg shm_cfg);
 
 /**
  * @brief 共享内存数据读取
@@ -79,7 +82,7 @@ int shm_init(shm_t *shm, shm_cfg_t shm_cfg);
  * @param dst  待读取的数据目标地址
  * @param size 读取字节数
  */
-usize shm_read(shm_t *shm, void *dst, usize size);
+size_t shm_read(struct shm *shm, void *dst, size_t size);
 
 /**
  * @brief 共享内存数据写入
@@ -88,7 +91,7 @@ usize shm_read(shm_t *shm, void *dst, usize size);
  * @param src  待写入的数据源地址
  * @param size 写入字节数
  */
-usize shm_write(shm_t *shm, const void *src, usize size);
+size_t shm_write(struct shm *shm, const void *src, size_t size);
 
 #ifdef __cplusplus
 }

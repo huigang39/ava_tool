@@ -1,10 +1,10 @@
 ifeq ($(OS),Windows_NT)
 SHELL := cmd.exe
+ifeq ($(COMPILER),msvc)
 ifndef VCVARS_DONE
 
 _GOALS    := $(if $(MAKECMDGOALS),$(MAKECMDGOALS),static)
-_MSVC_DEFAULT_GOALS := static shared all msvc-win tool test
-_MSVC_ENV_GOALS := $(if $(filter msvc,$(COMPILER)),$(_GOALS),$(filter $(_MSVC_DEFAULT_GOALS),$(_GOALS)))
+_MSVC_ENV_GOALS := $(filter-out fmt,$(_GOALS))
 
 ifneq ($(_MSVC_ENV_GOALS),)
 
@@ -32,6 +32,7 @@ $(_GOALS): _msvc_env
 endif # _CL_OK
 endif # _MSVC_ENV_GOALS
 endif # VCVARS_DONE
+endif # COMPILER=msvc
 endif # Windows_NT (MSVC init)
 
 ifndef _MSVC_REINVOKE
@@ -121,6 +122,9 @@ GCC_ARCHIVER_EXE          := ar
 GCC_MCU_STATIC_LIB        := $(PROJECT_NAME).a
 GCC_MCU_CFLAGS            := -c $(OPTIMIZATION) -g -Wall -mcpu=cortex-m7 -mfloat-abi=hard -mfpu=fpv5-d16
 
+GCC_WIN_STATIC_LIB        := $(PROJECT_NAME).a
+GCC_WIN_CFLAGS            := -c $(OPTIMIZATION) -g -Wall -Wextra -std=gnu11
+
 GCC_LINUX_STATIC_LIB      := $(PROJECT_NAME).a
 GCC_LINUX_SHARED_LIB      := $(PROJECT_NAME).so
 GCC_LINUX_CFLAGS          := -c $(OPTIMIZATION) -g -Wall -Wextra -fPIC
@@ -182,6 +186,12 @@ ifneq ($(COMPILER),)
             CFLAGS        := $(GCC_MCU_CFLAGS)
             STATIC_LIB    := $(GCC_MCU_STATIC_LIB)
             PLATFORM_DIR  := mcu
+        else ifeq ($(PLATFORM),win)
+            CC            := $(GCC_COMPILER_EXE)
+            AR            := $(GCC_ARCHIVER_EXE)
+            CFLAGS        := $(GCC_WIN_CFLAGS)
+            STATIC_LIB    := $(GCC_WIN_STATIC_LIB)
+            PLATFORM_DIR  := win-gcc
         else ifeq ($(PLATFORM),linux)
             CC            := $(GCC_COMPILER_EXE)
             AR            := $(GCC_ARCHIVER_EXE)
@@ -247,7 +257,9 @@ OUTPUT_LIB_DIR            := $(LIB_DIR)/$(PLATFORM_DIR)
 OUTPUT_STATIC_LIB         := $(OUTPUT_LIB_DIR)/$(STATIC_LIB)
 OUTPUT_SHARED_LIB         := $(OUTPUT_LIB_DIR)/$(SHARED_LIB)
 
-ALL_SRC_FILES             := $(foreach dir,$(SRC_DIR),$(wildcard $(dir)/*.c))
+rwildcard                 = $(foreach entry,$(wildcard $(1)/*),$(call rwildcard,$(entry),$(2))) $(wildcard $(1)/$(2))
+ALL_SRC_FILES             := $(call rwildcard,$(SRC_DIR),*.c)
+SRC_SUBDIRS               := $(sort $(patsubst %/,%,$(dir $(ALL_SRC_FILES))))
 
 ifeq ($(ALL_SRC_FILES),)
     ifeq ($(OS),Windows_NT)
@@ -279,7 +291,7 @@ endif
 
 OBJ_FILES                 := $(SRC_FILES:$(SRC_DIR)/%.c=$(OUTPUT_BUILD_DIR)/%.o)
 
-.PHONY: all static shared tool test clean fmt list help info ac5-mcu ac6-mcu gcc-mcu gcc-linux clang-mac clang-linux msvc-win
+.PHONY: all static shared tool test clean fmt list help info ac5-mcu ac6-mcu gcc-mcu gcc-win gcc-linux clang-mac clang-linux msvc-win
 
 .DEFAULT_GOAL := static
 
@@ -442,6 +454,9 @@ ac6-mcu:
 
 gcc-mcu:
 	@$(MAKE) COMPILER=gcc PLATFORM=mcu static
+
+gcc-win:
+	@$(MAKE) COMPILER=gcc PLATFORM=win static
 
 gcc-linux:
 	@$(MAKE) COMPILER=gcc PLATFORM=linux static

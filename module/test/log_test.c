@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 
-static void log_stdout(void *fp, const void *src, usize size);
+static void log_stdout(void *fp, const void *src, size_t size);
 
 #define WRITE_THREAD_NUM   (100)
 #define MEMPOOL_SIZE       (SIZE_16MB)
@@ -16,13 +16,13 @@ static void log_stdout(void *fp, const void *src, usize size);
 
 NO_ASAN
 ALIGN(4096)
-u64   g_producers_cnts[WRITE_THREAD_NUM];
-log_t g_log;
+uint64_t   g_producers_cnts[WRITE_THREAD_NUM];
+struct log g_log;
 
 NO_ASAN
 ALIGN(4096)
-u8        g_mempool_buf[MEMPOOL_SIZE];
-mempool_t g_mempool = {
+uint8_t        g_mempool_buf[MEMPOOL_SIZE];
+struct mempool g_mempool = {
     .buf = g_mempool_buf,
     .cap = sizeof(g_mempool_buf),
 };
@@ -30,12 +30,12 @@ mempool_t g_mempool = {
 volatile bool g_stop_flush = false;
 
 static void
-log_stdout(void *fp, const void *src, const usize size)
+log_stdout(void *fp, const void *src, const size_t size)
 {
-        if (fp != NULL) {
-                fwrite(src, size, 1, fp);
-                fflush(fp);
-        }
+    if (fp != NULL) {
+        fwrite(src, size, 1, fp);
+        fflush(fp);
+    }
 }
 
 #if OS(WIN)
@@ -46,19 +46,19 @@ static void *
 flush_thread_func(void *arg)
 #endif
 {
-        ARG_UNUSED(arg);
+    ARG_UNUSED(arg);
 
-        while (!g_stop_flush) {
-                log_flush(&g_log);
-                delay_ms(1, DELAY_YIELD);
-        }
-
-        // 收到主线程安全退出信号后，再执行一次最终收尾
+    while (!g_stop_flush) {
         log_flush(&g_log);
+        delay_ms(1, DELAY_YIELD);
+    }
+
+    // 收到主线程安全退出信号后,再执行一次最终收尾
+    log_flush(&g_log);
 #if OS(WIN)
-        return 0;
+    return 0;
 #else
-        return NULL;
+    return NULL;
 #endif
 }
 
@@ -70,95 +70,100 @@ static void *
 write_thread_func(void *arg)
 #endif
 {
-        const u64 idx = *(u64 *)arg;
+    const uint64_t idx = *(uint64_t *)arg;
 
-        for (int i = 0; i < 1000; i++) {
+    for (int i = 0; i < 1000; i++) {
 
 #if OS(WIN)
-                log_debug(&g_log, idx, "thread_id %10llu, cnt: %10llu\n", (usize)GetCurrentThreadId(), g_producers_cnts[idx]++);
+        log_debug(&g_log,
+                  idx,
+                  "thread_id %10LLU, cnt: %10LLU\n",
+                  (size_t)GetCurrentThreadId(),
+                  g_producers_cnts[idx]++);
 #else
-                log_debug(&g_log, idx, "thread_id %10llu, cnt: %10llu\n", (usize)pthread_self(), g_producers_cnts[idx]++);
+        log_debug(&g_log,
+                  idx,
+                  "thread_id %10LLU, cnt: %10LLU\n",
+                  (size_t)pthread_self(),
+                  g_producers_cnts[idx]++);
 #endif
-                // delay_ms(1, YIELD);
-        }
+        // delay_ms(1, YIELD);
+    }
 
 #if OS(WIN)
-        return 0;
+    return 0;
 #else
-        return NULL;
+    return NULL;
 #endif
 }
 
 int
 main()
 {
-        mempool_init(&g_mempool);
+    mempool_init(&g_mempool);
 
-        const log_cfg_t log_cfg = {
-            .e_mode   = LOG_MODE_SYNC,
-            .e_level  = LOG_LEVEL_DEBUG,
-            .e_format = LOG_FORMAT_TEXT,
-            .mempool  = &g_mempool,
+    const struct log_cfg log_cfg = {
+        .e_mode   = LOG_MODE_SYNC,
+        .e_level  = LOG_LEVEL_DEBUG,
+        .e_format = LOG_FORMAT_TXT,
+        .mempool  = &g_mempool,
 
-            //     .file_path = "log_test.log",
-            .file_size = SIZE_1MB,
-            .max_files = 3,
-            .e_ring    = LOG_RING_ROTATE,
+        //     .file_path = "log_test.log",
+        .file_size = SIZE_1MB,
+        .max_files = 3,
+        .e_ring    = LOG_RING_ROTATE,
 
-            .fd      = stdout,
-            .f_flush = log_stdout,
+        .fd      = stdout,
+        .f_flush = log_stdout,
 
-            .chunk_size = LOG_CHUNK_SIZE,
-            .flush_cap  = LOG_FLUSH_BUF_SIZE,
-            .nproducers = WRITE_THREAD_NUM,
-            .f_get_ts   = get_mono_ts_us,
-        };
-        log_init(&g_log, log_cfg);
+        .chunk_size = LOG_CHUNK_SIZE,
+        .flush_cap  = LOG_FLUSH_BUF_SIZE,
+        .nproducers = WRITE_THREAD_NUM,
+        .f_get_ts   = get_mono_ts_us,
+    };
+    log_init(&g_log, log_cfg);
 
 #if OS(WIN)
-        HANDLE flush_thread = CreateThread(NULL, 0, flush_thread_func, NULL, 0, NULL);
+    HANDLE flush_thread = CreateThread(NULL, 0, flush_thread_func, NULL, 0, NULL);
 #else
-        pthread_t flush_thread;
-        pthread_create(&flush_thread, NULL, flush_thread_func, NULL);
+    pthread_t flush_thread;
+    pthread_create(&flush_thread, NULL, flush_thread_func, NULL);
 #endif
 
-        u64 thread_ids[WRITE_THREAD_NUM];
+    uint64_t thread_ids[WRITE_THREAD_NUM];
 #if OS(WIN)
-        HANDLE write_thread[WRITE_THREAD_NUM];
+    HANDLE write_thread[WRITE_THREAD_NUM];
 #else
-        pthread_t write_thread[WRITE_THREAD_NUM];
+    pthread_t write_thread[WRITE_THREAD_NUM];
 #endif
-        for (u32 i = 0; i < WRITE_THREAD_NUM; i++) {
-                thread_ids[i] = i;
+    for (uint32_t i = 0; i < WRITE_THREAD_NUM; i++) {
+        thread_ids[i] = i;
 #if OS(WIN)
-                write_thread[i] = CreateThread(NULL, 0, write_thread_func, &thread_ids[i], 0, NULL);
+        write_thread[i] = CreateThread(NULL, 0, write_thread_func, &thread_ids[i], 0, NULL);
 #else
-                pthread_create(&write_thread[i], NULL, write_thread_func, &thread_ids[i]);
+        pthread_create(&write_thread[i], NULL, write_thread_func, &thread_ids[i]);
 #endif
-        }
+    }
 
-        // 1. 挂起等待所有生产者的写动作完毕
 #if OS(WIN)
-        WaitForMultipleObjects(WRITE_THREAD_NUM, write_thread, TRUE, INFINITE);
-        for (u32 i = 0; i < WRITE_THREAD_NUM; i++)
-                CloseHandle(write_thread[i]);
+    WaitForMultipleObjects(WRITE_THREAD_NUM, write_thread, true, INFINITE);
+    for (uint32_t i = 0; i < WRITE_THREAD_NUM; i++)
+        CloseHandle(write_thread[i]);
 #else
-        for (u32 i = 0; i < WRITE_THREAD_NUM; i++)
-                pthread_join(write_thread[i], NULL);
+    for (uint32_t i = 0; i < WRITE_THREAD_NUM; i++)
+        pthread_join(write_thread[i], NULL);
 #endif
 
-        // 2. 告诉后台落盘线程安全退出
-        g_stop_flush = true;
+    g_stop_flush = true;
 #if OS(WIN)
-        WaitForSingleObject(flush_thread, INFINITE);
-        CloseHandle(flush_thread);
+    WaitForSingleObject(flush_thread, INFINITE);
+    CloseHandle(flush_thread);
 #else
-        pthread_join(flush_thread, NULL);
+    pthread_join(flush_thread, NULL);
 #endif
 
-        // 3. 安全地回收模块，它会自动将所有还没满的 Chunk 刷进文件里
-        log_deinit(&g_log);
+    log_deinit(&g_log);
 
-        printf("\nWait-Free Chunk MPSC Log Test Complete!\n");
-        return 0;
+    printf("\nWait-Free Chunk MPSC Log Test Complete!\n");
+    return 0;
 }

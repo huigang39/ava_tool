@@ -4,7 +4,8 @@
 #include <stdint.h>
 
 #include "macrodef.h"
-#include "typedef.h"
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,16 +17,16 @@ extern "C" {
 
 /* 侵入式链表节点 */
 struct mpsc_node;
-typedef struct mpsc_node {
-        ATOMIC(struct mpsc_node *) next;
-} mpsc_node_t;
+struct mpsc_node {
+    ATOMIC(struct mpsc_node *) next;
+};
 
 /* 全局无锁队列 */
-typedef struct mpsc {
-        ATOMIC(mpsc_node_t *) head; // 生产者：原子交换头指针
-        mpsc_node_t *tail;          // 消费者：单线程读取尾指针
-        mpsc_node_t  stub;          // 哨兵节点
-} mpsc_t;
+struct mpsc {
+    ATOMIC(struct mpsc_node *) head; // 生产者:原子交换头指针
+    struct mpsc_node *tail;          // 消费者:单线程读取尾指针
+    struct mpsc_node  stub;          // 哨兵节点
+};
 
 /* -------------------------------------------------------------------------- */
 /*                                  接口声明                                  */
@@ -34,18 +35,18 @@ typedef struct mpsc {
 /**
  * @brief 初始化无锁队列
  */
-void mpsc_init(mpsc_t *mpsc);
+void mpsc_init(struct mpsc *mpsc);
 
 /**
- * @brief 生产者：将节点推入队列 (绝对 Wait-Free, 无锁)
+ * @brief 生产者:将节点推入队列 (绝对 Wait-Free, 无锁)
  */
-void mpsc_push(mpsc_t *mpsc, mpsc_node_t *node);
+void mpsc_push(struct mpsc *mpsc, struct mpsc_node *node);
 
 /**
- * @brief 消费者：从队列中弹出一个节点
- * @return mpsc_node_t* 成功返回节点指针，队列为空或生产者正在写入时返回 NULL
+ * @brief 消费者:从队列中弹出一个节点
+ * @return struct mpsc_node* 成功返回节点指针,队列为空或生产者正在写入时返回 NULL
  */
-mpsc_node_t *mpsc_pop(mpsc_t *mpsc);
+struct mpsc_node *mpsc_pop(struct mpsc *mpsc);
 
 #ifdef __cplusplus
 }

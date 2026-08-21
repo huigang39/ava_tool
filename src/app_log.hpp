@@ -1,7 +1,7 @@
 #ifndef APP_LOG_HPP
 #define APP_LOG_HPP
 
-#include "log.h"
+#include "module.h"
 
 extern log_t g_log_ops;
 extern log_t g_log_perf;

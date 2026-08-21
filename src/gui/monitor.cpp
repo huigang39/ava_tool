@@ -30,6 +30,22 @@ std::atomic<int>  g_maxHssHz{1000};
 std::vector<Monitor *> Monitor::sInstances_;
 std::mutex             Monitor::sMtxInstances_;
 
+static std::string sMonitorFunctionBindingRequest;
+
+void
+requestMonitorFunctionBinding(const std::string &variableName)
+{
+        sMonitorFunctionBindingRequest = variableName;
+}
+
+std::string
+consumeMonitorFunctionBindingRequest()
+{
+        std::string result;
+        result.swap(sMonitorFunctionBindingRequest);
+        return result;
+}
+
 class MonitorChannel;
 class MonitorScope;
 
@@ -293,11 +309,17 @@ MonitorScope::menu()
         // Resume = go (green); Pause = caution (amber).
         ImGui::SameLine();
         if (paused_) {
-                if (ui::Button(tr("Resume J-Link", "继续J-Link"), ui::BtnStyle::Success))
+                if (ui::Button(tr("Resume J-Link", "继续J-Link"), ui::BtnStyle::Success)) {
                         paused_ = false;
+                        if (parent_)
+                                parent_->setModified();
+                }
         } else {
-                if (ui::Button(tr("Pause J-Link Sampling", "暂停J-Link采样"), ui::BtnStyle::Warning))
+                if (ui::Button(tr("Pause J-Link Sampling", "暂停J-Link采样"), ui::BtnStyle::Warning)) {
                         paused_ = true;
+                        if (parent_)
+                                parent_->setModified();
+                }
         }
 
         ImGui::Separator();
@@ -335,12 +357,52 @@ MonitorScope::tableDraw()
         ImGui::TableSetupColumn(tr("Port###col_port", "端口###col_port"), ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn(
             tr("Wave###col_wave", "波形###col_wave"), ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 100.0f);
+
+        if (restoreTableWidths_) {
+                ImGuiTable *table = ImGui::GetCurrentTable();
+                if (table && !table->IsLayoutLocked) {
+                        for (int i = 0; i < 6 && i < table->ColumnsCount; ++i) {
+                                const float width = tableColumnWidths_[i];
+                                if (width <= 1.0f)
+                                        continue;
+                                ImGuiTableColumn &column = table->Columns[i];
+                                if (column.Flags & ImGuiTableColumnFlags_WidthStretch)
+                                        column.StretchWeight = width;
+                                else
+                                        column.WidthRequest = width;
+                                column.AutoFitQueue = 0;
+                        }
+                        restoreTableWidths_ = false;
+                }
+        }
+        if (restoreTableSort_) {
+                if (tableSortColumn_ >= 0 && tableSortColumn_ < 5)
+                        ImGui::TableSetColumnSortDirection(
+                            tableSortColumn_, static_cast<ImGuiSortDirection>(tableSortDirection_), false);
+                else
+                        ImGui::TableSetColumnSortDirection(0, ImGuiSortDirection_None, false);
+                restoreTableSort_ = false;
+        }
         ImGui::TableHeadersRow();
 
         ImGuiTableSortSpecs *sortSpecs = ImGui::TableGetSortSpecs();
         if (sortSpecs && sortSpecs->SpecsDirty) {
-                forceManualTableOrder_ = false;
-                sortSpecs->SpecsDirty  = false;
+                int nextColumn    = -1;
+                int nextDirection = ImGuiSortDirection_Ascending;
+                if (sortSpecs->SpecsCount > 0) {
+                        nextColumn             = sortSpecs->Specs[0].ColumnIndex;
+                        nextDirection          = sortSpecs->Specs[0].SortDirection;
+                        forceManualTableOrder_ = false;
+                } else {
+                        forceManualTableOrder_ = true;
+                }
+                if (tableSortColumn_ != nextColumn || tableSortDirection_ != nextDirection) {
+                        tableSortColumn_    = nextColumn;
+                        tableSortDirection_ = nextDirection;
+                        if (parent_)
+                                parent_->setModified();
+                }
+                sortSpecs->SpecsDirty = false;
         }
 
         auto chOrder = [&](const std::string &k) -> i64 {
@@ -583,6 +645,48 @@ MonitorScope::tableDraw()
                                                         pair.second->markPendingDelete();
                                         selectedGroupPaths_.clear();
                                 }
+                                ImGui::BeginDisabled();
+                                ImGui::MenuItem(tr("Edit Properties (select a leaf)", "编辑属性（请选择叶子变量）"));
+                                ImGui::EndDisabled();
+                                ImGui::Separator();
+                                ImGui::TextDisabled("%s", tr("Access mode", "读写模式"));
+                                auto groupSupportsWrite = [](const MonitorChannel &channel) {
+                                        const std::string &device = channel.getDevice();
+                                        return device == "JLINK" || device == "SHM" || device == "LOCAL";
+                                };
+                                auto setGroupWritable = [&](bool writable) {
+                                        for (auto &pair : chs_) {
+                                                auto &selected = *pair.second;
+                                                if (!selected.selected_ || (writable && !groupSupportsWrite(selected)))
+                                                        continue;
+                                                selected.setWritable(writable);
+                                                if (!writable)
+                                                        selected.waveEnable_ = false;
+                                        }
+                                        if (parent_)
+                                                parent_->setModified();
+                                };
+                                if (ImGui::MenuItem(tr("Read only", "只读")))
+                                        setGroupWritable(false);
+                                bool allGroupWritable = true;
+                                for (const auto &leaf : groupLeaves) {
+                                        auto it = chs_.find(leaf);
+                                        if (it != chs_.end() && !groupSupportsWrite(*it->second)) {
+                                                allGroupWritable = false;
+                                                break;
+                                        }
+                                }
+                                ImGui::BeginDisabled(!allGroupWritable);
+                                if (ImGui::MenuItem(tr("Read / write", "读写")))
+                                        setGroupWritable(true);
+                                ImGui::EndDisabled();
+                                ImGui::Separator();
+                                ImGui::BeginDisabled();
+                                ImGui::MenuItem(tr("Bind Functions (select a leaf)", "绑定函数（请选择叶子变量）"));
+                                ImGui::MenuItem(tr("DWT trace (select a leaf)", "DWT 跟踪（请选择叶子变量）"));
+                                ImGui::MenuItem(tr("Enum definition (select a leaf)", "枚举定义（请选择叶子变量）"));
+                                ImGui::MenuItem(tr("Restore hidden (0)", "恢复隐藏成员 (0)"));
+                                ImGui::EndDisabled();
                                 ImGui::EndPopup();
                         }
 
@@ -610,6 +714,22 @@ MonitorScope::tableDraw()
                 lastSelectedIndex_ = -1;
         }
 
+        drawChannelPropertiesPopup();
+
+        if (const ImGuiTable *table = ImGui::GetCurrentTable()) {
+                const bool userResizing = table->ResizedColumn >= 0;
+                for (int i = 0; i < 6 && i < table->ColumnsCount; ++i) {
+                        const float width = table->Columns[i].WidthGiven;
+                        if (width <= 1.0f)
+                                continue;
+                        if (tableWidthsInitialized_ && userResizing && std::abs(tableColumnWidths_[i] - width) > 0.5f &&
+                            parent_)
+                                parent_->setModified();
+                        tableColumnWidths_[i] = width;
+                }
+                tableWidthsInitialized_ = true;
+        }
+
         ImGui::EndTable();
 }
 
@@ -620,6 +740,150 @@ isIntegerType(const std::string &t)
                 return false;
         char c = t[0];
         return (c == 'U' || c == 'I') && (t != "U32_HEX");
+}
+
+void
+MonitorScope::beginChannelProperties(const std::string &channelName)
+{
+        auto it = chs_.find(channelName);
+        if (it == chs_.end() || !it->second)
+                return;
+        auto &channel                   = *it->second;
+        channelPropertyEdit_            = {};
+        channelPropertyEdit_.targetName = channelName;
+        snprintf(channelPropertyEdit_.name, sizeof(channelPropertyEdit_.name), "%s", channelName.c_str());
+        if (channel.getLabel() != channelName)
+                snprintf(channelPropertyEdit_.alias, sizeof(channelPropertyEdit_.alias), "%s", channel.getLabel().c_str());
+        snprintf(channelPropertyEdit_.address, sizeof(channelPropertyEdit_.address), "%zX", channel.getAddr());
+        snprintf(channelPropertyEdit_.shmName, sizeof(channelPropertyEdit_.shmName), "%s", channel.getShmRegionName().c_str());
+        static const char *types[]     = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
+        channelPropertyEdit_.typeIndex = 2;
+        for (int i = 0; i < IM_ARRAYSIZE(types); ++i)
+                if (channel.getType() == types[i]) {
+                        channelPropertyEdit_.typeIndex = i;
+                        break;
+                }
+        static const char *devices[] = {"JLINK", "SHM", "LOCAL", "AUDIO", "UDP"};
+        for (int i = 0; i < IM_ARRAYSIZE(devices); ++i)
+                if (channel.getDevice() == devices[i]) {
+                        channelPropertyEdit_.deviceIndex = i;
+                        break;
+                }
+        channelPropertyEdit_.writable = channel.isWritable();
+        channelPropertyEdit_.enums    = channel.getEnums();
+}
+
+void
+MonitorScope::drawChannelPropertiesPopup()
+{
+        if (channelPropertyEdit_.targetName.empty())
+                return;
+        ImGui::OpenPopup("###EditMonitorChannelProperties");
+        if (!ImGui::BeginPopupModal(
+                tr("Edit Variable Properties###EditMonitorChannelProperties", "编辑变量属性###EditMonitorChannelProperties"),
+                nullptr,
+                ImGuiWindowFlags_AlwaysAutoResize))
+                return;
+
+        ImGui::TextUnformatted(tr("Name", "名称"));
+        ImGui::SameLine(100);
+        ImGui::SetNextItemWidth(280);
+        ImGui::InputText("##monitorPropName", channelPropertyEdit_.name, sizeof(channelPropertyEdit_.name));
+        ImGui::TextUnformatted(tr("Alias", "别名"));
+        ImGui::SameLine(100);
+        ImGui::SetNextItemWidth(280);
+        ImGui::InputText("##monitorPropAlias", channelPropertyEdit_.alias, sizeof(channelPropertyEdit_.alias));
+
+        static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
+        ImGui::TextUnformatted(tr("Type", "类型"));
+        ImGui::SameLine(100);
+        ImGui::SetNextItemWidth(280);
+        ImGui::Combo("##monitorPropType", &channelPropertyEdit_.typeIndex, types, IM_ARRAYSIZE(types));
+
+        ImGui::TextUnformatted(tr("Address", "地址"));
+        ImGui::SameLine(100);
+        ImGui::SetNextItemWidth(280);
+        ImGui::InputText("##monitorPropAddress", channelPropertyEdit_.address, sizeof(channelPropertyEdit_.address));
+
+        static const char *devices[] = {"JLINK", "SHM", "LOCAL", "AUDIO", "UDP"};
+        ImGui::TextUnformatted(tr("Port", "端口"));
+        ImGui::SameLine(100);
+        ImGui::SetNextItemWidth(280);
+        ImGui::Combo("##monitorPropPort", &channelPropertyEdit_.deviceIndex, devices, IM_ARRAYSIZE(devices));
+        if (channelPropertyEdit_.deviceIndex == 1) {
+                ImGui::TextUnformatted(tr("SHM Name", "SHM 名称"));
+                ImGui::SameLine(100);
+                ImGui::SetNextItemWidth(280);
+                ImGui::InputText("##monitorPropShm", channelPropertyEdit_.shmName, sizeof(channelPropertyEdit_.shmName));
+        }
+        if (channelPropertyEdit_.deviceIndex == 3)
+                channelPropertyEdit_.writable = false;
+        else
+                ImGui::Checkbox(tr("Writable", "可写"), &channelPropertyEdit_.writable);
+
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", tr("Enum definition", "枚举定义"));
+        int removeEnum = -1;
+        for (int i = 0; i < static_cast<int>(channelPropertyEdit_.enums.size()); ++i) {
+                auto &entry = channelPropertyEdit_.enums[i];
+                ImGui::PushID(i);
+                char enumName[128]{};
+                snprintf(enumName, sizeof(enumName), "%s", entry.name.c_str());
+                ImGui::SetNextItemWidth(180);
+                if (ImGui::InputText("##enumName", enumName, sizeof(enumName)))
+                        entry.name = enumName;
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90);
+                if (ImGui::InputScalar("##enumValue", ImGuiDataType_S64, &entry.value)) {
+                }
+                ImGui::SameLine();
+                if (ImGui::SmallButton("X"))
+                        removeEnum = i;
+                ImGui::PopID();
+        }
+        if (removeEnum >= 0)
+                channelPropertyEdit_.enums.erase(channelPropertyEdit_.enums.begin() + removeEnum);
+        if (ImGui::SmallButton(tr("+ Enum", "+ 枚举")))
+                channelPropertyEdit_.enums.push_back({"VALUE", 0});
+
+        ImGui::Separator();
+        if (ui::Button(tr("Apply", "应用"), ui::BtnStyle::Success, ImVec2(100, 0))) {
+                auto it = chs_.find(channelPropertyEdit_.targetName);
+                if (it != chs_.end() && it->second) {
+                        auto              channel = it->second;
+                        const std::string newName =
+                            channelPropertyEdit_.name[0] ? channelPropertyEdit_.name : channelPropertyEdit_.targetName;
+                        channel->setLabel(channelPropertyEdit_.alias);
+                        channel->setType(types[std::clamp(channelPropertyEdit_.typeIndex, 0, IM_ARRAYSIZE(types) - 1)]);
+                        try {
+                                channel->setAddr(static_cast<usize>(std::stoull(channelPropertyEdit_.address, nullptr, 16)));
+                        } catch (...) {
+                        }
+                        const int deviceIndex = std::clamp(channelPropertyEdit_.deviceIndex, 0, IM_ARRAYSIZE(devices) - 1);
+                        channel->setDevice(devices[deviceIndex]);
+                        channel->setWritable(deviceIndex != 3 && channelPropertyEdit_.writable);
+                        channel->setShmRegionName(channelPropertyEdit_.shmName);
+                        channel->setEnums(std::move(channelPropertyEdit_.enums));
+                        if (channel->getDevice() == "SHM")
+                                shmInit(*channel);
+                        if (newName != channelPropertyEdit_.targetName && chs_.find(newName) == chs_.end()) {
+                                auto node  = chs_.extract(it);
+                                node.key() = newName;
+                                channel->setName(newName);
+                                chs_.insert(std::move(node));
+                        }
+                        if (parent_)
+                                parent_->setModified();
+                }
+                channelPropertyEdit_.targetName.clear();
+                ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Cancel", "取消"), ImVec2(100, 0))) {
+                channelPropertyEdit_.targetName.clear();
+                ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
 }
 
 void
@@ -706,6 +970,60 @@ MonitorScope::drawTableRow(const std::string               &chName,
                                 if (pair.second->selected_)
                                         pair.second->markPendingDelete();
                 }
+                if (ImGui::MenuItem(tr("Edit Properties...", "编辑属性...")))
+                        beginChannelProperties(chName);
+                const bool canBind = ch->getDevice() == "LOCAL";
+                ImGui::BeginDisabled(!canBind);
+                if (ImGui::MenuItem(canBind ? tr("Bind Read/Write Functions...", "绑定读写函数...")
+                                            : tr("Bind Functions (LOCAL only)", "绑定函数（仅 LOCAL）")))
+                        requestMonitorFunctionBinding(ch->getSymbolName().empty() ? chName : ch->getSymbolName());
+                ImGui::EndDisabled();
+                const u32  traceSize = typeBytes(ch->getType());
+                const bool canTrace  = ch->getDevice() == "JLINK" && traceSize > 0;
+                ImGui::BeginDisabled(!canTrace);
+                if (ImGui::MenuItem(canTrace ? tr("Trace writes with DWT", "使用 DWT 跟踪写入")
+                                             : tr("DWT trace (JLINK scalar only)", "DWT 跟踪（仅 JLINK 标量）")))
+                        JLinkPort::instance().configureDwtWriteTrace(static_cast<u32>(ch->getAddr()),
+                                                                     traceSize,
+                                                                     ch->getSymbolName().empty() ? chName
+                                                                                                 : ch->getSymbolName());
+                ImGui::EndDisabled();
+                const bool canEditEnum = isIntegerType(ch->getType());
+                ImGui::BeginDisabled(!canEditEnum);
+                if (ImGui::MenuItem(canEditEnum ? tr("Edit Enum Definition...", "编辑枚举定义...")
+                                                : tr("Enum definition (integer scalar only)", "枚举定义（仅整数标量）")))
+                        beginChannelProperties(chName);
+                ImGui::EndDisabled();
+                ImGui::BeginDisabled();
+                ImGui::MenuItem(tr("Restore hidden (0)", "恢复隐藏成员 (0)"));
+                ImGui::EndDisabled();
+                ImGui::Separator();
+                ImGui::TextDisabled("%s", tr("Access mode", "读写模式"));
+                auto supportsWrite = [](const MonitorChannel &channel) {
+                        const std::string &device = channel.getDevice();
+                        return device == "JLINK" || device == "SHM" || device == "LOCAL";
+                };
+                auto applyWritable = [&](bool writable) {
+                        for (auto &pair : chs_) {
+                                auto &selected = *pair.second;
+                                if (!selected.selected_ || (writable && !supportsWrite(selected)))
+                                        continue;
+                                selected.setWritable(writable);
+                                if (!writable) {
+                                        selected.waveEnable_ = false;
+                                        float discarded      = 0.0f;
+                                        selected.consumeWValDirty(discarded);
+                                }
+                        }
+                        if (parent_)
+                                parent_->setModified();
+                };
+                if (ImGui::MenuItem(tr("Read only", "只读"), nullptr, !ch->isWritable()))
+                        applyWritable(false);
+                ImGui::BeginDisabled(!supportsWrite(*ch));
+                if (ImGui::MenuItem(tr("Read / write", "读写"), nullptr, ch->isWritable()))
+                        applyWritable(true);
+                ImGui::EndDisabled();
                 // ── Alias / rename ───────────────────────────────────────────
                 ImGui::Separator();
                 ImGui::TextDisabled("%s", tr("Alias", "别名"));
@@ -793,7 +1111,10 @@ MonitorScope::drawTableRow(const std::string               &chName,
         }
         // 3. Type
         ImGui::TableNextColumn();
-        ImGui::Text("%s", ch->getType().c_str());
+        if (ch->isEnum())
+                ImGui::Text("ENUM (%s)", ch->getType().c_str());
+        else
+                ImGui::Text("%s", ch->getType().c_str());
 
         // 4. Address
         ImGui::TableNextColumn();
@@ -1633,6 +1954,7 @@ MonitorScope::reorderChannelTo(const std::string &src, const std::string &dst)
                 chs_[keys[i]]->setOrder(i);
         nextChannelOrder_      = (i64)keys.size();
         forceManualTableOrder_ = true;
+        tableSortColumn_       = -1;
         if (parent_)
                 parent_->setModified();
 }
@@ -1702,6 +2024,7 @@ MonitorScope::reorderGroupBefore(const std::string &srcGroup, const std::string 
                 chs_[keys[i]]->setOrder(i);
         nextChannelOrder_      = (i64)keys.size();
         forceManualTableOrder_ = true;
+        tableSortColumn_       = -1;
         if (parent_)
                 parent_->setModified();
 }
@@ -2024,6 +2347,14 @@ Monitor::updateDisplay()
         const std::string stableName   = name_.empty() ? "monitor_" + std::to_string(reinterpret_cast<uintptr_t>(this)) : name_;
         const std::string visibleTitle = getTitle().empty() ? tr("Variable Monitor", "变量监视器") : getTitle();
         const std::string winLabel     = visibleTitle + "###" + stableName;
+        if (fillAppOnNextDraw_) {
+                const ImGuiViewport *viewport = ImGui::GetMainViewport();
+                ImGui::SetNextWindowDockID(0, ImGuiCond_Always);
+                ImGui::SetNextWindowViewport(viewport->ID);
+                ImGui::SetNextWindowPos(viewport->WorkPos, ImGuiCond_Always);
+                ImGui::SetNextWindowSize(viewport->WorkSize, ImGuiCond_Always);
+                fillAppOnNextDraw_ = false;
+        }
         if (ImGui::Begin(winLabel.c_str(), &open, ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
                 if (!open)
                         markPendingDelete();
@@ -2068,6 +2399,13 @@ Monitor::updateDisplay()
                         return;
                 }
 
+                if (!importTimeOriginText_.empty()) {
+                        ImGui::TextDisabled("%s: %s  (%s)",
+                                            tr("Time origin", "起始时间"),
+                                            importTimeOriginText_.c_str(),
+                                            tr("X axis = relative seconds", "X 轴 = 相对秒"));
+                }
+
                 // ---- Flow layout for the toolbar ----------------------------------------
                 // ImGui's SameLine() never wraps, so a row of widgets overflows past the
                 // window edge (and gets clipped / disappears) on a narrow window. tbFlow()
@@ -2101,8 +2439,9 @@ Monitor::updateDisplay()
                     monSampPaused ? tr("Resume All J-Link", "恢复J-Link采样") : tr("Pause All J-Link", "暂停J-Link采样");
                 tbFlow(tbBtnW(pauseAllLabel));
                 // Resume = go (green); Pause = caution (amber).
-                if (ui::Button(pauseAllLabel, monSampPaused ? ui::BtnStyle::Success : ui::BtnStyle::Warning))
+                if (ui::Button(pauseAllLabel, monSampPaused ? ui::BtnStyle::Success : ui::BtnStyle::Warning)) {
                         setSamplingPaused(!monSampPaused);
+                }
                 if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("%s",
                                           tr("Pause/resume J-Link acquisition for all scopes in this monitor",

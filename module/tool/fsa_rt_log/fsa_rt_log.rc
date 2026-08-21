@@ -1,0 +1,35 @@
+#include <windows.h>
+#include "version.h"
+
+#define RC_STRINGIFY_IMPL(value) #value
+#define RC_STRINGIFY(value)      RC_STRINGIFY_IMPL(value)
+#define RC_VERSION_STRING(major, minor, patch) \
+    RC_STRINGIFY(major) "." RC_STRINGIFY(minor) "." RC_STRINGIFY(patch)
+
+1 VERSIONINFO
+FILEVERSION FSA_RT_LOG_VER_MAJOR,FSA_RT_LOG_VER_MINOR,FSA_RT_LOG_VER_PATCH,0
+PRODUCTVERSION FSA_RT_LOG_VER_MAJOR,FSA_RT_LOG_VER_MINOR,FSA_RT_LOG_VER_PATCH,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "FSA"
+            VALUE "FileDescription", "FSA real-time data logger"
+            VALUE "FileVersion", RC_VERSION_STRING(FSA_RT_LOG_VER_MAJOR, FSA_RT_LOG_VER_MINOR, FSA_RT_LOG_VER_PATCH)
+            VALUE "InternalName", "fsa_rt_log"
+            VALUE "OriginalFilename", "fsa_rt_log.exe"
+            VALUE "ProductName", "FSA Real-Time Log"
+            VALUE "ProductVersion", RC_VERSION_STRING(FSA_RT_LOG_VER_MAJOR, FSA_RT_LOG_VER_MINOR, FSA_RT_LOG_VER_PATCH)
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

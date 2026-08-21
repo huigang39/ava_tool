@@ -60,96 +60,97 @@ extern "C" {
 /*                                  类型定义                                  */
 /* -------------------------------------------------------------------------- */
 
-typedef enum net_type {
-        NET_TYPE_NULL,
-        NET_TYPE_UDP,
-        NET_TYPE_TCP,
-} net_type_e;
+enum net_type {
+    NET_TYPE_NULL,
+    NET_TYPE_UDP,
+    NET_TYPE_TCP,
+};
 
-typedef enum net_mode {
-        NET_MODE_SYNC_YIELD,
-        NET_MODE_SYNC_SPIN,
-        NET_MODE_ASYNC,
-} net_mode_e;
+enum net_mode {
+    NET_MODE_SYNC_YIELD,
+    NET_MODE_SYNC_SPIN,
+    NET_MODE_ASYNC,
+};
 
-typedef enum net_op {
-        NET_OP_SEND,
-        NET_OP_RECV,
-} net_op_e;
+enum net_op {
+    NET_OP_SEND,
+    NET_OP_RECV,
+};
 
 #pragma pack(push, 1)
-typedef struct net_log_header {
-        usize ts;       // 时间戳
-        u8    e_op;     // 收发标志 (net_op_e, 存储为 u8 以保持包紧凑)
-        u32   dst_ip;   // 设备IP
-        u16   dst_port; // 设备端口
-        u16   size;     // 数据长度
-} net_log_header_t;
+struct net_log_header {
+    size_t   ts;       // 时间戳
+    uint8_t  e_op;     // 收发标志 (net_op_e, 存储为 uint8_t 以保持包紧凑)
+    uint32_t dst_ip;   // 设备IP
+    uint16_t dst_port; // 设备端口
+    uint16_t size;     // 数据长度
+};
 #pragma pack(pop)
 
-typedef struct net_resp {
-        char ip[MAX_IP_SIZE];
-        char buf[MAX_RESP_BUF_SIZE];
-} net_resp_t;
+struct net_resp {
+    char ip[MAX_IP_SIZE];
+    char buf[MAX_RESP_BUF_SIZE];
+};
 
 struct net_ch;
 typedef void (*net_async_cb_f)(struct net_ch *ch, void *buf, int ret);
 
-typedef struct net_ch {
-        list_head_t    ch_node;
-        sockfd_t       fd;
-        net_async_cb_f f_send_cb, f_recv_cb;
-        net_mode_e     e_mode;
-        u32            dst_ip, src_ip;
-        u16            dst_port, src_port;
-} net_ch_t;
+struct net_ch {
+    struct list_head ch_node;
+    sockfd_t         fd;
+    net_async_cb_f   f_send_cb, f_recv_cb;
+    enum net_mode    e_mode;
+    uint32_t         dst_ip, src_ip;
+    uint16_t         dst_port, src_port;
+};
 
-typedef struct net_async_req {
-        net_ch_t      *ch;
-        void          *buf;
-        usize          size;
-        net_async_cb_f f_cb;
-        ATOMIC(u8) processed;
+struct net_async_req {
+    struct net_ch *ch;
+    void          *buf;
+    size_t         size;
+    net_async_cb_f f_cb;
+    ATOMIC(uint8_t) processed;
 #if OS(WIN) || OS(MAC)
-        u64         timeout_us;
-        list_head_t pending_node; // 待处理请求链表节点
+    uint64_t         timeout_us;
+    struct list_head pending_node; // 待处理请求链表节点
 #endif
 #if OS(WIN)
-        OVERLAPPED ov;
+    OVERLAPPED ov;
 #endif
 #if OS(MAC)
-        net_op_e e_op;
+    enum net_op e_op;
 #endif
-} net_async_req_t;
+};
 
-typedef u64 (*net_get_ts_f)(void);
+typedef uint64_t (*net_get_ts_f)(void);
 
-typedef struct net_cfg {
-        net_type_e   e_type;
-        mempool_t   *mempool;
-        u32          ring_len;
-        log_cfg_t    log_cfg;
-        net_get_ts_f f_get_ts;
-} net_cfg_t;
+struct net_cfg {
+    enum net_type   e_type;
+    struct mempool *mempool;
+    uint32_t        ring_len;
+    struct log_cfg  log_cfg;
+    net_get_ts_f    f_get_ts;
+};
 
-typedef struct net_lo {
-        list_head_t ch_root;
-        log_t       log;
+struct net_lo {
+    struct list_head ch_root;
+    struct log       log;
 #if OS(LINUX)
-        struct io_uring ring;
+    struct io_uring ring;
+    bool            ring_initialized;
 #elif OS(MAC)
-        int         kq;
-        list_head_t pending_reqs;
+    int              kq;
+    struct list_head pending_reqs;
 #elif OS(WIN)
-        HANDLE      iocp;
-        list_head_t pending_reqs; // 待处理的异步请求列表
+    HANDLE           iocp;
+    struct list_head pending_reqs; // 待处理的异步请求列表
 #endif
-} net_lo_t;
+};
 
-typedef struct net {
-        net_cfg_t cfg;
-        net_lo_t  lo;
-} net_t;
+struct net {
+    struct net_cfg cfg;
+    struct net_lo  lo;
+};
 
 /* -------------------------------------------------------------------------- */
 /*                                  接口声明                                  */
@@ -170,7 +171,7 @@ int net_set_nonblock(sockfd_t fd);
  * @param net_cfg net 配置
  * @return        错误码
  */
-int net_init(net_t *net, net_cfg_t net_cfg);
+int net_init(struct net *net, struct net_cfg net_cfg);
 
 /**
  * @brief 清理 net 相关 socket
@@ -178,7 +179,7 @@ int net_init(net_t *net, net_cfg_t net_cfg);
  * @param net net 结构体
  * @return    错误码
  */
-void net_destroy(net_t *net);
+void net_destroy(struct net *net);
 
 /**
  * @brief 返回 net 通道
@@ -186,9 +187,9 @@ void net_destroy(net_t *net);
  * @param det_ip    目标 IP
  * @param dst_port  目标端口
  * @param e_mode    收发模式
- * @return          net_ch_t
+ * @return          struct net_ch
  */
-net_ch_t net_cfg_ch(u32 det_ip, u16 dst_port, net_mode_e e_mode);
+struct net_ch net_cfg_ch(uint32_t det_ip, uint16_t dst_port, enum net_mode e_mode);
 
 /**
  * @brief 添加 net 通道
@@ -197,7 +198,7 @@ net_ch_t net_cfg_ch(u32 det_ip, u16 dst_port, net_mode_e e_mode);
  * @param ch  通道
  * @return    错误码
  */
-int net_add_ch(net_t *net, net_ch_t *ch);
+int net_add_ch(struct net *net, struct net_ch *ch);
 
 /**
  * @brief 同步发送
@@ -207,7 +208,7 @@ int net_add_ch(net_t *net, net_ch_t *ch);
  * @param size   发送字节数
  * @return       成功返回发送的字节数, 失败返回错误码
  */
-isize net_sync_send(const net_ch_t *ch, const void *tx_buf, usize size);
+ptrdiff_t net_sync_send(const struct net_ch *ch, const void *tx_buf, size_t size);
 
 /**
  * @brief 让出等待同步接收
@@ -218,7 +219,8 @@ isize net_sync_send(const net_ch_t *ch, const void *tx_buf, usize size);
  * @param timeout_us 超时时间(微秒)
  * @return           成功返回接收的字节数, 失败返回错误码
  */
-isize net_sync_recv_yield(const net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us);
+ptrdiff_t
+net_sync_recv_yield(const struct net_ch *ch, void *rx_buf, size_t cap, uint32_t timeout_us);
 
 /**
  * @brief 自旋等待同步接收
@@ -229,7 +231,8 @@ isize net_sync_recv_yield(const net_ch_t *ch, void *rx_buf, usize cap, u32 timeo
  * @param timeout_us 超时时间(微秒)
  * @return           成功返回接收的字节数, 失败返回错误码
  */
-isize net_sync_recv_spin(const net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us);
+ptrdiff_t
+net_sync_recv_spin(const struct net_ch *ch, void *rx_buf, size_t cap, uint32_t timeout_us);
 
 /**
  * @brief 异步发送
@@ -240,7 +243,7 @@ isize net_sync_recv_spin(const net_ch_t *ch, void *rx_buf, usize cap, u32 timeou
  * @param size   发送字节数
  * @return       成功返回发送的字节数, 失败返回错误码
  */
-isize net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size);
+ptrdiff_t net_async_send(struct net *net, struct net_ch *ch, void *tx_buf, size_t size);
 
 /**
  * @brief 异步接收
@@ -252,7 +255,8 @@ isize net_async_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size);
  * @param timeout_us 超时时间(微秒)
  * @return           成功返回接收的字节数, 失败返回错误码
  */
-isize net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us);
+ptrdiff_t
+net_async_recv(struct net *net, struct net_ch *ch, void *rx_buf, size_t cap, uint32_t timeout_us);
 
 /**
  * @brief 轮询处理异步请求
@@ -260,7 +264,7 @@ isize net_async_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 time
  * @param net net 结构体
  * @return    错误码
  */
-int net_poll(net_t *net);
+int net_poll(struct net *net);
 
 /**
  * @brief 根据 net 配置自动选择模式发送
@@ -271,7 +275,7 @@ int net_poll(net_t *net);
  * @param size   发送字节数
  * @return       成功返回发送的字节数, 失败返回错误码
  */
-isize net_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size);
+ptrdiff_t net_send(struct net *net, struct net_ch *ch, void *tx_buf, size_t size);
 
 /**
  * @brief 根据 net 配置自动选择模式接收
@@ -283,7 +287,8 @@ isize net_send(net_t *net, net_ch_t *ch, void *tx_buf, usize size);
  * @param timeout_us 超时时间(微秒)
  * @return           成功返回接收的字节数, 失败返回错误码
  */
-isize net_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us);
+ptrdiff_t
+net_recv(struct net *net, struct net_ch *ch, void *rx_buf, size_t cap, uint32_t timeout_us);
 
 /**
  * @brief 根据 net 配置自动选择模式发送并接收
@@ -297,7 +302,13 @@ isize net_recv(net_t *net, net_ch_t *ch, void *rx_buf, usize cap, u32 timeout_us
  * @param timeout_us 超时时间(微秒)
  * @return           成功返回接收的字节数, 失败返回错误码
  */
-isize net_send_recv(net_t *net, net_ch_t *ch, void *tx_buf, usize size, void *rx_buf, usize cap, u32 timeout_us);
+ptrdiff_t net_send_recv(struct net    *net,
+                        struct net_ch *ch,
+                        void          *tx_buf,
+                        size_t         size,
+                        void          *rx_buf,
+                        size_t         cap,
+                        uint32_t       timeout_us);
 
 /**
  * @brief 向指定广播 IP 和端口发送并接收回复内容
@@ -311,7 +322,13 @@ isize net_send_recv(net_t *net, net_ch_t *ch, void *tx_buf, usize size, void *rx
  * @param timeout_us 超时时间(微秒)
  * @return           成功返回回复的 IP 个数, 失败返回错误码
  */
-int net_broadcast(u32 ip, u16 port, const void *tx_buf, usize size, net_resp_t *resps, usize resps_cap, u32 timeout_us);
+int net_broadcast(uint32_t         ip,
+                  uint16_t         port,
+                  const void      *tx_buf,
+                  size_t           size,
+                  struct net_resp *resps,
+                  size_t           resps_cap,
+                  uint32_t         timeout_us);
 
 #ifdef __cplusplus
 }

@@ -1,16 +1,16 @@
 # author: Huigang Wang
 # email: huigang39@outlook.com
-# version: 0.6
-# date: 2026-01-03
+# version: 0.7
+# date: 2026-08-11
 
 Language: Cpp
-TabWidth: 8
-IndentWidth: 8
+TabWidth: 4
+IndentWidth: 4
 # BasedOnStyle: GNU
 # UseTab: ForIndentation
 
 # 最大行宽
-ColumnLimit: 128
+ColumnLimit: 100
 
 # case 缩进
 IndentCaseLabels: true

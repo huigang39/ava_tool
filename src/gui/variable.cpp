@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <memory>
@@ -25,6 +26,8 @@
 #include "inc/jlinkport.h"
 #include "inc/net.h"
 #include "inc/shm.h"
+
+static std::string shmShadowKey(const VarEntry &v);
 
 // Helper to decode raw bytes to string based on DataType
 static std::string
@@ -147,14 +150,200 @@ portName(PortType port)
                         return "UDP";
                 case PortType::SHM:
                         return "SHM";
-                case PortType::MANUAL:
-                        return "MANUAL";
                 case PortType::LOCAL:
                         return "LOCAL";
                 case PortType::AUDIO:
                         return "AUDIO";
                 default:
                         return "JLINK";
+        }
+}
+
+static PortType
+portFromJson(const cJSON *object)
+{
+        if (!object)
+                return PortType::JLINK;
+        if (const cJSON *s = cJSON_GetObjectItem(object, "portStr"); cJSON_IsString(s)) {
+                const std::string name = s->valuestring;
+                if (name == "LOCAL" || name == "MANUAL")
+                        return PortType::LOCAL;
+                if (name == "SHM")
+                        return PortType::SHM;
+                if (name == "AUDIO")
+                        return PortType::AUDIO;
+                if (name == "UDP")
+                        return PortType::UDP;
+                return PortType::JLINK;
+        }
+        const cJSON *n = cJSON_GetObjectItem(object, "port");
+        if (!cJSON_IsNumber(n))
+                return PortType::JLINK;
+        // Historical values: MANUAL=3, LOCAL=4, AUDIO=5.
+        switch (n->valueint) {
+                case 1:
+                        return PortType::UDP;
+                case 2:
+                        return PortType::SHM;
+                case 3:
+                case 4:
+                        return PortType::LOCAL;
+                case 5:
+                        return PortType::AUDIO;
+                default:
+                        return PortType::JLINK;
+        }
+}
+
+static CType
+dataTypeToCType(DataType type)
+{
+        switch (type) {
+                case DataType::U8:
+                        return CType::U8;
+                case DataType::U16:
+                        return CType::U16;
+                case DataType::U32:
+                        return CType::U32;
+                case DataType::U64:
+                        return CType::U64;
+                case DataType::I8:
+                        return CType::I8;
+                case DataType::I16:
+                        return CType::I16;
+                case DataType::I32:
+                        return CType::I32;
+                case DataType::I64:
+                        return CType::I64;
+                case DataType::F32:
+                        return CType::F32;
+                case DataType::F64:
+                        return CType::F64;
+                default:
+                        return CType::Unknown;
+        }
+}
+
+static std::string
+functionSignature(const CFuncDecl &fn)
+{
+        std::string out  = fn.retRaw.empty() ? ctypeLabel(fn.retType) : fn.retRaw;
+        out             += " " + fn.name + "(";
+        for (size_t i = 0; i < fn.params.size(); ++i) {
+                if (i)
+                        out += ", ";
+                out += fn.params[i].rawType.empty() ? ctypeLabel(fn.params[i].type) : fn.params[i].rawType;
+        }
+        return out + ")";
+}
+
+static std::string
+methodSignature(const CMethodDecl &method)
+{
+        std::string out  = method.retRaw.empty() ? ctypeLabel(method.retType) : method.retRaw;
+        out             += " " + method.fullClassName + "::" + method.name + "(";
+        for (size_t i = 0; i < method.params.size(); ++i) {
+                if (i)
+                        out += ", ";
+                out += method.params[i].rawType.empty() ? ctypeLabel(method.params[i].type) : method.params[i].rawType;
+        }
+        return out + ")";
+}
+
+static bool
+pointerMatchesDataType(const CParam &param, DataType type)
+{
+        if (param.type != CType::Ptr)
+                return false;
+        std::string raw;
+        raw.reserve(param.rawType.size());
+        for (unsigned char c : param.rawType)
+                if (!std::isspace(c) && c != '*' && c != '&')
+                        raw.push_back(static_cast<char>(std::tolower(c)));
+        auto eraseWord = [&](const char *word) {
+                for (size_t pos = raw.find(word); pos != std::string::npos; pos = raw.find(word))
+                        raw.erase(pos, std::strlen(word));
+        };
+        eraseWord("const");
+        eraseWord("volatile");
+        switch (type) {
+                case DataType::U8:
+                        return raw == "uint8_t" || raw == "unsignedchar";
+                case DataType::I8:
+                        return raw == "int8_t" || raw == "signedchar";
+                case DataType::U16:
+                        return raw == "uint16_t" || raw == "unsignedshort";
+                case DataType::I16:
+                        return raw == "int16_t" || raw == "short" || raw == "signedshort";
+                case DataType::U32:
+                        return raw == "uint32_t" || raw == "unsignedint";
+                case DataType::I32:
+                        return raw == "int32_t" || raw == "int" || raw == "signedint";
+                case DataType::U64:
+                        return raw == "uint64_t" || raw == "unsignedlonglong";
+                case DataType::I64:
+                        return raw == "int64_t" || raw == "longlong" || raw == "signedlonglong";
+                case DataType::F32:
+                        return raw == "float";
+                case DataType::F64:
+                        return raw == "double";
+                default:
+                        return false;
+        }
+}
+
+static bool
+isReadAccessor(const CFuncDecl &fn, DataType type)
+{
+        if (fn.isVariadic || dataTypeToCType(type) == CType::Unknown)
+                return false;
+        if (fn.params.empty())
+                return fn.retType == dataTypeToCType(type);
+        return fn.params.size() == 1 && pointerMatchesDataType(fn.params[0], type) &&
+               (fn.retType == CType::Void || ctypeIsInteger(fn.retType));
+}
+
+static bool
+isWriteAccessor(const CFuncDecl &fn, DataType type)
+{
+        if (fn.isVariadic || fn.params.size() != 1 || dataTypeToCType(type) == CType::Unknown)
+                return false;
+        const bool parameterMatches = pointerMatchesDataType(fn.params[0], type) || fn.params[0].type == dataTypeToCType(type);
+        return parameterMatches && (fn.retType == CType::Void || ctypeIsInteger(fn.retType));
+}
+
+static bool
+callStatusOk(const CallResult &result, CType returnType, std::string &error)
+{
+        if (!result.ok) {
+                error = result.error;
+                return false;
+        }
+        if ((returnType == CType::I8 || returnType == CType::I16 || returnType == CType::I32 || returnType == CType::I64) &&
+            static_cast<int64_t>(result.rawU64) < 0) {
+                error = "function returned failure status " + std::to_string(static_cast<int64_t>(result.rawU64));
+                return false;
+        }
+        return true;
+}
+
+static void
+storeCallValue(const CallResult &result, DataType type, std::array<uint8_t, 8> &dst)
+{
+        switch (type) {
+                case DataType::F32: {
+                        const float value = static_cast<float>(result.rawF64);
+                        std::memcpy(dst.data(), &value, sizeof(value));
+                        break;
+                }
+                case DataType::F64:
+                        std::memcpy(dst.data(), &result.rawF64, sizeof(result.rawF64));
+                        break;
+                default: {
+                        const u32 size = Parser::typeBytes(type);
+                        std::memcpy(dst.data(), &result.rawU64, std::min<u32>(size, sizeof(result.rawU64)));
+                        break;
+                }
         }
 }
 
@@ -333,7 +522,232 @@ Variable::handleDroppedFile(const std::string &path)
                         ImGui::InsertNotification({ImGuiToastType::Success, toastDismissTime_, "Loaded BIN: %s", path.c_str()});
                 else
                         ImGui::InsertNotification({ImGuiToastType::Error, toastDismissTime_, "Failed to load BIN"});
+        } else if (ext == ".h" || ext == ".hpp" || ext == ".hh" || ext == ".hxx") {
+                parseFunctionHeader(path);
+        } else if (ext == ".dll" || ext == ".so" || ext == ".dylib" || ext.find(".so.") == 0) {
+                loadFunctionLibrary(path);
         }
+}
+
+bool
+Variable::parseFunctionHeader(const std::string &path)
+{
+        FunctionSource *target = sourceForHeader(path);
+        target->headerPath     = path;
+        std::ifstream stream(path, std::ios::binary);
+        if (!stream) {
+                target->status        = tr("Cannot open function header.", "无法打开函数头文件。");
+                target->statusError   = true;
+                target->statusWarning = false;
+                return false;
+        }
+        const std::string source((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+        target->declarations = parseHeaderFull(source);
+        functionPanelOpen_   = true;
+        size_t methodCount   = 0;
+        for (const auto &cls : target->declarations.classes)
+                methodCount += cls.methods.size();
+        if (!target->declarations.functions.empty()) {
+                target->status = std::to_string(target->declarations.functions.size()) +
+                                 tr(" top-level C functions parsed.", " 个顶层 C 函数已解析。");
+                target->statusError   = false;
+                target->statusWarning = false;
+        } else if (!target->declarations.classes.empty()) {
+                target->status = tr("No top-level C functions. Found ", "未找到顶层 C 函数；发现 ") +
+                                 std::to_string(target->declarations.classes.size()) + tr(" C++ class(es), ", " 个 C++ 类、") +
+                                 std::to_string(methodCount) +
+                                 tr(" method(s). Variable binding requires an extern \"C\" wrapper.",
+                                    " 个成员方法。变量绑定需要 extern \"C\" 包装函数。");
+                target->statusError   = false;
+                target->statusWarning = true;
+        } else {
+                target->status        = tr("No callable declarations were found in the header.", "头文件中未找到可调用声明。");
+                target->statusError   = true;
+                target->statusWarning = false;
+        }
+        isModified_ = true;
+        return !target->declarations.functions.empty() || !target->declarations.classes.empty();
+}
+
+bool
+Variable::loadFunctionLibrary(const std::string &path)
+{
+        FunctionSource *target = sourceForLibrary(path);
+        target->libraryPath    = path;
+        std::lock_guard<std::mutex> callLock(sdkCallMtx_);
+        if (!target->loader.load(path)) {
+                target->status        = target->loader.lastError();
+                target->statusError   = true;
+                target->statusWarning = false;
+                return false;
+        }
+        functionPanelOpen_    = true;
+        target->status        = tr("Dynamic library loaded.", "动态库已加载。");
+        target->statusError   = false;
+        target->statusWarning = false;
+        isModified_           = true;
+        return true;
+}
+
+std::string
+Variable::functionSourceKey(const FunctionSource &source)
+{
+        return !source.libraryPath.empty() ? source.libraryPath : source.headerPath;
+}
+
+static std::string
+lowerPathStem(const std::string &path)
+{
+        std::string stem = std::filesystem::path(path).stem().string();
+        std::ranges::transform(stem, stem.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return stem;
+}
+
+Variable::FunctionSource *
+Variable::sourceForLibrary(const std::string &path)
+{
+        for (auto &source : functionSources_)
+                if (source->libraryPath == path)
+                        return source.get();
+        const std::string stem = lowerPathStem(path);
+        for (auto &source : functionSources_)
+                if (source->libraryPath.empty() && !source->headerPath.empty() && lowerPathStem(source->headerPath) == stem)
+                        return source.get();
+        for (auto &source : functionSources_)
+                if (source->libraryPath.empty())
+                        return source.get();
+        functionSources_.push_back(std::make_unique<FunctionSource>());
+        return functionSources_.back().get();
+}
+
+Variable::FunctionSource *
+Variable::sourceForHeader(const std::string &path)
+{
+        for (auto &source : functionSources_)
+                if (source->headerPath == path)
+                        return source.get();
+        const std::string stem = lowerPathStem(path);
+        for (auto &source : functionSources_)
+                if (source->headerPath.empty() && !source->libraryPath.empty() && lowerPathStem(source->libraryPath) == stem)
+                        return source.get();
+        for (auto &source : functionSources_)
+                if (source->headerPath.empty())
+                        return source.get();
+        functionSources_.push_back(std::make_unique<FunctionSource>());
+        return functionSources_.back().get();
+}
+
+const CFuncDecl *
+Variable::findFunction(const VarEntry::FunctionBinding &binding, FunctionSource **resolvedSource) const
+{
+        if (binding.empty())
+                return nullptr;
+        for (const auto &source : functionSources_) {
+                if (!binding.sourcePath.empty() && binding.sourcePath != functionSourceKey(*source))
+                        continue;
+                for (const auto &fn : source->declarations.functions)
+                        if (fn.name == binding.functionName &&
+                            (binding.signature.empty() || binding.signature == functionSignature(fn))) {
+                                if (resolvedSource)
+                                        *resolvedSource = source.get();
+                                return &fn;
+                        }
+        }
+        return nullptr;
+}
+
+void
+Variable::startAccessorThread()
+{
+        if (accessor_)
+                return;
+        accessor_       = std::make_shared<AccessState>();
+        auto state      = accessor_;
+        accessorThread_ = std::thread([this, state]() {
+                LOG_I("Variable[%s] function accessor thread started", name_.c_str());
+                while (true) {
+                        std::vector<AccessReadReq> reads;
+                        std::deque<AccessWriteReq> writes;
+                        {
+                                std::unique_lock<std::mutex> lk(state->mtx);
+                                state->cv.wait(
+                                    lk, [&]() { return !state->running || state->readsPending || !state->writes.empty(); });
+                                if (!state->running)
+                                        break;
+                                if (state->readsPending) {
+                                        reads               = state->reads;
+                                        state->readsPending = false;
+                                }
+                                writes.swap(state->writes);
+                        }
+
+                        for (auto &request : writes) {
+                                AccessResult             result;
+                                std::vector<std::string> args(1, request.valueText);
+                                std::vector<void *>      pointers;
+                                if (request.function.params[0].type == CType::Ptr)
+                                        pointers = {request.value.data()};
+                                CallResult called;
+                                if (!request.source) {
+                                        called.error = "function source is unavailable";
+                                } else {
+                                        std::lock_guard<std::mutex> callLock(sdkCallMtx_);
+                                        called = request.source->loader.call(request.function, args, pointers);
+                                }
+                                result.ok = callStatusOk(called, request.function.retType, result.error);
+                                std::lock_guard<std::mutex> lk(state->mtx);
+                                state->writeResults[request.name] = std::move(result);
+                        }
+
+                        for (const auto &request : reads) {
+                                AccessResult result;
+                                result.size = Parser::typeBytes(request.type);
+                                CallResult called;
+                                if (request.function.params.empty()) {
+                                        if (request.source) {
+                                                std::lock_guard<std::mutex> callLock(sdkCallMtx_);
+                                                called = request.source->loader.call(request.function, {});
+                                        } else {
+                                                called.error = "function source is unavailable";
+                                        }
+                                        result.ok = callStatusOk(called, request.function.retType, result.error);
+                                        if (result.ok) {
+                                                storeCallValue(called, request.type, result.value);
+                                                result.hasValue = true;
+                                        }
+                                } else {
+                                        std::vector<std::string> args(1);
+                                        std::vector<void *>      pointers{result.value.data()};
+                                        if (request.source) {
+                                                std::lock_guard<std::mutex> callLock(sdkCallMtx_);
+                                                called = request.source->loader.call(request.function, args, pointers);
+                                        } else {
+                                                called.error = "function source is unavailable";
+                                        }
+                                        result.ok       = callStatusOk(called, request.function.retType, result.error);
+                                        result.hasValue = result.ok;
+                                }
+                                std::lock_guard<std::mutex> lk(state->mtx);
+                                state->results[request.name] = std::move(result);
+                        }
+                }
+                LOG_I("Variable[%s] function accessor thread stopped", name_.c_str());
+        });
+}
+
+void
+Variable::stopAccessorThread()
+{
+        if (accessor_) {
+                {
+                        std::lock_guard<std::mutex> lk(accessor_->mtx);
+                        accessor_->running = false;
+                }
+                accessor_->cv.notify_all();
+        }
+        if (accessorThread_.joinable())
+                accessorThread_.join();
+        accessor_.reset();
 }
 
 static const dwarf::Type *
@@ -430,6 +844,9 @@ scalarPayloadType(const dwarf::Info &info, u64 typeOff)
                 }
         }
         if (t->kind == dwarf::TypeKind::ENUM) {
+                if (t->inner != 0)
+                        if (const char *underlying = scalarPayloadType(info, t->inner))
+                                return underlying;
                 const u64 sz = t->size ? t->size : 4;
                 if (sz == 1)
                         return "I8";
@@ -653,7 +1070,7 @@ Variable::flattenDataTree(std::vector<SearchEntry> &pool, const std::string &par
                 e.path        = parentPath;
                 e.addr        = 0;
                 e.type        = node.type;
-                e.defaultPort = PortType::MANUAL;
+                e.defaultPort = PortType::LOCAL;
                 e.typeOff     = 0;
                 pool.push_back(e);
         }
@@ -670,22 +1087,94 @@ static void flattenForStructPayload(const dwarf::Info                           
                                     int                                                                    maxDepth);
 
 void
+Variable::restoreTableWidths(TableUiState &state, int columnCount)
+{
+        if (!state.restoreWidths)
+                return;
+        ImGuiTable *table = ImGui::GetCurrentTable();
+        if (!table || table->IsLayoutLocked)
+                return;
+        for (int i = 0; i < columnCount && i < table->ColumnsCount && i < static_cast<int>(state.widths.size()); ++i) {
+                const float width = state.widths[i];
+                if (width <= 1.0f)
+                        continue;
+                ImGuiTableColumn &column = table->Columns[i];
+                if (column.Flags & ImGuiTableColumnFlags_WidthStretch)
+                        column.StretchWeight = width;
+                else
+                        column.WidthRequest = width;
+                column.AutoFitQueue = 0;
+        }
+        state.restoreWidths = false;
+}
+
+void
+Variable::restoreTableSort(TableUiState &state)
+{
+        if (!state.restoreSort)
+                return;
+        ImGui::TableSetColumnSortDirection(state.sortColumn, static_cast<ImGuiSortDirection>(state.sortDirection), false);
+        state.restoreSort = false;
+}
+
+void
+Variable::captureTableWidths(TableUiState &state, int columnCount)
+{
+        const ImGuiTable *table        = ImGui::GetCurrentTable();
+        const bool        userResizing = table && table->ResizedColumn >= 0;
+        for (int i = 0; i < columnCount && i < static_cast<int>(state.widths.size()); ++i) {
+                const float width = table && i < table->ColumnsCount ? table->Columns[i].WidthGiven : 0.0f;
+                if (width <= 1.0f)
+                        continue;
+                if (state.initialized && userResizing && std::abs(state.widths[i] - width) > 0.5f)
+                        isModified_ = true;
+                state.widths[i] = width;
+        }
+        state.initialized = true;
+}
+
+void
+Variable::captureTableSort(TableUiState &state, int column, int direction)
+{
+        if (state.sortColumn == column && state.sortDirection == direction)
+                return;
+        state.sortColumn    = column;
+        state.sortDirection = direction;
+        isModified_         = true;
+}
+
+void
 Variable::drawSymbolTree()
 {
         std::lock_guard lk(mtxElf_);
         if (dwarfInfo_.present && !dwarfInfo_.variables.empty()) {
-                if (ImGui::BeginTable("SymbolTreeTable",
+                if (ImGui::BeginTable("SymbolTreeTableV2",
                                       4,
                                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable,
                                       ImVec2(0, 0))) {
+                        auto symbolSortFlags = [&](int column) {
+                                ImGuiTableColumnFlags result = ImGuiTableColumnFlags_None;
+                                if (symbolTableUi_.sortColumn == column) {
+                                        result |= ImGuiTableColumnFlags_DefaultSort;
+                                        result |= symbolTableUi_.sortDirection == ImGuiSortDirection_Descending
+                                                      ? ImGuiTableColumnFlags_PreferSortDescending
+                                                      : ImGuiTableColumnFlags_PreferSortAscending;
+                                }
+                                return result;
+                        };
                         ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
-                                                ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn(
-                            tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthFixed, 120.0f);
-                        ImGui::TableSetupColumn(
-                            tr("Size###col_size", "大小###col_size"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
-                        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
+                                                ImGuiTableColumnFlags_WidthStretch | symbolSortFlags(0));
+                        ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"),
+                                                ImGuiTableColumnFlags_WidthFixed | symbolSortFlags(1),
+                                                120.0f);
+                        ImGui::TableSetupColumn(tr("Size###col_size", "大小###col_size"),
+                                                ImGuiTableColumnFlags_WidthFixed | symbolSortFlags(2),
+                                                60.0f);
+                        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"),
+                                                ImGuiTableColumnFlags_WidthStretch | symbolSortFlags(3));
+                        restoreTableWidths(symbolTableUi_, 4);
+                        restoreTableSort(symbolTableUi_);
                         ImGui::TableHeadersRow();
 
                         std::vector<const dwarf::Variable *> vars;
@@ -696,6 +1185,7 @@ Variable::drawSymbolTree()
                         if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
                                 if (sorts_specs->SpecsCount > 0) {
                                         const auto *spec = &sorts_specs->Specs[0];
+                                        captureTableSort(symbolTableUi_, spec->ColumnIndex, spec->SortDirection);
                                         std::sort(vars.begin(),
                                                   vars.end(),
                                                   [&](const dwarf::Variable *a, const dwarf::Variable *b) -> bool {
@@ -730,19 +1220,33 @@ Variable::drawSymbolTree()
                         for (const auto *v : vars) {
                                 drawSymbolLeaf(v->name, v->name, v->addr, v->type, 0);
                         }
+                        captureTableWidths(symbolTableUi_, 4);
                         ImGui::EndTable();
                 }
         } else if (!dataTree_.children.empty()) {
-                if (ImGui::BeginTable("BinTreeTable",
+                if (ImGui::BeginTable("BinTreeTableV2",
                                       3,
                                       ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable,
                                       ImVec2(0, 0))) {
+                        auto binSortFlags = [&](int column) {
+                                ImGuiTableColumnFlags result = ImGuiTableColumnFlags_None;
+                                if (binTableUi_.sortColumn == column) {
+                                        result |= ImGuiTableColumnFlags_DefaultSort;
+                                        result |= binTableUi_.sortDirection == ImGuiSortDirection_Descending
+                                                      ? ImGuiTableColumnFlags_PreferSortDescending
+                                                      : ImGuiTableColumnFlags_PreferSortAscending;
+                                }
+                                return result;
+                        };
                         ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
-                                                ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
+                                                ImGuiTableColumnFlags_WidthStretch | binSortFlags(0));
+                        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"),
+                                                ImGuiTableColumnFlags_WidthStretch | binSortFlags(1));
                         ImGui::TableSetupColumn(tr("Value###col_value", "数值###col_value"),
-                                                ImGuiTableColumnFlags_WidthStretch);
+                                                ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthStretch);
+                        restoreTableWidths(binTableUi_, 3);
+                        restoreTableSort(binTableUi_);
                         ImGui::TableHeadersRow();
 
                         std::vector<DataTree *> nodes;
@@ -753,6 +1257,7 @@ Variable::drawSymbolTree()
                         if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
                                 if (sorts_specs->SpecsCount > 0) {
                                         const auto *spec = &sorts_specs->Specs[0];
+                                        captureTableSort(binTableUi_, spec->ColumnIndex, spec->SortDirection);
                                         std::sort(
                                             nodes.begin(), nodes.end(), [&](const DataTree *a, const DataTree *b) -> bool {
                                                     int cmp = 0;
@@ -775,6 +1280,7 @@ Variable::drawSymbolTree()
 
                         for (auto *n : nodes)
                                 drawDataTreeLeaf(*n);
+                        captureTableWidths(binTableUi_, 3);
                         ImGui::EndTable();
                 }
         } else {
@@ -923,9 +1429,14 @@ Variable::drawDataTreeLeaf(DataTree &node, const int indentLevel)
                         VarEntry v;
                         v.name     = node.name;
                         v.type     = node.type;
-                        v.port     = PortType::MANUAL;
+                        v.port     = PortType::LOCAL;
                         v.addr     = 0;
                         v.writable = false;
+                        {
+                                std::lock_guard<std::mutex> lk(mtxLocal_);
+                                localBufs_.emplace(v.name,
+                                                   std::vector<uint8_t>(std::max<u32>(1, Parser::typeBytes(v.type)), 0));
+                        }
                         vars_.push_back(v);
                 }
 
@@ -1093,19 +1604,35 @@ Variable::drawSymbolBrowser()
         } else {
                 constexpr ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                                   ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
-                if (ImGui::BeginTable("SymbolSearchTable", 4, flags, ImVec2(0, 0))) {
+                if (ImGui::BeginTable("SymbolSearchTableV2", 4, flags, ImVec2(0, 0))) {
+                        auto symbolSortFlags = [&](int column) {
+                                ImGuiTableColumnFlags result = ImGuiTableColumnFlags_None;
+                                if (symbolTableUi_.sortColumn == column) {
+                                        result |= ImGuiTableColumnFlags_DefaultSort;
+                                        result |= symbolTableUi_.sortDirection == ImGuiSortDirection_Descending
+                                                      ? ImGuiTableColumnFlags_PreferSortDescending
+                                                      : ImGuiTableColumnFlags_PreferSortAscending;
+                                }
+                                return result;
+                        };
                         ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
-                                                ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
-                        ImGui::TableSetupColumn(
-                            tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthFixed, 120.0f);
-                        ImGui::TableSetupColumn(
-                            tr("Size###col_size", "大小###col_size"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
-                        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
+                                                ImGuiTableColumnFlags_WidthStretch | symbolSortFlags(0));
+                        ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"),
+                                                ImGuiTableColumnFlags_WidthFixed | symbolSortFlags(1),
+                                                120.0f);
+                        ImGui::TableSetupColumn(tr("Size###col_size", "大小###col_size"),
+                                                ImGuiTableColumnFlags_WidthFixed | symbolSortFlags(2),
+                                                60.0f);
+                        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"),
+                                                ImGuiTableColumnFlags_WidthStretch | symbolSortFlags(3));
+                        restoreTableWidths(symbolTableUi_, 4);
+                        restoreTableSort(symbolTableUi_);
                         ImGui::TableHeadersRow();
 
                         if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
                                 if (sorts_specs->SpecsCount > 0 && sorts_specs->SpecsDirty) {
                                         const auto *spec = &sorts_specs->Specs[0];
+                                        captureTableSort(symbolTableUi_, spec->ColumnIndex, spec->SortDirection);
                                         std::sort(searchResults_.begin(),
                                                   searchResults_.end(),
                                                   [&](const SearchEntry &a, const SearchEntry &b) -> bool {
@@ -1221,9 +1748,192 @@ Variable::drawSymbolBrowser()
 
                                 ImGui::PopID();
                         }
+                        captureTableWidths(symbolTableUi_, 4);
                         ImGui::EndTable();
                 }
         }
+}
+
+void
+Variable::drawFunctionPanel()
+{
+        if (ImGui::Button(tr("Library...##varfn", "动态库...##varfn"))) {
+                std::string path = nativeDlgOpen(tr("Select library", "选择动态库"), {{"Libraries", {"dll", "so", "dylib"}}});
+                if (!path.empty())
+                        loadFunctionLibrary(path);
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(functionSources_.empty());
+        if (ImGui::Button(tr("Load All##varfn", "全部加载##varfn")))
+                for (auto &source : functionSources_)
+                        if (!source->libraryPath.empty())
+                                loadFunctionLibrary(source->libraryPath);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Header...##varfn", "头文件...##varfn"))) {
+                std::string path = nativeDlgOpen(tr("Select header", "选择头文件"), {{"Headers", {"h", "hpp", "hh", "hxx"}}});
+                if (!path.empty())
+                        parseFunctionHeader(path);
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(functionSources_.empty());
+        if (ImGui::Button(tr("Reparse All##varfn", "全部重解析##varfn")))
+                for (auto &source : functionSources_)
+                        if (!source->headerPath.empty())
+                                parseFunctionHeader(source->headerPath);
+        ImGui::EndDisabled();
+
+        for (size_t i = 0; i < functionSources_.size(); ++i) {
+                const auto &source      = *functionSources_[i];
+                size_t      methodCount = 0;
+                for (const auto &cls : source.declarations.classes)
+                        methodCount += cls.methods.size();
+                const std::string key = functionSourceKey(source);
+                const std::string label =
+                    key.empty() ? tr("Unconfigured source", "未配置源") : std::filesystem::path(key).filename().string();
+                ImGui::TextDisabled("[%d] %s  C=%d C++=%d/%d",
+                                    (int)i + 1,
+                                    label.c_str(),
+                                    (int)source.declarations.functions.size(),
+                                    (int)source.declarations.classes.size(),
+                                    (int)methodCount);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("DLL: %s\nHeader: %s", source.libraryPath.c_str(), source.headerPath.c_str());
+                if (!source.status.empty()) {
+                        ImGui::SameLine();
+                        const ImVec4 color = source.statusError     ? ImVec4(1.0f, 0.35f, 0.35f, 1.0f)
+                                             : source.statusWarning ? ImVec4(1.0f, 0.72f, 0.25f, 1.0f)
+                                                                    : ImVec4(0.35f, 0.85f, 0.45f, 1.0f);
+                        ImGui::TextColored(color, "%s", source.status.c_str());
+                }
+        }
+        constexpr ImGuiTableFlags flags =
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
+        if (ImGui::BeginTable("FunctionBrowserTable", 4, flags, ImVec2(0, 0))) {
+                ImGui::TableSetupColumn(tr("Source", "来源"), ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                ImGui::TableSetupColumn(tr("Kind", "类别"), ImGuiTableColumnFlags_WidthFixed, 55.0f);
+                ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthFixed, 180.0f);
+                ImGui::TableSetupColumn(tr("Signature", "签名"), ImGuiTableColumnFlags_WidthStretch);
+                ImGui::TableHeadersRow();
+                for (const auto &sourcePtr : functionSources_) {
+                        const auto       &source     = *sourcePtr;
+                        const std::string sourceName = std::filesystem::path(functionSourceKey(source)).filename().string();
+                        for (const auto &fn : source.declarations.functions) {
+                                ImGui::TableNextRow();
+                                ImGui::TableSetColumnIndex(0);
+                                ImGui::TextUnformatted(sourceName.c_str());
+                                ImGui::TableSetColumnIndex(1);
+                                ImGui::TextColored(ImVec4(0.35f, 0.85f, 0.45f, 1.0f), "C");
+                                ImGui::TableSetColumnIndex(2);
+                                ImGui::TextUnformatted(fn.name.c_str());
+                                ImGui::TableSetColumnIndex(3);
+                                const std::string sig = functionSignature(fn);
+                                ImGui::TextUnformatted(sig.c_str());
+                        }
+                        for (const auto &cls : source.declarations.classes) {
+                                for (const auto &method : cls.methods) {
+                                        ImGui::TableNextRow();
+                                        ImGui::TableSetColumnIndex(0);
+                                        ImGui::TextUnformatted(sourceName.c_str());
+                                        ImGui::TableSetColumnIndex(1);
+                                        ImGui::TextDisabled("C++");
+                                        ImGui::TableSetColumnIndex(2);
+                                        const std::string name = cls.fullName + "::" + method.name;
+                                        ImGui::TextUnformatted(name.c_str());
+                                        ImGui::TableSetColumnIndex(3);
+                                        const std::string sig = methodSignature(method);
+                                        ImGui::TextDisabled("%s", sig.c_str());
+                                        if (ImGui::IsItemHovered())
+                                                ImGui::SetTooltip(
+                                                    "%s",
+                                                    tr("C++ member method: visible for inspection, but LOCAL bindings require "
+                                                       "a C ABI wrapper.",
+                                                       "C++ 成员方法：可浏览，但 LOCAL 绑定需要 C ABI 包装函数。"));
+                                }
+                        }
+                }
+                ImGui::EndTable();
+        }
+}
+
+static bool
+isIntegerDataType(DataType type)
+{
+        return type == DataType::U8 || type == DataType::U16 || type == DataType::U32 || type == DataType::U64 ||
+               type == DataType::I8 || type == DataType::I16 || type == DataType::I32 || type == DataType::I64;
+}
+
+void
+Variable::drawFunctionBindingPopup()
+{
+        if (functionBindIdx_ < 0 || functionBindIdx_ >= (int)vars_.size())
+                return;
+        ImGui::OpenPopup("###BindVariableFunctions");
+        if (!ImGui::BeginPopupModal(tr("Bind Functions###BindVariableFunctions", "绑定读写函数###BindVariableFunctions"),
+                                    nullptr,
+                                    ImGuiWindowFlags_AlwaysAutoResize))
+                return;
+
+        VarEntry &v = vars_[functionBindIdx_];
+        ImGui::Text("%s: %s (%s)", tr("Variable", "变量"), v.name.c_str(), Parser::dataTypeToStr(v.type));
+        auto drawBinding = [&](const char *label, VarEntry::FunctionBinding &binding, bool read) {
+                FunctionSource   *resolvedSource = nullptr;
+                const CFuncDecl  *resolved       = findFunction(binding, &resolvedSource);
+                const std::string preview =
+                    binding.empty()
+                        ? tr("(none)", "（无）")
+                        : (resolved ? std::filesystem::path(functionSourceKey(*resolvedSource)).filename().string() +
+                                          " :: " + functionSignature(*resolved)
+                                    : binding.functionName);
+                ImGui::SetNextItemWidth(440.0f);
+                if (ImGui::BeginCombo(label, preview.c_str())) {
+                        if (ImGui::Selectable(tr("(none)", "（无）"), binding.empty())) {
+                                binding = {};
+                                if (read)
+                                        v.readFunctionError.clear();
+                                else
+                                        v.writeFunctionError.clear();
+                                v.functionError = !v.writeFunctionError.empty() ? v.writeFunctionError : v.readFunctionError;
+                                isModified_     = true;
+                        }
+                        for (const auto &source : functionSources_) {
+                                const std::string sourceName =
+                                    std::filesystem::path(functionSourceKey(*source)).filename().string();
+                                for (const auto &fn : source->declarations.functions) {
+                                        if (!(read ? isReadAccessor(fn, v.type) : isWriteAccessor(fn, v.type)))
+                                                continue;
+                                        const std::string sig  = functionSignature(fn);
+                                        const std::string item = sourceName + " :: " + sig;
+                                        if (ImGui::Selectable(item.c_str(), resolved == &fn)) {
+                                                binding.sourcePath   = functionSourceKey(*source);
+                                                binding.functionName = fn.name;
+                                                binding.signature    = sig;
+                                                v.functionError.clear();
+                                                v.readFunctionError.clear();
+                                                v.writeFunctionError.clear();
+                                                isModified_ = true;
+                                        }
+                                }
+                        }
+                        ImGui::EndCombo();
+                }
+                if (!binding.empty() && !resolved)
+                        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.3f, 1.0f),
+                                           "%s",
+                                           tr("Saved function/signature is unresolved.", "保存的函数/签名已失效。"));
+        };
+        drawBinding(tr("Read function", "读取函数"), v.readFunction, true);
+        drawBinding(tr("Write function", "写入函数"), v.writeFunction, false);
+        if (!v.functionError.empty())
+                ImGui::TextWrapped("%s: %s", tr("Last error", "最近错误"), v.functionError.c_str());
+        ImGui::TextDisabled("%s",
+                            tr("Read: T fn(void) or status fn(T*). Write: status fn(T) or status fn(T*).",
+                               "读取：T fn(void) 或 status fn(T*)；写入：status fn(T) 或 status fn(T*)。"));
+        if (ImGui::Button(tr("Done", "完成"), ImVec2(120, 0))) {
+                functionBindIdx_ = -1;
+                ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
 }
 
 void
@@ -1267,20 +1977,37 @@ Variable::drawVariableList()
 
         constexpr ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_Sortable;
-        if (ImGui::BeginTable("VarMonitorTable", 6, flags, ImVec2(0, 0))) {
+        if (ImGui::BeginTable("VarMonitorTableV2", 6, flags, ImVec2(0, 0))) {
+                auto watchSortFlags = [&](int column) {
+                        ImGuiTableColumnFlags result = ImGuiTableColumnFlags_None;
+                        if (watchTableUi_.sortColumn == column) {
+                                result |= ImGuiTableColumnFlags_DefaultSort;
+                                result |= watchTableUi_.sortDirection == ImGuiSortDirection_Descending
+                                              ? ImGuiTableColumnFlags_PreferSortDescending
+                                              : ImGuiTableColumnFlags_PreferSortAscending;
+                        }
+                        return result;
+                };
                 ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"),
-                                        ImGuiTableColumnFlags_DefaultSort | ImGuiTableColumnFlags_WidthStretch);
+                                        ImGuiTableColumnFlags_WidthStretch | watchSortFlags(0));
                 ImGui::TableSetupColumn(tr("Value###col_value", "数值###col_value"),
                                         ImGuiTableColumnFlags_NoSort | ImGuiTableColumnFlags_WidthStretch);
-                ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
-                ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthFixed, 150.0f);
-                ImGui::TableSetupColumn(tr("Port###col_port", "端口###col_port"), ImGuiTableColumnFlags_WidthFixed, 80.0f);
-                ImGui::TableSetupColumn(tr("R/W###col_rw", "读写###col_rw"), ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                ImGui::TableSetupColumn(
+                    tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthFixed | watchSortFlags(2), 60.0f);
+                ImGui::TableSetupColumn(
+                    tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthFixed | watchSortFlags(3), 150.0f);
+                ImGui::TableSetupColumn(
+                    tr("Port###col_port", "端口###col_port"), ImGuiTableColumnFlags_WidthFixed | watchSortFlags(4), 80.0f);
+                ImGui::TableSetupColumn(
+                    tr("R/W###col_rw", "读写###col_rw"), ImGuiTableColumnFlags_WidthFixed | watchSortFlags(5), 50.0f);
+                restoreTableWidths(watchTableUi_, 6);
+                restoreTableSort(watchTableUi_);
                 ImGui::TableHeadersRow();
 
                 if (ImGuiTableSortSpecs *sorts_specs = ImGui::TableGetSortSpecs()) {
                         if (sorts_specs->SpecsCount > 0 && sorts_specs->SpecsDirty) {
                                 const auto *spec = &sorts_specs->Specs[0];
+                                captureTableSort(watchTableUi_, spec->ColumnIndex, spec->SortDirection);
                                 std::sort(vars_.begin(), vars_.end(), [&](const VarEntry &a, const VarEntry &b) -> bool {
                                         int cmp = 0;
                                         switch (spec->ColumnIndex) {
@@ -1323,7 +2050,7 @@ Variable::drawVariableList()
                 // Build the monitor drag payload (CHANNEL / STRUCT_CHANNEL) for a row. This is
                 // carried by the "=" grip so the same handle both reorders the row (in-window)
                 // and drops onto a monitor to add channels.
-                auto setMonitorPayload = [&](const VarEntry &v, bool isComplex, bool hasManualStruct) {
+                auto setMonitorPayload = [&](const VarEntry &v, bool isComplex, bool hasManualAggregate) {
                         if (isComplex) {
                                 auto sp      = std::make_unique<StructChannelPayload>();
                                 sp->writable = v.writable;
@@ -1335,12 +2062,16 @@ Variable::drawVariableList()
                                 snprintf(sp->rootName, sizeof(sp->rootName), "%s", v.name.c_str());
                                 sp->rootAddr    = v.addr;
                                 sp->rootTypeOff = v.typeOff;
-                                if (hasManualStruct) {
+                                if (hasManualAggregate) {
                                         for (const auto &sf : v.structFields) {
                                                 if (sp->count >= StructChannelPayload::kMaxEntries)
                                                         break;
                                                 auto &e = sp->entries[sp->count++];
-                                                snprintf(e.name, sizeof(e.name), "%s.%s", v.name.c_str(), sf.name);
+                                                snprintf(e.name,
+                                                         sizeof(e.name),
+                                                         v.isArray ? "%s%s" : "%s.%s",
+                                                         v.name.c_str(),
+                                                         sf.name);
                                                 e.addr = v.addr + sf.byteOffset;
                                                 snprintf(e.type, sizeof(e.type), "%s", Parser::dataTypeToStr(sf.type));
                                                 e.writable = v.writable;
@@ -1414,9 +2145,9 @@ Variable::drawVariableList()
                                 std::lock_guard lk(mtxElf_);
                                 t = resolveAlias(dwarfInfo_, v.typeOff);
                         }
-                        const bool hasManualStruct = !v.structFields.empty();
-                        const bool isComplex =
-                            hasManualStruct || (t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
+                        const bool hasManualAggregate = v.isStruct && v.typeOff == 0;
+                        const bool isComplex          = hasManualAggregate ||
+                                               (t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
                                                       t->kind == dwarf::TypeKind::ARRAY));
 
                         // "=" grip — selection + the single drag handle for this row. Dragging it
@@ -1439,7 +2170,7 @@ Variable::drawVariableList()
                         }
                         if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
                                 rowDragSrc_ = i;
-                                setMonitorPayload(v, isComplex, hasManualStruct);
+                                setMonitorPayload(v, isComplex, hasManualAggregate);
                                 ImGui::Text(tr("Dragging %s", "拖拽 %s"), v.name.c_str());
                                 ImGui::EndDragDropSource();
                         }
@@ -1471,10 +2202,19 @@ Variable::drawVariableList()
                                                  sizeof(editPropBuf_.addrBuf),
                                                  "%llX",
                                                  (unsigned long long)v.addr);
-                                        editPropBuf_.type         = v.type;
-                                        editPropBuf_.port         = v.port;
-                                        editPropBuf_.writable     = v.writable;
-                                        editPropBuf_.structMode   = !v.structFields.empty();
+                                        editPropBuf_.type        = v.type;
+                                        editPropBuf_.port        = v.port;
+                                        editPropBuf_.writable    = v.writable;
+                                        editPropBuf_.structMode  = v.isStruct;
+                                        editPropBuf_.unionMode   = v.isUnion;
+                                        editPropBuf_.arrayMode   = v.isArray;
+                                        editPropBuf_.typeChanged = false;
+                                        if (t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
+                                                  t->kind == dwarf::TypeKind::ARRAY)) {
+                                                editPropBuf_.structMode = true;
+                                                editPropBuf_.unionMode  = t->kind == dwarf::TypeKind::UNION;
+                                                editPropBuf_.arrayMode  = t->kind == dwarf::TypeKind::ARRAY;
+                                        }
                                         editPropBuf_.structFields = v.structFields;
                                         if (v.port == PortType::SHM) {
                                                 snprintf(editPropBuf_.shmName, sizeof(editPropBuf_.shmName), "%s", v.shm.name);
@@ -1487,28 +2227,64 @@ Variable::drawVariableList()
                                                          v.audio.deviceName);
                                         }
                                 }
-                                const u32 traceSize = Parser::typeBytes(v.type);
-                                if (v.port == PortType::JLINK && !isComplex && traceSize > 0 &&
-                                    ImGui::MenuItem(tr("Trace writes with DWT", "使用 DWT 跟踪写入"))) {
+                                ImGui::Separator();
+                                ImGui::TextDisabled("%s", tr("Access mode", "读写模式"));
+                                auto applyWritable = [&](bool writable) {
+                                        for (auto &selected : vars_) {
+                                                if (!selected.selected || (writable && selected.port == PortType::AUDIO))
+                                                        continue;
+                                                selected.writable = writable;
+                                        }
+                                        isModified_        = true;
+                                        propertiesChanged_ = true;
+                                };
+                                if (ImGui::MenuItem(tr("Read only", "只读"), nullptr, !v.writable))
+                                        applyWritable(false);
+                                ImGui::BeginDisabled(v.port == PortType::AUDIO);
+                                if (ImGui::MenuItem(tr("Read / write", "读写"), nullptr, v.writable))
+                                        applyWritable(true);
+                                ImGui::EndDisabled();
+                                ImGui::Separator();
+                                const bool canBindFunctions = v.port == PortType::LOCAL && !isComplex;
+                                ImGui::BeginDisabled(!canBindFunctions);
+                                if (ImGui::MenuItem(canBindFunctions ? tr("Bind Read/Write Functions...", "绑定读写函数...")
+                                                                     : tr("Bind Functions (LOCAL scalar only)",
+                                                                          "绑定函数（仅 LOCAL 标量）"))) {
+                                        functionBindIdx_   = i;
+                                        functionPanelOpen_ = true;
+                                }
+                                ImGui::EndDisabled();
+                                const u32  traceSize = Parser::typeBytes(v.type);
+                                const bool canTrace  = v.port == PortType::JLINK && !isComplex && traceSize > 0;
+                                ImGui::BeginDisabled(!canTrace);
+                                if (ImGui::MenuItem(canTrace
+                                                        ? tr("Trace writes with DWT", "使用 DWT 跟踪写入")
+                                                        : tr("DWT trace (JLINK scalar only)", "DWT 跟踪（仅 JLINK 标量）"))) {
                                         JLinkPort::instance().configureDwtWriteTrace(
                                             static_cast<u32>(v.addr), traceSize, v.name);
                                 }
-                                const bool isEnumType = (t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty();
-                                if (!isComplex && isEnumType &&
-                                    ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
+                                ImGui::EndDisabled();
+                                const bool isEnumType  = (t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty();
+                                const bool canEditEnum = !isComplex && (isEnumType || isIntegerDataType(v.type));
+                                ImGui::BeginDisabled(!canEditEnum);
+                                if (ImGui::MenuItem(
+                                        canEditEnum ? tr("Edit Enum Definition...", "编辑枚举定义...")
+                                                    : tr("Enum definition (integer scalar only)", "枚举定义（仅整数标量）"))) {
                                         pendingEnumEdit = true;
                                 }
-                                if (isComplex && !v.hiddenMembers.empty()) {
-                                        char restoreLabel[64];
-                                        snprintf(restoreLabel,
-                                                 sizeof(restoreLabel),
-                                                 "Restore hidden (%d)",
-                                                 (int)v.hiddenMembers.size());
-                                        if (ImGui::MenuItem(restoreLabel)) {
-                                                v.hiddenMembers.clear();
-                                                isModified_ = true;
-                                        }
+                                ImGui::EndDisabled();
+                                char restoreLabel[96];
+                                snprintf(restoreLabel,
+                                         sizeof(restoreLabel),
+                                         "%s (%d)",
+                                         tr("Restore hidden", "恢复隐藏成员"),
+                                         (int)v.hiddenMembers.size());
+                                ImGui::BeginDisabled(!isComplex || v.hiddenMembers.empty());
+                                if (ImGui::MenuItem(restoreLabel)) {
+                                        v.hiddenMembers.clear();
+                                        isModified_ = true;
                                 }
+                                ImGui::EndDisabled();
                                 ImGui::EndPopup();
                         }
 
@@ -1576,12 +2352,16 @@ Variable::drawVariableList()
 
                         // Type
                         ImGui::TableSetColumnIndex(2);
-                        if (hasManualStruct) {
-                                ImGui::TextUnformatted("STRUCT");
+                        if (hasManualAggregate) {
+                                ImGui::TextUnformatted(v.isArray ? "ARRAY" : (v.isUnion ? "UNION" : "STRUCT"));
                         } else if (isComplex) {
-                                ImGui::TextUnformatted(t->kind == dwarf::TypeKind::ARRAY ? "ARRAY" : "STRUCT");
+                                ImGui::TextUnformatted(t->kind == dwarf::TypeKind::ARRAY
+                                                           ? "ARRAY"
+                                                           : (t->kind == dwarf::TypeKind::UNION ? "UNION" : "STRUCT"));
                         } else if ((t && t->kind == dwarf::TypeKind::ENUM) || !v.enumDefs.empty()) {
-                                ImGui::TextUnformatted("ENUM");
+                                const char *storage =
+                                    t ? scalarPayloadType(dwarfInfo_, v.typeOff) : Parser::dataTypeToStr(v.type);
+                                ImGui::Text("ENUM (%s)", storage ? storage : Parser::dataTypeToStr(v.type));
                         } else {
                                 ImGui::TextUnformatted(Parser::dataTypeToStr(v.type));
                         }
@@ -1608,13 +2388,26 @@ Variable::drawVariableList()
 
                         // R/W
                         ImGui::TableSetColumnIndex(5);
-                        if (v.writable)
+                        const bool hasFunction = !v.readFunction.empty() || !v.writeFunction.empty();
+                        if (hasFunction)
+                                ImGui::TextColored(v.functionError.empty() ? ImVec4(0.35f, 0.75f, 1.0f, 1.0f)
+                                                                           : ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
+                                                   "FN");
+                        else if (v.writable)
                                 ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "RW");
                         else
                                 ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 1.0f), "RO");
+                        if (hasFunction && ImGui::IsItemHovered()) {
+                                if (!v.functionError.empty())
+                                        ImGui::SetTooltip("%s", v.functionError.c_str());
+                                else
+                                        ImGui::SetTooltip("R: %s\nW: %s",
+                                                          v.readFunction.empty() ? "-" : v.readFunction.functionName.c_str(),
+                                                          v.writeFunction.empty() ? "-" : v.writeFunction.functionName.c_str());
+                        }
 
                         if (open && isComplex) {
-                                if (hasManualStruct) {
+                                if (hasManualAggregate) {
                                         // Render manually defined struct fields from LOCAL buffer
                                         int                          fieldMoveSrc = -1, fieldMoveDst = -1;
                                         std::unique_lock<std::mutex> lk(mtxLocal_);
@@ -1632,10 +2425,16 @@ Variable::drawVariableList()
                                                         fieldDragSrc_    = fi;
                                                         ChannelDropPayload p{};
                                                         p.writable = v.writable;
-                                                        snprintf(p.name, sizeof(p.name), "%s.%s", v.name.c_str(), sf.name);
+                                                        snprintf(p.name,
+                                                                 sizeof(p.name),
+                                                                 v.isArray ? "%s%s" : "%s.%s",
+                                                                 v.name.c_str(),
+                                                                 sf.name);
                                                         p.addr = v.addr + sf.byteOffset;
                                                         snprintf(p.type, sizeof(p.type), "%s", Parser::dataTypeToStr(sf.type));
-                                                        snprintf(p.device, sizeof(p.device), "LOCAL");
+                                                        snprintf(p.device, sizeof(p.device), "%s", portName(v.port));
+                                                        if (v.port == PortType::SHM)
+                                                                snprintf(p.shmName, sizeof(p.shmName), "%s", v.shm.name);
                                                         p.numBytes = (u8)Parser::typeBytes(sf.type);
                                                         auto eit   = v.memberEnumDefs.find(p.name);
                                                         if (eit != v.memberEnumDefs.end() && !eit->second.empty()) {
@@ -1678,19 +2477,31 @@ Variable::drawVariableList()
                                                                       ImGuiTreeNodeFlags_SpanFullWidth);
                                                 ImGui::PopStyleColor(2);
                                                 ImGui::TableSetColumnIndex(1);
-                                                if (it != localBufs_.end()) {
-                                                        const auto &fbuf = it->second;
-                                                        u32         fsz  = Parser::typeBytes(sf.type);
-                                                        if (sf.byteOffset + fsz <= (u32)fbuf.size()) {
-                                                                uint8_t tmp[8]{};
-                                                                std::memcpy(tmp, fbuf.data() + sf.byteOffset, fsz);
-                                                                ImGui::TextUnformatted(decodeValue(tmp, sf.type, 0, 0).c_str());
-                                                        } else {
-                                                                ImGui::TextDisabled("---");
+                                                uint8_t   tmp[8]{};
+                                                const u32 fsz        = Parser::typeBytes(sf.type);
+                                                bool      valueReady = false;
+                                                if (v.port == PortType::LOCAL && it != localBufs_.end() &&
+                                                    sf.byteOffset + fsz <= (u32)it->second.size()) {
+                                                        std::memcpy(tmp, it->second.data() + sf.byteOffset, fsz);
+                                                        valueReady = true;
+                                                } else if (v.port == PortType::JLINK) {
+                                                        auto pit = syncReadCache_.find(v.addr + sf.byteOffset);
+                                                        if (pit != syncReadCache_.end() && pit->second.ok) {
+                                                                std::memcpy(tmp, pit->second.buf, fsz);
+                                                                valueReady = true;
                                                         }
-                                                } else {
-                                                        ImGui::TextDisabled("---");
+                                                } else if (v.port == PortType::SHM) {
+                                                        auto sit = shmShadowBufs_.find(shmShadowKey(v));
+                                                        if (sit != shmShadowBufs_.end() &&
+                                                            sf.byteOffset + fsz <= (u32)sit->second.size()) {
+                                                                std::memcpy(tmp, sit->second.data() + sf.byteOffset, fsz);
+                                                                valueReady = true;
+                                                        }
                                                 }
+                                                if (valueReady)
+                                                        ImGui::TextUnformatted(decodeValue(tmp, sf.type, 0, 0).c_str());
+                                                else
+                                                        ImGui::TextDisabled("---");
                                                 ImGui::TableSetColumnIndex(2);
                                                 ImGui::TextUnformatted(Parser::dataTypeToStr(sf.type));
                                                 ImGui::TableSetColumnIndex(3);
@@ -1735,6 +2546,7 @@ Variable::drawVariableList()
                         isModified_        = true;
                 }
 
+                captureTableWidths(watchTableUi_, 6);
                 ImGui::EndTable();
         }
 
@@ -1790,18 +2602,25 @@ Variable::addScalarToWatch(const ChannelDropPayload &p)
                 v.audio.deviceIndex = static_cast<int>(p.addr);
                 snprintf(v.audio.deviceName, sizeof(v.audio.deviceName), "%s", p.shmName);
         } else if (strcmp(p.device, "LOCAL") == 0 || strcmp(p.device, "MANUAL") == 0) {
-                v.port     = PortType::MANUAL;
+                v.port     = PortType::LOCAL;
                 v.writable = false; // Manual/Bin data is usually readonly in this context
         } else {
                 v.port = PortType::JLINK;
         }
 
-        if (strcmp(p.type, "STRUCT") == 0 || strcmp(p.type, "ARRAY") == 0)
-                v.type = DataType::U32; // Placeholder; tree uses typeOff
-        else
+        if (strcmp(p.type, "STRUCT") == 0 || strcmp(p.type, "UNION") == 0 || strcmp(p.type, "ARRAY") == 0) {
+                v.type     = DataType::U32; // Placeholder; tree uses typeOff
+                v.isStruct = true;
+                v.isUnion  = strcmp(p.type, "UNION") == 0;
+                v.isArray  = strcmp(p.type, "ARRAY") == 0;
+        } else
                 v.type = Parser::strToDataType(p.type);
 
         vars_.push_back(v);
+        if (v.port == PortType::LOCAL) {
+                std::lock_guard<std::mutex> lk(mtxLocal_);
+                localBufs_.emplace(v.name, std::vector<uint8_t>(std::max<u32>(1, Parser::typeBytes(v.type)), 0));
+        }
         isModified_ = true;
 }
 
@@ -1816,6 +2635,12 @@ Variable::addStructToWatch(const StructChannelPayload &s)
         v.typeOff  = s.rootTypeOff;
         v.writable = true;
         v.type     = DataType::U32; // placeholder; tree uses typeOff
+        if (const dwarf::Type *type = resolveAlias(dwarfInfo_, v.typeOff)) {
+                v.isStruct = type->kind == dwarf::TypeKind::STRUCT || type->kind == dwarf::TypeKind::UNION ||
+                             type->kind == dwarf::TypeKind::ARRAY;
+                v.isUnion = type->kind == dwarf::TypeKind::UNION;
+                v.isArray = type->kind == dwarf::TypeKind::ARRAY;
+        }
         if (strcmp(s.device, "SHM") == 0) {
                 v.port = PortType::SHM;
                 snprintf(v.shm.name, sizeof(v.shm.name), "%s", s.shmName[0] != '\0' ? s.shmName : s.rootName);
@@ -1825,7 +2650,7 @@ Variable::addStructToWatch(const StructChannelPayload &s)
                 v.audio.deviceIndex = static_cast<int>(s.rootAddr);
                 snprintf(v.audio.deviceName, sizeof(v.audio.deviceName), "%s", s.shmName);
         } else if (strcmp(s.device, "LOCAL") == 0 || strcmp(s.device, "MANUAL") == 0) {
-                v.port     = PortType::MANUAL;
+                v.port     = PortType::LOCAL;
                 v.writable = false;
         } else {
                 v.port = PortType::JLINK;
@@ -1860,13 +2685,14 @@ Variable::drawAddVariableDialog()
                 static int            portIdx   = 0;
                 if (ImGui::Combo("##newVarPort", &portIdx, ports, IM_ARRAYSIZE(ports))) {
                         newVar_.port = portMap[portIdx];
-                        if (newVar_.port != PortType::LOCAL)
-                                newVar_.structMode = false;
                         if (newVar_.port == PortType::AUDIO) {
                                 newVar_.type             = DataType::F32;
                                 newVar_.writable         = false;
                                 newVar_.addr             = (u64)AudioInput::instance().defaultDeviceIndex();
                                 newVar_.audioDeviceIndex = static_cast<int>(newVar_.addr);
+                                newVar_.structMode       = false;
+                                newVar_.unionMode        = false;
+                                newVar_.arrayMode        = false;
                                 std::string devName      = AudioInput::instance().deviceName(newVar_.audioDeviceIndex);
                                 snprintf(newVar_.audioDeviceName, sizeof(newVar_.audioDeviceName), "%s", devName.c_str());
                         }
@@ -1877,45 +2703,42 @@ Variable::drawAddVariableDialog()
                 if (newVar_.port == PortType::AUDIO) {
                         newVar_.type = DataType::F32;
                         ImGui::TextDisabled("%s", tr("F32 normalized PCM sample (-1..1)", "F32 归一化 PCM 采样值 (-1..1)"));
-                } else if (newVar_.port == PortType::LOCAL) {
-                        // LOCAL port: type dropdown includes "Struct" option
-                        static const char *localTypes[] = {
-                            "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64", "Struct"};
-                        static const DataType localTypeVals[] = {DataType::U8,
-                                                                 DataType::U16,
-                                                                 DataType::U32,
-                                                                 DataType::U64,
-                                                                 DataType::I8,
-                                                                 DataType::I16,
-                                                                 DataType::I32,
-                                                                 DataType::I64,
-                                                                 DataType::F32,
-                                                                 DataType::F64};
-                        static int            localTypeIdx    = 2;
-                        // Keep visual selection consistent with structMode
-                        if (newVar_.structMode && localTypeIdx < 10)
-                                localTypeIdx = 10;
-                        else if (!newVar_.structMode && localTypeIdx == 10)
-                                localTypeIdx = 2;
-                        if (ImGui::Combo("##newVarType", &localTypeIdx, localTypes, IM_ARRAYSIZE(localTypes))) {
-                                if (localTypeIdx < 10) {
-                                        newVar_.type       = localTypeVals[localTypeIdx];
+                } else {
+                        static const char *types[] = {
+                            "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64", "STRUCT", "UNION", "ARRAY"};
+                        static const DataType typeVals[] = {DataType::U8,
+                                                            DataType::U16,
+                                                            DataType::U32,
+                                                            DataType::U64,
+                                                            DataType::I8,
+                                                            DataType::I16,
+                                                            DataType::I32,
+                                                            DataType::I64,
+                                                            DataType::F32,
+                                                            DataType::F64};
+                        int                   typeIdx    = 2;
+                        if (newVar_.structMode)
+                                typeIdx = newVar_.arrayMode ? 12 : (newVar_.unionMode ? 11 : 10);
+                        else {
+                                const char *curName = Parser::dataTypeToStr(newVar_.type);
+                                for (int k = 0; k < 10; ++k)
+                                        if (strcmp(types[k], curName) == 0) {
+                                                typeIdx = k;
+                                                break;
+                                        }
+                        }
+                        if (ImGui::Combo("##newVarType", &typeIdx, types, IM_ARRAYSIZE(types))) {
+                                if (typeIdx < 10) {
+                                        newVar_.type       = typeVals[typeIdx];
                                         newVar_.structMode = false;
-                                        // Auto-size buffer to match type
-                                        size_t tsz = Parser::typeBytes(newVar_.type);
-                                        if (tsz > 0)
-                                                newVar_.addr = (u64)tsz;
+                                        newVar_.unionMode  = false;
+                                        newVar_.arrayMode  = false;
                                 } else {
                                         newVar_.structMode = true;
+                                        newVar_.unionMode  = typeIdx == 11;
+                                        newVar_.arrayMode  = typeIdx == 12;
                                 }
                         }
-                        if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("%s", tr("Type", "类型"));
-                } else {
-                        static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
-                        static int         typeIdx = 2;
-                        if (ImGui::Combo("##newVarType", &typeIdx, types, IM_ARRAYSIZE(types)))
-                                newVar_.type = Parser::strToDataType(types[typeIdx]);
                         if (ImGui::IsItemHovered())
                                 ImGui::SetTooltip("%s", tr("Type", "类型"));
                 }
@@ -1960,7 +2783,7 @@ Variable::drawAddVariableDialog()
                                                     tr("Use &varname in SDK sequence to pass as pointer arg.",
                                                        "在 SDK 序列参数中输入 &varname 可将其作为指针参数传入。"));
                         } else {
-                                // ── Struct field editor ──
+                                // ── Manual aggregate member/element editor ──
                                 static const char *sfTypes[] = {
                                     "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
                                 static const DataType sfTypeVals[] = {DataType::U8,
@@ -1978,7 +2801,8 @@ Variable::drawAddVariableDialog()
                                 constexpr ImGuiTableFlags tfl =
                                     ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY;
                                 if (ImGui::BeginTable("##sftbl", 4, tfl, ImVec2(0, 120))) {
-                                        ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch);
+                                        ImGui::TableSetupColumn(newVar_.arrayMode ? tr("Element", "元素") : tr("Name", "名称"),
+                                                                ImGuiTableColumnFlags_WidthStretch);
                                         ImGui::TableSetupColumn(tr("Type", "类型"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
                                         ImGui::TableSetupColumn(tr("Offset", "偏移"), ImGuiTableColumnFlags_WidthFixed, 48.0f);
                                         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 22.0f);
@@ -2025,13 +2849,17 @@ Variable::drawAddVariableDialog()
                                         ImGui::EndTable();
                                 }
 
-                                if (ImGui::Button(tr("+ Field", "+ 添加字段"))) {
+                                if (ImGui::Button(newVar_.arrayMode ? tr("+ Element", "+ 添加元素")
+                                                                    : tr("+ Field", "+ 添加字段"))) {
                                         VarEntry::StructField sf{};
-                                        if (!newVar_.structFields.empty()) {
+                                        if (!newVar_.unionMode && !newVar_.structFields.empty()) {
                                                 const auto &last = newVar_.structFields.back();
                                                 sf.byteOffset    = last.byteOffset + Parser::typeBytes(last.type);
                                         }
-                                        snprintf(sf.name, sizeof(sf.name), "field%d", (int)newVar_.structFields.size());
+                                        if (newVar_.arrayMode)
+                                                snprintf(sf.name, sizeof(sf.name), "[%d]", (int)newVar_.structFields.size());
+                                        else
+                                                snprintf(sf.name, sizeof(sf.name), "field%d", (int)newVar_.structFields.size());
                                         newVar_.structFields.push_back(sf);
                                 }
                         }
@@ -2051,6 +2879,12 @@ Variable::drawAddVariableDialog()
                         v.port     = newVar_.port;
                         v.addr     = newVar_.addr;
                         v.writable = newVar_.writable;
+                        if (newVar_.structMode) {
+                                v.structFields = newVar_.structFields;
+                                v.isStruct     = true;
+                                v.isUnion      = newVar_.unionMode;
+                                v.isArray      = newVar_.arrayMode;
+                        }
                         if (v.port == PortType::SHM) {
                                 snprintf(v.shm.name, sizeof(v.shm.name), "%s", newVar_.shmName);
                                 v.shm.inited = false;
@@ -2063,9 +2897,8 @@ Variable::drawAddVariableDialog()
                         }
                         if (v.port == PortType::LOCAL) {
                                 size_t bsz;
-                                if (newVar_.structMode && !newVar_.structFields.empty()) {
-                                        v.structFields = newVar_.structFields;
-                                        bsz            = 0;
+                                if (newVar_.structMode) {
+                                        bsz = 0;
                                         for (const auto &sf : v.structFields)
                                                 bsz = std::max(bsz, (size_t)(sf.byteOffset + Parser::typeBytes(sf.type)));
                                         if (bsz == 0)
@@ -2081,6 +2914,8 @@ Variable::drawAddVariableDialog()
                         propertiesChanged_ = true;
                         state_             = WindowState::None;
                         newVar_.structMode = false;
+                        newVar_.unionMode  = false;
+                        newVar_.arrayMode  = false;
                         newVar_.structFields.clear();
                         ImGui::CloseCurrentPopup();
                 }
@@ -2088,6 +2923,8 @@ Variable::drawAddVariableDialog()
                 if (ImGui::Button(tr("Cancel", "取消"), ImVec2(120, 0))) {
                         state_             = WindowState::None;
                         newVar_.structMode = false;
+                        newVar_.unionMode  = false;
+                        newVar_.arrayMode  = false;
                         newVar_.structFields.clear();
                         ImGui::CloseCurrentPopup();
                 }
@@ -2273,6 +3110,8 @@ Variable::beginMemberProperties(
                         address = ov.address;
                 if (ov.hasType)
                         type = ov.type;
+                if (ov.hasType)
+                        memberPropEdit_.scalar = true;
                 if (ov.hasWritable)
                         writable = ov.writable;
         }
@@ -2310,19 +3149,33 @@ Variable::drawMemberPropertiesPopup()
 
         ImGui::TextUnformatted(tr("Type", "类型"));
         ImGui::SameLine(100);
-        if (memberPropEdit_.scalar) {
-                static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
-                int                typeIdx = 0;
-                for (int i = 0; i < IM_ARRAYSIZE(types); ++i)
+        const char *types[] = {"U8",
+                               "U16",
+                               "U32",
+                               "U64",
+                               "I8",
+                               "I16",
+                               "I32",
+                               "I64",
+                               "F32",
+                               "F64",
+                               tr("AGGREGATE (keep current)", "聚合类型（保持当前）")};
+        int         typeIdx = memberPropEdit_.scalar ? 0 : 10;
+        if (memberPropEdit_.scalar)
+                for (int i = 0; i < 10; ++i)
                         if (Parser::strToDataType(types[i]) == memberPropEdit_.type) {
                                 typeIdx = i;
                                 break;
                         }
-                ImGui::SetNextItemWidth(360);
-                if (ImGui::Combo("##memberType", &typeIdx, types, IM_ARRAYSIZE(types)))
-                        memberPropEdit_.type = Parser::strToDataType(types[typeIdx]);
-        } else {
-                ImGui::TextDisabled("%s", tr("STRUCT / ARRAY", "结构体 / 数组"));
+        ImGui::SetNextItemWidth(360);
+        if (ImGui::Combo("##memberType", &typeIdx, types, IM_ARRAYSIZE(types))) {
+                if (typeIdx < 10) {
+                        memberPropEdit_.scalar = true;
+                        memberPropEdit_.type   = Parser::strToDataType(types[typeIdx]);
+                } else {
+                        memberPropEdit_.scalar = false;
+                        memberPropEdit_.type   = DataType::UNKNOWN;
+                }
         }
 
         ImGui::Checkbox(tr("Writable", "可写"), &memberPropEdit_.writable);
@@ -2381,48 +3234,39 @@ Variable::drawEditPropertiesPopup()
                 ImGui::Text("%s", tr("Type", "类型"));
                 ImGui::SameLine(100);
                 ImGui::SetNextItemWidth(260);
-                if (editPropBuf_.port == PortType::LOCAL) {
-                        static const char *typesLocal[] = {
-                            "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64", "STRUCT"};
-                        static const DataType typeValsLocal[] = {DataType::U8,
-                                                                 DataType::U16,
-                                                                 DataType::U32,
-                                                                 DataType::U64,
-                                                                 DataType::I8,
-                                                                 DataType::I16,
-                                                                 DataType::I32,
-                                                                 DataType::I64,
-                                                                 DataType::F32,
-                                                                 DataType::F64,
-                                                                 DataType::UNKNOWN};
-                        int                   localTypeIdx    = editPropBuf_.structMode ? 10 : 2;
-                        if (!editPropBuf_.structMode) {
-                                const char *curName = Parser::dataTypeToStr(editPropBuf_.type);
-                                for (int k = 0; k < 10; ++k)
-                                        if (strcmp(typesLocal[k], curName) == 0) {
-                                                localTypeIdx = k;
-                                                break;
-                                        }
-                        }
-                        if (ImGui::Combo("##editPropType", &localTypeIdx, typesLocal, IM_ARRAYSIZE(typesLocal))) {
-                                if (localTypeIdx == 10) {
-                                        editPropBuf_.structMode = true;
-                                } else {
-                                        editPropBuf_.structMode = false;
-                                        editPropBuf_.type       = typeValsLocal[localTypeIdx];
-                                }
-                        }
-                } else {
-                        static const char *types[] = {"U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
-                        const char        *curName = Parser::dataTypeToStr(editPropBuf_.type);
-                        int                typeIdx = 2;
-                        for (int k = 0; k < IM_ARRAYSIZE(types); ++k)
+                static const char *types[] = {
+                    "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64", "STRUCT", "UNION", "ARRAY"};
+                static const DataType typeVals[] = {DataType::U8,
+                                                    DataType::U16,
+                                                    DataType::U32,
+                                                    DataType::U64,
+                                                    DataType::I8,
+                                                    DataType::I16,
+                                                    DataType::I32,
+                                                    DataType::I64,
+                                                    DataType::F32,
+                                                    DataType::F64};
+                int typeIdx = editPropBuf_.structMode ? (editPropBuf_.arrayMode ? 12 : (editPropBuf_.unionMode ? 11 : 10)) : 2;
+                if (!editPropBuf_.structMode) {
+                        const char *curName = Parser::dataTypeToStr(editPropBuf_.type);
+                        for (int k = 0; k < 10; ++k)
                                 if (strcmp(types[k], curName) == 0) {
                                         typeIdx = k;
                                         break;
                                 }
-                        if (ImGui::Combo("##editPropType", &typeIdx, types, IM_ARRAYSIZE(types)))
-                                editPropBuf_.type = Parser::strToDataType(types[typeIdx]);
+                }
+                if (ImGui::Combo("##editPropType", &typeIdx, types, IM_ARRAYSIZE(types))) {
+                        editPropBuf_.typeChanged = true;
+                        if (typeIdx >= 10) {
+                                editPropBuf_.structMode = true;
+                                editPropBuf_.unionMode  = typeIdx == 11;
+                                editPropBuf_.arrayMode  = typeIdx == 12;
+                        } else {
+                                editPropBuf_.structMode = false;
+                                editPropBuf_.unionMode  = false;
+                                editPropBuf_.arrayMode  = false;
+                                editPropBuf_.type       = typeVals[typeIdx];
+                        }
                 }
 
                 ImGui::Text("%s", tr("Address", "地址"));
@@ -2433,10 +3277,9 @@ Variable::drawEditPropertiesPopup()
                 ImGui::Text("%s", tr("Port", "端口"));
                 ImGui::SameLine(100);
                 ImGui::SetNextItemWidth(260);
-                static const char    *ports[]   = {"JLINK", "SHM", "LOCAL", "MANUAL", "AUDIO"};
-                static const PortType portMap[] = {
-                    PortType::JLINK, PortType::SHM, PortType::LOCAL, PortType::MANUAL, PortType::AUDIO};
-                int portIdx = 0;
+                static const char    *ports[]   = {"JLINK", "SHM", "LOCAL", "AUDIO"};
+                static const PortType portMap[] = {PortType::JLINK, PortType::SHM, PortType::LOCAL, PortType::AUDIO};
+                int                   portIdx   = 0;
                 for (int i = 0; i < IM_ARRAYSIZE(portMap); ++i)
                         if (portMap[i] == editPropBuf_.port) {
                                 portIdx = i;
@@ -2449,11 +3292,14 @@ Variable::drawEditPropertiesPopup()
                         editPropBuf_.type       = DataType::F32;
                         editPropBuf_.writable   = false;
                         editPropBuf_.structMode = false;
+                        editPropBuf_.unionMode  = false;
+                        editPropBuf_.arrayMode  = false;
                         ImGui::TextDisabled("%s", tr("F32 normalized PCM sample (-1..1)", "F32 归一化 PCM 采样值 (-1..1)"));
-                } else if (editPropBuf_.port == PortType::LOCAL) {
-                        ImGui::TextDisabled("%s",
-                                            tr("In-process buffer — use &varname in SDK sequence.",
-                                               "进程内缓冲区，在 SDK 序列参数中用 &varname 引用。"));
+                } else {
+                        if (editPropBuf_.port == PortType::LOCAL)
+                                ImGui::TextDisabled("%s",
+                                                    tr("In-process buffer — use &varname in SDK sequence.",
+                                                       "进程内缓冲区，在 SDK 序列参数中用 &varname 引用。"));
                         if (editPropBuf_.structMode) {
                                 static const char *sfTypes[] = {
                                     "U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "F32", "F64"};
@@ -2471,7 +3317,9 @@ Variable::drawEditPropertiesPopup()
                                 constexpr ImGuiTableFlags tfl =
                                     ImGuiTableFlags_Borders | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_ScrollY;
                                 if (ImGui::BeginTable("##epSfTbl", 4, tfl, ImVec2(0, 120))) {
-                                        ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch);
+                                        ImGui::TableSetupColumn(editPropBuf_.arrayMode ? tr("Element", "元素")
+                                                                                       : tr("Name", "名称"),
+                                                                ImGuiTableColumnFlags_WidthStretch);
                                         ImGui::TableSetupColumn(tr("Type", "类型"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
                                         ImGui::TableSetupColumn(tr("Offset", "偏移"), ImGuiTableColumnFlags_WidthFixed, 48.0f);
                                         ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 22.0f);
@@ -2511,13 +3359,19 @@ Variable::drawEditPropertiesPopup()
                                                 editPropBuf_.structFields.erase(editPropBuf_.structFields.begin() + toDelete);
                                         ImGui::EndTable();
                                 }
-                                if (ImGui::Button(tr("+ Field", "+ 添加字段"))) {
+                                if (ImGui::Button(editPropBuf_.arrayMode ? tr("+ Element", "+ 添加元素")
+                                                                         : tr("+ Field", "+ 添加字段"))) {
                                         VarEntry::StructField sf{};
-                                        if (!editPropBuf_.structFields.empty()) {
+                                        if (!editPropBuf_.unionMode && !editPropBuf_.structFields.empty()) {
                                                 const auto &last = editPropBuf_.structFields.back();
                                                 sf.byteOffset    = last.byteOffset + Parser::typeBytes(last.type);
                                         }
-                                        snprintf(sf.name, sizeof(sf.name), "field%d", (int)editPropBuf_.structFields.size());
+                                        if (editPropBuf_.arrayMode)
+                                                snprintf(
+                                                    sf.name, sizeof(sf.name), "[%d]", (int)editPropBuf_.structFields.size());
+                                        else
+                                                snprintf(
+                                                    sf.name, sizeof(sf.name), "field%d", (int)editPropBuf_.structFields.size());
                                         editPropBuf_.structFields.push_back(sf);
                                 }
                         }
@@ -2541,11 +3395,22 @@ Variable::drawEditPropertiesPopup()
 
                 ImGui::Separator();
                 if (ui::Button(tr("Apply", "应用"), ui::BtnStyle::Success, ImVec2(100, 0))) {
-                        VarEntry &v = vars_[editPropIdx_];
-                        v.name      = editPropBuf_.name;
-                        v.type      = editPropBuf_.type;
-                        v.port      = editPropBuf_.port;
-                        v.writable  = editPropBuf_.writable;
+                        VarEntry                      &v            = vars_[editPropIdx_];
+                        dwarf::TypeKind                previousKind = dwarf::TypeKind::UNKNOWN;
+                        std::vector<VarEntry::EnumDef> previousEnumDefs;
+                        {
+                                std::lock_guard lk(mtxElf_);
+                                if (const dwarf::Type *current = resolveAlias(dwarfInfo_, v.typeOff)) {
+                                        previousKind = current->kind;
+                                        if (current->kind == dwarf::TypeKind::ENUM)
+                                                for (const auto &entry : current->enums)
+                                                        previousEnumDefs.push_back({entry.name, entry.value});
+                                }
+                        }
+                        v.name     = editPropBuf_.name;
+                        v.type     = editPropBuf_.type;
+                        v.port     = editPropBuf_.port;
+                        v.writable = editPropBuf_.writable;
                         try {
                                 v.addr = std::stoull(editPropBuf_.addrBuf, nullptr, 16);
                         } catch (...) {
@@ -2555,15 +3420,43 @@ Variable::drawEditPropertiesPopup()
                                 snprintf(v.shm.name, sizeof(v.shm.name), "%s", editPropBuf_.shmName);
                         }
                         if (v.port == PortType::AUDIO) {
-                                v.type              = DataType::F32;
-                                v.writable          = false;
+                                v.type     = DataType::F32;
+                                v.typeOff  = 0;
+                                v.writable = false;
+                                v.isStruct = false;
+                                v.isUnion  = false;
+                                v.isArray  = false;
+                                v.structFields.clear();
+                                v.enumDefs.clear();
                                 v.addr              = (u64)std::max(0, editPropBuf_.audioDeviceIndex);
                                 v.audio.deviceIndex = editPropBuf_.audioDeviceIndex;
                                 snprintf(v.audio.deviceName, sizeof(v.audio.deviceName), "%s", editPropBuf_.audioDeviceName);
                         }
-                        if (v.port == PortType::LOCAL && editPropBuf_.structMode) {
+                        if (editPropBuf_.structMode) {
                                 v.isStruct     = true;
+                                v.isUnion      = editPropBuf_.unionMode;
+                                v.isArray      = editPropBuf_.arrayMode;
                                 v.structFields = editPropBuf_.structFields;
+                                const bool sameDwarfAggregate =
+                                    (previousKind == dwarf::TypeKind::STRUCT && !v.isUnion && !v.isArray) ||
+                                    (previousKind == dwarf::TypeKind::UNION && v.isUnion) ||
+                                    (previousKind == dwarf::TypeKind::ARRAY && v.isArray);
+                                if (!sameDwarfAggregate)
+                                        v.typeOff = 0;
+                        } else {
+                                const bool wasDwarfAggregate = previousKind == dwarf::TypeKind::STRUCT ||
+                                                               previousKind == dwarf::TypeKind::UNION ||
+                                                               previousKind == dwarf::TypeKind::ARRAY;
+                                if (wasDwarfAggregate || editPropBuf_.typeChanged)
+                                        v.typeOff = 0;
+                                if (previousKind == dwarf::TypeKind::ENUM && v.enumDefs.empty())
+                                        v.enumDefs = std::move(previousEnumDefs);
+                                v.isStruct = false;
+                                v.isUnion  = false;
+                                v.isArray  = false;
+                                v.structFields.clear();
+                        }
+                        if (v.port == PortType::LOCAL && editPropBuf_.structMode) {
                                 size_t totalSz = 0;
                                 for (const auto &sf : v.structFields)
                                         totalSz = std::max<size_t>(totalSz, sf.byteOffset + Parser::typeBytes(sf.type));
@@ -2572,8 +3465,6 @@ Variable::drawEditPropertiesPopup()
                                 std::lock_guard lk(mtxLocal_);
                                 localBufs_[v.name].assign(totalSz, 0);
                         } else if (v.port == PortType::LOCAL && !editPropBuf_.structMode) {
-                                v.isStruct = false;
-                                v.structFields.clear();
                                 std::lock_guard lk(mtxLocal_);
                                 auto            it = localBufs_.find(v.name);
                                 if (it != localBufs_.end())
@@ -2609,9 +3500,23 @@ Variable::exportVarFile(const std::string &path)
                 snprintf(addrBuf, sizeof(addrBuf), "0x%08llX", (unsigned long long)v.addr);
                 cJSON_AddStringToObject(vObj, "addr", addrBuf);
                 cJSON_AddBoolToObject(vObj, "writable", v.writable);
+                cJSON_AddBoolToObject(vObj, "isStruct", v.isStruct);
+                cJSON_AddBoolToObject(vObj, "isUnion", v.isUnion);
+                cJSON_AddBoolToObject(vObj, "isArray", v.isArray);
                 cJSON_AddNumberToObject(vObj, "typeOff", (double)v.typeOff);
                 cJSON_AddNumberToObject(vObj, "bitOffset", v.bitOffset);
                 cJSON_AddNumberToObject(vObj, "bitSize", v.bitSize);
+                auto saveBinding = [vObj](const char *key, const VarEntry::FunctionBinding &binding) {
+                        if (binding.empty())
+                                return;
+                        cJSON *object = cJSON_CreateObject();
+                        cJSON_AddStringToObject(object, "source", binding.sourcePath.c_str());
+                        cJSON_AddStringToObject(object, "name", binding.functionName.c_str());
+                        cJSON_AddStringToObject(object, "signature", binding.signature.c_str());
+                        cJSON_AddItemToObject(vObj, key, object);
+                };
+                saveBinding("readFunction", v.readFunction);
+                saveBinding("writeFunction", v.writeFunction);
                 if (v.port == PortType::SHM) {
                         cJSON_AddStringToObject(vObj, "shmName", v.shm.name);
                 }
@@ -2629,9 +3534,30 @@ Variable::exportVarFile(const std::string &path)
                         }
                         cJSON_AddItemToObject(vObj, "enumDefs", eArr);
                 }
+                if (!v.structFields.empty()) {
+                        cJSON *sfArr = cJSON_CreateArray();
+                        for (const auto &sf : v.structFields) {
+                                cJSON *field = cJSON_CreateObject();
+                                cJSON_AddStringToObject(field, "name", sf.name);
+                                cJSON_AddNumberToObject(field, "type", static_cast<int>(sf.type));
+                                cJSON_AddNumberToObject(field, "offset", sf.byteOffset);
+                                cJSON_AddItemToArray(sfArr, field);
+                        }
+                        cJSON_AddItemToObject(vObj, "structFields", sfArr);
+                }
                 cJSON_AddItemToArray(vArr, vObj);
         }
         cJSON_AddItemToObject(root, "variables", vArr);
+        if (!functionSources_.empty()) {
+                cJSON *sources = cJSON_CreateArray();
+                for (const auto &source : functionSources_) {
+                        cJSON *item = cJSON_CreateObject();
+                        cJSON_AddStringToObject(item, "libraryPath", source->libraryPath.c_str());
+                        cJSON_AddStringToObject(item, "headerPath", source->headerPath.c_str());
+                        cJSON_AddItemToArray(sources, item);
+                }
+                cJSON_AddItemToObject(root, "functionSources", sources);
+        }
 
         // Remember the ELF/AXF this list was built from, stored RELATIVE to the .var
         // file so the pair stays portable when moved together (resolved on import).
@@ -2680,6 +3606,27 @@ Variable::importVarFile(const std::string &path)
         }
 
         int imported = 0;
+        if (const cJSON *sources = cJSON_GetObjectItem(root, "functionSources"); cJSON_IsArray(sources)) {
+                for (const cJSON *item = sources->child; item; item = item->next) {
+                        auto source = std::make_unique<FunctionSource>();
+                        if (const cJSON *p = cJSON_GetObjectItem(item, "libraryPath"); cJSON_IsString(p))
+                                source->libraryPath = p->valuestring;
+                        if (const cJSON *p = cJSON_GetObjectItem(item, "headerPath"); cJSON_IsString(p))
+                                source->headerPath = p->valuestring;
+                        if (!source->libraryPath.empty() || !source->headerPath.empty())
+                                functionSources_.push_back(std::move(source));
+                }
+        } else {
+                auto source = std::make_unique<FunctionSource>();
+                if (const cJSON *p = cJSON_GetObjectItem(root, "functionLibraryPath"); cJSON_IsString(p))
+                        source->libraryPath = p->valuestring;
+                if (const cJSON *p = cJSON_GetObjectItem(root, "functionHeaderPath"); cJSON_IsString(p))
+                        source->headerPath = p->valuestring;
+                if (!source->libraryPath.empty() || !source->headerPath.empty())
+                        functionSources_.push_back(std::move(source));
+        }
+        if (!functionSources_.empty())
+                functionPanelOpen_ = true;
         for (int i = 0; i < cJSON_GetArraySize(vArr); ++i) {
                 cJSON *vObj  = cJSON_GetArrayItem(vArr, i);
                 cJSON *nItem = cJSON_GetObjectItem(vObj, "name");
@@ -2695,8 +3642,7 @@ Variable::importVarFile(const std::string &path)
 
                 if (cJSON_GetObjectItem(vObj, "type"))
                         v.type = (DataType)cJSON_GetObjectItem(vObj, "type")->valueint;
-                if (cJSON_GetObjectItem(vObj, "port"))
-                        v.port = (PortType)cJSON_GetObjectItem(vObj, "port")->valueint;
+                v.port = portFromJson(vObj);
 
                 // Address: prefer string "0x..." format, fall back to numeric
                 cJSON *addrItem = cJSON_GetObjectItem(vObj, "addr");
@@ -2712,12 +3658,31 @@ Variable::importVarFile(const std::string &path)
 
                 if (cJSON_GetObjectItem(vObj, "writable"))
                         v.writable = cJSON_IsTrue(cJSON_GetObjectItem(vObj, "writable"));
+                if (const cJSON *item = cJSON_GetObjectItem(vObj, "isStruct"); cJSON_IsBool(item))
+                        v.isStruct = cJSON_IsTrue(item);
+                if (const cJSON *item = cJSON_GetObjectItem(vObj, "isUnion"); cJSON_IsBool(item))
+                        v.isUnion = cJSON_IsTrue(item);
+                if (const cJSON *item = cJSON_GetObjectItem(vObj, "isArray"); cJSON_IsBool(item))
+                        v.isArray = cJSON_IsTrue(item);
                 if (cJSON_GetObjectItem(vObj, "typeOff"))
                         v.typeOff = (u64)cJSON_GetObjectItem(vObj, "typeOff")->valuedouble;
                 if (cJSON_GetObjectItem(vObj, "bitOffset"))
                         v.bitOffset = (u32)cJSON_GetObjectItem(vObj, "bitOffset")->valueint;
                 if (cJSON_GetObjectItem(vObj, "bitSize"))
                         v.bitSize = (u32)cJSON_GetObjectItem(vObj, "bitSize")->valueint;
+                auto loadBinding = [vObj](const char *key, VarEntry::FunctionBinding &binding) {
+                        const cJSON *object = cJSON_GetObjectItem(vObj, key);
+                        if (!cJSON_IsObject(object))
+                                return;
+                        if (const cJSON *source = cJSON_GetObjectItem(object, "source"); cJSON_IsString(source))
+                                binding.sourcePath = source->valuestring;
+                        if (const cJSON *name = cJSON_GetObjectItem(object, "name"); cJSON_IsString(name))
+                                binding.functionName = name->valuestring;
+                        if (const cJSON *sig = cJSON_GetObjectItem(object, "signature"); cJSON_IsString(sig))
+                                binding.signature = sig->valuestring;
+                };
+                loadBinding("readFunction", v.readFunction);
+                loadBinding("writeFunction", v.writeFunction);
 
                 if (v.port == PortType::UDP) {
                         if (cJSON_IsString(cJSON_GetObjectItem(vObj, "udpIp")))
@@ -2758,6 +3723,26 @@ Variable::importVarFile(const std::string &path)
                         }
                 }
 
+                if (const cJSON *fields = cJSON_GetObjectItem(vObj, "structFields"); cJSON_IsArray(fields)) {
+                        for (const cJSON *item = fields->child; item; item = item->next) {
+                                VarEntry::StructField field;
+                                if (const cJSON *name = cJSON_GetObjectItem(item, "name"); cJSON_IsString(name))
+                                        snprintf(field.name, sizeof(field.name), "%s", name->valuestring);
+                                if (const cJSON *type = cJSON_GetObjectItem(item, "type"); cJSON_IsNumber(type))
+                                        field.type = static_cast<DataType>(type->valueint);
+                                if (const cJSON *offset = cJSON_GetObjectItem(item, "offset"); cJSON_IsNumber(offset))
+                                        field.byteOffset = static_cast<u32>(offset->valuedouble);
+                                v.structFields.push_back(field);
+                        }
+                        v.isStruct = v.isStruct || !v.structFields.empty();
+                }
+                if (v.port == PortType::LOCAL) {
+                        size_t size = std::max<u32>(1, Parser::typeBytes(v.type));
+                        for (const auto &field : v.structFields)
+                                size = std::max(size, static_cast<size_t>(field.byteOffset + Parser::typeBytes(field.type)));
+                        std::lock_guard<std::mutex> lk(mtxLocal_);
+                        localBufs_.emplace(v.name, std::vector<uint8_t>(size, 0));
+                }
                 vars_.push_back(v);
                 imported++;
         }
@@ -2933,6 +3918,54 @@ Variable::updateVariables()
                 return;
         lastUpdateTs_ = now;
 
+        // Publish LOCAL function reads to their own worker and consume the last
+        // completed batch. Dynamic library calls never run on the render thread.
+        std::vector<AccessReadReq> functionReads;
+        for (const auto &v : vars_) {
+                if (v.port != PortType::LOCAL || v.isStruct || v.readFunction.empty())
+                        continue;
+                FunctionSource *source = nullptr;
+                if (const CFuncDecl *fn = findFunction(v.readFunction, &source); fn && isReadAccessor(*fn, v.type))
+                        functionReads.push_back({v.name, v.type, *fn, source});
+        }
+        if (!functionReads.empty() || accessor_) {
+                startAccessorThread();
+                std::unordered_map<std::string, AccessResult> completed;
+                std::unordered_map<std::string, AccessResult> completedWrites;
+                {
+                        std::lock_guard<std::mutex> lk(accessor_->mtx);
+                        completed.swap(accessor_->results);
+                        completedWrites.swap(accessor_->writeResults);
+                        accessor_->reads        = functionReads;
+                        accessor_->readsPending = !functionReads.empty();
+                }
+                if (!functionReads.empty())
+                        accessor_->cv.notify_one();
+                for (auto &v : vars_) {
+                        auto result = completed.find(v.name);
+                        if (result == completed.end())
+                                continue;
+                        v.readFunctionError = result->second.ok ? std::string{} : result->second.error;
+                        v.functionError     = !v.writeFunctionError.empty() ? v.writeFunctionError : v.readFunctionError;
+                        if (result->second.ok && result->second.hasValue && v.port == PortType::LOCAL) {
+                                std::lock_guard<std::mutex> lk(mtxLocal_);
+                                auto                       &buffer   = localBufs_[v.name];
+                                const size_t                required = std::max<size_t>(1, Parser::typeBytes(v.type));
+                                if (buffer.size() >= required)
+                                        std::memcpy(buffer.data(),
+                                                    result->second.value.data(),
+                                                    std::min<size_t>(required, result->second.size));
+                        }
+                }
+                for (auto &v : vars_) {
+                        auto result = completedWrites.find(v.name);
+                        if (result != completedWrites.end()) {
+                                v.writeFunctionError = result->second.ok ? std::string{} : result->second.error;
+                                v.functionError = !v.writeFunctionError.empty() ? v.writeFunctionError : v.readFunctionError;
+                        }
+                }
+        }
+
         // Publish the current set of JLINK scalar reads for the worker thread, and
         // take a snapshot of the latest values it has produced.
         std::unordered_map<u64, PollVal> polledVals;
@@ -2942,6 +3975,11 @@ Variable::updateVariables()
                 for (const auto &v : vars_) {
                         if (v.port != PortType::JLINK || v.is_editing)
                                 continue;
+                        if (v.isStruct && v.typeOff == 0) {
+                                for (const auto &field : v.structFields)
+                                        reqByAddr[v.addr + field.byteOffset] = Parser::typeBytes(field.type);
+                                continue;
+                        }
                         const dwarf::Type *t = resolveAlias(dwarfInfo_, v.typeOff);
                         if (t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
                                   t->kind == dwarf::TypeKind::ARRAY))
@@ -2969,6 +4007,26 @@ Variable::updateVariables()
                 const dwarf::Type *t         = resolveAlias(dwarfInfo_, v.typeOff);
                 const bool         isComplex = t && (t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
                                              t->kind == dwarf::TypeKind::ARRAY);
+                if (v.isStruct && v.typeOff == 0) {
+                        v.valueStr = std::string(v.isArray ? "array (" : (v.isUnion ? "union (" : "struct (")) +
+                                     std::to_string(v.structFields.size()) + " fields)";
+                        if (v.port == PortType::SHM) {
+                                size_t totalSz = 0;
+                                for (const auto &field : v.structFields)
+                                        totalSz = std::max<size_t>(totalSz, field.byteOffset + Parser::typeBytes(field.type));
+                                if (!v.shm.inited) {
+                                        shm_cfg_t cfg = {v.shm.name, SHM_READWRITE, 4096};
+                                        if (shm_init(&v.shm.handle, cfg) == 0)
+                                                v.shm.inited = true;
+                                }
+                                if (v.shm.inited && totalSz > 0 && totalSz <= 4096) {
+                                        auto &shadow = shmShadowBufs_[shmShadowKey(v)];
+                                        shadow.resize(totalSz);
+                                        shm_read(&v.shm.handle, shadow.data(), totalSz);
+                                }
+                        }
+                        continue;
+                }
                 if (isComplex) {
                         v.valueStr = "...";
                         // For SHM structs: read the full blob and populate the member cache so the
@@ -3068,8 +4126,9 @@ Variable::updateVariables()
                         }
                 } else if (v.port == PortType::LOCAL) {
                         if (!v.structFields.empty()) {
-                                // Manual struct: show field count summary
-                                v.valueStr = "struct (" + std::to_string(v.structFields.size()) + " fields)";
+                                // Manual aggregate: show field count summary.
+                                v.valueStr = std::string(v.isArray ? "array (" : (v.isUnion ? "union (" : "struct (")) +
+                                             std::to_string(v.structFields.size()) + " fields)";
                                 continue;
                         }
                         std::lock_guard<std::mutex> lk(mtxLocal_);
@@ -3162,11 +4221,30 @@ Variable::writeVariable(const VarEntry &v, const std::string &newVal)
                 } else if (v.port == PortType::SHM && v.shm.inited) {
                         shm_write(const_cast<shm_t *>(&v.shm.handle), buf, sz);
                 } else if (v.port == PortType::LOCAL) {
-                        std::lock_guard<std::mutex> lk(mtxLocal_);
-                        auto                       &vec = localBufs_[v.name];
-                        if (vec.empty())
-                                vec.resize(8, 0); // fallback
-                        std::memcpy(vec.data(), buf, std::min<size_t>(sz, vec.size()));
+                        {
+                                std::lock_guard<std::mutex> lk(mtxLocal_);
+                                auto                       &vec = localBufs_[v.name];
+                                if (vec.empty())
+                                        vec.resize(8, 0); // fallback
+                                std::memcpy(vec.data(), buf, std::min<size_t>(sz, vec.size()));
+                        }
+                        FunctionSource *source = nullptr;
+                        if (const CFuncDecl *fn = findFunction(v.writeFunction, &source); fn && isWriteAccessor(*fn, v.type)) {
+                                startAccessorThread();
+                                AccessWriteReq request;
+                                request.name      = v.name;
+                                request.type      = v.type;
+                                request.function  = *fn;
+                                request.source    = source;
+                                request.size      = std::min<u32>(sz, static_cast<u32>(request.value.size()));
+                                request.valueText = newVal;
+                                std::memcpy(request.value.data(), buf, request.size);
+                                {
+                                        std::lock_guard<std::mutex> lk(accessor_->mtx);
+                                        accessor_->writes.push_back(std::move(request));
+                                }
+                                accessor_->cv.notify_one();
+                        }
                 }
         } catch (...) {
                 ImGui::InsertNotification({ImGuiToastType::Error, 2000, "Invalid input for %s", v.name.c_str()});
@@ -3180,48 +4258,51 @@ Variable::draw()
         // publishes this set to the background reader on the next refresh tick.
         memberPollReqs_.clear();
 
-        // The Symbol Browser pane only appears once a symbol/data source has been
-        // imported (ELF/AXF via drag-drop or "Load File", or a bin/json data tree),
-        // or while an ELF is still loading. Until then the watch list fills the window.
+        // Symbol and function browsers share the lower area and stack vertically.
+        // Each keeps the same compact arrow/header strip when collapsed.
         const bool showSymbolBrowser = isElfLoading_.load(std::memory_order_acquire) || !elfPath_.empty() ||
                                        !binPath_.empty() || !cfgPath_.empty() || !dataTree_.children.empty();
+        constexpr f32 kStripH          = 22.0f;
+        constexpr f32 kSplitH          = 6.0f;
+        const bool    symbolExpanded   = showSymbolBrowser && !symBrowserCollapsed_;
+        const bool    functionExpanded = functionPanelOpen_;
+        const int     expandedCount    = (symbolExpanded ? 1 : 0) + (functionExpanded ? 1 : 0);
+        const int     headerCount      = (showSymbolBrowser ? 1 : 0) + 1; // function header is always available
+        const f32     availY           = ImGui::GetContentRegionAvail().y;
+        const f32     headerTotal      = headerCount * kStripH;
+        const f32     splitTotal       = expandedCount > 0 ? kSplitH : 0.0f;
+        const f32     minimumBrowsers  = expandedCount * 70.0f;
+        const f32     maxTop           = std::max(60.0f, availY - headerTotal - splitTotal - minimumBrowsers);
+        const f32     topH =
+            expandedCount > 0 ? std::clamp(watchListHeight_, 60.0f, maxTop) : std::max(60.0f, availY - headerTotal);
+
+        if (ImGui::BeginChild("TopSection", ImVec2(0, topH), false))
+                drawVariableList();
+        ImGui::EndChild();
+
+        if (expandedCount > 0) {
+                ImVec2 splitPos = ImGui::GetCursorScreenPos();
+                float  width    = ImGui::GetContentRegionAvail().x;
+                ImGui::InvisibleButton("##browserSplit", ImVec2(width, kSplitH));
+                if (ImGui::IsItemActive()) {
+                        watchListHeight_ = std::max(60.0f, watchListHeight_ + ImGui::GetIO().MouseDelta.y);
+                        isModified_      = true;
+                }
+                const ImU32 color = ImGui::IsItemHovered() || ImGui::IsItemActive()
+                                        ? ImGui::GetColorU32(ImGuiCol_SeparatorActive)
+                                        : ImGui::GetColorU32(ImGuiCol_Separator);
+                ImGui::GetWindowDrawList()->AddLine(ImVec2(splitPos.x, splitPos.y + kSplitH * 0.5f),
+                                                    ImVec2(splitPos.x + width, splitPos.y + kSplitH * 0.5f),
+                                                    color,
+                                                    1.0f);
+                if (ImGui::IsItemHovered())
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        }
+
+        const f32 browserContentTotal = std::max(0.0f, availY - topH - headerTotal - splitTotal);
+        const f32 eachContent         = expandedCount > 0 ? browserContentTotal / expandedCount : 0.0f;
 
         if (showSymbolBrowser) {
-                constexpr f32 kStripH = 22.0f; // header strip height
-                constexpr f32 kSplitH = 6.0f;  // draggable splitter height
-                f32           availY  = ImGui::GetContentRegionAvail().y;
-
-                // Watch list takes all space except bottom strip (and symbol browser when expanded)
-                f32 topH = symBrowserCollapsed_
-                               ? availY - kStripH
-                               : std::max(60.0f, std::min(watchListHeight_, availY - kStripH - kSplitH - 60.0f));
-
-                if (ImGui::BeginChild("TopSection", ImVec2(0, topH), false)) {
-                        drawVariableList();
-                }
-                ImGui::EndChild();
-
-                if (!symBrowserCollapsed_) {
-                        // Thin draggable splitter line
-                        ImVec2 splitPos = ImGui::GetCursorScreenPos();
-                        float  w        = ImGui::GetContentRegionAvail().x;
-                        ImGui::InvisibleButton("##symSplit", ImVec2(w, kSplitH));
-                        if (ImGui::IsItemActive()) {
-                                watchListHeight_ = std::max(60.0f, watchListHeight_ + ImGui::GetIO().MouseDelta.y);
-                                isModified_      = true;
-                        }
-                        ImU32 lineCol = ImGui::IsItemHovered() || ImGui::IsItemActive()
-                                            ? ImGui::GetColorU32(ImGuiCol_SeparatorActive)
-                                            : ImGui::GetColorU32(ImGuiCol_Separator);
-                        ImGui::GetWindowDrawList()->AddLine(ImVec2(splitPos.x, splitPos.y + kSplitH * 0.5f),
-                                                            ImVec2(splitPos.x + w, splitPos.y + kSplitH * 0.5f),
-                                                            lineCol,
-                                                            1.0f);
-                        if (ImGui::IsItemHovered())
-                                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
-                }
-
-                // Header strip: collapse/expand arrow + label
                 ImGui::AlignTextToFramePadding();
                 if (ImGui::ArrowButton("##symhdr", symBrowserCollapsed_ ? ImGuiDir_Right : ImGuiDir_Down)) {
                         symBrowserCollapsed_ = !symBrowserCollapsed_;
@@ -3239,14 +4320,37 @@ Variable::draw()
                 }
 
                 if (!symBrowserCollapsed_) {
-                        if (ImGui::BeginChild("BottomSection", ImVec2(0, 0), false)) {
+                        if (ImGui::BeginChild("SymbolBrowserSection", ImVec2(0, eachContent), false)) {
                                 drawSymbolBrowser();
                         }
                         ImGui::EndChild();
                 }
+        }
+
+        ImGui::AlignTextToFramePadding();
+        if (ImGui::ArrowButton("##fnhdr", functionPanelOpen_ ? ImGuiDir_Down : ImGuiDir_Right)) {
+                functionPanelOpen_ = !functionPanelOpen_;
+                isModified_        = true;
+        }
+        ImGui::SameLine();
+        if (!functionSources_.empty()) {
+                ImGui::TextDisabled("%s (%d)", tr("Function Browser", "函数浏览器"), (int)functionSources_.size());
+                if (ImGui::IsItemHovered()) {
+                        std::string paths;
+                        for (const auto &source : functionSources_) {
+                                if (!paths.empty())
+                                        paths += "\n";
+                                paths += absoluteDisplayPath(functionSourceKey(*source));
+                        }
+                        ImGui::SetTooltip("%s", paths.c_str());
+                }
         } else {
-                // No symbol source yet — the watch list uses the full window.
-                drawVariableList();
+                ImGui::TextDisabled("%s", tr("Function Browser", "函数浏览器"));
+        }
+        if (functionPanelOpen_) {
+                if (ImGui::BeginChild("FunctionBrowserSection", ImVec2(0, eachContent), false))
+                        drawFunctionPanel();
+                ImGui::EndChild();
         }
 
         drawAddVariableDialog();
@@ -3254,6 +4358,7 @@ Variable::draw()
         drawSubEnumEditPopup();
         drawMemberPropertiesPopup();
         drawEditPropertiesPopup();
+        drawFunctionBindingPopup();
         if (state_ == WindowState::LoadElf) {
                 state_        = WindowState::None;
                 std::string p = nativeDlgOpen("Choose Symbol File", {{"Symbol Files", {"elf", "axf", "out", "json", "bin"}}});
@@ -3330,16 +4435,55 @@ Variable::save(void *node) const
         cJSON_AddNumberToObject(root, "updateIntervalMs", updateIntervalMs_);
         cJSON_AddNumberToObject(root, "watchListHeight", watchListHeight_);
         cJSON_AddBoolToObject(root, "symbolBrowserCollapsed", symBrowserCollapsed_);
+        cJSON_AddBoolToObject(root, "functionBrowserOpen", functionPanelOpen_);
         cJSON_AddBoolToObject(root, "elfFilterObjectsOnly", elfFilterObjectsOnly_);
+        if (!functionSources_.empty()) {
+                cJSON *sources = cJSON_CreateArray();
+                for (const auto &source : functionSources_) {
+                        cJSON *item = cJSON_CreateObject();
+                        cJSON_AddStringToObject(item, "libraryPath", source->libraryPath.c_str());
+                        cJSON_AddStringToObject(item, "headerPath", source->headerPath.c_str());
+                        cJSON_AddItemToArray(sources, item);
+                }
+                cJSON_AddItemToObject(root, "functionSources", sources);
+        }
+        auto saveTableUi = [root](const char *name, const TableUiState &state, int columnCount) {
+                cJSON *table = cJSON_CreateObject();
+                cJSON_AddNumberToObject(table, "sortColumn", state.sortColumn);
+                cJSON_AddNumberToObject(table, "sortDirection", state.sortDirection);
+                cJSON *widths = cJSON_CreateArray();
+                for (int i = 0; i < columnCount && i < static_cast<int>(state.widths.size()); ++i)
+                        cJSON_AddItemToArray(widths, cJSON_CreateNumber(state.widths[i]));
+                cJSON_AddItemToObject(table, "columnWidths", widths);
+                cJSON_AddItemToObject(root, name, table);
+        };
+        saveTableUi("watchTableUi", watchTableUi_, 6);
+        saveTableUi("symbolTableUi", symbolTableUi_, 4);
+        saveTableUi("binTableUi", binTableUi_, 3);
         cJSON *vArr = cJSON_CreateArray();
         for (const auto &v : vars_) {
                 cJSON *vObj = cJSON_CreateObject();
                 cJSON_AddStringToObject(vObj, "name", v.name.c_str());
                 cJSON_AddNumberToObject(vObj, "type", (int)v.type);
                 cJSON_AddNumberToObject(vObj, "port", (int)v.port);
+                cJSON_AddStringToObject(vObj, "portStr", portName(v.port));
                 cJSON_AddNumberToObject(vObj, "addr", (double)v.addr);
                 cJSON_AddBoolToObject(vObj, "writable", v.writable);
+                cJSON_AddBoolToObject(vObj, "isStruct", v.isStruct);
+                cJSON_AddBoolToObject(vObj, "isUnion", v.isUnion);
+                cJSON_AddBoolToObject(vObj, "isArray", v.isArray);
                 cJSON_AddNumberToObject(vObj, "typeOff", (double)v.typeOff);
+                auto saveBinding = [vObj](const char *key, const VarEntry::FunctionBinding &binding) {
+                        if (binding.empty())
+                                return;
+                        cJSON *object = cJSON_CreateObject();
+                        cJSON_AddStringToObject(object, "source", binding.sourcePath.c_str());
+                        cJSON_AddStringToObject(object, "name", binding.functionName.c_str());
+                        cJSON_AddStringToObject(object, "signature", binding.signature.c_str());
+                        cJSON_AddItemToObject(vObj, key, object);
+                };
+                saveBinding("readFunction", v.readFunction);
+                saveBinding("writeFunction", v.writeFunction);
                 if (v.port == PortType::SHM) {
                         cJSON_AddStringToObject(vObj, "shmName", v.shm.name);
                 }
@@ -3405,14 +4549,88 @@ void
 Variable::load(const void *node)
 {
         const cJSON *root = static_cast<const cJSON *>(node);
+        stopAccessorThread();
+        functionSources_.clear();
+        if (const cJSON *sources = cJSON_GetObjectItem(root, "functionSources"); cJSON_IsArray(sources)) {
+                for (const cJSON *item = sources->child; item; item = item->next) {
+                        auto source = std::make_unique<FunctionSource>();
+                        if (const cJSON *path = cJSON_GetObjectItem(item, "libraryPath"); cJSON_IsString(path))
+                                source->libraryPath = path->valuestring;
+                        if (const cJSON *path = cJSON_GetObjectItem(item, "headerPath"); cJSON_IsString(path))
+                                source->headerPath = path->valuestring;
+                        source->status = tr("Use Load/Reparse to activate this source.", "请使用加载/重新解析来启用此函数源。");
+                        if (!source->libraryPath.empty() || !source->headerPath.empty())
+                                functionSources_.push_back(std::move(source));
+                }
+        } else {
+                auto source = std::make_unique<FunctionSource>();
+                if (const cJSON *path = cJSON_GetObjectItem(root, "functionLibraryPath"); cJSON_IsString(path))
+                        source->libraryPath = path->valuestring;
+                if (const cJSON *path = cJSON_GetObjectItem(root, "functionHeaderPath"); cJSON_IsString(path))
+                        source->headerPath = path->valuestring;
+                source->status = tr("Use Load/Reparse to activate this source.", "请使用加载/重新解析来启用此函数源。");
+                if (!source->libraryPath.empty() || !source->headerPath.empty())
+                        functionSources_.push_back(std::move(source));
+        }
+        if (!functionSources_.empty()) {
+                functionPanelOpen_ = true;
+        }
         if (const cJSON *interval = cJSON_GetObjectItem(root, "updateIntervalMs"); cJSON_IsNumber(interval))
                 updateIntervalMs_ = static_cast<u32>(std::clamp(interval->valueint, 10, 2000));
         if (const cJSON *height = cJSON_GetObjectItem(root, "watchListHeight"); cJSON_IsNumber(height))
                 watchListHeight_ = std::max(60.0f, static_cast<float>(height->valuedouble));
         if (const cJSON *collapsed = cJSON_GetObjectItem(root, "symbolBrowserCollapsed"); cJSON_IsBool(collapsed))
                 symBrowserCollapsed_ = cJSON_IsTrue(collapsed);
+        if (const cJSON *open = cJSON_GetObjectItem(root, "functionBrowserOpen"); cJSON_IsBool(open))
+                functionPanelOpen_ = cJSON_IsTrue(open);
         if (const cJSON *objectsOnly = cJSON_GetObjectItem(root, "elfFilterObjectsOnly"); cJSON_IsBool(objectsOnly))
                 elfFilterObjectsOnly_ = cJSON_IsTrue(objectsOnly);
+        watchTableUi_                = TableUiState{};
+        watchTableUi_.widths         = {250.0f, 250.0f, 60.0f, 150.0f, 80.0f, 50.0f};
+        watchTableUi_.restoreWidths  = true;
+        watchTableUi_.restoreSort    = true;
+        symbolTableUi_               = TableUiState{};
+        symbolTableUi_.widths        = {300.0f, 120.0f, 60.0f, 240.0f, 0.0f, 0.0f};
+        symbolTableUi_.restoreWidths = true;
+        symbolTableUi_.restoreSort   = true;
+        binTableUi_                  = TableUiState{};
+        binTableUi_.widths           = {300.0f, 180.0f, 240.0f, 0.0f, 0.0f, 0.0f};
+        binTableUi_.restoreWidths    = true;
+        binTableUi_.restoreSort      = true;
+        auto loadTableUi =
+            [root](const char *name, TableUiState &state, int columnCount, const std::vector<int> &sortableColumns) {
+                    const cJSON *table = cJSON_GetObjectItem(root, name);
+                    if (!cJSON_IsObject(table))
+                            return;
+                    if (const cJSON *column = cJSON_GetObjectItem(table, "sortColumn"); cJSON_IsNumber(column)) {
+                            const int candidate = column->valueint;
+                            if (std::find(sortableColumns.begin(), sortableColumns.end(), candidate) != sortableColumns.end())
+                                    state.sortColumn = candidate;
+                    }
+                    if (const cJSON *direction = cJSON_GetObjectItem(table, "sortDirection"); cJSON_IsNumber(direction)) {
+                            if (direction->valueint == ImGuiSortDirection_Ascending ||
+                                direction->valueint == ImGuiSortDirection_Descending)
+                                    state.sortDirection = direction->valueint;
+                    }
+                    bool widthsLoaded = false;
+                    if (const cJSON *widths = cJSON_GetObjectItem(table, "columnWidths"); cJSON_IsArray(widths)) {
+                            const int count = std::min(columnCount, cJSON_GetArraySize(widths));
+                            for (int i = 0; i < count; ++i) {
+                                    const cJSON *width = cJSON_GetArrayItem(widths, i);
+                                    if (cJSON_IsNumber(width) && width->valuedouble > 1.0) {
+                                            state.widths[i] = static_cast<float>(width->valuedouble);
+                                            widthsLoaded    = true;
+                                    }
+                            }
+                    }
+                    if (widthsLoaded)
+                            state.restoreWidths = true;
+                    state.restoreSort = true;
+                    state.initialized = false;
+            };
+        loadTableUi("watchTableUi", watchTableUi_, 6, {0, 2, 3, 4, 5});
+        loadTableUi("symbolTableUi", symbolTableUi_, 4, {0, 1, 2, 3});
+        loadTableUi("binTableUi", binTableUi_, 3, {0, 1});
         cJSON *vArr = cJSON_GetObjectItem(root, "vars");
         if (cJSON_IsArray(vArr)) {
                 vars_.clear();
@@ -3423,11 +4641,30 @@ Variable::load(const void *node)
                                 continue;
                         v.name     = cJSON_GetObjectItem(vObj, "name")->valuestring;
                         v.type     = (DataType)cJSON_GetObjectItem(vObj, "type")->valueint;
-                        v.port     = (PortType)cJSON_GetObjectItem(vObj, "port")->valueint;
+                        v.port     = portFromJson(vObj);
                         v.addr     = (u64)cJSON_GetObjectItem(vObj, "addr")->valuedouble;
                         v.writable = cJSON_IsTrue(cJSON_GetObjectItem(vObj, "writable"));
+                        if (const cJSON *item = cJSON_GetObjectItem(vObj, "isStruct"); cJSON_IsBool(item))
+                                v.isStruct = cJSON_IsTrue(item);
+                        if (const cJSON *item = cJSON_GetObjectItem(vObj, "isUnion"); cJSON_IsBool(item))
+                                v.isUnion = cJSON_IsTrue(item);
+                        if (const cJSON *item = cJSON_GetObjectItem(vObj, "isArray"); cJSON_IsBool(item))
+                                v.isArray = cJSON_IsTrue(item);
                         if (cJSON_GetObjectItem(vObj, "typeOff"))
                                 v.typeOff = (u64)cJSON_GetObjectItem(vObj, "typeOff")->valuedouble;
+                        auto loadBinding = [vObj](const char *key, VarEntry::FunctionBinding &binding) {
+                                const cJSON *object = cJSON_GetObjectItem(vObj, key);
+                                if (!cJSON_IsObject(object))
+                                        return;
+                                if (const cJSON *source = cJSON_GetObjectItem(object, "source"); cJSON_IsString(source))
+                                        binding.sourcePath = source->valuestring;
+                                if (const cJSON *name = cJSON_GetObjectItem(object, "name"); cJSON_IsString(name))
+                                        binding.functionName = name->valuestring;
+                                if (const cJSON *sig = cJSON_GetObjectItem(object, "signature"); cJSON_IsString(sig))
+                                        binding.signature = sig->valuestring;
+                        };
+                        loadBinding("readFunction", v.readFunction);
+                        loadBinding("writeFunction", v.writeFunction);
                         if (v.port == PortType::SHM) {
                                 if (cJSON_GetObjectItem(vObj, "shmName"))
                                         snprintf(v.shm.name,
@@ -3463,6 +4700,7 @@ Variable::load(const void *node)
                                                 sf.byteOffset = (u32)(int)off->valuedouble;
                                         v.structFields.push_back(sf);
                                 }
+                                v.isStruct = v.isStruct || !v.structFields.empty();
                         }
                         if (v.port == PortType::LOCAL) {
                                 size_t bsz = (v.addr > 0) ? (size_t)v.addr : 8;
@@ -3572,6 +4810,10 @@ Variable::addRecursive(const std::string &fullPath, u64 addr, u64 typeOff, PortT
                 v.typeOff   = typeOff;
                 v.bitOffset = bitOffset;
                 v.bitSize   = bitSize;
+                v.isStruct  = t->kind == dwarf::TypeKind::STRUCT || t->kind == dwarf::TypeKind::UNION ||
+                             t->kind == dwarf::TypeKind::ARRAY;
+                v.isUnion = t->kind == dwarf::TypeKind::UNION;
+                v.isArray = t->kind == dwarf::TypeKind::ARRAY;
                 vars_.push_back(v);
                 isModified_ = true;
         } else {
@@ -3607,11 +4849,10 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
         if (!t)
                 return;
 
-        const char *devLabel = (port == PortType::SHM)      ? "SHM"
-                               : (port == PortType::LOCAL)  ? "LOCAL"
-                               : (port == PortType::MANUAL) ? "MANUAL"
-                               : (port == PortType::UDP)    ? "UDP"
-                                                            : "JLINK";
+        const char *devLabel = (port == PortType::SHM)     ? "SHM"
+                               : (port == PortType::LOCAL) ? "LOCAL"
+                               : (port == PortType::UDP)   ? "UDP"
+                                                           : "JLINK";
 
         auto drawValueCell =
             [&](u64 memberAddr, const char *sType, u64 memberTypeOff, const std::string &mPath, u32 bitOffset, u32 bitSize) {
@@ -3687,12 +4928,18 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         u64 memberAddr =
                             memberOverride && memberOverride->hasAddress ? memberOverride->address : defaultMemberAddr;
                         DataType effectiveType = baseSType ? Parser::strToDataType(baseSType) : DataType::UNKNOWN;
-                        if (baseSType && memberOverride && memberOverride->hasType)
+                        if (memberOverride && memberOverride->hasType)
                                 effectiveType = memberOverride->type;
-                        std::string effectiveTypeName = baseSType ? Parser::dataTypeToStr(effectiveType) : "";
-                        const char *sType             = baseSType ? effectiveTypeName.c_str() : nullptr;
-                        const bool  isComplex         = !sType;
-                        const bool  memberWritable =
+                        std::string effectiveTypeName =
+                            effectiveType != DataType::UNKNOWN ? Parser::dataTypeToStr(effectiveType) : "";
+                        const char        *sType     = effectiveType != DataType::UNKNOWN ? effectiveTypeName.c_str() : nullptr;
+                        const bool         isComplex = !sType;
+                        const dwarf::Type *memberType = resolveAlias(dwarfInfo_, m.type);
+                        const char        *complexTypeName =
+                            memberType && memberType->kind == dwarf::TypeKind::UNION
+                                       ? "UNION"
+                                       : (memberType && memberType->kind == dwarf::TypeKind::ARRAY ? "ARRAY" : "STRUCT");
+                        const bool memberWritable =
                             memberOverride && memberOverride->hasWritable ? memberOverride->writable : parentWritable;
                         const std::string displayName = memberOverride && !memberOverride->alias.empty()
                                                             ? memberOverride->alias
@@ -3773,10 +5020,19 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         }
 
                         {
-                                const dwarf::Type *mt = resolveAlias(dwarfInfo_, m.type);
-                                const bool         isMemberEnum =
-                                    mt && mt->kind == dwarf::TypeKind::ENUM && !(memberOverride && memberOverride->hasType);
+                                const dwarf::Type *mt            = resolveAlias(dwarfInfo_, m.type);
+                                const bool         hasCustomEnum = parentVarIdx >= 0 && parentVarIdx < (int)vars_.size() &&
+                                                           vars_[parentVarIdx].memberEnumDefs.contains(memberPath) &&
+                                                           !vars_[parentVarIdx].memberEnumDefs.at(memberPath).empty();
+                                const bool isMemberEnum = hasCustomEnum || (mt && mt->kind == dwarf::TypeKind::ENUM &&
+                                                                            !(memberOverride && memberOverride->hasType));
                                 if (ImGui::BeginPopupContextItem()) {
+                                        if (ImGui::MenuItem(tr("Delete", "删除"))) {
+                                                if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
+                                                        vars_[parentVarIdx].hiddenMembers.insert(memberPath);
+                                                        isModified_ = true;
+                                                }
+                                        }
                                         if (ImGui::MenuItem(tr("Edit Properties...", "编辑属性...")))
                                                 beginMemberProperties(parentVarIdx,
                                                                       memberPath,
@@ -3785,24 +5041,58 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                                                                 : DataType::UNKNOWN,
                                                                       baseSType != nullptr,
                                                                       parentWritable);
+                                        ImGui::Separator();
+                                        ImGui::TextDisabled("%s", tr("Access mode", "读写模式"));
+                                        auto setMemberWritable = [&](bool writable) {
+                                                if (parentVarIdx < 0 || parentVarIdx >= (int)vars_.size())
+                                                        return;
+                                                auto &memberOv       = vars_[parentVarIdx].memberOverrides[memberPath];
+                                                memberOv.hasWritable = true;
+                                                memberOv.writable    = writable;
+                                                isModified_          = true;
+                                                propertiesChanged_   = true;
+                                        };
+                                        if (ImGui::MenuItem(tr("Read only", "只读"), nullptr, !memberWritable))
+                                                setMemberWritable(false);
+                                        ImGui::BeginDisabled(port == PortType::AUDIO);
+                                        if (ImGui::MenuItem(tr("Read / write", "读写"), nullptr, memberWritable))
+                                                setMemberWritable(true);
+                                        ImGui::EndDisabled();
+                                        ImGui::Separator();
+                                        ImGui::BeginDisabled();
+                                        ImGui::MenuItem(tr("Bind Read/Write Functions...", "绑定读写函数..."));
+                                        ImGui::EndDisabled();
                                         const u32 traceSize =
                                             baseSType ? Parser::typeBytes(Parser::strToDataType(baseSType)) : 0;
-                                        if (port == PortType::JLINK && traceSize > 0 &&
-                                            ImGui::MenuItem(tr("Trace writes with DWT", "使用 DWT 跟踪写入"))) {
+                                        ImGui::BeginDisabled(port != PortType::JLINK || traceSize == 0);
+                                        if (ImGui::MenuItem(tr("Trace writes with DWT", "使用 DWT 跟踪写入"))) {
                                                 JLinkPort::instance().configureDwtWriteTrace(
                                                     static_cast<u32>(memberAddr), traceSize, memberPath);
                                         }
-                                        if (ImGui::MenuItem(tr("Delete", "删除"))) {
-                                                if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
-                                                        vars_[parentVarIdx].hiddenMembers.insert(memberPath);
-                                                        isModified_ = true;
-                                                }
-                                        }
-                                        if (isMemberEnum && ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
+                                        ImGui::EndDisabled();
+                                        const bool canEditMemberEnum = sType && isIntegerDataType(effectiveType);
+                                        ImGui::BeginDisabled(!canEditMemberEnum);
+                                        if (ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
                                                 enumSubEditParentIdx_     = parentVarIdx;
                                                 enumSubEditMemberPath_    = memberPath;
                                                 enumSubEditMemberTypeOff_ = m.type;
                                         }
+                                        ImGui::EndDisabled();
+                                        const int hiddenCount = parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()
+                                                                    ? (int)vars_[parentVarIdx].hiddenMembers.size()
+                                                                    : 0;
+                                        char      restoreLabel[96];
+                                        snprintf(restoreLabel,
+                                                 sizeof(restoreLabel),
+                                                 "%s (%d)",
+                                                 tr("Restore hidden", "恢复隐藏成员"),
+                                                 hiddenCount);
+                                        ImGui::BeginDisabled(hiddenCount == 0);
+                                        if (ImGui::MenuItem(restoreLabel)) {
+                                                vars_[parentVarIdx].hiddenMembers.clear();
+                                                isModified_ = true;
+                                        }
+                                        ImGui::EndDisabled();
                                         ImGui::EndPopup();
                                 }
                                 if (ImGui::IsItemHovered())
@@ -3817,9 +5107,9 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                         ImGui::TextUnformatted("...");
                                 ImGui::TableSetColumnIndex(2);
                                 if (isMemberEnum)
-                                        ImGui::TextUnformatted("ENUM");
+                                        ImGui::Text("ENUM (%s)", baseSType ? baseSType : "I32");
                                 else
-                                        ImGui::TextUnformatted(sType ? sType : "STRUCT");
+                                        ImGui::TextUnformatted(sType ? sType : complexTypeName);
                                 ImGui::TableSetColumnIndex(3);
                                 ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
                                 ImGui::TableSetColumnIndex(4);
@@ -3859,11 +5149,12 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         u64 memberAddr =
                             memberOverride && memberOverride->hasAddress ? memberOverride->address : defaultMemberAddr;
                         DataType effectiveType = baseSType ? Parser::strToDataType(baseSType) : DataType::UNKNOWN;
-                        if (baseSType && memberOverride && memberOverride->hasType)
+                        if (memberOverride && memberOverride->hasType)
                                 effectiveType = memberOverride->type;
-                        std::string effectiveTypeName = baseSType ? Parser::dataTypeToStr(effectiveType) : "";
-                        const char *sType             = baseSType ? effectiveTypeName.c_str() : nullptr;
-                        const bool  isComplex         = !sType;
+                        std::string effectiveTypeName =
+                            effectiveType != DataType::UNKNOWN ? Parser::dataTypeToStr(effectiveType) : "";
+                        const char *sType     = effectiveType != DataType::UNKNOWN ? effectiveTypeName.c_str() : nullptr;
+                        const bool  isComplex = !sType;
                         const bool  memberWritable =
                             memberOverride && memberOverride->hasWritable ? memberOverride->writable : parentWritable;
                         const std::string displayName =
@@ -3941,10 +5232,19 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                         }
 
                         {
-                                const dwarf::Type *et2 = resolveAlias(dwarfInfo_, t->inner);
-                                const bool         isElemEnum =
-                                    et2 && et2->kind == dwarf::TypeKind::ENUM && !(memberOverride && memberOverride->hasType);
+                                const dwarf::Type *et2           = resolveAlias(dwarfInfo_, t->inner);
+                                const bool         hasCustomEnum = parentVarIdx >= 0 && parentVarIdx < (int)vars_.size() &&
+                                                           vars_[parentVarIdx].memberEnumDefs.contains(memberPath) &&
+                                                           !vars_[parentVarIdx].memberEnumDefs.at(memberPath).empty();
+                                const bool isElemEnum = hasCustomEnum || (et2 && et2->kind == dwarf::TypeKind::ENUM &&
+                                                                          !(memberOverride && memberOverride->hasType));
                                 if (ImGui::BeginPopupContextItem()) {
+                                        if (ImGui::MenuItem(tr("Delete", "删除"))) {
+                                                if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
+                                                        vars_[parentVarIdx].hiddenMembers.insert(memberPath);
+                                                        isModified_ = true;
+                                                }
+                                        }
                                         if (ImGui::MenuItem(tr("Edit Properties...", "编辑属性...")))
                                                 beginMemberProperties(parentVarIdx,
                                                                       memberPath,
@@ -3953,24 +5253,58 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                                                                 : DataType::UNKNOWN,
                                                                       baseSType != nullptr,
                                                                       parentWritable);
+                                        ImGui::Separator();
+                                        ImGui::TextDisabled("%s", tr("Access mode", "读写模式"));
+                                        auto setElementWritable = [&](bool writable) {
+                                                if (parentVarIdx < 0 || parentVarIdx >= (int)vars_.size())
+                                                        return;
+                                                auto &memberOv       = vars_[parentVarIdx].memberOverrides[memberPath];
+                                                memberOv.hasWritable = true;
+                                                memberOv.writable    = writable;
+                                                isModified_          = true;
+                                                propertiesChanged_   = true;
+                                        };
+                                        if (ImGui::MenuItem(tr("Read only", "只读"), nullptr, !memberWritable))
+                                                setElementWritable(false);
+                                        ImGui::BeginDisabled(port == PortType::AUDIO);
+                                        if (ImGui::MenuItem(tr("Read / write", "读写"), nullptr, memberWritable))
+                                                setElementWritable(true);
+                                        ImGui::EndDisabled();
+                                        ImGui::Separator();
+                                        ImGui::BeginDisabled();
+                                        ImGui::MenuItem(tr("Bind Read/Write Functions...", "绑定读写函数..."));
+                                        ImGui::EndDisabled();
                                         const u32 traceSize =
                                             baseSType ? Parser::typeBytes(Parser::strToDataType(baseSType)) : 0;
-                                        if (port == PortType::JLINK && traceSize > 0 &&
-                                            ImGui::MenuItem(tr("Trace writes with DWT", "使用 DWT 跟踪写入"))) {
+                                        ImGui::BeginDisabled(port != PortType::JLINK || traceSize == 0);
+                                        if (ImGui::MenuItem(tr("Trace writes with DWT", "使用 DWT 跟踪写入"))) {
                                                 JLinkPort::instance().configureDwtWriteTrace(
                                                     static_cast<u32>(memberAddr), traceSize, memberPath);
                                         }
-                                        if (ImGui::MenuItem(tr("Delete", "删除"))) {
-                                                if (parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()) {
-                                                        vars_[parentVarIdx].hiddenMembers.insert(memberPath);
-                                                        isModified_ = true;
-                                                }
-                                        }
-                                        if (isElemEnum && ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
+                                        ImGui::EndDisabled();
+                                        const bool canEditElemEnum = sType && isIntegerDataType(effectiveType);
+                                        ImGui::BeginDisabled(!canEditElemEnum);
+                                        if (ImGui::MenuItem(tr("Edit Enum Definition...", "编辑枚举定义..."))) {
                                                 enumSubEditParentIdx_     = parentVarIdx;
                                                 enumSubEditMemberPath_    = memberPath;
                                                 enumSubEditMemberTypeOff_ = t->inner;
                                         }
+                                        ImGui::EndDisabled();
+                                        const int hiddenCount = parentVarIdx >= 0 && parentVarIdx < (int)vars_.size()
+                                                                    ? (int)vars_[parentVarIdx].hiddenMembers.size()
+                                                                    : 0;
+                                        char      restoreLabel[96];
+                                        snprintf(restoreLabel,
+                                                 sizeof(restoreLabel),
+                                                 "%s (%d)",
+                                                 tr("Restore hidden", "恢复隐藏成员"),
+                                                 hiddenCount);
+                                        ImGui::BeginDisabled(hiddenCount == 0);
+                                        if (ImGui::MenuItem(restoreLabel)) {
+                                                vars_[parentVarIdx].hiddenMembers.clear();
+                                                isModified_ = true;
+                                        }
+                                        ImGui::EndDisabled();
                                         ImGui::EndPopup();
                                 }
                                 if (ImGui::IsItemHovered())
@@ -3984,9 +5318,13 @@ Variable::drawVarVarTreeRow(const std::string &fullPath,
                                         ImGui::TextUnformatted("...");
                                 ImGui::TableSetColumnIndex(2);
                                 if (isElemEnum)
-                                        ImGui::TextUnformatted("ENUM");
+                                        ImGui::Text("ENUM (%s)", baseSType ? baseSType : "I32");
                                 else
-                                        ImGui::TextUnformatted(sType ? sType : "ARRAY");
+                                        ImGui::TextUnformatted(
+                                            sType ? sType
+                                                  : (et2 && et2->kind == dwarf::TypeKind::UNION
+                                                         ? "UNION"
+                                                         : (et2 && et2->kind == dwarf::TypeKind::STRUCT ? "STRUCT" : "ARRAY")));
                                 ImGui::TableSetColumnIndex(3);
                                 ImGui::Text("0x%08llX", (unsigned long long)memberAddr);
                                 ImGui::TableSetColumnIndex(4);
@@ -4051,7 +5389,7 @@ Variable::setLocalScalar(const std::string &name, double value)
         // variable of the same name is intentionally left untouched.
         DataType type = DataType::UNKNOWN;
         for (const auto &v : vars_)
-                if (v.name == name && v.port == PortType::LOCAL && v.structFields.empty()) {
+                if (v.name == name && v.port == PortType::LOCAL && !v.isStruct) {
                         type = v.type;
                         break;
                 }
@@ -4125,6 +5463,66 @@ Variable::setLocalScalar(const std::string &name, double value)
         isModified_ = true;
 }
 
+bool
+Variable::writeLocalScalarFromMonitor(const std::string &name, double value)
+{
+        const VarEntry *target = nullptr;
+        for (const auto &v : vars_)
+                if (v.name == name && v.port == PortType::LOCAL && !v.isStruct) {
+                        target = &v;
+                        break;
+                }
+        if (!target)
+                return false;
+
+        char text[64]{};
+        switch (target->type) {
+                case DataType::F32:
+                case DataType::F64:
+                        snprintf(text, sizeof(text), "%.17g", value);
+                        break;
+                case DataType::U8:
+                case DataType::U16:
+                case DataType::U32:
+                case DataType::U64:
+                        snprintf(text, sizeof(text), "%llu", static_cast<unsigned long long>(value));
+                        break;
+                case DataType::I8:
+                case DataType::I16:
+                case DataType::I32:
+                case DataType::I64:
+                        snprintf(text, sizeof(text), "%lld", static_cast<long long>(value));
+                        break;
+                default:
+                        return false;
+        }
+        writeVariable(*target, text);
+        return true;
+}
+
+bool
+Variable::openFunctionBindingFor(const std::string &name)
+{
+        for (int i = 0; i < static_cast<int>(vars_.size()); ++i) {
+                auto &variable = vars_[i];
+                if (variable.name != name || variable.port != PortType::LOCAL || variable.isStruct)
+                        continue;
+                const dwarf::Type *type = nullptr;
+                {
+                        std::lock_guard lk(mtxElf_);
+                        type = resolveAlias(dwarfInfo_, variable.typeOff);
+                }
+                if (type && (type->kind == dwarf::TypeKind::STRUCT || type->kind == dwarf::TypeKind::UNION ||
+                             type->kind == dwarf::TypeKind::ARRAY))
+                        return false;
+                functionBindIdx_   = i;
+                functionPanelOpen_ = true;
+                open_              = true;
+                return true;
+        }
+        return false;
+}
+
 void
 Variable::addLocalStructVar(const std::string &name, const std::vector<VarEntry::StructField> &fields, size_t totalSize)
 {
@@ -4173,7 +5571,7 @@ Variable::getPopupMembers(const std::string &varName, const std::string &pathPre
                 baseAddr = ve->addr;
 
         const dwarf::Type *t = resolveAlias(dwarfInfo_, typeOff);
-        if (!t || t->kind != dwarf::TypeKind::STRUCT)
+        if (!t || (t->kind != dwarf::TypeKind::STRUCT && t->kind != dwarf::TypeKind::UNION))
                 return result;
 
         for (const auto &m : t->members) {
@@ -4183,7 +5581,7 @@ Variable::getPopupMembers(const std::string &varName, const std::string &pathPre
                 pm.name     = m.name;
                 pm.typeOff  = m.type;
                 pm.addr     = baseAddr + m.offset;
-                pm.isStruct = mt && mt->kind == dwarf::TypeKind::STRUCT;
+                pm.isStruct = mt && (mt->kind == dwarf::TypeKind::STRUCT || mt->kind == dwarf::TypeKind::UNION);
                 if (!pm.isStruct) {
                         auto it   = memberValueCache_.find(mPath);
                         pm.valStr = (it != memberValueCache_.end()) ? it->second : "...";
@@ -4235,7 +5633,7 @@ Variable::refreshDwarfMember(const std::string &memberPath)
 
         while (!subPath.empty()) {
                 const dwarf::Type *t = resolveAlias(dwarfInfo_, typeOff);
-                if (!t || t->kind != dwarf::TypeKind::STRUCT)
+                if (!t || (t->kind != dwarf::TypeKind::STRUCT && t->kind != dwarf::TypeKind::UNION))
                         return;
 
                 std::string elem;
@@ -4379,7 +5777,7 @@ Variable::collectLocalChannelValues() const
         std::vector<std::pair<std::string, float>> outVals;
         std::lock_guard<std::mutex>                lk(mtxLocal_);
         for (const auto &v : vars_) {
-                if (v.port != PortType::LOCAL && v.port != PortType::MANUAL)
+                if (v.port != PortType::LOCAL)
                         continue;
                 auto it = localBufs_.find(v.name);
                 if (it == localBufs_.end() || it->second.empty())
@@ -4454,7 +5852,7 @@ Variable::readLocalScalar(const std::string &name, double &out) const
 {
         DataType type = DataType::UNKNOWN;
         for (const auto &v : vars_)
-                if (v.name == name && (v.port == PortType::LOCAL || v.port == PortType::MANUAL) && v.structFields.empty()) {
+                if (v.name == name && v.port == PortType::LOCAL && !v.isStruct) {
                         type = v.type;
                         break;
                 }

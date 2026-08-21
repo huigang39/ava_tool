@@ -85,7 +85,8 @@ BkpSramDebugger::resolveProtocolLayout(ProtocolLayout &layout) const
         layout.channelBase  = layout.control + 0x1cu;
         layout.status       = layout.control + 0x9cu;
         layout.errorChannel = layout.control + 0xa0u;
-        layout.stateBase    = layout.control + 0xa4u;
+        layout.dataSize     = layout.control + 0xb0u;
+        layout.stateBase    = layout.control + 0xb4u;
 
         auto resolve = [&](const char *name, std::uint32_t &address) {
                 std::uint32_t found = 0;
@@ -98,6 +99,7 @@ BkpSramDebugger::resolveProtocolLayout(ProtocolLayout &layout) const
         resolve("g_debug_trace_ctrl.sample_div", layout.sampleDiv);
         resolve("g_debug_trace_ctrl.status", layout.status);
         resolve("g_debug_trace_ctrl.error_channel", layout.errorChannel);
+        resolve("g_debug_trace_ctrl.data_size", layout.dataSize);
 
         std::uint32_t channel0Address = layout.channelBase;
         std::uint32_t channel0Type    = layout.channelBase + 4u;
@@ -109,17 +111,21 @@ BkpSramDebugger::resolveProtocolLayout(ProtocolLayout &layout) const
         layout.channelStride     = channel1Address > channel0Address ? channel1Address - channel0Address : 8u;
         layout.channelTypeOffset = channel0Type - channel0Address;
 
-        std::uint32_t state0Active = layout.stateBase;
-        std::uint32_t state1Active = layout.stateBase + 32u;
-        resolve("g_debug_trace_ctrl.state[0].active", state0Active);
-        resolve("g_debug_trace_ctrl.state[1].active", state1Active);
-        layout.stateBase   = state0Active;
-        layout.stateStride = state1Active > state0Active ? state1Active - state0Active : 32u;
+        // Anchor the state array at the first member of the structure, not at
+        // `active`. The firmware layout is address/type/active/...; anchoring at
+        // a later member makes all following DWARF-derived offsets too small.
+        std::uint32_t state0Base = layout.stateBase;
+        std::uint32_t state1Base = layout.stateBase + 32u;
+        resolve("g_debug_trace_ctrl.state[0].address", state0Base);
+        resolve("g_debug_trace_ctrl.state[1].address", state1Base);
+        layout.stateBase   = state0Base;
+        layout.stateStride = state1Base > state0Base ? state1Base - state0Base : 32u;
         auto stateOffset   = [&](const char *name, std::uint32_t &offset) {
                 std::uint32_t address = 0;
-                if (resolver(name, address) && address >= state0Active)
-                        offset = address - state0Active;
+                if (resolver(name, address) && address >= state0Base)
+                        offset = address - state0Base;
         };
+        stateOffset("g_debug_trace_ctrl.state[0].active", layout.stateActiveOffset);
         stateOffset("g_debug_trace_ctrl.state[0].address", layout.stateAddressOffset);
         stateOffset("g_debug_trace_ctrl.state[0].type", layout.stateTypeOffset);
         stateOffset("g_debug_trace_ctrl.state[0].buffer_address", layout.stateBufferOffset);
@@ -430,7 +436,10 @@ BkpSramDebugger::submitConfig(const ProtocolLayout             &layout,
 }
 
 bool
-BkpSramDebugger::readChannel(const ProtocolLayout &layout, const std::size_t index, const ValueType configuredType)
+BkpSramDebugger::readChannel(const ProtocolLayout &layout,
+                             const std::size_t     index,
+                             const ValueType       configuredType,
+                             std::uint32_t         sampleDiv)
 {
         if (index >= kMaxChannels)
                 return false;
@@ -441,21 +450,24 @@ BkpSramDebugger::readChannel(const ProtocolLayout &layout, const std::size_t ind
         std::vector<std::uint8_t> state(layout.stateStride);
         if (!jlink.readMem(stateAddress, layout.stateStride, state.data()))
                 return false;
-        auto field = [&](const std::uint32_t offset) {
+        auto field = [](const std::vector<std::uint8_t> &bytes, const std::uint32_t offset) {
                 std::uint32_t value = 0;
-                if (offset + sizeof(value) <= state.size())
-                        std::memcpy(&value, state.data() + offset, sizeof(value));
+                if (offset + sizeof(value) <= bytes.size())
+                        std::memcpy(&value, bytes.data() + offset, sizeof(value));
                 return value;
         };
 
-        const bool          active        = field(layout.stateActiveOffset) != 0u;
-        const std::uint32_t actualAddress = field(layout.stateAddressOffset);
-        const std::uint32_t actualTypeRaw = field(layout.stateTypeOffset);
-        const std::uint32_t sampleBase    = field(layout.stateBufferOffset);
-        const std::uint32_t capacity      = field(layout.stateCapacityOffset);
-        const std::uint32_t generation    = field(layout.stateGenerationOffset);
-        const std::uint32_t writeSeq      = field(layout.stateWriteSeqOffset);
-        const std::uint32_t overwrites    = field(layout.stateOverwritesOffset);
+        // Configuration is committed by the firmware before ACK is written, so
+        // the live reader only needs one metadata transaction per channel. Sample
+        // slots still use the two-snapshot commit-marker check below.
+        const bool          active        = field(state, layout.stateActiveOffset) != 0u;
+        const std::uint32_t actualAddress = field(state, layout.stateAddressOffset);
+        const std::uint32_t actualTypeRaw = field(state, layout.stateTypeOffset);
+        const std::uint32_t sampleBase    = field(state, layout.stateBufferOffset);
+        const std::uint32_t capacity      = field(state, layout.stateCapacityOffset);
+        const std::uint32_t generation    = field(state, layout.stateGenerationOffset);
+        const std::uint32_t writeSeq      = field(state, layout.stateWriteSeqOffset);
+        const std::uint32_t overwrites    = field(state, layout.stateOverwritesOffset);
         const ValueType     actualType    = actualTypeRaw <= static_cast<std::uint32_t>(ValueType::F32)
                                                 ? static_cast<ValueType>(actualTypeRaw)
                                                 : configuredType;
@@ -466,15 +478,23 @@ BkpSramDebugger::readChannel(const ProtocolLayout &layout, const std::size_t ind
                 runtime_[index].generation = generation;
                 return true;
         }
-        const std::uint64_t poolEnd = static_cast<std::uint64_t>(layout.data) + kDataPoolSize;
+        const std::uint32_t poolSize = kDataPoolSize;
+        const std::uint64_t poolEnd  = static_cast<std::uint64_t>(layout.data) + poolSize;
         const std::uint64_t bufferEnd =
             static_cast<std::uint64_t>(sampleBase) + static_cast<std::uint64_t>(capacity) * kSampleStride;
         if (capacity == 0u || capacity > kDataPoolSize / kSampleStride || sampleBase < layout.data || bufferEnd > poolEnd) {
-                setError(tr("Firmware returned an invalid debug-trace buffer layout.", "固件返回的调试跟踪缓冲区布局无效。"));
+                std::ostringstream message;
+                message << tr("Invalid trace-layout snapshot: ch=", "调试缓冲区快照无效：通道=") << index
+                        << ", base=" << hexAddress(sampleBase) << ", capacity=" << capacity
+                        << ", pool=" << hexAddress(layout.data) << ".." << hexAddress(static_cast<std::uint32_t>(poolEnd));
+                setStatus(message.str());
                 return false;
         }
 
-        std::uint32_t cursor = 0;
+        std::uint32_t cursor         = 0;
+        bool          plotTickKnown  = false;
+        std::uint32_t lastRawTick    = 0u;
+        double        plotTickOffset = 0.0;
         {
                 std::lock_guard lock(dataMtx_);
                 auto           &runtime = runtime_[index];
@@ -490,48 +510,73 @@ BkpSramDebugger::readChannel(const ProtocolLayout &layout, const std::size_t ind
                 const bool          ringFull = overwrites != 0u || writeSeq >= capacity;
                 const std::uint32_t oldest   = ringFull ? writeSeq - capacity : 0u;
                 if (!runtime.generationKnown || runtime.generation != generation) {
-                        runtime.generationKnown = true;
-                        runtime.generation      = generation;
-                        runtime.cursor          = oldest;
-                        runtime.displayType     = actualType;
-                        runtime.points.clear();
-                        runtime.display.clear();
+                        const bool preserveHistory         = runtime.preserveHistoryOnReacquire;
+                        runtime.generationKnown            = true;
+                        runtime.generation                 = generation;
+                        runtime.cursor                     = oldest;
+                        runtime.displayType                = actualType;
+                        runtime.preserveHistoryOnReacquire = false;
+                        if (!preserveHistory) {
+                                runtime.points.clear();
+                                runtime.display.clear();
+                                runtime.plotTickKnown  = false;
+                                runtime.lastRawTick    = 0u;
+                                runtime.plotTickOffset = 0.0;
+                        }
                 }
                 // A modular distance greater than the capacity means the reader fell behind.
                 // A normal numeric comparison is incorrect on the UINT32_MAX -> 0 boundary.
                 if (writeSeq - runtime.cursor > capacity)
                         runtime.cursor = writeSeq - capacity;
-                cursor = runtime.cursor;
+                cursor         = runtime.cursor;
+                plotTickKnown  = runtime.plotTickKnown;
+                lastRawTick    = runtime.lastRawTick;
+                plotTickOffset = runtime.plotTickOffset;
         }
 
-        const std::uint32_t       sampleBytes = capacity * kSampleStride;
-        std::vector<std::uint8_t> before(sampleBytes);
-        std::vector<std::uint8_t> after(sampleBytes);
-        if (!jlink.readMem(sampleBase, sampleBytes, before.data()))
-                return false;
-        if (!jlink.readMem(sampleBase, sampleBytes, after.data()))
-                return false;
-
+        sampleDiv               = std::max(sampleDiv, 1u);
         std::uint32_t remaining = writeSeq - cursor;
         if (remaining > capacity) {
                 cursor    = writeSeq - capacity;
                 remaining = capacity;
         }
-        const bool         attemptedRead = remaining != 0u;
+        const std::uint32_t       batchCursor   = cursor;
+        const bool                attemptedRead = remaining != 0u;
+        const std::uint32_t       firstSlot     = cursor % capacity;
+        const std::uint32_t       firstCount    = std::min(remaining, capacity - firstSlot);
+        const std::uint32_t       secondCount   = remaining - firstCount;
+        const std::size_t         pendingBytes  = static_cast<std::size_t>(remaining) * kSampleStride;
+        std::vector<std::uint8_t> before(pendingBytes);
+        std::vector<std::uint8_t> after(pendingBytes);
+        auto                      readPending = [&](std::vector<std::uint8_t> &destination) {
+                if (firstCount != 0u &&
+                    !jlink.readMem(sampleBase + firstSlot * kSampleStride, firstCount * kSampleStride, destination.data()))
+                        return false;
+                if (secondCount != 0u &&
+                    !jlink.readMem(sampleBase,
+                                   secondCount * kSampleStride,
+                                   destination.data() + static_cast<std::size_t>(firstCount) * kSampleStride))
+                        return false;
+                return true;
+        };
+        // Read only the newly produced logical range. Previously the complete
+        // per-channel ring was transferred twice every poll, which monopolized
+        // the shared J-Link transport and starved POLL/HSS.
+        if (remaining != 0u && (!readPending(before) || !readPending(after)))
+                return false;
+
         std::vector<Point> collected;
         std::uint64_t      dropped  = 0;
         std::uint32_t      expected = cursor;
         std::uint32_t      observed = cursor;
         while (remaining != 0u && !stopRequested_.load(std::memory_order_acquire)) {
                 --remaining;
-                const std::size_t offset    = static_cast<std::size_t>(cursor % capacity) * kSampleStride;
+                const std::size_t offset    = static_cast<std::size_t>(cursor - batchCursor) * kSampleStride;
                 std::uint32_t     seqBefore = 0;
                 std::uint32_t     seqAfter  = 0;
-                std::uint32_t     tick      = 0;
                 std::uint32_t     raw       = 0;
                 std::memcpy(&seqBefore, before.data() + offset, sizeof(seqBefore));
-                std::memcpy(&tick, before.data() + offset + 4u, sizeof(tick));
-                std::memcpy(&raw, before.data() + offset + 8u, sizeof(raw));
+                std::memcpy(&raw, before.data() + offset + 4u, sizeof(raw));
                 std::memcpy(&seqAfter, after.data() + offset, sizeof(seqAfter));
                 expected = cursor;
                 observed = seqAfter;
@@ -541,18 +586,10 @@ BkpSramDebugger::readChannel(const ProtocolLayout &layout, const std::size_t ind
                         continue;
                 }
 
-                collected.push_back(
-                    {cursor, tick, raw, static_cast<double>(tick), decodeValue(raw, actualType), sessionTimeSec()});
+                const std::uint32_t tick     = cursor * sampleDiv;
+                const double        plotTick = static_cast<double>(cursor) * static_cast<double>(sampleDiv);
+                collected.push_back({cursor, tick, raw, plotTick, decodeValue(raw, actualType), sessionTimeSec()});
                 ++cursor;
-        }
-
-        std::uint32_t generationAfter = 0;
-        if (!jlink.readMem(stateAddress + layout.stateGenerationOffset, sizeof(generationAfter), &generationAfter))
-                return false;
-        if (generationAfter != generation) {
-                std::lock_guard lock(dataMtx_);
-                runtime_[index].generationKnown = false;
-                return true; // discard the complete batch and reacquire layout
         }
 
         {
@@ -580,6 +617,9 @@ BkpSramDebugger::readChannel(const ProtocolLayout &layout, const std::size_t ind
                 runtime.observedSeq       = observed;
                 runtime.droppedSamples   += dropped;
                 runtime.validatedSamples += collected.size();
+                runtime.plotTickKnown     = plotTickKnown;
+                runtime.lastRawTick       = lastRawTick;
+                runtime.plotTickOffset    = plotTickOffset;
         }
         if (collected.empty() && attemptedRead)
                 setStatus(tr("Target ring buffer is being overwritten before J-Link can read it; increase the sample divider.",
@@ -591,6 +631,7 @@ void
 BkpSramDebugger::workerLoop(std::vector<ChannelConfig> config, const std::uint32_t sampleDiv, const ProtocolLayout layout)
 {
         std::uint64_t configuredEpoch    = 0u;
+        bool          captureConfigured  = false;
         int           readFailures       = 0;
         bool          rateKnown          = false;
         std::uint32_t lastRateWriteSeq   = 0u;
@@ -613,10 +654,23 @@ BkpSramDebugger::workerLoop(std::vector<ChannelConfig> config, const std::uint32
 
                 const std::uint64_t epoch = jlink.targetEpoch();
                 if (configuredEpoch != epoch) {
+                        if (captureConfigured) {
+                                // Do not automatically recommit after a reset: the v4
+                                // firmware deliberately freezes the retained ring. Leave
+                                // it untouched for the one-shot "Read Retained Data" path.
+                                actualSampleHz_.store(0.0f, std::memory_order_relaxed);
+                                actualReadHz_.store(0.0f, std::memory_order_relaxed);
+                                state_.store(State::Stopped, std::memory_order_release);
+                                setStatus(tr("Target reset detected; retained BKP history is frozen. Click Read Retained Data.",
+                                             "检测到目标复位；BKP 历史已冻结，请点击“读取保留数据”。"));
+                                return;
+                        }
                         {
                                 std::lock_guard lock(dataMtx_);
-                                for (auto &runtime : runtime_)
-                                        runtime.generationKnown = false;
+                                for (auto &runtime : runtime_) {
+                                        runtime.preserveHistoryOnReacquire = true;
+                                        runtime.generationKnown            = false;
+                                }
                         }
                         state_.store(State::Starting, std::memory_order_release);
                         setStatus(tr("Submitting configuration after target connection/reset...",
@@ -628,9 +682,10 @@ BkpSramDebugger::workerLoop(std::vector<ChannelConfig> config, const std::uint32
                                 }
                                 return;
                         }
-                        configuredEpoch = epoch;
-                        readFailures    = 0;
-                        rateKnown       = false;
+                        configuredEpoch   = epoch;
+                        captureConfigured = true;
+                        readFailures      = 0;
+                        rateKnown         = false;
                         actualSampleHz_.store(0.0f, std::memory_order_relaxed);
                         actualReadHz_.store(0.0f, std::memory_order_relaxed);
                         state_.store(State::Running, std::memory_order_release);
@@ -639,7 +694,7 @@ BkpSramDebugger::workerLoop(std::vector<ChannelConfig> config, const std::uint32
 
                 bool ok = true;
                 for (const auto &channel : config) {
-                        if (!readChannel(layout, channel.slot, channel.type)) {
+                        if (!readChannel(layout, channel.slot, channel.type, sampleDiv)) {
                                 ok = false;
                                 break;
                         }
@@ -652,14 +707,19 @@ BkpSramDebugger::workerLoop(std::vector<ChannelConfig> config, const std::uint32
                                 continue;
                         }
                         if (++readFailures >= 10) {
-                                setError(tr("Debug trace repeatedly failed while J-Link remained connected.",
-                                            "J-Link 保持连接时调试跟踪连续读取失败。"));
+                                const std::string detail = statusSnapshot();
+                                setError(detail.empty() ? tr("Debug trace repeatedly failed while J-Link remained connected.",
+                                                             "J-Link 保持连接时调试跟踪连续读取失败。")
+                                                        : detail);
                                 return;
                         }
-                        setStatus(tr("Debug trace read failed; retrying...", "调试跟踪读取失败，正在重试……"));
+                        if (statusSnapshot().empty())
+                                setStatus(tr("Debug trace read failed; retrying...", "调试跟踪读取失败，正在重试……"));
                         std::this_thread::sleep_for(std::chrono::milliseconds(20));
                         continue;
                 }
+                if (readFailures != 0)
+                        setStatus({});
                 readFailures = 0;
                 if (!config.empty()) {
                         std::uint32_t currentWriteSeq   = 0u;
@@ -798,12 +858,134 @@ void
 BkpSramDebugger::clearData()
 {
         std::lock_guard lock(dataMtx_);
-        for (auto &runtime : runtime_)
+        for (auto &runtime : runtime_) {
                 runtime.points.clear();
-        for (auto &runtime : runtime_)
                 runtime.display.clear();
+                runtime.plotTickKnown  = false;
+                runtime.lastRawTick    = 0u;
+                runtime.plotTickOffset = 0.0;
+        }
         for (auto &points : plotCache_)
                 points.clear();
+}
+
+void
+BkpSramDebugger::readRetainedHistory()
+{
+        const State currentState = state_.load(std::memory_order_acquire);
+        if (currentState == State::Running || currentState == State::Starting || currentState == State::Stopping)
+                return;
+
+        ProtocolLayout layout;
+        if (!resolveProtocolLayout(layout)) {
+                setError(tr("Load an ELF containing g_debug_trace_ctrl and g_debug_trace_data first.",
+                            "请先加载包含 g_debug_trace_ctrl 和 g_debug_trace_data 的 ELF。"));
+                return;
+        }
+        auto &jlink = JLinkPort::instance();
+        if (!jlink.isConnected()) {
+                setError(tr("J-Link is not connected.", "J-Link 未连接。"));
+                return;
+        }
+
+        state_.store(State::Starting, std::memory_order_release);
+        setStatus(tr("Reading retained BKP SRAM history...", "正在读取 BKP SRAM 保留历史……"));
+
+        std::vector<ChannelConfig> retained;
+        retained.reserve(kMaxChannels);
+        std::vector<ChannelConfig> previous;
+        {
+                std::lock_guard lock(configMtx_);
+                previous = channels_;
+        }
+
+        for (std::size_t slot = 0; slot < kMaxChannels; ++slot) {
+                const std::uint32_t stateAddress = layout.stateBase + static_cast<std::uint32_t>(slot) * layout.stateStride;
+                std::vector<std::uint8_t> bytes(layout.stateStride);
+                if (!jlink.readMem(stateAddress, layout.stateStride, bytes.data())) {
+                        setError(tr("Failed to read retained channel metadata.", "读取保留通道元数据失败。"));
+                        return;
+                }
+                auto field = [&](const std::uint32_t offset) {
+                        std::uint32_t value = 0u;
+                        if (offset + sizeof(value) <= bytes.size())
+                                std::memcpy(&value, bytes.data() + offset, sizeof(value));
+                        return value;
+                };
+                if (field(layout.stateActiveOffset) == 0u)
+                        continue;
+
+                const std::uint32_t address = field(layout.stateAddressOffset);
+                const std::uint32_t typeRaw = field(layout.stateTypeOffset);
+                if (typeRaw > static_cast<std::uint32_t>(ValueType::F32))
+                        continue;
+
+                ChannelConfig config;
+                const auto    old = std::find_if(previous.begin(), previous.end(), [&](const ChannelConfig &candidate) {
+                        return candidate.slot == slot && candidate.address == address;
+                });
+                if (old != previous.end()) {
+                        config = *old;
+                } else {
+                        config.name = "BKP Channel " + std::to_string(slot);
+                        config.slot = static_cast<std::uint32_t>(slot);
+                }
+                config.address                = address;
+                config.type                   = static_cast<ValueType>(typeRaw);
+                const std::string addressText = hexAddress(address);
+                std::snprintf(config.addressText, sizeof(config.addressText), "%s", addressText.c_str());
+                retained.push_back(std::move(config));
+        }
+
+        if (retained.empty()) {
+                state_.store(State::Stopped, std::memory_order_release);
+                setStatus(tr("No retained BKP SRAM channels were found.", "未找到保留的 BKP SRAM 通道。"));
+                return;
+        }
+
+        {
+                std::lock_guard lock(configMtx_);
+                channels_ = retained;
+        }
+        {
+                std::lock_guard lock(dataMtx_);
+                for (auto &runtime : runtime_) {
+                        runtime.points.clear();
+                        runtime.display.clear();
+                        runtime.generationKnown            = false;
+                        runtime.preserveHistoryOnReacquire = false;
+                        runtime.cursor                     = 0u;
+                        runtime.plotTickKnown              = false;
+                        runtime.lastRawTick                = 0u;
+                        runtime.plotTickOffset             = 0.0;
+                }
+                for (auto &points : plotCache_)
+                        points.clear();
+        }
+
+        std::uint32_t retainedSampleDiv = 1u;
+        if (!jlink.readMem(layout.sampleDiv, sizeof(retainedSampleDiv), &retainedSampleDiv)) {
+                setError(tr("Failed to read retained sample divider.", "读取保留采样分频失败。"));
+                return;
+        }
+        retainedSampleDiv = std::max(retainedSampleDiv, 1u);
+
+        std::uint64_t sampleCount = 0u;
+        for (const auto &channel : retained) {
+                if (!readChannel(layout, channel.slot, channel.type, retainedSampleDiv)) {
+                        setError(tr("Failed to read retained BKP SRAM samples.", "读取 BKP SRAM 保留样本失败。"));
+                        return;
+                }
+                std::lock_guard lock(dataMtx_);
+                sampleCount += runtime_[channel.slot].points.size();
+        }
+
+        modified_.store(true, std::memory_order_release);
+        state_.store(State::Stopped, std::memory_order_release);
+        std::ostringstream message;
+        message << tr("Retained history loaded: ", "保留历史读取完成：") << retained.size() << tr(" channels, ", " 个通道，")
+                << sampleCount << tr(" samples.", " 个样本。");
+        setStatus(message.str());
 }
 
 void
@@ -872,7 +1054,7 @@ BkpSramDebugger::draw()
         const bool  busy    = state == State::Starting || state == State::Stopping;
         const bool  running = state == State::Running;
         const bool  active  = running || state == State::Starting;
-        ImGui::TextDisabled("g_debug_trace_data: BKP SRAM (4096 B)");
+        ImGui::TextDisabled("g_debug_trace_ctrl: DTCM NOINIT | g_debug_trace_data: BKP SRAM (4096 B)");
         ImGui::SameLine();
         ImGui::TextDisabled("| %s", tr("16 channels max / dynamically shared ring pool", "最多 16 通道 / 动态均分环形数据池"));
 
@@ -961,6 +1143,9 @@ BkpSramDebugger::draw()
         ImGui::SameLine();
         if (ui::Button(tr("Export CSV", "导出 CSV"), ui::BtnStyle::Success))
                 exportCsv();
+        ImGui::SameLine();
+        if (ui::Button(tr("Read Retained Data", "读取保留数据"), ui::BtnStyle::Primary))
+                readRetainedHistory();
 
         const char *viewModeNames[] = {tr("FULL", "全览"), tr("FOLLOW", "跟随"), tr("MANUAL", "手动")};
         const float modeWidth       = 90.0f;

@@ -46,7 +46,7 @@ def udp_echo_server(host="0.0.0.0", port=2333):
 
 
 if __name__ == "__main__":
-    # 从命令行参数获取端口号（如果提供）
+    # 从命令行参数获取端口号(如果提供)
     port = 2333
     if len(sys.argv) > 1:
         try:

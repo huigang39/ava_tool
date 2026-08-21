@@ -126,13 +126,33 @@ class Gui
         struct CsvImportPending {
                 std::string                   monitorName;
                 std::vector<CsvChannelImport> channels;
+                std::string                   timeOriginText;
         };
         std::mutex                    mtxCsvPending_{};
         std::vector<CsvImportPending> csvPendingList_{};
 
-        void importCsvAsync(const std::string &path, const std::string &monitorName);
+        void importCsvAsync(const std::string &path, const std::string &monitorName, int timeColumn = -2, int timeUnit = 0);
         void importAudioAsync(const std::string &path, const std::string &monitorName);
         void processPendingCsvImports();
+
+        struct CsvImportDialog {
+                bool                     open{false};
+                std::string              path;
+                std::vector<std::string> headers;
+                int                      timeColumn{-1};
+                int                      timeUnit{0};
+        } csvImportDialog_{};
+        std::vector<std::string> csvImportQueue_{};
+        bool                     showEmptyImportPopup_{false};
+        std::string              emptyImportFile_{};
+        bool                     emptyImportIsCsv_{true};
+        bool                     showUnsupportedFilePopup_{false};
+        std::vector<std::string> unsupportedFiles_{};
+        void                     beginCsvImport(const std::string &path);
+        void                     drawCsvImportDialog();
+        void                     drawEmptyImportPopup();
+        void                     drawUnsupportedFilePopup();
+        void                     startCsvImport(const std::string &path, int timeColumn, int timeUnit = 0);
 
         // Auto-update (GitHub Releases). Checked once at startup and on demand from
         // the Help menu; the result drives an "update available" popup.

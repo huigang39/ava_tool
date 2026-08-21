@@ -15,7 +15,8 @@
 #include <time.h>
 
 #include "macrodef.h"
-#include "typedef.h"
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -47,167 +48,167 @@ extern "C" {
 #define S2CNT(s, hz)   ((s) * (hz))
 #define MS2CNT(ms, hz) ((ms) * (hz) / 1000.0F)
 
-#define TIMED_EXEC(ret, period_us, code)                               \
-        do {                                                           \
-                const u64 __start = get_mono_ts_us();                  \
-                {code};                                                \
-                const u64 __elapsed = get_mono_ts_us() - __start;      \
-                (ret)               = __elapsed;                       \
-                if (__elapsed < (period_us)) {                         \
-                        const u64 remaining = (period_us) - __elapsed; \
-                        delay_us(remaining);                           \
-                }                                                      \
-        } while (0)
+#define TIMED_EXEC(ret, period_us, code)                        \
+    do {                                                        \
+        const uint64_t __start = get_mono_ts_us();              \
+        {code};                                                 \
+        const uint64_t __elapsed = get_mono_ts_us() - __start;  \
+        (ret)                    = __elapsed;                   \
+        if (__elapsed < (period_us)) {                          \
+            const uint64_t remaining = (period_us) - __elapsed; \
+            delay_us(remaining);                                \
+        }                                                       \
+    } while (0)
 
-HAPI u64
+HAPI uint64_t
 get_mono_ts_ns(void)
 {
 #if OS(POSIX)
-        struct timespec ts;
+    struct timespec ts;
 #ifdef CLOCK_MONOTONIC_RAW
-        clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
 #else
-        clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
 #endif
-        return ts.tv_sec * NANO_PER_SEC + ts.tv_nsec;
+    return ts.tv_sec * NANO_PER_SEC + ts.tv_nsec;
 #elif OS(WIN)
-        LARGE_INTEGER frequency, counter;
-        QueryPerformanceFrequency(&frequency);
-        QueryPerformanceCounter(&counter);
-        u64 q = (u64)counter.QuadPart / (u64)frequency.QuadPart;
-        u64 r = (u64)counter.QuadPart % (u64)frequency.QuadPart;
-        return q * 1000000000ULL + (r * 1000000000ULL) / (u64)frequency.QuadPart;
+    LARGE_INTEGER frequency, counter;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&counter);
+    uint64_t q = (uint64_t)counter.QuadPart / (uint64_t)frequency.QuadPart;
+    uint64_t r = (uint64_t)counter.QuadPart % (uint64_t)frequency.QuadPart;
+    return q * 1000000000ULL + (r * 1000000000ULL) / (uint64_t)frequency.QuadPart;
 #endif
-        return 0;
+    return 0;
 }
 
-HAPI u64
+HAPI uint64_t
 get_mono_ts_us(void)
 {
-        return get_mono_ts_ns() / 1000;
+    return get_mono_ts_ns() / 1000;
 }
 
-HAPI u64
+HAPI uint64_t
 get_mono_ts_ms(void)
 {
-        return get_mono_ts_ns() / 1000000;
+    return get_mono_ts_ns() / 1000000;
 }
 
-HAPI u64
+HAPI uint64_t
 get_mono_ts_s(void)
 {
-        return get_mono_ts_ns() / 1000000000;
+    return get_mono_ts_ns() / 1000000000;
 }
 
-HAPI u64
+HAPI uint64_t
 get_real_ts_ns(void)
 {
 #if OS(POSIX)
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        return ts.tv_sec * NANO_PER_SEC + ts.tv_nsec;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec * NANO_PER_SEC + ts.tv_nsec;
 #elif OS(WIN)
-        FILETIME ft;
-        GetSystemTimeAsFileTime(&ft);
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
 
-        ULARGE_INTEGER uli;
-        uli.LowPart  = ft.dwLowDateTime;
-        uli.HighPart = ft.dwHighDateTime;
+    ULARGE_INTEGER uli;
+    uli.LowPart  = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
 
-        return (uli.QuadPart - WIN_TO_UNIX_EPOCH) * 100;
+    return (uli.QuadPart - WIN_TO_UNIX_EPOCH) * 100;
 #endif
-        return 0;
+    return 0;
 }
 
-HAPI u64
+HAPI uint64_t
 get_real_ts_us(void)
 {
-        return get_real_ts_ns() / 1000;
+    return get_real_ts_ns() / 1000;
 }
 
-HAPI u64
+HAPI uint64_t
 get_real_ts_ms(void)
 {
-        return get_real_ts_ns() / 1000000;
+    return get_real_ts_ns() / 1000000;
 }
 
-HAPI u64
+HAPI uint64_t
 get_real_ts_s(void)
 {
-        return get_real_ts_ns() / 1000000000;
+    return get_real_ts_ns() / 1000000000;
 }
 
-typedef enum {
-        DELAY_SPIN,
-        DELAY_YIELD,
-} delay_e;
+enum delay {
+    DELAY_SPIN,
+    DELAY_YIELD,
+};
 
 HAPI void
-spin(u32 us)
+spin(uint32_t us)
 {
-        u64 start = get_mono_ts_us();
-        while ((get_mono_ts_us() - start) < us)
-                ;
+    uint64_t start = get_mono_ts_us();
+    while ((get_mono_ts_us() - start) < us)
+        ;
 }
 
 #if OS(POSIX)
 HAPI void
-yield(const u32 ms)
+yield(const uint32_t ms)
 {
-        usleep((u32)(ms) * 1000);
+    usleep((uint32_t)(ms) * 1000);
 }
 #elif OS(WIN)
 HAPI void
-yield(const u32 ms)
+yield(const uint32_t ms)
 {
-        Sleep(ms);
+    Sleep(ms);
 }
 #else
 HAPI void
-yield(const u32 ms)
+yield(const uint32_t ms)
 {
-        spin(MS2US(ms));
+    spin(MS2US(ms));
 }
 #endif
 
 HAPI void
-delay_us(const u64 us)
+delay_us(const uint64_t us)
 {
-        spin((u32)us);
+    spin((uint32_t)us);
 }
 
 HAPI void
-delay_ms(const u64 ms, const delay_e e_delay)
+delay_ms(const uint64_t ms, const enum delay e_delay)
 {
-        switch (e_delay) {
-                case DELAY_SPIN: {
-                        spin((u32)MS2US(ms));
-                        break;
-                }
-                case DELAY_YIELD: {
-                        yield((u32)ms);
-                        break;
-                }
-                default:
-                        break;
+    switch (e_delay) {
+        case DELAY_SPIN: {
+            spin((uint32_t)MS2US(ms));
+            break;
         }
+        case DELAY_YIELD: {
+            yield((uint32_t)ms);
+            break;
+        }
+        default:
+            break;
+    }
 }
 
 HAPI void
-delay_s(const u64 s, const delay_e e_delay)
+delay_s(const uint64_t s, const enum delay e_delay)
 {
-        switch (e_delay) {
-                case DELAY_SPIN: {
-                        spin((u32)S2US(s));
-                        break;
-                }
-                case DELAY_YIELD: {
-                        yield((u32)S2MS(s));
-                        break;
-                }
-                default:
-                        break;
+    switch (e_delay) {
+        case DELAY_SPIN: {
+            spin((uint32_t)S2US(s));
+            break;
         }
+        case DELAY_YIELD: {
+            yield((uint32_t)S2MS(s));
+            break;
+        }
+        default:
+            break;
+    }
 }
 
 #ifdef __cplusplus

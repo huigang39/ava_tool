@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -9,11 +10,17 @@
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <memory>
 #include <string_view>
 #include <tuple>
+#include <unordered_set>
 
 #include "cJSON.h"
+#include "core/jlink_port.hpp"
+#include "core/type_codec.hpp"
 #include "gui/i18n.hpp"
+#include "gui/monitor.hpp"
+#include "gui/monitor_types.hpp"
 #include "imgui.h"
 #include "platform/native_dlg.hpp"
 
@@ -71,10 +78,364 @@ csvQuoted(const std::string &text)
 }
 } // namespace
 
+MidiTool::~MidiTool()
+{
+        stopPlayback();
+}
+
+bool
+MidiTool::writeTarget(const Target &target, float value)
+{
+        std::uint8_t bytes[8]{};
+        encodeFromF32(value, target.type, bytes);
+        if (target.bitSize != 0)
+                return JLinkPort::instance().writeMemBitfield(
+                    target.address, target.numBytes, bytes, target.bitOffset, target.bitSize);
+        return JLinkPort::instance().writeMem(target.address, target.numBytes, bytes);
+}
+
+bool
+MidiTool::validateTarget(Target &target, std::string &error)
+{
+        static constexpr const char *types[] = {"F32", "F64", "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64"};
+        if (!target.symbol.empty() && symbolResolver_) {
+                std::uint32_t resolved = 0;
+                if (symbolResolver_(target.symbol, resolved) && resolved != 0)
+                        target.address = resolved;
+        }
+        const bool supported =
+            std::any_of(std::begin(types), std::end(types), [&](const char *type) { return target.type == type; });
+        if (!supported) {
+                error = tr("Only scalar numeric variables can be used.", "只能使用标量数值变量。");
+                return false;
+        }
+        if (!target.writable) {
+                error = tr("The selected variable is read-only.", "所选变量为只读变量。");
+                return false;
+        }
+        if (target.address == 0) {
+                error = tr("The selected variable has no valid J-Link address.", "所选变量没有有效的 J-Link 地址。");
+                return false;
+        }
+        target.numBytes = target.numBytes == 0 ? typeBytes(target.type) : target.numBytes;
+        if (target.numBytes == 0 || target.numBytes > 8 ||
+            (target.bitSize != 0 &&
+             (target.bitOffset >= target.numBytes * 8 || target.bitSize > target.numBytes * 8 - target.bitOffset))) {
+                error = tr("Invalid variable width or bit-field metadata.", "变量宽度或位域信息无效。");
+                return false;
+        }
+        return true;
+}
+
+bool
+MidiTool::acceptTargetDrop(Target &target)
+{
+        bool accepted = false;
+        if (!ImGui::BeginDragDropTarget())
+                return false;
+        if (const ImGuiPayload *drop = ImGui::AcceptDragDropPayload("CHANNEL")) {
+                if (drop->DataSize == sizeof(ChannelDropPayload)) {
+                        const auto &source = *static_cast<const ChannelDropPayload *>(drop->Data);
+                        if (std::strcmp(source.device, "JLINK") == 0) {
+                                stopPlayback();
+                                target.name      = source.name;
+                                target.symbol    = source.name;
+                                target.type      = source.type;
+                                target.address   = static_cast<std::uint32_t>(source.addr);
+                                target.numBytes  = source.numBytes != 0 ? source.numBytes : typeBytes(target.type);
+                                target.bitOffset = source.bitOffset;
+                                target.bitSize   = source.bitSize;
+                                target.writable  = source.writable;
+                                accepted         = true;
+                        } else {
+                                status_ =
+                                    tr("HFI playback targets must be J-Link variables.", "HFI 播放目标必须是 J-Link 变量。");
+                                statusError_ = true;
+                        }
+                }
+        }
+        if (const ImGuiPayload *drop = ImGui::AcceptDragDropPayload("DND_CHANNEL_MOVE")) {
+                if (drop->DataSize == sizeof(ChannelMovePayload)) {
+                        const auto     &source = *static_cast<const ChannelMovePayload *>(drop->Data);
+                        MonitorChannel *channel =
+                            !source.isGroup && source.srcScope ? source.srcScope->findChannel(source.chName) : nullptr;
+                        if (channel && channel->getDevice() == "JLINK") {
+                                stopPlayback();
+                                target.name = channel->getName();
+                                target.symbol =
+                                    channel->getSymbolName().empty() ? channel->getName() : channel->getSymbolName();
+                                target.type     = channel->getType();
+                                target.address  = static_cast<std::uint32_t>(channel->getAddr());
+                                target.numBytes = channel->getNumBytes() != 0 ? channel->getNumBytes() : typeBytes(target.type);
+                                target.bitOffset = channel->getBitOffset();
+                                target.bitSize   = channel->getBitSize();
+                                target.writable  = channel->isWritable();
+                                accepted         = true;
+                        } else {
+                                status_ = tr("Drop one writable J-Link scalar channel.", "请拖入一个可写的 J-Link 标量通道。");
+                                statusError_ = true;
+                        }
+                }
+        }
+        ImGui::EndDragDropTarget();
+        if (accepted) {
+                std::string error;
+                if (!validateTarget(target, error)) {
+                        status_      = error;
+                        statusError_ = true;
+                        target       = Target{};
+                        return false;
+                }
+                status_      = tr("HFI target variable bound.", "HFI 目标变量已绑定。");
+                statusError_ = false;
+                modified_    = true;
+        }
+        return accepted;
+}
+
+void
+MidiTool::drawTarget(const char *label, const char *id, Target &target)
+{
+        ImGui::TextUnformatted(label);
+        ImGui::SameLine(145.0f);
+        std::string button = target.address == 0 ? std::string(tr("Drop a variable here", "拖入变量到这里"))
+                                                 : target.name + "  [" + target.type + "]  0x";
+        if (target.address != 0) {
+                char address[16];
+                std::snprintf(address, sizeof(address), "%08X", target.address);
+                button += address;
+        }
+        button += "###";
+        button += id;
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::Button(button.c_str(), ImVec2(-1.0f, 0.0f));
+        acceptTargetDrop(target);
+        if (ImGui::BeginPopupContextItem()) {
+                if (ImGui::MenuItem(tr("Clear binding", "清除绑定"))) {
+                        stopPlayback();
+                        target    = Target{};
+                        modified_ = true;
+                }
+                ImGui::EndPopup();
+        }
+        if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s",
+                                  tr("Drag from Variable Manager or Monitor; right-click to clear",
+                                     "从变量管理器或变量监视器拖入；右键清除"));
+}
+
+void
+MidiTool::stopPlayback()
+{
+        stopRequested_.store(true, std::memory_order_release);
+        playbackCv_.notify_all();
+        if (playbackThread_.joinable())
+                playbackThread_.join();
+        playbackState_.store(0, std::memory_order_release);
+        playbackMidiNote_.store(-1, std::memory_order_release);
+        playbackRowIndex_.store(-1, std::memory_order_release);
+        lastAutoScrolledRow_ = -1;
+        playbackFrequencyHz_.store(0.0f, std::memory_order_release);
+        playbackVoltage_.store(0.0f, std::memory_order_release);
+}
+
+void
+MidiTool::startPlayback()
+{
+        stopPlayback();
+        std::string error;
+        if (notes_.empty())
+                error = tr("Load a MIDI file first.", "请先加载 MIDI 文件。");
+        else if (!JLinkPort::instance().isConnected())
+                error = tr("Connect J-Link before playback.", "播放前请先连接 J-Link。");
+        else if (!validateTarget(frequencyTarget_, error) || !validateTarget(amplitudeTarget_, error)) {
+        } else if (frequencyTarget_.address == amplitudeTarget_.address)
+                error =
+                    tr("Frequency and voltage amplitude must use different variables.", "注入频率和电压幅值必须绑定不同变量。");
+        if (!error.empty()) {
+                status_      = error;
+                statusError_ = true;
+                return;
+        }
+
+        std::vector<Note> playbackNotes;
+        const double      pitch = std::pow(2.0, transpose_ / 12.0);
+        const double      speed = std::max(0.01, speedScale_);
+        for (std::size_t sourceRow = 0; sourceRow < notes_.size(); ++sourceRow) {
+                Note note = notes_[sourceRow];
+                if (trackFilter_ >= 0 && note.track != static_cast<std::uint32_t>(trackFilter_))
+                        continue;
+                if (channelFilter_ >= 0 && note.channel != static_cast<std::uint8_t>(channelFilter_))
+                        continue;
+                note.startSec    /= speed;
+                note.durationSec /= speed;
+                note.frequencyHz *= pitch;
+                note.sourceRow    = static_cast<int>(sourceRow);
+                playbackNotes.push_back(std::move(note));
+        }
+        if (playbackNotes.empty()) {
+                status_      = tr("No notes match the selected track/channel filter.", "没有音符符合当前轨道/通道筛选条件。");
+                statusError_ = true;
+                return;
+        }
+
+        stopRequested_.store(false, std::memory_order_release);
+        playbackWriteFailed_.store(false, std::memory_order_release);
+        playbackTimeSec_.store(0.0, std::memory_order_release);
+        playbackRowIndex_.store(-1, std::memory_order_release);
+        lastAutoScrolledRow_ = -1;
+        playbackState_.store(1, std::memory_order_release);
+        status_         = tr("HFI MIDI playback started.", "HFI MIDI 播放已开始。");
+        statusError_    = false;
+        playbackThread_ = std::thread(&MidiTool::playbackMain,
+                                      this,
+                                      std::move(playbackNotes),
+                                      frequencyTarget_,
+                                      amplitudeTarget_,
+                                      minVoltage_,
+                                      maxVoltage_,
+                                      polyphonyMode_);
+}
+
+void
+MidiTool::playbackMain(
+    std::vector<Note> notes, Target frequency, Target amplitude, double minVoltage, double maxVoltage, int polyphonyMode)
+{
+        struct Event {
+                double      time;
+                std::size_t note;
+                bool        on;
+        };
+        std::vector<Event> events;
+        events.reserve(notes.size() * 2);
+        for (std::size_t i = 0; i < notes.size(); ++i) {
+                events.push_back({notes[i].startSec, i, true});
+                events.push_back({notes[i].startSec + notes[i].durationSec, i, false});
+        }
+        std::sort(events.begin(), events.end(), [](const Event &a, const Event &b) {
+                if (a.time != b.time)
+                        return a.time < b.time;
+                return static_cast<int>(a.on) > static_cast<int>(b.on); // zero-duration note ends inactive
+        });
+
+        std::unordered_set<std::size_t> active;
+        auto                            origin     = std::chrono::steady_clock::now();
+        std::size_t                     eventIndex = 0;
+        std::size_t                     selected   = std::numeric_limits<std::size_t>::max();
+
+        if (!writeTarget(amplitude, 0.0f)) {
+                playbackWriteFailed_.store(true, std::memory_order_release);
+                playbackRowIndex_.store(-1, std::memory_order_release);
+                playbackState_.store(0, std::memory_order_release);
+                return;
+        }
+
+        while (eventIndex < events.size() && !stopRequested_.load(std::memory_order_acquire)) {
+                if (playbackState_.load(std::memory_order_acquire) == 2) {
+                        const auto        pausedAt        = std::chrono::steady_clock::now();
+                        const std::size_t pausedSelection = selected;
+                        if (!writeTarget(amplitude, 0.0f)) {
+                                playbackWriteFailed_.store(true, std::memory_order_release);
+                                break;
+                        }
+                        playbackVoltage_.store(0.0f, std::memory_order_release);
+                        std::unique_lock lock(playbackMutex_);
+                        playbackCv_.wait(lock, [&]() {
+                                return stopRequested_.load(std::memory_order_acquire) ||
+                                       playbackState_.load(std::memory_order_acquire) != 2;
+                        });
+                        origin += std::chrono::steady_clock::now() - pausedAt;
+                        if (!stopRequested_.load(std::memory_order_acquire) &&
+                            pausedSelection != std::numeric_limits<std::size_t>::max()) {
+                                const Note &note     = notes[pausedSelection];
+                                const float velocity = static_cast<float>(note.velocity) / 127.0f;
+                                const float volts    = static_cast<float>(minVoltage + (maxVoltage - minVoltage) * velocity);
+                                if (!writeTarget(frequency, static_cast<float>(note.frequencyHz)) ||
+                                    !writeTarget(amplitude, volts)) {
+                                        playbackWriteFailed_.store(true, std::memory_order_release);
+                                        break;
+                                }
+                                playbackVoltage_.store(volts, std::memory_order_release);
+                        }
+                        continue;
+                }
+
+                const auto   now     = std::chrono::steady_clock::now();
+                const double elapsed = std::chrono::duration<double>(now - origin).count();
+                playbackTimeSec_.store(elapsed, std::memory_order_release);
+                const double waitSec = events[eventIndex].time - elapsed;
+                if (waitSec > 0.0005) {
+                        std::unique_lock lock(playbackMutex_);
+                        playbackCv_.wait_for(lock, std::chrono::duration<double>(std::min(waitSec, 0.01)));
+                        continue;
+                }
+
+                const double eventTime = events[eventIndex].time;
+                while (eventIndex < events.size() && std::abs(events[eventIndex].time - eventTime) < 1e-9) {
+                        const Event &event = events[eventIndex++];
+                        if (event.on)
+                                active.insert(event.note);
+                        else
+                                active.erase(event.note);
+                }
+
+                std::size_t next = std::numeric_limits<std::size_t>::max();
+                for (std::size_t candidate : active) {
+                        if (next == std::numeric_limits<std::size_t>::max()) {
+                                next = candidate;
+                                continue;
+                        }
+                        if ((polyphonyMode == 0 && notes[candidate].midiNote > notes[next].midiNote) ||
+                            (polyphonyMode == 1 && notes[candidate].midiNote < notes[next].midiNote) ||
+                            (polyphonyMode == 2 && (notes[candidate].startSec > notes[next].startSec ||
+                                                    (notes[candidate].startSec == notes[next].startSec && candidate > next))))
+                                next = candidate;
+                }
+
+                if (next != selected) {
+                        selected = next;
+                        if (selected == std::numeric_limits<std::size_t>::max()) {
+                                if (!writeTarget(amplitude, 0.0f)) {
+                                        playbackWriteFailed_.store(true, std::memory_order_release);
+                                        break;
+                                }
+                                playbackMidiNote_.store(-1, std::memory_order_release);
+                                playbackRowIndex_.store(-1, std::memory_order_release);
+                                playbackFrequencyHz_.store(0.0f, std::memory_order_release);
+                                playbackVoltage_.store(0.0f, std::memory_order_release);
+                        } else {
+                                const Note &note     = notes[selected];
+                                const float hz       = static_cast<float>(note.frequencyHz);
+                                const float velocity = static_cast<float>(note.velocity) / 127.0f;
+                                const float volts    = static_cast<float>(minVoltage + (maxVoltage - minVoltage) * velocity);
+                                if (!writeTarget(frequency, hz) || !writeTarget(amplitude, volts)) {
+                                        playbackWriteFailed_.store(true, std::memory_order_release);
+                                        break;
+                                }
+                                playbackMidiNote_.store(note.midiNote, std::memory_order_release);
+                                playbackRowIndex_.store(note.sourceRow, std::memory_order_release);
+                                playbackFrequencyHz_.store(hz, std::memory_order_release);
+                                playbackVoltage_.store(volts, std::memory_order_release);
+                        }
+                }
+        }
+
+        writeTarget(amplitude, 0.0f);
+        if (!events.empty())
+                playbackTimeSec_.store(std::min(playbackTimeSec_.load(), events.back().time), std::memory_order_release);
+        playbackMidiNote_.store(-1, std::memory_order_release);
+        playbackRowIndex_.store(-1, std::memory_order_release);
+        playbackFrequencyHz_.store(0.0f, std::memory_order_release);
+        playbackVoltage_.store(0.0f, std::memory_order_release);
+        playbackState_.store(0, std::memory_order_release);
+}
+
 void
 MidiTool::setOpen(bool open)
 {
         if (open_ != open) {
+                if (!open)
+                        stopPlayback();
                 open_     = open;
                 modified_ = true;
         }
@@ -91,6 +452,7 @@ MidiTool::consumeModified()
 void
 MidiTool::clear()
 {
+        stopPlayback();
         notes_.clear();
         sourcePath_.clear();
         status_.clear();
@@ -105,6 +467,7 @@ MidiTool::clear()
 bool
 MidiTool::loadFile(const std::string &path)
 {
+        stopPlayback();
         FILE *file = nativeFopen(path, "rb");
         if (!file) {
                 status_      = tr("Cannot open MIDI file.", "无法打开 MIDI 文件。");
@@ -178,15 +541,20 @@ MidiTool::loadFile(const std::string &path)
                         continue;
                 }
 
-                const std::uint32_t                                 trackIndex = parsedTracks++;
-                std::string                                         trackName  = "Track " + std::to_string(trackIndex + 1);
-                std::array<std::uint8_t, 16>                        programs{};
-                std::array<std::array<std::deque<Active>, 128>, 16> active;
-                std::array<std::array<std::deque<Active>, 128>, 16> sustained;
-                std::array<bool, 16>                                sustainDown{};
-                std::uint64_t                                       tick          = 0;
-                std::uint8_t                                        runningStatus = 0;
-                std::size_t                                         p             = body;
+                const std::uint32_t          trackIndex = parsedTracks++;
+                std::string                  trackName  = "Track " + std::to_string(trackIndex + 1);
+                std::array<std::uint8_t, 16> programs{};
+                // 4096 std::deque objects are far too large for the Windows GUI
+                // thread stack when MIDI parsing is nested inside .ava loading.
+                // Keep the parser workspace on the heap so restoring a session
+                // cannot overflow the main-thread stack.
+                using NoteQueues               = std::array<std::array<std::deque<Active>, 128>, 16>;
+                auto                 active    = std::make_unique<NoteQueues>();
+                auto                 sustained = std::make_unique<NoteQueues>();
+                std::array<bool, 16> sustainDown{};
+                std::uint64_t        tick          = 0;
+                std::uint8_t         runningStatus = 0;
+                std::size_t          p             = body;
 
                 auto emitNote = [&](std::uint8_t channel, std::uint8_t note, const Active &start, std::uint64_t endTick) {
                         if (rawNotes.size() < kMaxNotes)
@@ -200,19 +568,19 @@ MidiTool::loadFile(const std::string &path)
                                                     trackName});
                 };
                 auto finishNote = [&](std::uint8_t channel, std::uint8_t note, std::uint64_t endTick) {
-                        auto &queue = active[channel][note];
+                        auto &queue = (*active)[channel][note];
                         if (queue.empty())
                                 return;
                         const Active start = queue.front();
                         queue.pop_front();
                         if (sustainDown[channel])
-                                sustained[channel][note].push_back(start);
+                                (*sustained)[channel][note].push_back(start);
                         else
                                 emitNote(channel, note, start, endTick);
                 };
                 auto releaseSustain = [&](std::uint8_t channel, std::uint64_t endTick) {
                         for (std::uint8_t note = 0; note < 128; ++note) {
-                                auto &queue = sustained[channel][note];
+                                auto &queue = (*sustained)[channel][note];
                                 while (!queue.empty()) {
                                         emitNote(channel, note, queue.front(), endTick);
                                         queue.pop_front();
@@ -302,7 +670,7 @@ MidiTool::loadFile(const std::string &path)
                                 break;
                         }
                         if (kind == 0x90 && b != 0)
-                                active[channel][a].push_back({tick, b, programs[channel]});
+                                (*active)[channel][a].push_back({tick, b, programs[channel]});
                         else if (kind == 0x80 || (kind == 0x90 && b == 0))
                                 finishNote(channel, a, tick);
                         else if (kind == 0xc0)
@@ -315,7 +683,7 @@ MidiTool::loadFile(const std::string &path)
                         } else if (kind == 0xb0 && (a == 120 || a == 123)) {
                                 sustainDown[channel] = false;
                                 for (std::uint8_t note = 0; note < 128; ++note)
-                                        while (!active[channel][note].empty())
+                                        while (!(*active)[channel][note].empty())
                                                 finishNote(channel, note, tick);
                                 releaseSustain(channel, tick);
                         }
@@ -325,7 +693,7 @@ MidiTool::loadFile(const std::string &path)
                 for (std::uint8_t ch = 0; ch < 16; ++ch)
                         for (std::uint8_t note = 0; note < 128; ++note) {
                                 sustainDown[ch] = false;
-                                while (!active[ch][note].empty())
+                                while (!(*active)[ch][note].empty())
                                         finishNote(ch, note, tick);
                         }
                 for (std::uint8_t ch = 0; ch < 16; ++ch)
@@ -448,7 +816,7 @@ MidiTool::exportCsv(const std::string &path) const
                 return false;
         std::fprintf(file,
                      "index,track,track_name,channel,program,midi_note,note_name,velocity,start_s,duration_s,end_s,"
-                     "note_hz,carrier_hz,lower_sideband_hz,upper_sideband_hz\r\n");
+                     "hfi_frequency_hz,hfi_voltage_v\r\n");
         const double speed = std::max(0.01, speedScale_);
         const double pitch = std::pow(2.0, transpose_ / 12.0);
         for (std::size_t i = 0; i < notes_.size(); ++i) {
@@ -456,9 +824,10 @@ MidiTool::exportCsv(const std::string &path) const
                 const double      hz    = note.frequencyHz * pitch;
                 const double      start = note.startSec / speed;
                 const double      dur   = note.durationSec / speed;
+                const double      volts = minVoltage_ + (maxVoltage_ - minVoltage_) * note.velocity / 127.0;
                 const std::string track = csvQuoted(note.trackName);
                 std::fprintf(file,
-                             "%zu,%u,%s,%u,%u,%u,%s,%u,%.9f,%.9f,%.9f,%.6f,%.6f,%.6f,%.6f\r\n",
+                             "%zu,%u,%s,%u,%u,%u,%s,%u,%.9f,%.9f,%.9f,%.6f,%.6f\r\n",
                              i,
                              note.track,
                              track.c_str(),
@@ -471,9 +840,7 @@ MidiTool::exportCsv(const std::string &path) const
                              dur,
                              start + dur,
                              hz,
-                             carrierHz_,
-                             std::max(0.0, carrierHz_ - hz),
-                             carrierHz_ + hz);
+                             volts);
         }
         return std::fclose(file) == 0;
 }
@@ -516,22 +883,86 @@ MidiTool::draw()
                                 ImGui::SetTooltip("%s", sourcePath_.c_str());
                 }
 
-                const double oldCarrier   = carrierHz_;
-                const double oldSpeed     = speedScale_;
-                const int    oldTranspose = transpose_;
-                ImGui::SetNextItemWidth(150.0f);
-                ImGui::InputDouble(tr("Carrier Hz", "载波 Hz"), &carrierHz_, 1000.0, 10000.0, "%.1f");
-                carrierHz_ = std::max(0.0, carrierHz_);
+                const int state = playbackState_.load(std::memory_order_acquire);
+                ImGui::BeginDisabled(state != 0);
+                drawTarget(tr("HFI frequency variable", "HFI 注入频率变量"), "hfi_frequency", frequencyTarget_);
+                drawTarget(tr("HFI voltage variable", "HFI 电压幅值变量"), "hfi_voltage", amplitudeTarget_);
+
+                const double oldSpeed      = speedScale_;
+                const double oldMinVoltage = minVoltage_;
+                const double oldMaxVoltage = maxVoltage_;
+                const int    oldTranspose  = transpose_;
+                const int    oldTrack      = trackFilter_;
+                const int    oldChannel    = channelFilter_;
+                const int    oldPolyphony  = polyphonyMode_;
+
+                ImGui::SetNextItemWidth(110.0f);
+                ImGui::InputDouble(tr("Min voltage", "最小电压"), &minVoltage_, 0.1, 1.0, "%.3f V");
                 ImGui::SameLine();
-                ImGui::SetNextItemWidth(120.0f);
+                ImGui::SetNextItemWidth(110.0f);
+                ImGui::InputDouble(tr("Max voltage", "最大电压"), &maxVoltage_, 0.1, 1.0, "%.3f V");
+                minVoltage_ = std::max(0.0, minVoltage_);
+                maxVoltage_ = std::max(minVoltage_, maxVoltage_);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(110.0f);
                 ImGui::SliderInt(tr("Transpose", "移调"), &transpose_, -48, 48, "%+d st");
                 ImGui::SameLine();
-                ImGui::SetNextItemWidth(120.0f);
+                ImGui::SetNextItemWidth(105.0f);
                 const double minSpeed = 0.1;
                 const double maxSpeed = 4.0;
                 ImGui::SliderScalar(tr("Speed", "速度"), ImGuiDataType_Double, &speedScale_, &minSpeed, &maxSpeed, "%.2fx");
-                if (carrierHz_ != oldCarrier || speedScale_ != oldSpeed || transpose_ != oldTranspose)
+
+                ImGui::SetNextItemWidth(90.0f);
+                ImGui::InputInt(tr("Track (-1=all)", "轨道（-1=全部）"), &trackFilter_);
+                trackFilter_ = std::clamp(trackFilter_, -1, std::max(-1, static_cast<int>(trackCount_) - 1));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(90.0f);
+                ImGui::InputInt(tr("Channel (-1=all)", "通道（-1=全部）"), &channelFilter_);
+                channelFilter_ = std::clamp(channelFilter_, -1, 15);
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(145.0f);
+                const char *polyphonyItems[] = {
+                    tr("Highest note", "最高音"), tr("Lowest note", "最低音"), tr("Latest note", "最后按下")};
+                ImGui::Combo(tr("Polyphony", "复音选择"), &polyphonyMode_, polyphonyItems, 3);
+
+                if (speedScale_ != oldSpeed || minVoltage_ != oldMinVoltage || maxVoltage_ != oldMaxVoltage ||
+                    transpose_ != oldTranspose || trackFilter_ != oldTrack || channelFilter_ != oldChannel ||
+                    polyphonyMode_ != oldPolyphony)
                         modified_ = true;
+                ImGui::EndDisabled();
+
+                if (ImGui::Button(tr("Start HFI playback", "开始 HFI 播放")))
+                        startPlayback();
+                ImGui::SameLine();
+                ImGui::BeginDisabled(state == 0);
+                if (state == 2) {
+                        if (ImGui::Button(tr("Resume", "继续"))) {
+                                playbackState_.store(1, std::memory_order_release);
+                                playbackCv_.notify_all();
+                        }
+                } else {
+                        if (ImGui::Button(tr("Pause", "暂停"))) {
+                                playbackState_.store(2, std::memory_order_release);
+                                playbackCv_.notify_all();
+                        }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(tr("Stop", "停止")))
+                        stopPlayback();
+                ImGui::EndDisabled();
+
+                ImGui::SameLine();
+                const int liveNote = playbackMidiNote_.load(std::memory_order_acquire);
+                if (playbackWriteFailed_.load(std::memory_order_acquire))
+                        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f),
+                                           "%s",
+                                           tr("J-Link write failed; playback stopped", "J-Link 写入失败，播放已停止"));
+                else if (state != 0)
+                        ImGui::Text(tr("Time %.3f s | %s | %.3f Hz | %.3f V", "时间 %.3f s | %s | %.3f Hz | %.3f V"),
+                                    playbackTimeSec_.load(std::memory_order_acquire),
+                                    liveNote >= 0 ? noteName(static_cast<std::uint8_t>(liveNote)).c_str() : tr("rest", "休止"),
+                                    playbackFrequencyHz_.load(std::memory_order_acquire),
+                                    playbackVoltage_.load(std::memory_order_acquire));
 
                 if (!notes_.empty()) {
                         ImGui::Text(tr("Format %u | Tracks %u | TPQN/SMPTE 0x%04X | Notes %zu | Tempo events %zu | "
@@ -555,7 +986,7 @@ MidiTool::draw()
                 const ImGuiTableFlags flags = ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
                                               ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
                                               ImGuiTableFlags_SizingFixedFit;
-                if (ImGui::BeginTable("##midi_notes", 12, flags, ImVec2(0, 0))) {
+                if (ImGui::BeginTable("##midi_notes", 10, flags, ImVec2(0, 0))) {
                         ImGui::TableSetupScrollFreeze(2, 1);
                         ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 55.0f);
                         ImGui::TableSetupColumn(tr("Track", "轨道"), ImGuiTableColumnFlags_WidthFixed, 65.0f);
@@ -565,14 +996,19 @@ MidiTool::draw()
                         ImGui::TableSetupColumn(tr("Start (s)", "开始 (s)"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
                         ImGui::TableSetupColumn(tr("Duration (s)", "时长 (s)"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
                         ImGui::TableSetupColumn(tr("End (s)", "结束 (s)"), ImGuiTableColumnFlags_WidthFixed, 100.0f);
-                        ImGui::TableSetupColumn(tr("Note Hz", "音符 Hz"), ImGuiTableColumnFlags_WidthFixed, 105.0f);
-                        ImGui::TableSetupColumn(tr("Carrier Hz", "载波 Hz"), ImGuiTableColumnFlags_WidthFixed, 105.0f);
-                        ImGui::TableSetupColumn(tr("Lower Hz", "下边带 Hz"), ImGuiTableColumnFlags_WidthFixed, 110.0f);
-                        ImGui::TableSetupColumn(tr("Upper Hz", "上边带 Hz"), ImGuiTableColumnFlags_WidthFixed, 110.0f);
+                        ImGui::TableSetupColumn(
+                            tr("HFI frequency Hz", "HFI 频率 Hz"), ImGuiTableColumnFlags_WidthFixed, 120.0f);
+                        ImGui::TableSetupColumn(tr("HFI voltage V", "HFI 电压 V"), ImGuiTableColumnFlags_WidthFixed, 110.0f);
                         ImGui::TableHeadersRow();
 
+                        const int liveRow = playbackRowIndex_.load(std::memory_order_acquire);
+                        if (liveRow < 0)
+                                lastAutoScrolledRow_ = -1;
+                        const bool       scrollToLiveRow = liveRow >= 0 && liveRow != lastAutoScrolledRow_;
                         ImGuiListClipper clipper;
                         clipper.Begin(static_cast<int>(notes_.size()));
+                        if (scrollToLiveRow && liveRow < static_cast<int>(notes_.size()))
+                                clipper.IncludeItemByIndex(liveRow);
                         const double speed = std::max(0.01, speedScale_);
                         const double pitch = std::pow(2.0, transpose_ / 12.0);
                         while (clipper.Step()) {
@@ -581,7 +1017,16 @@ MidiTool::draw()
                                         const double hz    = note.frequencyHz * pitch;
                                         const double start = note.startSec / speed;
                                         const double dur   = note.durationSec / speed;
+                                        const double volts = minVoltage_ + (maxVoltage_ - minVoltage_) * note.velocity / 127.0;
                                         ImGui::TableNextRow();
+                                        if (row == liveRow) {
+                                                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0,
+                                                                       ImGui::GetColorU32(ImVec4(1.0f, 0.68f, 0.08f, 0.42f)));
+                                                if (scrollToLiveRow) {
+                                                        ImGui::SetScrollHereY(0.5f);
+                                                        lastAutoScrolledRow_ = liveRow;
+                                                }
+                                        }
                                         ImGui::TableSetColumnIndex(0);
                                         ImGui::Text("%d", row);
                                         ImGui::TableSetColumnIndex(1);
@@ -603,11 +1048,7 @@ MidiTool::draw()
                                         ImGui::TableSetColumnIndex(8);
                                         ImGui::Text("%.3f", hz);
                                         ImGui::TableSetColumnIndex(9);
-                                        ImGui::Text("%.3f", carrierHz_);
-                                        ImGui::TableSetColumnIndex(10);
-                                        ImGui::Text("%.3f", std::max(0.0, carrierHz_ - hz));
-                                        ImGui::TableSetColumnIndex(11);
-                                        ImGui::Text("%.3f", carrierHz_ + hz);
+                                        ImGui::Text("%.3f", volts);
                                 }
                         }
                         ImGui::EndTable();
@@ -615,6 +1056,8 @@ MidiTool::draw()
         }
         ImGui::End();
         if (keepOpen != open_) {
+                if (!keepOpen)
+                        stopPlayback();
                 open_     = keepOpen;
                 modified_ = true;
         }
@@ -627,33 +1070,115 @@ MidiTool::save(void *node) const
         cJSON *obj  = cJSON_CreateObject();
         cJSON_AddBoolToObject(obj, "open", open_);
         cJSON_AddStringToObject(obj, "sourcePath", sourcePath_.c_str());
-        cJSON_AddNumberToObject(obj, "carrierHz", carrierHz_);
         cJSON_AddNumberToObject(obj, "speedScale", speedScale_);
         cJSON_AddNumberToObject(obj, "transpose", transpose_);
+        cJSON_AddNumberToObject(obj, "minVoltage", minVoltage_);
+        cJSON_AddNumberToObject(obj, "maxVoltage", maxVoltage_);
+        cJSON_AddNumberToObject(obj, "trackFilter", trackFilter_);
+        cJSON_AddNumberToObject(obj, "channelFilter", channelFilter_);
+        cJSON_AddNumberToObject(obj, "polyphonyMode", polyphonyMode_);
+        auto saveTarget = [obj](const char *name, const Target &target) {
+                cJSON *item = cJSON_CreateObject();
+                cJSON_AddStringToObject(item, "name", target.name.c_str());
+                cJSON_AddStringToObject(item, "symbol", target.symbol.c_str());
+                cJSON_AddStringToObject(item, "type", target.type.c_str());
+                cJSON_AddNumberToObject(item, "address", target.address);
+                cJSON_AddNumberToObject(item, "numBytes", target.numBytes);
+                cJSON_AddNumberToObject(item, "bitOffset", target.bitOffset);
+                cJSON_AddNumberToObject(item, "bitSize", target.bitSize);
+                cJSON_AddBoolToObject(item, "writable", target.writable);
+                cJSON_AddItemToObject(obj, name, item);
+        };
+        saveTarget("frequencyTarget", frequencyTarget_);
+        saveTarget("amplitudeTarget", amplitudeTarget_);
         cJSON_AddItemToObject(root, "midiTool", obj);
 }
 
 void
 MidiTool::load(const void *node)
 {
+        stopPlayback();
+        notes_.clear();
+        sourcePath_.clear();
+        status_.clear();
+        statusError_      = false;
+        open_             = false;
+        format_           = 0;
+        division_         = 0;
+        trackCount_       = 0;
+        tempoCount_       = 0;
+        durationSec_      = 0.0;
+        minBpm_           = 120.0;
+        maxBpm_           = 120.0;
+        speedScale_       = 1.0;
+        transpose_        = 0;
+        minVoltage_       = 0.0;
+        maxVoltage_       = 1.0;
+        trackFilter_      = -1;
+        channelFilter_    = -1;
+        polyphonyMode_    = 0;
+        frequencyTarget_  = Target{};
+        amplitudeTarget_  = Target{};
         const auto  *root = static_cast<const cJSON *>(node);
         const cJSON *obj  = cJSON_GetObjectItem(root, "midiTool");
         if (!cJSON_IsObject(obj)) {
                 modified_ = false;
                 return;
         }
+        bool savedOpen = open_;
         if (const cJSON *v = cJSON_GetObjectItem(obj, "open"); cJSON_IsBool(v))
-                open_ = cJSON_IsTrue(v);
-        if (const cJSON *v = cJSON_GetObjectItem(obj, "carrierHz"); cJSON_IsNumber(v))
-                carrierHz_ = std::max(0.0, v->valuedouble);
+                savedOpen = cJSON_IsTrue(v);
         if (const cJSON *v = cJSON_GetObjectItem(obj, "speedScale"); cJSON_IsNumber(v))
                 speedScale_ = std::clamp(v->valuedouble, 0.1, 4.0);
         if (const cJSON *v = cJSON_GetObjectItem(obj, "transpose"); cJSON_IsNumber(v))
                 transpose_ = std::clamp(v->valueint, -48, 48);
+        if (const cJSON *v = cJSON_GetObjectItem(obj, "minVoltage"); cJSON_IsNumber(v))
+                minVoltage_ = std::max(0.0, v->valuedouble);
+        if (const cJSON *v = cJSON_GetObjectItem(obj, "maxVoltage"); cJSON_IsNumber(v))
+                maxVoltage_ = std::max(minVoltage_, v->valuedouble);
+        if (const cJSON *v = cJSON_GetObjectItem(obj, "trackFilter"); cJSON_IsNumber(v))
+                trackFilter_ = v->valueint;
+        if (const cJSON *v = cJSON_GetObjectItem(obj, "channelFilter"); cJSON_IsNumber(v))
+                channelFilter_ = std::clamp(v->valueint, -1, 15);
+        if (const cJSON *v = cJSON_GetObjectItem(obj, "polyphonyMode"); cJSON_IsNumber(v))
+                polyphonyMode_ = std::clamp(v->valueint, 0, 2);
+        auto loadTarget = [obj](const char *name, Target &target) {
+                const cJSON *item = cJSON_GetObjectItem(obj, name);
+                if (!cJSON_IsObject(item))
+                        return;
+                if (const cJSON *v = cJSON_GetObjectItem(item, "name"); cJSON_IsString(v))
+                        target.name = v->valuestring;
+                if (const cJSON *v = cJSON_GetObjectItem(item, "symbol"); cJSON_IsString(v))
+                        target.symbol = v->valuestring;
+                if (const cJSON *v = cJSON_GetObjectItem(item, "type"); cJSON_IsString(v))
+                        target.type = v->valuestring;
+                if (const cJSON *v = cJSON_GetObjectItem(item, "address"); cJSON_IsNumber(v))
+                        target.address = static_cast<std::uint32_t>(v->valuedouble);
+                if (const cJSON *v = cJSON_GetObjectItem(item, "numBytes"); cJSON_IsNumber(v))
+                        target.numBytes = v->valueint;
+                if (const cJSON *v = cJSON_GetObjectItem(item, "bitOffset"); cJSON_IsNumber(v))
+                        target.bitOffset = v->valueint;
+                if (const cJSON *v = cJSON_GetObjectItem(item, "bitSize"); cJSON_IsNumber(v))
+                        target.bitSize = v->valueint;
+                if (const cJSON *v = cJSON_GetObjectItem(item, "writable"); cJSON_IsBool(v))
+                        target.writable = cJSON_IsTrue(v);
+        };
+        loadTarget("frequencyTarget", frequencyTarget_);
+        loadTarget("amplitudeTarget", amplitudeTarget_);
         if (const cJSON *v = cJSON_GetObjectItem(obj, "sourcePath"); cJSON_IsString(v) && v->valuestring[0]) {
-                std::error_code ec;
-                if (std::filesystem::is_regular_file(v->valuestring, ec))
+                // nativeFopen() performs the project's UTF-8 -> UTF-16 conversion
+                // on Windows. Constructing std::filesystem::path directly from a
+                // UTF-8 JSON string can throw for Chinese paths under the active
+                // Windows code page and used to abort the entire .ava load.
+                try {
                         loadFile(v->valuestring);
+                } catch (const std::exception &) {
+                        notes_.clear();
+                        sourcePath_  = v->valuestring;
+                        status_      = tr("MIDI could not be restored from this session.", "无法从该会话恢复 MIDI 文件。");
+                        statusError_ = true;
+                }
         }
+        open_     = savedOpen;
         modified_ = false;
 }

@@ -144,6 +144,7 @@ class JLinkPort
 
         void drawUI();
         void drawWindows();
+        void drawDllSettingsMenu();
         void openTraceWindow();
         void configureDwtWriteTrace(u32 address, u32 size, const std::string &name);
         void setTraceAddressResolver(std::function<std::string(u32)> resolver);
@@ -169,6 +170,22 @@ class JLinkPort
         std::atomic<int>  speedKHz_{4000};
         std::atomic<bool> configModified_{false};
         std::string       lastErr_{};
+
+        struct DllCandidate {
+                std::string path;
+                std::string version;
+        };
+        mutable std::mutex        dllMtx_{};
+        std::string               selectedDllPath_{}; // empty = bundled/default search
+        std::string               loadedDllPath_{};   // resolved path of the DLL actually loaded
+        std::vector<DllCandidate> dllCandidates_{};
+        std::string               dllScanLocation_{};
+        std::atomic<bool>         dllScanning_{false};
+        std::atomic<bool>         dllScanCancel_{false};
+        std::atomic<bool>         dllScanCompleted_{false};
+        std::thread               dllScanThread_{};
+        void                      startDllScan();
+        std::string               selectedDllPath() const;
 
         static constexpr int kMaxReadFails = 10;
         std::atomic<int>     readFailCount_{0};

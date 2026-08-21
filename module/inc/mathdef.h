@@ -16,20 +16,20 @@
 #include <math.h>
 
 #include "fastmath.h"
-#include "typedef.h"
+#include "motor_control/types.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 #ifdef FAST_MATH
-#define SIN(x)       fast_sinf(x)
-#define COS(x)       fast_cosf(x)
-#define TAN(x)       fast_tanf(x)
-#define EXP(x)       fast_expf(x)
-#define ABS(x)       fast_absf(x)
-#define SQRT(x)      fast_sqrtf(x)
-#define MOD(x, y)    fast_modf(x, y)
+#define SIN(x)       fast_sinf_rt(x)
+#define COS(x)       fast_cosf_rt(x)
+#define TAN(x)       fast_tanf_rt(x)
+#define EXP(x)       fast_expf_rt(x)
+#define ABS(x)       fast_absf_rt(x)
+#define SQRT(x)      fast_sqrtf_rt(x)
+#define MOD(x, y)    fast_modf_rt(x, y)
 #define CPYSGN(x, y) copysignf(x, y)
 #define LOG(x)       logf(x)
 #elif defined(ARM_MATH)
@@ -70,6 +70,7 @@ extern "C" {
 #define DIV_3_BY_2           (1.5000000F)
 #define SQRT_2               (1.4142135F)
 #define SQRT_3               (1.7320508F)
+#define DIV_1_BY_3           (0.3333333F)
 #define DIV_1_BY_SQRT_3      (0.5773502F)
 #define DIV_SQRT_3_BY_2      (0.8660254F)
 #define DIV_SQRT_2_BY_SQRT_3 (0.8164966F)
@@ -89,7 +90,29 @@ extern "C" {
 #define IS_INF(x)                        isinf(x)
 #define IS_IN_RANGE_CLOSE(val, min, max) ((val) >= (min) && (val) <= (max))
 #define IS_IN_RANGE_OPEN(val, min, max)  ((val) > (min) && (val) < (max))
-#define IS_SAME_DIR(x, y)                ((x) * (y) > 0 ? TRUE : FALSE)
+#define IS_SAME_DIR(x, y)                ((x) * (y) > 0 ? true : false)
+
+HAPI uint8_t
+f32_is_finite_rt(const float32_t val)
+{
+    return !IS_NAN(val) && !IS_INF(val);
+}
+
+HAPI float32_t
+f32_finite_or_rt(const float32_t val, const float32_t fallback)
+{
+    return f32_is_finite_rt(val) ? val : fallback;
+}
+
+HAPI float32_t
+wrap_pi_once_rt(const float32_t rad)
+{
+    if (rad > PI)
+        return rad - TAU;
+    if (rad < -PI)
+        return rad + TAU;
+    return rad;
+}
 
 #define SGN(x)                           ((x) == 0.0F ? 0.0F : (x) > 0.0F ? 1.0F : -1.0F)
 
@@ -117,46 +140,46 @@ extern "C" {
 #define OUTSHAFT2ELEC(theta, ratio, npp) ((theta) * (ratio) * (npp))
 #define ELEC2OUTSHAFT(theta, ratio, npp) ((theta) / (ratio) / (npp))
 
-#define RAW2THETA(cnt, full_cnt)         ((f32)(cnt) / (f32)full_cnt * TAU)
+#define RAW2THETA(cnt, full_cnt)         ((float32_t)(cnt) / (float32_t)full_cnt * TAU)
 
 #define TOGGLE_THETA(dir, theta)         ((dir) == -1 ? (TAU) - (theta) : (theta))
 #define TOGGLE_OMEGA(dir, omega)         ((dir) == -1 ? -(omega) : (omega))
 
-#define CYCLE_CNT(cnt, theta, prev_theta)                         \
-        do {                                                      \
-                if ((cnt) == 0 && (prev_theta) == 0.0F) {         \
-                        (prev_theta) = (theta);                   \
-                        break;                                    \
-                }                                                 \
-                const f32 __delta_theta = (theta) - (prev_theta); \
-                if (__delta_theta < -PI)                          \
-                        (cnt)++;                                  \
-                else if (__delta_theta > PI)                      \
-                        (cnt)--;                                  \
-                (prev_theta) = (theta);                           \
-        } while (0)
+#define CYCLE_CNT(cnt, theta, prev_theta)                       \
+    do {                                                        \
+        if ((cnt) == 0 && (prev_theta) == 0.0F) {               \
+            (prev_theta) = (theta);                             \
+            break;                                              \
+        }                                                       \
+        const float32_t __delta_theta = (theta) - (prev_theta); \
+        if (__delta_theta < -PI)                                \
+            (cnt)++;                                            \
+        else if (__delta_theta > PI)                            \
+            (cnt)--;                                            \
+        (prev_theta) = (theta);                                 \
+    } while (0)
 
 #define IS_POWER_OF_2(n)    ((n) != 0 && (((n) & ((n) - 1)) == 0))
 #define ROUNDUP_POW_OF_2(n) ((n) == 0 ? 1 : (1ULL << (sizeof(n) * 8 - clz64((n) - 1))))
 
-#define INTEGRATOR(ret, val, gain, fs)          \
-        do {                                    \
-                (ret) += (gain) * (val) / (fs); \
-        } while (0)
+#define INTEGRATOR(ret, val, gain, fs)  \
+    do {                                \
+        (ret) += (gain) * (val) / (fs); \
+    } while (0)
 
-#define DERIVATIVE(ret, val, prev_val, gain, fs)                   \
-        do {                                                       \
-                (ret)      = (gain) * ((val) - (prev_val)) * (fs); \
-                (prev_val) = (val);                                \
-        } while (0)
+#define DERIVATIVE(ret, val, prev_val, gain, fs)           \
+    do {                                                   \
+        (ret)      = (gain) * ((val) - (prev_val)) * (fs); \
+        (prev_val) = (val);                                \
+    } while (0)
 
-#define THETA_DERIVATIVE(ret, theta, prev_theta, gain, fs)      \
-        do {                                                    \
-                f32 __delta_theta;                              \
-                WARP_PI(__delta_theta, (theta) - (prev_theta)); \
-                (ret)        = (gain) * (__delta_theta) * (fs); \
-                (prev_theta) = (theta);                         \
-        } while (0)
+#define THETA_DERIVATIVE(ret, theta, prev_theta, gain, fs) \
+    do {                                                   \
+        float32_t __delta_theta;                           \
+        WARP_PI(__delta_theta, (theta) - (prev_theta));    \
+        (ret)        = (gain) * (__delta_theta) * (fs);    \
+        (prev_theta) = (theta);                            \
+    } while (0)
 
 /**
  * @brief 一阶低通滤波
@@ -166,16 +189,16 @@ extern "C" {
  * @param wc  截止频率 (rad/s)
  * @param fs  采样频率 (Hz)
  */
-#define LOWPASS(ret, val, wc, fs)                                                         \
-        do {                                                                              \
-                if ((wc) == 0.0F)                                                         \
-                        (ret) = (val);                                                    \
-                else {                                                                    \
-                        const f32 __rc    = 1.0F / (wc);                                  \
-                        const f32 __alpha = 1.0F / (1.0F + (__rc) * (fs));                \
-                        (ret)             = (__alpha) * (val) + (1.0F - __alpha) * (ret); \
-                }                                                                         \
-        } while (0)
+#define LOWPASS(ret, val, wc, fs)                                                   \
+    do {                                                                            \
+        if ((wc) == 0.0F)                                                           \
+            (ret) = (val);                                                          \
+        else {                                                                      \
+            const float32_t __rc    = 1.0F / (wc);                                  \
+            const float32_t __alpha = 1.0F / (1.0F + (__rc) * (fs));                \
+            (ret)                   = (__alpha) * (val) + (1.0F - __alpha) * (ret); \
+        }                                                                           \
+    } while (0)
 
 /**
  * @brief 一阶高通滤波 y[k] = beta * (y[k-1] + x[k] - x[k-1])
@@ -186,318 +209,330 @@ extern "C" {
  * @param wc       截止频率 (rad/s)
  * @param fs       采样频率 (Hz)
  */
-#define HIGHPASS(ret, val, prev_val, wc, fs)                                         \
-        do {                                                                         \
-                if ((wc) == 0.0F)                                                    \
-                        (ret) = 0.0F;                                                \
-                else {                                                               \
-                        const f32 __rc    = 1.0F / (wc);                             \
-                        const f32 __alpha = 1.0F / (1.0F + (__rc) * (fs));           \
-                        const f32 __beta  = 1.0F - (__alpha);                        \
-                        (ret)             = (__beta) * ((ret) + (val) - (prev_val)); \
-                        (prev_val)        = (val);                                   \
-                }                                                                    \
-        } while (0)
+#define HIGHPASS(ret, val, prev_val, wc, fs)                                   \
+    do {                                                                       \
+        if ((wc) == 0.0F)                                                      \
+            (ret) = 0.0F;                                                      \
+        else {                                                                 \
+            const float32_t __rc    = 1.0F / (wc);                             \
+            const float32_t __alpha = 1.0F / (1.0F + (__rc) * (fs));           \
+            const float32_t __beta  = 1.0F - (__alpha);                        \
+            (ret)                   = (__beta) * ((ret) + (val) - (prev_val)); \
+            (prev_val)              = (val);                                   \
+        }                                                                      \
+    } while (0)
 
-#define CLAMP(ret, min, max)                                      \
-        do {                                                      \
-                (ret) = ((ret) <= (min)) ? (min) : MIN(ret, max); \
-        } while (0)
+#define CLAMP(ret, min, max)                              \
+    do {                                                  \
+        (ret) = ((ret) <= (min)) ? (min) : MIN(ret, max); \
+    } while (0)
 
 #define CLAMP_RET(val, min, max) ((val) <= (min)) ? (min) : MIN(val, max)
 
-#define UVW_CLAMP(ret, min, max)              \
-        do {                                  \
-                CLAMP((ret).u, (min), (max)); \
-                CLAMP((ret).v, (min), (max)); \
-                CLAMP((ret).w, (min), (max)); \
-        } while (0)
+#define UVW_CLAMP(ret, min, max)      \
+    do {                              \
+        CLAMP((ret).u, (min), (max)); \
+        CLAMP((ret).v, (min), (max)); \
+        CLAMP((ret).w, (min), (max)); \
+    } while (0)
 
-#define WARP_PI(ret, rad)                        \
-        do {                                     \
-                f32 __tmp;                       \
-                if (ABS(rad) > TAU)              \
-                        __tmp = MOD((rad), TAU); \
-                else                             \
-                        __tmp = (rad);           \
-                if (__tmp > PI)                  \
-                        (ret) = __tmp - TAU;     \
-                else if (__tmp < -PI)            \
-                        (ret) = __tmp + TAU;     \
-                else                             \
-                        (ret) = __tmp;           \
-        } while (0)
+#define WARP_PI(ret, rad)            \
+    do {                             \
+        float32_t __tmp;             \
+        if (ABS(rad) > TAU)          \
+            __tmp = MOD((rad), TAU); \
+        else                         \
+            __tmp = (rad);           \
+        if (__tmp > PI)              \
+            (ret) = __tmp - TAU;     \
+        else if (__tmp < -PI)        \
+            (ret) = __tmp + TAU;     \
+        else                         \
+            (ret) = __tmp;           \
+    } while (0)
 
-#define WARP_TAU(ret, rad)                       \
-        do {                                     \
-                f32 __tmp;                       \
-                if (ABS(rad) > TAU)              \
-                        __tmp = MOD((rad), TAU); \
-                else                             \
-                        __tmp = (rad);           \
-                if (__tmp < 0.0F)                \
-                        (ret) = __tmp + TAU;     \
-                else                             \
-                        (ret) = __tmp;           \
-        } while (0)
+#define WARP_TAU(ret, rad)           \
+    do {                             \
+        float32_t __tmp;             \
+        if (ABS(rad) > TAU)          \
+            __tmp = MOD((rad), TAU); \
+        else                         \
+            __tmp = (rad);           \
+        if (__tmp < 0.0F)            \
+            (ret) = __tmp + TAU;     \
+        else                         \
+            (ret) = __tmp;           \
+    } while (0)
 
-#define UVW_ADD_VEC(ret, x, y)           \
-        do {                             \
-                (ret).u = (x).u + (y).u; \
-                (ret).v = (x).v + (y).v; \
-                (ret).w = (x).w + (y).w; \
-        } while (0)
+#define UVW_ADD_VEC(ret, x, y)   \
+    do {                         \
+        (ret).u = (x).u + (y).u; \
+        (ret).v = (x).v + (y).v; \
+        (ret).w = (x).w + (y).w; \
+    } while (0)
 
-#define UVW_SUB_VEC(ret, x, y)           \
-        do {                             \
-                (ret).u = (x).u - (y).u; \
-                (ret).v = (x).v - (y).v; \
-                (ret).w = (x).w - (y).w; \
-        } while (0)
+#define UVW_SUB_VEC(ret, x, y)   \
+    do {                         \
+        (ret).u = (x).u - (y).u; \
+        (ret).v = (x).v - (y).v; \
+        (ret).w = (x).w - (y).w; \
+    } while (0)
 
-#define UVW_MUL_VEC(ret, x, y)           \
-        do {                             \
-                (ret).u = (x).u * (y).u; \
-                (ret).v = (x).v * (y).v; \
-                (ret).w = (x).w * (y).w; \
-        } while (0)
+#define UVW_MUL_VEC(ret, x, y)   \
+    do {                         \
+        (ret).u = (x).u * (y).u; \
+        (ret).v = (x).v * (y).v; \
+        (ret).w = (x).w * (y).w; \
+    } while (0)
 
-#define UVW_DIV_VEC(ret, x, y)           \
-        do {                             \
-                (ret).u = (x).u / (y).u; \
-                (ret).v = (x).v / (y).v; \
-                (ret).w = (x).w / (y).w; \
-        } while (0)
+#define UVW_DIV_VEC(ret, x, y)   \
+    do {                         \
+        (ret).u = (x).u / (y).u; \
+        (ret).v = (x).v / (y).v; \
+        (ret).w = (x).w / (y).w; \
+    } while (0)
 
-#define UVW_ADD(ret, x, y)             \
-        do {                           \
-                (ret).u = (x).u + (y); \
-                (ret).v = (x).v + (y); \
-                (ret).w = (x).w + (y); \
-        } while (0)
+#define UVW_ADD(ret, x, y)     \
+    do {                       \
+        (ret).u = (x).u + (y); \
+        (ret).v = (x).v + (y); \
+        (ret).w = (x).w + (y); \
+    } while (0)
 
-#define UVW_SUB(ret, x, y)             \
-        do {                           \
-                (ret).u = (x).u - (y); \
-                (ret).v = (x).v - (y); \
-                (ret).w = (x).w - (y); \
-        } while (0)
+#define UVW_SUB(ret, x, y)     \
+    do {                       \
+        (ret).u = (x).u - (y); \
+        (ret).v = (x).v - (y); \
+        (ret).w = (x).w - (y); \
+    } while (0)
 
-#define UVW_MUL(ret, x, y)             \
-        do {                           \
-                (ret).u = (x).u * (y); \
-                (ret).v = (x).v * (y); \
-                (ret).w = (x).w * (y); \
-        } while (0)
+#define UVW_MUL(ret, x, y)     \
+    do {                       \
+        (ret).u = (x).u * (y); \
+        (ret).v = (x).v * (y); \
+        (ret).w = (x).w * (y); \
+    } while (0)
 
-#define UVW_DIV(ret, x, y)             \
-        do {                           \
-                (ret).u = (x).u / (y); \
-                (ret).v = (x).v / (y); \
-                (ret).w = (x).w / (y); \
-        } while (0)
+#define UVW_DIV(ret, x, y)     \
+    do {                       \
+        (ret).u = (x).u / (y); \
+        (ret).v = (x).v / (y); \
+        (ret).w = (x).w / (y); \
+    } while (0)
 
-#define AB_ADD_VEC(ret, x, y)            \
-        do {                             \
-                (ret).a = (x).a + (y).a; \
-                (ret).b = (x).b + (y).b; \
-        } while (0)
+#define AB_ADD_VEC(ret, x, y)    \
+    do {                         \
+        (ret).a = (x).a + (y).a; \
+        (ret).b = (x).b + (y).b; \
+    } while (0)
 
-#define AB_SUB_VEC(ret, x, y)            \
-        do {                             \
-                (ret).a = (x).a - (y).a; \
-                (ret).b = (x).b - (y).b; \
-        } while (0)
+#define AB_SUB_VEC(ret, x, y)    \
+    do {                         \
+        (ret).a = (x).a - (y).a; \
+        (ret).b = (x).b - (y).b; \
+    } while (0)
 
-#define AB_MUL_VEC(ret, x, y)            \
-        do {                             \
-                (ret).a = (x).a * (y).a; \
-                (ret).b = (x).b * (y).b; \
-        } while (0)
+#define AB_MUL_VEC(ret, x, y)    \
+    do {                         \
+        (ret).a = (x).a * (y).a; \
+        (ret).b = (x).b * (y).b; \
+    } while (0)
 
-#define AB_DIV_VEC(ret, x, y)            \
-        do {                             \
-                (ret).a = (x).a / (y).a; \
-                (ret).b = (x).b / (y).b; \
-        } while (0)
+#define AB_DIV_VEC(ret, x, y)    \
+    do {                         \
+        (ret).a = (x).a / (y).a; \
+        (ret).b = (x).b / (y).b; \
+    } while (0)
 
-HAPI u8
-is_f32_equal(const f32 x, const f32 y, const f32 rel_tol, const f32 abs_tol)
+HAPI uint8_t
+is_f32_equal(const float32_t x, const float32_t y, const float32_t rel_tol, const float32_t abs_tol)
 {
-        /* 计算两数的绝对差值 */
-        const f32 diff = ABS(x - y);
+    /* 计算两数的绝对差值 */
+    const float32_t diff = ABS(x - y);
 
-        /* 绝对误差检查 */
-        if (diff <= abs_tol)
-                return TRUE;
+    /* 绝对误差检查 */
+    if (diff <= abs_tol)
+        return true;
 
-        /* 相对误差检查 */
-        const f32 abs_x   = ABS(x);
-        const f32 abs_y   = ABS(y);
-        const f32 max_val = (abs_x > abs_y) ? abs_x : abs_y;
+    /* 相对误差检查 */
+    const float32_t abs_x   = ABS(x);
+    const float32_t abs_y   = ABS(y);
+    const float32_t max_val = (abs_x > abs_y) ? abs_x : abs_y;
 
-        /* 判定差值是否在最大值的相对允许比例范围内 */
-        return diff <= (max_val * rel_tol);
+    /* 判定差值是否在最大值的相对允许比例范围内 */
+    return diff <= (max_val * rel_tol);
 }
 
-HAPI f32_ab_t
-clarke_amp(const f32_uvw_t f32_abc)
+HAPI struct f32_ab
+clarke_amp_rt(const struct f32_uvw f32_abc)
 {
-        f32_ab_t f32_ab;
-        f32_ab.a = DIV_2_BY_3 * (f32_abc.u - 0.5f * (f32_abc.v + f32_abc.w));
-        f32_ab.b = DIV_2_BY_3 * (f32_abc.v - f32_abc.w) * DIV_SQRT_3_BY_2;
-        return f32_ab;
+    struct f32_ab f32_ab;
+    f32_ab.a = DIV_2_BY_3 * (f32_abc.u - 0.5F * (f32_abc.v + f32_abc.w));
+    f32_ab.b = DIV_2_BY_3 * (f32_abc.v - f32_abc.w) * DIV_SQRT_3_BY_2;
+    return f32_ab;
 }
 
-HAPI f32_ab_t
-clarke_pow(const f32_uvw_t f32_abc)
+HAPI struct f32_ab
+clarke_pow(const struct f32_uvw f32_abc)
 {
-        f32_ab_t f32_ab;
-        f32_ab.a = DIV_SQRT_2_BY_SQRT_3 * (f32_abc.u - 0.5f * (f32_abc.v + f32_abc.w));
-        f32_ab.b = DIV_SQRT_2_BY_SQRT_3 * (f32_abc.v - f32_abc.w) * DIV_SQRT_3_BY_2;
-        return f32_ab;
+    struct f32_ab f32_ab;
+    f32_ab.a = DIV_SQRT_2_BY_SQRT_3 * (f32_abc.u - 0.5F * (f32_abc.v + f32_abc.w));
+    f32_ab.b = DIV_SQRT_2_BY_SQRT_3 * (f32_abc.v - f32_abc.w) * DIV_SQRT_3_BY_2;
+    return f32_ab;
 }
 
-HAPI f32_uvw_t
-inv_clarke(const f32_ab_t f32_ab)
+HAPI struct f32_uvw
+inv_clarke_rt(const struct f32_ab f32_ab)
 {
-        f32_uvw_t f32_uvw;
-        const f32 f32_a = -(f32_ab.a * 0.5f);
-        const f32 f32_b = f32_ab.b * DIV_SQRT_3_BY_2;
-        f32_uvw.u       = f32_ab.a;
-        f32_uvw.v       = f32_a + f32_b;
-        f32_uvw.w       = f32_a - f32_b;
-        return f32_uvw;
+    struct f32_uvw  f32_uvw;
+    const float32_t f32_a = -(f32_ab.a * 0.5F);
+    const float32_t f32_b = f32_ab.b * DIV_SQRT_3_BY_2;
+    f32_uvw.u             = f32_ab.a;
+    f32_uvw.v             = f32_a + f32_b;
+    f32_uvw.w             = f32_a - f32_b;
+    return f32_uvw;
 }
 
-HAPI f32_dq_t
-park(const f32_ab_t f32_ab, const f32 theta)
+HAPI struct f32_dq
+park_sincos_rt(const struct f32_ab f32_ab, const float32_t sin_theta, const float32_t cos_theta)
 {
-        f32_dq_t f32_dq;
-        f32_dq.d = f32_ab.b * SIN(theta) + f32_ab.a * COS(theta);
-        f32_dq.q = f32_ab.b * COS(theta) - f32_ab.a * SIN(theta);
-        return f32_dq;
+    struct f32_dq f32_dq;
+    f32_dq.d = f32_ab.b * sin_theta + f32_ab.a * cos_theta;
+    f32_dq.q = f32_ab.b * cos_theta - f32_ab.a * sin_theta;
+    return f32_dq;
 }
 
-HAPI f32_ab_t
-inv_park(const f32_dq_t f32_dq, const f32 theta)
+HAPI struct f32_ab
+inv_park_sincos_rt(const struct f32_dq f32_dq, const float32_t sin_theta, const float32_t cos_theta)
 {
-        f32_ab_t f32_ab;
-        f32_ab.a = f32_dq.d * COS(theta) - f32_dq.q * SIN(theta);
-        f32_ab.b = f32_dq.d * SIN(theta) + f32_dq.q * COS(theta);
-        return f32_ab;
+    struct f32_ab f32_ab;
+    f32_ab.a = f32_dq.d * cos_theta - f32_dq.q * sin_theta;
+    f32_ab.b = f32_dq.d * sin_theta + f32_dq.q * cos_theta;
+    return f32_ab;
+}
+
+HAPI struct f32_dq
+park_rt(const struct f32_ab f32_ab, const float32_t theta)
+{
+    return park_sincos_rt(f32_ab, SIN(theta), COS(theta));
+}
+
+HAPI struct f32_ab
+inv_park_rt(const struct f32_dq f32_dq, const float32_t theta)
+{
+    return inv_park_sincos_rt(f32_dq, SIN(theta), COS(theta));
 }
 
 HAPI void
-find_max(const f32 *arr, const usize n, f32 *max_val, usize *max_idx)
+find_max(const float32_t *arr, const size_t n, float32_t *max_val, size_t *max_idx)
 {
-        if (n == 0) {
-                *max_val = 0.0f;
-                *max_idx = 0;
-                return;
-        }
+    if (n == 0) {
+        *max_val = 0.0F;
+        *max_idx = 0;
+        return;
+    }
 
 #if defined(__AVX__)
-        usize  i       = 0;
-        __m256 max_vec = _mm256_set1_ps(arr[0]);
-        f32    tmp_max = arr[0];
-        usize  idx_max = 0;
+    size_t    i       = 0;
+    __m256    max_vec = _mm256_set1_ps(arr[0]);
+    float32_t tmp_max = arr[0];
+    size_t    idx_max = 0;
 
-        for (; i + 7 < n; i += 8) {
-                __m256 v = _mm256_loadu_ps(arr + i);
-                max_vec  = _mm256_max_ps(max_vec, v);
+    for (; i + 7 < n; i += 8) {
+        __m256 v = _mm256_loadu_ps(arr + i);
+        max_vec  = _mm256_max_ps(max_vec, v);
 
-                f32 tmp[8];
-                _mm256_storeu_ps(tmp, max_vec);
-                for (int j = 0; j < 8; j++) {
-                        if (tmp[j] > tmp_max) {
-                                tmp_max = tmp[j];
-                                idx_max = i + j;
-                        }
-                }
+        float32_t tmp[8];
+        _mm256_storeu_ps(tmp, max_vec);
+        for (int j = 0; j < 8; j++) {
+            if (tmp[j] > tmp_max) {
+                tmp_max = tmp[j];
+                idx_max = i + j;
+            }
         }
+    }
 
-        for (; i < n; i++) {
-                if (arr[i] > tmp_max) {
-                        tmp_max = arr[i];
-                        idx_max = i;
-                }
+    for (; i < n; i++) {
+        if (arr[i] > tmp_max) {
+            tmp_max = arr[i];
+            idx_max = i;
         }
+    }
 
-        *max_val = tmp_max;
-        *max_idx = idx_max;
+    *max_val = tmp_max;
+    *max_idx = idx_max;
 
 #elif defined(__SSE__)
-        usize  i       = 0;
-        __m128 max_vec = _mm_set1_ps(arr[0]);
-        f32    tmp_max = arr[0];
-        usize  idx_max = 0;
+    size_t    i       = 0;
+    __m128    max_vec = _mm_set1_ps(arr[0]);
+    float32_t tmp_max = arr[0];
+    size_t    idx_max = 0;
 
-        for (; i + 3 < n; i += 4) {
-                const __m128 v = _mm_loadu_ps(arr + i);
-                max_vec        = _mm_max_ps(max_vec, v);
+    for (; i + 3 < n; i += 4) {
+        const __m128 v = _mm_loadu_ps(arr + i);
+        max_vec        = _mm_max_ps(max_vec, v);
 
-                f32 tmp[4];
-                _mm_storeu_ps(tmp, max_vec);
-                for (int j = 0; j < 4; j++) {
-                        if (tmp[j] > tmp_max) {
-                                tmp_max = tmp[j];
-                                idx_max = i + j;
-                        }
-                }
+        float32_t tmp[4];
+        _mm_storeu_ps(tmp, max_vec);
+        for (int j = 0; j < 4; j++) {
+            if (tmp[j] > tmp_max) {
+                tmp_max = tmp[j];
+                idx_max = i + j;
+            }
         }
+    }
 
-        for (; i < n; i++) {
-                if (arr[i] > tmp_max) {
-                        tmp_max = arr[i];
-                        idx_max = i;
-                }
+    for (; i < n; i++) {
+        if (arr[i] > tmp_max) {
+            tmp_max = arr[i];
+            idx_max = i;
         }
+    }
 
-        *max_val = tmp_max;
-        *max_idx = idx_max;
+    *max_val = tmp_max;
+    *max_idx = idx_max;
 
 #elif HAS(NEON)
-        usize       i       = 0;
-        float32x4_t max_vec = vdupq_n_f32(arr[0]);
-        f32         tmp_max = arr[0];
-        usize       idx_max = 0;
+    size_t      i       = 0;
+    float32x4_t max_vec = vdupq_n_f32(arr[0]);
+    float32_t   tmp_max = arr[0];
+    size_t      idx_max = 0;
 
-        for (; i + 3 < n; i += 4) {
-                const float32x4_t v = vld1q_f32(arr + i);
-                max_vec             = vmaxq_f32(max_vec, v);
+    for (; i + 3 < n; i += 4) {
+        const float32x4_t v = vld1q_f32(arr + i);
+        max_vec             = vmaxq_f32(max_vec, v);
 
-                f32 tmp[4];
-                vst1q_f32(tmp, max_vec);
-                for (int j = 0; j < 4; j++) {
-                        if (tmp[j] > tmp_max) {
-                                tmp_max = tmp[j];
-                                idx_max = i + j;
-                        }
-                }
+        float32_t tmp[4];
+        vst1q_f32(tmp, max_vec);
+        for (int j = 0; j < 4; j++) {
+            if (tmp[j] > tmp_max) {
+                tmp_max = tmp[j];
+                idx_max = i + j;
+            }
         }
+    }
 
-        for (; i < n; i++) {
-                if (arr[i] > tmp_max) {
-                        tmp_max = arr[i];
-                        idx_max = i;
-                }
+    for (; i < n; i++) {
+        if (arr[i] > tmp_max) {
+            tmp_max = arr[i];
+            idx_max = i;
         }
+    }
 
-        *max_val = tmp_max;
-        *max_idx = idx_max;
+    *max_val = tmp_max;
+    *max_idx = idx_max;
 
 #else
-        f32   tmp_max = arr[0];
-        usize idx_max = 0;
-        for (usize i = 1; i < n; i++) {
-                if (arr[i] > tmp_max) {
-                        tmp_max = arr[i];
-                        idx_max = i;
-                }
+    float32_t tmp_max = arr[0];
+    size_t    idx_max = 0;
+    for (size_t i = 1; i < n; i++) {
+        if (arr[i] > tmp_max) {
+            tmp_max = arr[i];
+            idx_max = i;
         }
-        *max_val = tmp_max;
-        *max_idx = idx_max;
+    }
+    *max_val = tmp_max;
+    *max_idx = idx_max;
 #endif
 }
 
@@ -507,125 +542,125 @@ find_max(const f32 *arr, const usize n, f32 *max_val, usize *max_idx)
  * @param coeffs 多项式系数, 升幂排列
  * @param order  阶数
  * @param x      输入值
- * @return f32   输出值
+ * @return float32_t   输出值
  */
-HAPI f32
-poly_eval(const f32 *coeffs, const u32 order, const f32 x)
+HAPI float32_t
+poly_eval_rt(const float32_t *coeffs, const uint32_t order, const float32_t x)
 {
-        f32 res = coeffs[order];
-        for (u32 i = order; i > 0; i--)
-                res = res * x + coeffs[i - 1];
+    float32_t res = coeffs[order];
+    for (uint32_t i = order; i > 0; i--)
+        res = res * x + coeffs[i - 1];
 
-        return res;
+    return res;
 }
 
-HAPI u16
-f32_to_f16(const f32 f32_val)
+HAPI uint16_t
+f32_to_f16(const float32_t f32_val)
 {
-        const union {
-                f32 f;
-                u32 i;
-        } u = {.f = f32_val};
+    const union {
+        float32_t f;
+        uint32_t  i;
+    } u = {.f = f32_val};
 
-        const u32 sign     = u.i >> 16 & 0x8000;
-        const u32 exponent = u.i >> 23 & 0xFF;
-        const u32 mantissa = u.i & 0x007FFFFF;
+    const uint32_t sign     = u.i >> 16 & 0x8000;
+    const uint32_t exponent = u.i >> 23 & 0xFF;
+    const uint32_t mantissa = u.i & 0x007FFFFF;
 
-        /* 处理零、无穷大、NaN */
-        if (exponent == 0)
-                return (u16)sign;
+    /* 处理零,无穷大,NaN */
+    if (exponent == 0)
+        return (uint16_t)sign;
 
-        if (exponent == 255)
-                return (u16)(sign | (mantissa == 0 ? 0x7C00 : 0x7E00));
+    if (exponent == 255)
+        return (uint16_t)(sign | (mantissa == 0 ? 0x7C00 : 0x7E00));
 
-        /* 计算 FP16 指数 */
-        const i32 f16_exp = (i32)exponent - 112; // -127 + 15 = -112
+    /* 计算 FP16 指数 */
+    const int32_t f16_exp = (int32_t)exponent - 112; // -127 + 15 = -112
 
-        /* 处理溢出和下溢 */
-        if (f16_exp >= 31)
-                return (u16)(sign | 0x7C00); // 溢出 -> 无穷大
+    /* 处理溢出和下溢 */
+    if (f16_exp >= 31)
+        return (uint16_t)(sign | 0x7C00); // 溢出 -> 无穷大
 
-        if (f16_exp <= 0)
-                return (u16)sign; // 下溢 -> 零
+    if (f16_exp <= 0)
+        return (uint16_t)sign; // 下溢 -> 零
 
-        /* 组合结果 */
-        return (u16)(sign | f16_exp << 10 | mantissa >> 13);
+    /* 组合结果 */
+    return (uint16_t)(sign | f16_exp << 10 | mantissa >> 13);
 }
 
-HAPI f32
-f16_to_f32(const u16 f16_val)
+HAPI float32_t
+f16_to_f32(const uint16_t f16_val)
 {
-        const u32 sign     = ((u32)f16_val & 0x8000) << 16;
-        u32       exponent = (f16_val >> 10) & 0x1F;
-        u32       mantissa = (u32)f16_val & 0x03FF;
+    const uint32_t sign     = ((uint32_t)f16_val & 0x8000) << 16;
+    uint32_t       exponent = (f16_val >> 10) & 0x1F;
+    uint32_t       mantissa = (uint32_t)f16_val & 0x03FF;
 
-        if (exponent == 0) {
-                if (mantissa == 0) {
-                        const union {
-                                f32 f;
-                                u32 i;
-                        } u = {.i = sign};
-                        return u.f;
-                }
-                /* 非规格化数处理 */
-                exponent = 1;
-                while ((mantissa & 0x0400) == 0) {
-                        mantissa <<= 1;
-                        exponent--;
-                }
-                mantissa &= 0x03FF;
-        } else if (exponent == 31) {
-                const union {
-                        f32 f;
-                        u32 i;
-                } u = {.i = sign | (mantissa == 0 ? 0x7F800000 : 0x7FC00000)};
-                return u.f;
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            const union {
+                float32_t f;
+                uint32_t  i;
+            } u = {.i = sign};
+            return u.f;
         }
-
-        const u32 f32_exp      = (exponent + 112) << 23; // 112 = 127 - 15
-        const u32 f32_mantissa = mantissa << 13;
-
+        /* 非规格化数处理 */
+        exponent = 1;
+        while ((mantissa & 0x0400) == 0) {
+            mantissa <<= 1;
+            exponent--;
+        }
+        mantissa &= 0x03FF;
+    } else if (exponent == 31) {
         const union {
-                f32 f;
-                u32 i;
-        } u = {.i = sign | f32_exp | f32_mantissa};
+            float32_t f;
+            uint32_t  i;
+        } u = {.i = sign | (mantissa == 0 ? 0x7F800000 : 0x7FC00000)};
         return u.f;
+    }
+
+    const uint32_t f32_exp      = (exponent + 112) << 23; // 112 = 127 - 15
+    const uint32_t f32_mantissa = mantissa << 13;
+
+    const union {
+        float32_t f;
+        uint32_t  i;
+    } u = {.i = sign | f32_exp | f32_mantissa};
+    return u.f;
 }
 
 HAPI void
-f32_sort_asc(f32 *buf, usize len)
+f32_sort_asc(float32_t *buf, size_t len)
 {
-        if (!buf || len < 2)
-                return;
+    if (!buf || len < 2)
+        return;
 
-        for (usize gap = len >> 1; gap > 0; gap >>= 1) {
-                for (usize i = gap; i < len; i++) {
-                        f32   temp = buf[i];
-                        usize j;
-                        for (j = i; j >= gap && buf[j - gap] > temp; j -= gap)
-                                buf[j] = buf[j - gap];
+    for (size_t gap = len >> 1; gap > 0; gap >>= 1) {
+        for (size_t i = gap; i < len; i++) {
+            float32_t temp = buf[i];
+            size_t    j;
+            for (j = i; j >= gap && buf[j - gap] > temp; j -= gap)
+                buf[j] = buf[j - gap];
 
-                        buf[j] = temp;
-                }
+            buf[j] = temp;
         }
+    }
 }
 
 HAPI void
-f32_sort_desc(f32 *buf, usize len)
+f32_sort_desc(float32_t *buf, size_t len)
 {
-        if (!buf || len < 2)
-                return;
+    if (!buf || len < 2)
+        return;
 
-        for (usize gap = len >> 1; gap > 0; gap >>= 1) {
-                for (usize i = gap; i < len; i++) {
-                        f32   temp = buf[i];
-                        usize j;
-                        for (j = i; j >= gap && buf[j - gap] < temp; j -= gap)
-                                buf[j] = buf[j - gap];
+    for (size_t gap = len >> 1; gap > 0; gap >>= 1) {
+        for (size_t i = gap; i < len; i++) {
+            float32_t temp = buf[i];
+            size_t    j;
+            for (j = i; j >= gap && buf[j - gap] < temp; j -= gap)
+                buf[j] = buf[j - gap];
 
-                        buf[j] = temp;
-                }
+            buf[j] = temp;
         }
+    }
 }
 
 #ifdef __cplusplus

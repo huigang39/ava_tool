@@ -149,7 +149,7 @@ ifeq ($(COMPILER),msvc)
                         /I"$(LIBFFI_DIR)/include"
         LDLIBS       := ws2_32.lib winmm.lib shlwapi.lib comdlg32.lib OpenGL32.lib advapi32.lib ole32.lib dbghelp.lib \
                         mfplat.lib mfreadwrite.lib mfuuid.lib \
-                        "$(GLFW_LIB)" "$(JLINK_LIB)" "$(FFTW_LIB)" "$(MODULE_LIB)" "$(LIBFFI_LIB)"
+                        "$(GLFW_LIB)" "$(FFTW_LIB)" "$(MODULE_LIB)" "$(LIBFFI_LIB)"
         PLATFORM_DIR := win
     else
         $(error msvc 仅支持 win 平台)
@@ -407,7 +407,7 @@ endif
 $(MODULE_LIB):
 	@$(ECHO_NL)
 	@echo building module library...
-	@$(MAKE) -C $(DIR_MODULE) static --no-print-directory
+	@$(MAKE) -C $(DIR_MODULE) static PROJECT_NAME=module --no-print-directory
 
 $(OUTPUT_BUILD_DIR)/%.o: %.cpp
 	@$(ECHO_NL)

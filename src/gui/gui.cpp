@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <fstream>
 #include <ranges>
 #include <sstream>
@@ -77,6 +78,61 @@ hasAudioExtension(const std::string &path)
         std::string ext = std::filesystem::path(path).extension().string();
         std::ranges::transform(ext, ext.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return ext == ".m4a" || ext == ".mp3" || ext == ".wav" || ext == ".aac" || ext == ".flac" || ext == ".wma";
+}
+
+static std::string
+sanitizeRecentPath(std::string path)
+{
+        // A recent.txt accidentally saved as UTF-16 contains embedded NULs.  Such
+        // a string is non-empty to C++, but becomes an empty label when passed to
+        // ImGui as a C string, causing its root-window empty-ID assertion.
+        if (path.find('\0') != std::string::npos)
+                return {};
+        if (path.size() >= 3 && static_cast<unsigned char>(path[0]) == 0xEF && static_cast<unsigned char>(path[1]) == 0xBB &&
+            static_cast<unsigned char>(path[2]) == 0xBF)
+                path.erase(0, 3);
+
+        const auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+        const auto first    = std::ranges::find_if(path, notSpace);
+        if (first == path.end())
+                return {};
+        const auto last = std::find_if(path.rbegin(), path.rend(), notSpace).base();
+        path            = std::string(first, last);
+        if (std::ranges::any_of(path, [](unsigned char c) { return c < 0x20; }))
+                return {};
+        return path;
+}
+
+static std::string
+pathToUtf8(const std::filesystem::path &path)
+{
+        const std::u8string utf8 = path.u8string();
+        return std::string(utf8.begin(), utf8.end());
+}
+
+static std::string
+recentDisplayName(const std::string &path)
+{
+        try {
+                std::string name = pathToUtf8(std::filesystem::u8path(path).filename());
+                if (name.empty() || name.find('\0') != std::string::npos)
+                        name = path;
+                if (!name.empty() && name.find('\0') == std::string::npos)
+                        return name;
+        } catch (const std::filesystem::filesystem_error &) {
+        }
+        return "(invalid session)";
+}
+
+static bool
+recentPathExists(const std::string &path)
+{
+        try {
+                std::error_code ec;
+                return std::filesystem::exists(std::filesystem::u8path(path), ec) && !ec;
+        } catch (const std::filesystem::filesystem_error &) {
+                return false;
+        }
 }
 
 void
@@ -215,6 +271,13 @@ Gui::Gui(const std::string &initialPath)
                 }
                 return false;
         });
+        midiTool_.setSymbolResolver([this](const std::string &name, std::uint32_t &address) {
+                for (const auto &variableWindow : vars_ | std::views::values) {
+                        if (variableWindow->findElfSymbolAddress(name, address))
+                                return true;
+                }
+                return false;
+        });
 
         TutorialGuide::instance().loadState(getAppDir());
 }
@@ -222,9 +285,11 @@ Gui::Gui(const std::string &initialPath)
 Gui::~Gui()
 {
         LOG_I("~Gui()");
+        midiTool_.stop();
         JLinkPort::instance().setTraceAddressResolver({});
         bkpSramDebugger_.setSymbolResolver({});
         deviceManager_.setSymbolResolver({});
+        midiTool_.setSymbolResolver({});
 
         // Hide window immediately to give user instant feedback
         if (window_) {
@@ -272,12 +337,25 @@ Gui::loadRecentList()
         recentSessions_.clear();
         std::ifstream f(getAppDir() + "/recent.txt");
         std::string   line;
+        bool          repaired = false;
         while (std::getline(f, line)) {
-                while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
-                        line.pop_back();
-                if (!line.empty())
-                        recentSessions_.push_back(line);
+                std::string path = sanitizeRecentPath(std::move(line));
+                if (path.empty()) {
+                        repaired = true;
+                        continue;
+                }
+                if (std::ranges::find(recentSessions_, path) != recentSessions_.end()) {
+                        repaired = true;
+                        continue;
+                }
+                recentSessions_.push_back(std::move(path));
+                if (recentSessions_.size() == 10) {
+                        repaired = f.peek() != std::ifstream::traits_type::eof();
+                        break;
+                }
         }
+        if (repaired)
+                saveRecentList();
 }
 
 void
@@ -291,12 +369,17 @@ Gui::saveRecentList()
 void
 Gui::addRecent(const std::string &path)
 {
-        if (path.empty())
+        const std::string cleanPath = sanitizeRecentPath(path);
+        if (cleanPath.empty())
                 return;
-        std::error_code ec;
-        std::string     abs = std::filesystem::absolute(path, ec).string();
-        if (ec)
-                abs = path;
+        std::string abs = cleanPath;
+        try {
+                std::error_code ec;
+                const auto      absPath = std::filesystem::absolute(std::filesystem::u8path(cleanPath), ec);
+                if (!ec)
+                        abs = pathToUtf8(absPath);
+        } catch (const std::filesystem::filesystem_error &) {
+        }
 
         // Move to front, de-duplicated, capped at 10 entries.
         for (auto it = recentSessions_.begin(); it != recentSessions_.end();) {
@@ -445,6 +528,7 @@ Gui::saveSession(const std::string &path)
                 cJSON_AddStringToObject(mObj, "name", m->getName().c_str());
                 cJSON_AddStringToObject(mObj, "title", m->getTitle().c_str());
                 cJSON_AddStringToObject(mObj, "samplingMode", m->samplingMode_ == Monitor::SamplingMode::HSS ? "HSS" : "POLL");
+                cJSON_AddBoolToObject(mObj, "jlinkSamplingPaused", m->isSamplingPaused());
                 cJSON_AddNumberToObject(mObj, "maxSampleHz", m->maxSampleHz_);
                 cJSON_AddNumberToObject(mObj, "historySeconds", static_cast<f64>(m->historySeconds_));
                 cJSON_AddNumberToObject(mObj, "maxDisplayPoints", static_cast<f64>(m->maxDisplayPoints_));
@@ -454,6 +538,10 @@ Gui::saveSession(const std::string &path)
                                                            : (hasAudioExtension(m->importSourcePath_) ? "audio" : "csv");
                         cJSON_AddStringToObject(mObj, "importSourcePath", monitorToRel(m->importSourcePath_).c_str());
                         cJSON_AddStringToObject(mObj, "importSourceType", importType.c_str());
+                        if (importType == "csv")
+                                cJSON_AddNumberToObject(mObj, "importTimeColumn", m->importTimeColumn_);
+                        if (importType == "csv")
+                                cJSON_AddNumberToObject(mObj, "importTimeUnit", m->importTimeUnit_);
                 }
 
                 cJSON *scopesArr = cJSON_CreateArray();
@@ -472,12 +560,23 @@ Gui::saveSession(const std::string &path)
                                 cJSON_AddStringToObject(sObj, "label", s->getLabel().c_str());
                         cJSON_AddNumberToObject(sObj, "order", static_cast<f64>(s->getOrder()));
                         cJSON_AddStringToObject(sObj, "draw", s->getDraw() == MonitorScope::DrawEnum::PLOT ? "PLOT" : "TABLE");
+                        cJSON_AddBoolToObject(sObj, "jlinkSamplingPaused", s->isPaused());
                         cJSON_AddNumberToObject(sObj, "height", static_cast<f64>(s->getHeight()));
                         cJSON_AddBoolToObject(sObj, "showFft", s->getShowFft());
                         cJSON_AddBoolToObject(sObj, "fftBars", s->getFftBars());
                         cJSON_AddBoolToObject(sObj, "showSidePanel", s->getShowSidePanel());
                         cJSON_AddNumberToObject(sObj, "fftPoints", static_cast<f64>(s->getFftPoints()));
                         cJSON_AddNumberToObject(sObj, "fftPeakCount", static_cast<f64>(s->getFftPeakCount()));
+
+                        cJSON *tableUi = cJSON_CreateObject();
+                        cJSON *widths  = cJSON_CreateArray();
+                        for (float width : s->getTableColumnWidths())
+                                cJSON_AddItemToArray(widths, cJSON_CreateNumber(width));
+                        cJSON_AddItemToObject(tableUi, "columnWidths", widths);
+                        cJSON_AddNumberToObject(tableUi, "sortColumn", s->getTableSortColumn());
+                        cJSON_AddNumberToObject(tableUi, "sortDirection", s->getTableSortDirection());
+                        cJSON_AddBoolToObject(tableUi, "manualOrder", s->usesManualTableOrder());
+                        cJSON_AddItemToObject(sObj, "tableUi", tableUi);
 
                         if (!s->getExpandedGroups().empty()) {
                                 cJSON *egArr = cJSON_CreateArray();
@@ -498,6 +597,7 @@ Gui::saveSession(const std::string &path)
                         for (auto *ch : orderedChs) {
                                 cJSON *chObj = cJSON_CreateObject();
                                 cJSON_AddStringToObject(chObj, "name", ch->getName().c_str());
+                                cJSON_AddNumberToObject(chObj, "order", static_cast<f64>(ch->getOrder()));
                                 cJSON_AddStringToObject(chObj, "type", ch->getType().c_str());
                                 char addrHex[32];
                                 snprintf(addrHex, sizeof(addrHex), "0x%zX", ch->getAddr());
@@ -710,6 +810,8 @@ Gui::loadSession(const std::string &path)
                 std::string monitorName;
                 std::string path;
                 std::string type;
+                int         timeColumn{-2};
+                int         timeUnit{0};
         };
         std::vector<PendingImportSource> pendingImportSources;
 
@@ -803,6 +905,9 @@ Gui::loadSession(const std::string &path)
                                         monitor->samplingMode_ = Monitor::SamplingMode::HSS;
                         }
 
+                        if (const cJSON *paused = cJSON_GetObjectItem(mItem, "jlinkSamplingPaused"); cJSON_IsBool(paused))
+                                monitor->samplingPaused_.store(cJSON_IsTrue(paused), std::memory_order_release);
+
                         if (const cJSON *srcPath = cJSON_GetObjectItem(mItem, "importSourcePath");
                             cJSON_IsString(srcPath) && srcPath->valuestring[0] != '\0') {
                                 monitor->importSourcePath_ = toAbs(srcPath->valuestring);
@@ -813,7 +918,17 @@ Gui::loadSession(const std::string &path)
                                         monitor->importSourceType_ =
                                             hasAudioExtension(monitor->importSourcePath_) ? "audio" : "csv";
                                 }
-                                pendingImportSources.push_back({mName, monitor->importSourcePath_, monitor->importSourceType_});
+                                if (const cJSON *timeCol = cJSON_GetObjectItem(mItem, "importTimeColumn");
+                                    cJSON_IsNumber(timeCol))
+                                        monitor->importTimeColumn_ = timeCol->valueint;
+                                if (const cJSON *timeUnit = cJSON_GetObjectItem(mItem, "importTimeUnit");
+                                    cJSON_IsNumber(timeUnit))
+                                        monitor->importTimeUnit_ = timeUnit->valueint;
+                                pendingImportSources.push_back({mName,
+                                                                monitor->importSourcePath_,
+                                                                monitor->importSourceType_,
+                                                                monitor->importTimeColumn_,
+                                                                monitor->importTimeUnit_});
                         }
 
                         const cJSON *scopesArr = cJSON_GetObjectItem(mItem, "scopes");
@@ -857,6 +972,9 @@ Gui::loadSession(const std::string &path)
                                         else
                                                 scope->setDraw(MonitorScope::DrawEnum::PLOT);
                                 }
+                                if (const cJSON *paused = cJSON_GetObjectItem(sItem, "jlinkSamplingPaused");
+                                    cJSON_IsBool(paused))
+                                        scope->setPaused(cJSON_IsTrue(paused));
                                 if (const cJSON *hItem = cJSON_GetObjectItem(sItem, "height"); cJSON_IsNumber(hItem))
                                         scope->getHeight() = static_cast<f32>(hItem->valuedouble);
 
@@ -881,6 +999,31 @@ Gui::loadSession(const std::string &path)
                                 if (const cJSON *fftPkItem = cJSON_GetObjectItem(sItem, "fftPeakCount");
                                     cJSON_IsNumber(fftPkItem))
                                         scope->getFftPeakCount() = fftPkItem->valueint;
+
+                                if (const cJSON *tableUi = cJSON_GetObjectItem(sItem, "tableUi"); cJSON_IsObject(tableUi)) {
+                                        std::array<float, 6> widths{};
+                                        if (const cJSON *items = cJSON_GetObjectItem(tableUi, "columnWidths");
+                                            cJSON_IsArray(items)) {
+                                                for (int i = 0; i < 6; ++i) {
+                                                        const cJSON *item = cJSON_GetArrayItem(items, i);
+                                                        if (cJSON_IsNumber(item) && item->valuedouble > 0.0)
+                                                                widths[i] = static_cast<float>(item->valuedouble);
+                                                }
+                                        }
+                                        int sortColumn = -1;
+                                        if (const cJSON *item = cJSON_GetObjectItem(tableUi, "sortColumn");
+                                            cJSON_IsNumber(item) && item->valueint >= -1 && item->valueint < 5)
+                                                sortColumn = item->valueint;
+                                        int sortDirection = ImGuiSortDirection_Ascending;
+                                        if (const cJSON *item = cJSON_GetObjectItem(tableUi, "sortDirection");
+                                            cJSON_IsNumber(item) && (item->valueint == ImGuiSortDirection_Ascending ||
+                                                                     item->valueint == ImGuiSortDirection_Descending))
+                                                sortDirection = item->valueint;
+                                        bool manualOrder = sortColumn < 0;
+                                        if (const cJSON *item = cJSON_GetObjectItem(tableUi, "manualOrder"); cJSON_IsBool(item))
+                                                manualOrder = cJSON_IsTrue(item);
+                                        scope->setTableUiState(widths, sortColumn, sortDirection, manualOrder);
+                                }
 
                                 if (const cJSON *egArr = cJSON_GetObjectItem(sItem, "expandedGroups"); cJSON_IsArray(egArr)) {
                                         for (int k = 0; k < cJSON_GetArraySize(egArr); ++k) {
@@ -911,6 +1054,12 @@ Gui::loadSession(const std::string &path)
                                         if (!ch)
                                                 continue;
                                         ch->historySeconds_ = monitor->historySeconds_;
+                                        if (const cJSON *orderItem = cJSON_GetObjectItem(chItem, "order");
+                                            cJSON_IsNumber(orderItem)) {
+                                                const i64 order = static_cast<i64>(orderItem->valuedouble);
+                                                ch->setOrder(order);
+                                                scope->noteChannelOrder(order);
+                                        }
 
                                         if (const cJSON *sn = cJSON_GetObjectItem(chItem, "symbolName"); cJSON_IsString(sn))
                                                 ch->getSymbolName() = sn->valuestring;
@@ -991,6 +1140,18 @@ Gui::loadSession(const std::string &path)
                         }
                 }
         }
+
+        // The top-bar switch represents the aggregate monitor state. Mixed
+        // per-monitor states intentionally show as "Pause all".
+        bool hasMonitor        = false;
+        bool allMonitorsPaused = true;
+        for (const auto &monitor : monitors_ | std::views::values) {
+                if (!monitor)
+                        continue;
+                hasMonitor         = true;
+                allMonitorsPaused &= monitor->isSamplingPaused();
+        }
+        g_jlinkSamplingPaused.store(hasMonitor && allMonitorsPaused, std::memory_order_release);
 
         u64 varStart = get_mono_ts_ms();
         if (const cJSON *VarArr = cJSON_GetObjectItem(root, "Variables"); cJSON_IsArray(VarArr)) {
@@ -1112,7 +1273,7 @@ Gui::loadSession(const std::string &path)
                 if (src.type == "audio" || (src.type.empty() && hasAudioExtension(src.path)))
                         importAudioAsync(src.path, src.monitorName);
                 else
-                        importCsvAsync(src.path, src.monitorName);
+                        importCsvAsync(src.path, src.monitorName, src.timeColumn, src.timeUnit);
         }
 
         cJSON_Delete(root);
@@ -1138,6 +1299,9 @@ Gui::drawBar()
                                 vars_.clear();
                                 deviceManager_.clear();
                                 bkpSramDebugger_.resetSession();
+                                midiTool_.clear();
+                                midiTool_.setOpen(false);
+                                midiTool_.consumeModified();
                                 currentSessionPath_ = "session.ava";
                                 isModified_         = false;
                                 isFirstSave_        = true;
@@ -1150,13 +1314,17 @@ Gui::drawBar()
                         if (ImGui::BeginMenu(tr("Recent Sessions", "最近会话"), !recentSessions_.empty())) {
                                 for (size_t i = 0; i < recentSessions_.size(); ++i) {
                                         const std::string &p      = recentSessions_[i];
-                                        const bool         exists = std::filesystem::exists(p);
-                                        std::string        label =
-                                            std::filesystem::path(p).filename().string() + "##recent" + std::to_string(i);
+                                        const bool         exists = recentPathExists(p);
+                                        const std::string  label  = recentDisplayName(p);
+                                        // Keep the ID independent of file-name bytes. This also
+                                        // protects against malformed legacy entries containing an
+                                        // early C-string terminator.
+                                        ImGui::PushID(static_cast<int>(i));
                                         if (ImGui::MenuItem(label.c_str(), nullptr, false, exists))
                                                 sessionToOpen = p;
                                         if (ImGui::IsItemHovered())
                                                 ImGui::SetTooltip("%s%s", p.c_str(), exists ? "" : "  (missing)");
+                                        ImGui::PopID();
                                 }
                                 ImGui::Separator();
                                 if (ImGui::MenuItem(tr("Clear Recent", "清空最近列表"))) {
@@ -1238,6 +1406,10 @@ Gui::drawBar()
                 }
 
                 if (ImGui::BeginMenu(tr("Settings", "设置"))) {
+                        if (ImGui::BeginMenu(tr("J-Link DLL", "J-Link DLL"))) {
+                                JLinkPort::instance().drawDllSettingsMenu();
+                                ImGui::EndMenu();
+                        }
                         if (ImGui::BeginMenu(tr("Sampler Run Mode", "采样器运行模式"))) {
                                 const int cur       = g_samplerRunMode.load();
                                 auto      applyMode = [&](int m) {
@@ -1621,6 +1793,17 @@ Gui::loop()
                 }
 
                 {
+                        const std::string bindVariable = consumeMonitorFunctionBindingRequest();
+                        if (!bindVariable.empty()) {
+                                bool opened = false;
+                                for (auto &variableWindow : vars_ | std::views::values)
+                                        if (variableWindow->openFunctionBindingFor(bindVariable)) {
+                                                opened = true;
+                                                break;
+                                        }
+                                if (!opened)
+                                        LOG_W("LOCAL variable '%s' was not found in Variable Manager", bindVariable.c_str());
+                        }
                         for (auto it = vars_.begin(); it != vars_.end();) {
                                 if (it->second->isPendingDelete()) {
                                         it          = vars_.erase(it);
@@ -1644,6 +1827,27 @@ Gui::loop()
                 // SDK/sequence panels). Resample it here each frame and push to any
                 // scope channel named "<var>" / "<var>.<field>" (device == LOCAL).
                 {
+                        std::vector<std::pair<std::string, double>> localWrites;
+                        {
+                                std::lock_guard lk(mtxMonitors_);
+                                for (auto &m : monitors_ | std::views::values)
+                                        for (auto &s : m->getScopes() | std::views::values)
+                                                for (auto &[cn, ch] : s->getChannels()) {
+                                                        if (ch->getDevice() != "LOCAL" || !ch->isWritable())
+                                                                continue;
+                                                        float value = 0.0f;
+                                                        if (!ch->consumeWValDirty(value))
+                                                                continue;
+                                                        const std::string &key =
+                                                            ch->getSymbolName().empty() ? cn : ch->getSymbolName();
+                                                        localWrites.emplace_back(key, value);
+                                                }
+                        }
+                        for (const auto &[name, value] : localWrites)
+                                for (auto &vw : vars_ | std::views::values)
+                                        if (vw->writeLocalScalarFromMonitor(name, value))
+                                                break;
+
                         std::unordered_map<std::string, float> localVals;
                         for (auto &vw : vars_ | std::views::values)
                                 for (auto &[chName, val] : vw->collectLocalChannelValues())
@@ -1775,6 +1979,7 @@ Gui::loop()
                 TutorialGuide::instance().draw();
 
                 processPendingCsvImports();
+                drawEmptyImportPopup();
 
                 for (const auto &file : sDroppedFiles_) {
                         std::string lowerFile = file;
@@ -1795,7 +2000,11 @@ Gui::loop()
                                         sp->pushDroppedFiles({file});
                                 deviceManager_.pushDroppedFiles({file});
                         } else if (lowerFile.ends_with(".csv") || hasAudioExtension(file)) {
-                                const bool        isAudioImport = hasAudioExtension(file);
+                                const bool isAudioImport = hasAudioExtension(file);
+                                if (!isAudioImport) {
+                                        beginCsvImport(file);
+                                        continue;
+                                }
                                 std::error_code   absEc;
                                 const std::string importPath =
                                     std::filesystem::absolute(std::filesystem::path(file), absEc).string();
@@ -1815,13 +2024,19 @@ Gui::loop()
                                         monitors_[monName]     = mon;
                                         isModified_            = true;
                                 }
-                                if (isAudioImport)
-                                        importAudioAsync(file, monName);
-                                else
-                                        importCsvAsync(file, monName);
+                                importAudioAsync(file, monName);
+                        } else if (lowerFile.ends_with(".elf") || lowerFile.ends_with(".axf") || lowerFile.ends_with(".out") ||
+                                   lowerFile.ends_with(".json") || lowerFile.ends_with(".bin")) {
+                                // Variable Manager consumes these from the same drop list.
+                        } else {
+                                unsupportedFiles_.push_back(file);
+                                showUnsupportedFilePopup_ = true;
+                                LOG_W("Unsupported dropped file format: %s", file.c_str());
                         }
                 }
                 sDroppedFiles_.clear();
+                drawCsvImportDialog();
+                drawUnsupportedFilePopup();
                 if (showQuitModal_) {
                         ImGui::OpenPopup("###Quit");
                         if (ImGui::BeginPopupModal(
@@ -2035,7 +2250,6 @@ Gui::syncVariableProperties(Variable *var)
                                                         break;
                                                 case PortType::UDP:
                                                 case PortType::LOCAL:
-                                                case PortType::MANUAL:
                                                         deviceName = "LOCAL";
                                                         break;
                                                 case PortType::SHM:
@@ -2735,9 +2949,257 @@ Gui::drawCalculator()
  * -------------------------------------------------------------------------- */
 
 void
-Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
+Gui::startCsvImport(const std::string &path, int timeColumn, int timeUnit)
 {
-        std::thread([this, path, monitorName]() {
+        std::error_code   absEc;
+        const std::string importPath = std::filesystem::absolute(std::filesystem::path(path), absEc).string();
+        std::string       stem       = std::filesystem::path(path).stem().string();
+        std::string       monName;
+        {
+                std::lock_guard lk(mtxMonitors_);
+                monName = stem;
+                int idx = 1;
+                while (monitors_.count(monName))
+                        monName = stem + "_" + std::to_string(idx++);
+                auto mon = std::make_shared<Monitor>(monName);
+                mon->csvLoading_.store(true, std::memory_order_release);
+                mon->importSourcePath_            = absEc ? path : importPath;
+                mon->importSourceType_            = "csv";
+                mon->importTimeColumn_            = timeColumn;
+                mon->importTimeUnit_              = timeUnit;
+                mon->maximizeWhenImportCompletes_ = true;
+                monitors_[monName]                = mon;
+                isModified_                       = true;
+        }
+        importCsvAsync(path, monName, timeColumn, timeUnit);
+}
+
+static std::string
+formatUnixTimestamp(double seconds)
+{
+        if (!std::isfinite(seconds) || seconds < 0.0)
+                return {};
+        const auto whole = static_cast<std::time_t>(std::floor(seconds));
+        std::tm    local{};
+#ifdef _WIN32
+        if (localtime_s(&local, &whole) != 0)
+                return {};
+#else
+        if (!localtime_r(&whole, &local))
+                return {};
+#endif
+        int micros = static_cast<int>(std::llround((seconds - std::floor(seconds)) * 1000000.0));
+        if (micros >= 1000000)
+                micros = 999999;
+        char buffer[64]{};
+        snprintf(buffer,
+                 sizeof(buffer),
+                 "%04d-%02d-%02d %02d:%02d:%02d.%06d",
+                 local.tm_year + 1900,
+                 local.tm_mon + 1,
+                 local.tm_mday,
+                 local.tm_hour,
+                 local.tm_min,
+                 local.tm_sec,
+                 micros);
+        return buffer;
+}
+
+void
+Gui::beginCsvImport(const std::string &path)
+{
+        if (csvImportDialog_.open) {
+                csvImportQueue_.push_back(path);
+                return;
+        }
+        std::ifstream file(path);
+        std::string   line;
+        if (!file.is_open() || !std::getline(file, line)) {
+                // Preserve the existing asynchronous error handling for unreadable files.
+                startCsvImport(path, -2, 0);
+                return;
+        }
+
+        auto splitHeader = [](const std::string &text) {
+                std::vector<std::string> result;
+                std::istringstream       stream(text);
+                std::string              token;
+                while (std::getline(stream, token, ',')) {
+                        while (!token.empty() && (token.back() == '\r' || token.back() == ' '))
+                                token.pop_back();
+                        while (!token.empty() && token.front() == ' ')
+                                token.erase(token.begin());
+                        result.push_back(token);
+                }
+                return result;
+        };
+
+        auto headers = splitHeader(line);
+        // Native exports already carry one Time column per channel and do not use
+        // a shared X-axis column, so keep their lossless automatic path.
+        bool native = !headers.empty();
+        for (const auto &header : headers) {
+                const size_t kindSplit = header.rfind("::");
+                if (kindSplit == std::string::npos) {
+                        native = false;
+                        break;
+                }
+                const std::string kind       = header.substr(kindSplit + 2);
+                const std::string rest       = header.substr(0, kindSplit);
+                const size_t      scopeSplit = rest.find("::");
+                if ((kind != "Time" && kind != "Value") || scopeSplit == std::string::npos || scopeSplit == 0 ||
+                    scopeSplit + 2 >= rest.size()) {
+                        native = false;
+                        break;
+                }
+        }
+        if (native) {
+                startCsvImport(path, -2, 0);
+                return;
+        }
+
+        csvImportDialog_.path       = path;
+        csvImportDialog_.headers    = std::move(headers);
+        csvImportDialog_.timeColumn = -1;
+        csvImportDialog_.timeUnit   = 0;
+        for (int i = 0; i < static_cast<int>(csvImportDialog_.headers.size()); ++i) {
+                std::string lower = csvImportDialog_.headers[i];
+                std::ranges::transform(
+                    lower, lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (lower == "t" || lower == "time" || lower == "ts" || lower == "timestamp" || lower == "index" ||
+                    lower == "x") {
+                        csvImportDialog_.timeColumn = i;
+                        break;
+                }
+        }
+        csvImportDialog_.open = true;
+}
+
+void
+Gui::drawCsvImportDialog()
+{
+        if (!csvImportDialog_.open && !csvImportQueue_.empty()) {
+                std::string next = std::move(csvImportQueue_.front());
+                csvImportQueue_.erase(csvImportQueue_.begin());
+                beginCsvImport(next);
+        }
+        if (!csvImportDialog_.open)
+                return;
+        ImGui::OpenPopup("###CsvImportOptions");
+        if (!ImGui::BeginPopupModal(
+                tr("CSV Import###CsvImportOptions", "导入 CSV###CsvImportOptions"), nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+                return;
+
+        ImGui::TextUnformatted(std::filesystem::path(csvImportDialog_.path).filename().string().c_str());
+        ImGui::Separator();
+        ImGui::Text("%s", tr("X axis / timestamp", "X 轴 / 时间戳"));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(280.0f);
+        const char *preview = csvImportDialog_.timeColumn < 0 ? tr("Row number", "行号")
+                                                              : csvImportDialog_.headers[csvImportDialog_.timeColumn].c_str();
+        if (ImGui::BeginCombo("##csvTimeColumn", preview)) {
+                if (ImGui::Selectable(tr("Row number", "行号"), csvImportDialog_.timeColumn == -1))
+                        csvImportDialog_.timeColumn = -1;
+                for (int i = 0; i < static_cast<int>(csvImportDialog_.headers.size()); ++i)
+                        if (ImGui::Selectable(csvImportDialog_.headers[i].c_str(), csvImportDialog_.timeColumn == i))
+                                csvImportDialog_.timeColumn = i;
+                ImGui::EndCombo();
+        }
+        if (csvImportDialog_.timeColumn >= 0) {
+                static const char *unitNamesEn[] = {"Auto detect", "Seconds (s)", "Milliseconds (ms)", "Microseconds (us)"};
+                static const char *unitNamesZh[] = {"自动识别", "秒 (s)", "毫秒 (ms)", "微秒 (us)"};
+                ImGui::Text("%s", tr("Timestamp unit", "时间戳单位"));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(280.0f);
+                const char *const *unitNames = g_lang == Lang::ZH ? unitNamesZh : unitNamesEn;
+                ImGui::Combo("##csvTimeUnit", &csvImportDialog_.timeUnit, unitNames, IM_ARRAYSIZE(unitNamesEn));
+        }
+        ImGui::TextDisabled("%s",
+                            tr("The selected column is converted to relative seconds; its first sample becomes X=0.",
+                               "所选列将换算为相对秒，首个数据点作为 X=0。"));
+        ImGui::Separator();
+        if (ui::Button(tr("Import", "导入"), ui::BtnStyle::Success, ImVec2(120, 0))) {
+                const std::string path       = csvImportDialog_.path;
+                const int         timeColumn = csvImportDialog_.timeColumn;
+                const int         timeUnit   = csvImportDialog_.timeUnit;
+                csvImportDialog_.open        = false;
+                ImGui::CloseCurrentPopup();
+                startCsvImport(path, timeColumn, timeUnit);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Cancel", "取消"), ImVec2(120, 0))) {
+                csvImportDialog_.open = false;
+                ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+}
+
+void
+Gui::drawEmptyImportPopup()
+{
+        if (!showEmptyImportPopup_)
+                return;
+        ImGui::OpenPopup("###EmptyImportData");
+        if (!ImGui::BeginPopupModal(tr("Import Failed###EmptyImportData", "导入失败###EmptyImportData"),
+                                    nullptr,
+                                    ImGuiWindowFlags_AlwaysAutoResize))
+                return;
+
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
+                           "%s",
+                           emptyImportIsCsv_ ? tr("CSV data is empty.", "CSV 数据为空。")
+                                             : tr("Imported data is empty.", "导入的数据为空。"));
+        if (!emptyImportFile_.empty()) {
+                ImGui::TextDisabled("%s", std::filesystem::path(emptyImportFile_).filename().string().c_str());
+        }
+        ImGui::TextWrapped("%s",
+                           emptyImportIsCsv_ ? tr("No importable numeric data rows were found. Please check the file contents "
+                                                  "and the selected timestamp column.",
+                                                  "没有找到可导入的数值数据行，请检查文件内容和所选时间戳列。")
+                                             : tr("No importable data was found. Please check the source file.",
+                                                  "没有找到可导入的数据，请检查源文件。"));
+        ImGui::Separator();
+        if (ui::Button(tr("OK", "确定"), ui::BtnStyle::Primary, ImVec2(120, 0))) {
+                showEmptyImportPopup_ = false;
+                ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+}
+
+void
+Gui::drawUnsupportedFilePopup()
+{
+        if (!showUnsupportedFilePopup_)
+                return;
+        ImGui::OpenPopup("###UnsupportedFileFormat");
+        if (!ImGui::BeginPopupModal(tr("Unsupported File###UnsupportedFileFormat", "不支持的文件###UnsupportedFileFormat"),
+                                    nullptr,
+                                    ImGuiWindowFlags_AlwaysAutoResize))
+                return;
+
+        ImGui::TextColored(
+            ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s", tr("Parsing this file format is not supported.", "不支持解析该格式文件。"));
+        ImGui::Separator();
+        for (const auto &file : unsupportedFiles_) {
+                const std::filesystem::path path(file);
+                std::string                 extension = path.extension().string();
+                if (extension.empty())
+                        extension = tr("no extension", "无后缀");
+                ImGui::BulletText("%s  (%s)", path.filename().string().c_str(), extension.c_str());
+        }
+        ImGui::Separator();
+        if (ui::Button(tr("OK", "确定"), ui::BtnStyle::Primary, ImVec2(120, 0))) {
+                showUnsupportedFilePopup_ = false;
+                unsupportedFiles_.clear();
+                ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+}
+
+void
+Gui::importCsvAsync(const std::string &path, const std::string &monitorName, int selectedTimeColumn, int selectedTimeUnit)
+{
+        std::thread([this, path, monitorName, selectedTimeColumn, selectedTimeUnit]() {
                 LOG_I("CSV import started: %s", path.c_str());
 
                 auto publishResult = [&](CsvImportPending &&result) {
@@ -2818,6 +3280,7 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
                 }
 
                 std::vector<CsvChannelImport> outChannels;
+                std::string                   timeOriginText;
 
                 if (isNative) {
                         // Map each column to its channel slot; preserve first-seen order.
@@ -2869,22 +3332,35 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
                                 }
                         }
                 } else {
-                        // Generic CSV: optional leading time column + data columns,
-                        // all dropped into a single scope.
-                        bool firstIsTime = false;
-                        {
-                                std::string h0 = headers[0];
-                                for (auto &c : h0)
-                                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                                firstIsTime = (h0 == "t" || h0 == "time" || h0 == "ts" || h0 == "timestamp" || h0 == "index" ||
-                                               h0 == "x");
+                        // Generic CSV: the X axis can be any explicitly selected
+                        // column. -1 keeps the legacy row-number mode; -2 auto-detects
+                        // common timestamp header names for old saved sessions.
+                        int timeCol = selectedTimeColumn;
+                        if (timeCol == -2) {
+                                timeCol = -1;
+                                for (int i = 0; i < static_cast<int>(headers.size()); ++i) {
+                                        std::string h = headers[i];
+                                        for (auto &c : h)
+                                                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                        if (h == "t" || h == "time" || h == "ts" || h == "timestamp" || h == "index" ||
+                                            h == "x") {
+                                                timeCol = i;
+                                                break;
+                                        }
+                                }
                         }
+                        if (timeCol < -1 || timeCol >= static_cast<int>(headers.size()))
+                                timeCol = -1;
 
-                        const int timeCol   = firstIsTime ? 0 : -1;
-                        const int dataStart = firstIsTime ? 1 : 0;
-
-                        std::vector<std::string> dataHeaders(headers.begin() + dataStart, headers.end());
-                        const int                nCols = static_cast<int>(dataHeaders.size());
+                        std::vector<int>         dataCols;
+                        std::vector<std::string> dataHeaders;
+                        for (int i = 0; i < static_cast<int>(headers.size()); ++i) {
+                                if (i == timeCol)
+                                        continue;
+                                dataCols.push_back(i);
+                                dataHeaders.push_back(headers[i]);
+                        }
+                        const int nCols = static_cast<int>(dataCols.size());
                         if (nCols == 0) {
                                 LOG_E("CSV import: no data columns in %s", path.c_str());
                                 publishEmpty();
@@ -2901,13 +3377,33 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
                                 std::vector<std::string> toks = splitCsv(line);
                                 toks.resize(headers.size());
 
-                                std::vector<double> rowVals(headers.size(), 0.0);
-                                for (size_t i = 0; i < toks.size(); ++i)
-                                        std::from_chars(toks[i].data(), toks[i].data() + toks[i].size(), rowVals[i]);
+                                double rawTime = rowIdx;
+                                if (timeCol >= 0) {
+                                        const std::string &token = toks[timeCol];
+                                        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), rawTime);
+                                        if (token.empty() || parsed.ec != std::errc{} ||
+                                            parsed.ptr != token.data() + token.size())
+                                                continue;
+                                }
 
-                                timestamps.push_back((timeCol >= 0) ? rowVals[timeCol] : rowIdx);
+                                std::vector<float> rowData(nCols, 0.0f);
+                                bool               hasNumericData = false;
+                                for (int c = 0; c < nCols; ++c) {
+                                        const std::string &token = toks[dataCols[c]];
+                                        double             value = 0.0;
+                                        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), value);
+                                        if (!token.empty() && parsed.ec == std::errc{} &&
+                                            parsed.ptr == token.data() + token.size()) {
+                                                rowData[c]     = static_cast<float>(value);
+                                                hasNumericData = true;
+                                        }
+                                }
+                                if (!hasNumericData)
+                                        continue;
+
+                                timestamps.push_back(rawTime);
                                 for (int c = 0; c < nCols; ++c)
-                                        columns[c].push_back(static_cast<float>(rowVals[dataStart + c]));
+                                        columns[c].push_back(rowData[c]);
                                 rowIdx += 1.0;
                         }
 
@@ -2915,6 +3411,30 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
                                 LOG_E("CSV import: no data rows in %s", path.c_str());
                                 publishEmpty();
                                 return;
+                        }
+
+                        if (timeCol >= 0) {
+                                int unit = std::clamp(selectedTimeUnit, 0, 3);
+                                if (unit == 0) {
+                                        const double magnitude = std::abs(timestamps.front());
+                                        if (magnitude >= 1.0e14)
+                                                unit = 3; // Unix microseconds
+                                        else if (magnitude >= 1.0e11)
+                                                unit = 2; // Unix milliseconds
+                                        else
+                                                unit = 1; // seconds, including already-relative timestamps
+                                }
+                                const double scale         = unit == 3 ? 1.0e-6 : (unit == 2 ? 1.0e-3 : 1.0);
+                                const double originRaw     = timestamps.front();
+                                const double originSeconds = originRaw * scale;
+                                // Epoch timestamps are rendered as local calendar time;
+                                // small relative timestamps intentionally have no date label.
+                                if (std::abs(originSeconds) >= 1.0e8)
+                                        timeOriginText = formatUnixTimestamp(originSeconds);
+                                for (double &timestamp : timestamps)
+                                        timestamp = (timestamp - originRaw) * scale;
+                                if (!timestamps.empty())
+                                        timestamps.front() = 0.0;
                         }
 
                         for (int c = 0; c < nCols; ++c) {
@@ -2936,8 +3456,9 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName)
                 LOG_I("CSV import done: %s  native=%d  channels=%zu", path.c_str(), isNative ? 1 : 0, outChannels.size());
 
                 CsvImportPending result;
-                result.monitorName = monitorName;
-                result.channels    = std::move(outChannels);
+                result.monitorName    = monitorName;
+                result.channels       = std::move(outChannels);
+                result.timeOriginText = std::move(timeOriginText);
 
                 publishResult(std::move(result));
         }).detach();
@@ -3157,8 +3678,21 @@ Gui::processPendingCsvImports()
         std::lock_guard lk(mtxMonitors_);
         for (auto &imp : pending) {
                 // Find the monitor that was created immediately on file drop
-                auto     it      = monitors_.find(imp.monitorName);
-                Monitor *monitor = (it != monitors_.end()) ? it->second.get() : nullptr;
+                auto       it      = monitors_.find(imp.monitorName);
+                Monitor   *monitor = (it != monitors_.end()) ? it->second.get() : nullptr;
+                const bool hasData = std::ranges::any_of(imp.channels, [](const CsvChannelImport &channel) {
+                        return !channel.values.empty() && !channel.timestamps.empty();
+                });
+                if (!hasData) {
+                        emptyImportFile_  = monitor ? monitor->importSourcePath_ : imp.monitorName;
+                        emptyImportIsCsv_ = !monitor || monitor->importSourceType_ != "audio";
+                        if (it != monitors_.end())
+                                monitors_.erase(it);
+                        showEmptyImportPopup_ = true;
+                        isModified_           = true;
+                        LOG_W("CSV import: no data rows in %s", emptyImportFile_.c_str());
+                        continue;
+                }
                 if (!monitor) {
                         // Fallback: create it now (shouldn't normally happen)
                         auto m                     = std::make_shared<Monitor>(imp.monitorName);
@@ -3186,7 +3720,9 @@ Gui::processPendingCsvImports()
                         ch->historySeconds_   = 0.0f; // static data — no time-based pruning
                         ch->maxDisplayPoints_ = 5000;
 
-                        const usize nPts = cd.values.size();
+                        const usize nPts = std::min(cd.values.size(), cd.timestamps.size());
+                        if (nPts == 0)
+                                continue;
                         ch->pushBatch(cd.values.data(), cd.timestamps.data(), nPts);
                         ch->publishSnapshot();
                         totalPts += nPts;
@@ -3212,9 +3748,14 @@ Gui::processPendingCsvImports()
                         monitor->dataStartTime_ = spanMin;
                         monitor->lastNow_       = spanMax;
                 }
+                monitor->importTimeOriginText_ = std::move(imp.timeOriginText);
 
                 // Clear loading flag — monitor will show data on the next frame
                 monitor->csvLoading_.store(false, std::memory_order_release);
+                if (monitor->maximizeWhenImportCompletes_) {
+                        monitor->fillAppOnNextDraw_           = true;
+                        monitor->maximizeWhenImportCompletes_ = false;
+                }
 
                 LOG_I("CSV import: monitor '%s' ready: %zu channels, %zu points", name.c_str(), imp.channels.size(), totalPts);
         }

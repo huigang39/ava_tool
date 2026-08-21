@@ -34,7 +34,7 @@ class BkpSramDebugger
 
       private:
         static constexpr std::uint32_t kDataPoolSize = 0x1000u;
-        static constexpr std::uint32_t kSampleStride = 12u;
+        static constexpr std::uint32_t kSampleStride = 8u;
         static constexpr std::size_t   kMaxChannels  = 16u;
         enum class ValueType : std::uint32_t { U8 = 0, I8 = 1, U16 = 2, I16 = 3, U32 = 4, I32 = 5, F32 = 6 };
         enum class State { Stopped, Starting, Running, Stopping, Error };
@@ -71,6 +71,10 @@ class BkpSramDebugger
                 std::uint64_t      droppedSamples{0};
                 std::uint64_t      validatedSamples{0};
                 bool               generationKnown{false};
+                bool               preserveHistoryOnReacquire{false};
+                bool               plotTickKnown{false};
+                std::uint32_t      lastRawTick{0};
+                double             plotTickOffset{0.0};
                 bool               active{false};
                 ValueType          displayType{ValueType::F32};
                 std::vector<Point> points{};
@@ -90,16 +94,17 @@ class BkpSramDebugger
                 std::uint32_t channelAddressOffset{0};
                 std::uint32_t channelTypeOffset{4};
                 std::uint32_t stateBase{0};
+                std::uint32_t dataSize{0};
                 std::uint32_t stateStride{32};
-                std::uint32_t stateActiveOffset{0};
-                std::uint32_t stateAddressOffset{4};
-                std::uint32_t stateTypeOffset{8};
+                std::uint32_t stateActiveOffset{8};
+                std::uint32_t stateAddressOffset{0};
+                std::uint32_t stateTypeOffset{4};
                 std::uint32_t stateBufferOffset{12};
                 std::uint32_t stateCapacityOffset{16};
                 std::uint32_t stateGenerationOffset{20};
                 std::uint32_t stateWriteSeqOffset{24};
                 std::uint32_t stateOverwritesOffset{28};
-                bool          valid() const { return control != 0u && data != 0u; }
+                bool          valid() const { return control != 0u && data != 0u && dataSize != 0u; }
         };
 
         mutable std::mutex                                        configMtx_{};
@@ -132,19 +137,20 @@ class BkpSramDebugger
         std::string                                               statusText_{};
         std::function<bool(const std::string &, std::uint32_t &)> symbolResolver_{};
 
-        void        start();
-        void        stop();
-        void        workerLoop(std::vector<ChannelConfig> config, std::uint32_t sampleDiv, ProtocolLayout layout);
-        bool        submitConfig(const ProtocolLayout             &layout,
-                                 const std::vector<ChannelConfig> &config,
-                                 std::uint32_t                     sampleDiv,
-                                 bool                              enable);
-        bool        readChannel(const ProtocolLayout &layout, std::size_t slot, ValueType configuredType);
-        bool        resolveProtocolLayout(ProtocolLayout &layout) const;
-        void        setError(const std::string &message);
-        void        setStatus(const std::string &message);
+        void start();
+        void stop();
+        void workerLoop(std::vector<ChannelConfig> config, std::uint32_t sampleDiv, ProtocolLayout layout);
+        bool submitConfig(const ProtocolLayout             &layout,
+                          const std::vector<ChannelConfig> &config,
+                          std::uint32_t                     sampleDiv,
+                          bool                              enable);
+        bool readChannel(const ProtocolLayout &layout, std::size_t slot, ValueType configuredType, std::uint32_t sampleDiv);
+        bool resolveProtocolLayout(ProtocolLayout &layout) const;
+        void setError(const std::string &message);
+        void setStatus(const std::string &message);
         std::string statusSnapshot() const;
         void        clearData();
+        void        readRetainedHistory();
         void        exportCsv();
         bool
         assignDroppedChannel(std::size_t index, const char *name, std::uint64_t address, const char *type, const char *device);

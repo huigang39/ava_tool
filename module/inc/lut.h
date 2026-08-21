@@ -1,26 +1,31 @@
 #ifndef LUT_H
 #define LUT_H
 
-#include "typedef.h"
+#include "motor_control/types.h"
 
-typedef struct table {
-        const f32 *x;   // 自变量数组(必须单调递增)
-        const f32 *y;   // 因变量数组
-        usize      len; // 表长度
-} table_t;
+struct table {
+    const float32_t *x;   // 自变量数组(必须单调递增)
+    const float32_t *y;   // 因变量数组
+    size_t           len; // 表长度
+};
 
-f32 lut_idx(const f32 *y, f32 x, usize len);
+float32_t lut_idx(const float32_t *y, float32_t x, size_t len);
 
 /**
  * @brief 查询输入数据在表中对应的 y 值(线性插值)
  *
  * @param table table 结构体
  * @param input 待查询数据
- * @return      f32
+ * @return      float32_t
  */
-f32 lut_binary(const table_t *table, f32 input);
+float32_t lut_binary(const struct table *table, float32_t input);
 
-f32_dq_t
-lut_interp_2d_dq(const f32 *x_axis, const f32 *y_axis, const f32 *z_table, usize x_len, usize y_len, f32 x_val, f32 y_val);
+struct f32_dq lut_interp_2d_dq(const float32_t *x_axis,
+                               const float32_t *y_axis,
+                               const float32_t *z_table,
+                               size_t           x_len,
+                               size_t           y_len,
+                               float32_t        x_val,
+                               float32_t        y_val);
 
 #endif // LUT_H

@@ -4,6 +4,8 @@
 #include "timeops.h"
 #include <array>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
 #include <mutex>
 #include <set>
@@ -16,10 +18,12 @@
 
 #include "app_log.hpp"
 #include "core/bin_parser.hpp"
+#include "core/c_header_parser.hpp"
 #include "core/dwarf_parser.hpp"
 #include "core/elf_parser.hpp"
 #include "core/json_parser.hpp"
 #include "core/parser.hpp"
+#include "core/sdk_loader.hpp"
 #include "module.h"
 
 class MonitorChannel;
@@ -27,14 +31,25 @@ struct ChannelDropPayload;
 struct StructChannelPayload;
 struct WatchMirrorRequest;
 
-enum class PortType { JLINK, UDP, SHM, MANUAL, LOCAL, AUDIO };
+// Persisted numeric values stay stable. Value 3 used to mean MANUAL and is
+// migrated to LOCAL when old sessions or .var files are loaded.
+enum class PortType { JLINK = 0, UDP = 1, SHM = 2, LOCAL = 4, AUDIO = 5 };
 
 struct VarEntry {
+        struct FunctionBinding {
+                std::string sourcePath;
+                std::string functionName;
+                std::string signature;
+                bool        empty() const { return functionName.empty(); }
+        };
+
         std::string name;
         DataType    type;
         PortType    port;
         u64         addr; // address or offset
         bool        isStruct{false};
+        bool        isUnion{false};
+        bool        isArray{false};
         u32         bitOffset{0};
         u32         bitSize{0};
 
@@ -62,6 +77,14 @@ struct VarEntry {
         u64  typeOff     = 0; // For DWARF nested display
         bool selected    = false;
         bool addrUnknown = false; // symbol missing from the (reloaded) ELF → show "UNKNOWN"
+
+        // Optional C accessors for LOCAL scalar variables. Stable names and
+        // signatures are stored instead of process-local function pointers.
+        FunctionBinding readFunction;
+        FunctionBinding writeFunction;
+        std::string     functionError; // runtime-only status
+        std::string     readFunctionError;
+        std::string     writeFunctionError;
 
         // User-editable enum label definitions (overrides DWARF when non-empty)
         struct EnumDef {
@@ -149,6 +172,23 @@ class Variable
         f32  watchListHeight_     = 300.0f;
         bool symBrowserCollapsed_ = false;
 
+        struct TableUiState {
+                int                  sortColumn{0};
+                int                  sortDirection{1}; // ImGuiSortDirection_Ascending
+                std::array<float, 6> widths{};
+                bool                 restoreWidths{false};
+                bool                 restoreSort{false};
+                bool                 initialized{false};
+        };
+        TableUiState watchTableUi_{};
+        TableUiState symbolTableUi_{};
+        TableUiState binTableUi_{};
+
+        void restoreTableWidths(TableUiState &state, int columnCount);
+        void restoreTableSort(TableUiState &state);
+        void captureTableWidths(TableUiState &state, int columnCount);
+        void captureTableSort(TableUiState &state, int column, int direction);
+
         u64 lastUpdateTs_{0};
         u32 updateIntervalMs_{200};
 
@@ -183,6 +223,64 @@ class Variable
         std::thread                pollThread_{};
         void                       startPollThread();
         void                       stopPollThread();
+
+        struct FunctionSource {
+                std::string libraryPath;
+                std::string headerPath;
+                SdkLoader   loader;
+                ParseResult declarations;
+                std::string status;
+                bool        statusError{false};
+                bool        statusWarning{false};
+        };
+        struct AccessReadReq {
+                std::string     name;
+                DataType        type{DataType::UNKNOWN};
+                CFuncDecl       function;
+                FunctionSource *source{nullptr};
+        };
+        struct AccessWriteReq {
+                std::string            name;
+                DataType               type{DataType::UNKNOWN};
+                CFuncDecl              function;
+                FunctionSource        *source{nullptr};
+                std::array<uint8_t, 8> value{};
+                u32                    size{0};
+                std::string            valueText;
+        };
+        struct AccessResult {
+                std::array<uint8_t, 8> value{};
+                u32                    size{0};
+                bool                   hasValue{false};
+                bool                   ok{false};
+                std::string            error;
+        };
+        struct AccessState {
+                std::mutex                                    mtx;
+                std::condition_variable                       cv;
+                std::vector<AccessReadReq>                    reads;
+                std::deque<AccessWriteReq>                    writes;
+                std::unordered_map<std::string, AccessResult> results;
+                std::unordered_map<std::string, AccessResult> writeResults;
+                bool                                          readsPending{false};
+                bool                                          running{true};
+        };
+        std::shared_ptr<AccessState>                 accessor_{};
+        std::thread                                  accessorThread_{};
+        std::mutex                                   sdkCallMtx_{};
+        std::vector<std::unique_ptr<FunctionSource>> functionSources_{};
+        bool                                         functionPanelOpen_{false};
+        i32                                          functionBindIdx_{-1};
+        void                                         startAccessorThread();
+        void                                         stopAccessorThread();
+        bool                                         loadFunctionLibrary(const std::string &path);
+        bool                                         parseFunctionHeader(const std::string &path);
+        void                                         drawFunctionPanel();
+        void                                         drawFunctionBindingPopup();
+        const CFuncDecl   *findFunction(const VarEntry::FunctionBinding &binding, FunctionSource **source = nullptr) const;
+        FunctionSource    *sourceForLibrary(const std::string &path);
+        FunctionSource    *sourceForHeader(const std::string &path);
+        static std::string functionSourceKey(const FunctionSource &source);
 
         // LOCAL port: variable-size in-process buffers keyed by variable name.
         // Buffers are pre-allocated (see drawAddVariableDialog OK handler) and
@@ -241,6 +339,9 @@ class Variable
                 int                                audioDeviceIndex{-1};
                 char                               audioDeviceName[128]{};
                 bool                               structMode{false};
+                bool                               unionMode{false};
+                bool                               arrayMode{false};
+                bool                               typeChanged{false};
                 std::vector<VarEntry::StructField> structFields;
         } editPropBuf_;
 
@@ -273,6 +374,8 @@ class Variable
                 char                               audioDeviceName[128]{};
                 char                               addrBuf[32] = "0"; // To avoid static persistence issues
                 bool                               structMode  = false;
+                bool                               unionMode   = false;
+                bool                               arrayMode   = false;
                 std::vector<VarEntry::StructField> structFields;
         } newVar_;
 
@@ -336,6 +439,10 @@ class Variable
         // per the variable's DataType. No-op if `name` is not a LOCAL variable
         // (so a user's manually-configured non-LOCAL entry is left untouched).
         void setLocalScalar(const std::string &name, double value);
+        // Apply a Monitor TABLE edit to a LOCAL scalar and invoke its optional
+        // DLL write accessor through the same path as the variable table.
+        bool writeLocalScalarFromMonitor(const std::string &name, double value);
+        bool openFunctionBindingFor(const std::string &name);
         // Programmatically add a LOCAL struct variable with predefined fields.
         // No-op if a variable with this name already exists.
         void addLocalStructVar(const std::string &name, const std::vector<VarEntry::StructField> &fields, size_t totalSize);
@@ -378,6 +485,7 @@ class Variable
         ~Variable()
         {
                 LOG_I("Variable Window Destroyed: %s", name_.c_str());
+                stopAccessorThread();
                 stopPollThread();
                 if (currentLoadingTask_) {
                         currentLoadingTask_->aborted = true;

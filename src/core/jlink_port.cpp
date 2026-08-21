@@ -10,8 +10,18 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <limits>
 #include <thread>
+#include <unordered_set>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#pragma comment(lib, "version.lib")
+#endif
 
 #include "cJSON.h"
 #include "imgui.h"
@@ -21,6 +31,156 @@
 #include "gui/i18n.hpp"
 #include "gui/tutorial_guide.hpp"
 #include "gui/ui_theme.hpp"
+#include "platform/native_dlg.hpp"
+
+// SEGGER RTT terminal exports are consumed only by ava_tool's J-Link transport.
+// They were removed from module/inc/jlink.h, so keep the DLL ABI private here.
+extern "C" {
+int JLINK_RTTERMINAL_Control(std::uint32_t command, void *parameter);
+int JLINK_RTTERMINAL_Read(std::uint32_t bufferIndex, char *buffer, std::uint32_t bufferSize);
+int JLINK_RTTERMINAL_Write(std::uint32_t bufferIndex, const void *buffer, std::uint32_t bufferSize);
+}
+
+static constexpr std::uint32_t JLINKARM_RTTERMINAL_CMD_START      = 0u;
+static constexpr std::uint32_t JLINKARM_RTTERMINAL_CMD_STOP       = 1u;
+static constexpr std::uint32_t JLINKARM_RTTERMINAL_CMD_GETNUMBUF  = 3u;
+static constexpr std::uint32_t JLINKARM_RTTERMINAL_DIRECTION_UP   = 0u;
+static constexpr std::uint32_t JLINKARM_RTTERMINAL_DIRECTION_DOWN = 1u;
+
+#ifdef _WIN32
+namespace
+{
+struct JLinkRuntimeApi {
+        HMODULE                                   dll{};
+        std::string                               loadedPath;
+        decltype(&::JLINKARM_Open)                Open{};
+        decltype(&::JLINKARM_Close)               Close{};
+        decltype(&::JLINKARM_IsOpen)              IsOpen{};
+        decltype(&::JLINKARM_Connect)             Connect{};
+        decltype(&::JLINKARM_ReadMemEx)           ReadMemEx{};
+        decltype(&::JLINKARM_WriteMemEx)          WriteMemEx{};
+        decltype(&::JLINKARM_ExecCommand)         ExecCommand{};
+        decltype(&::JLINKARM_TIF_Select)          TIF_Select{};
+        decltype(&::JLINKARM_SetSpeed)            SetSpeed{};
+        decltype(&::JLINKARM_Reset)               Reset{};
+        decltype(&::JLINKARM_Go)                  Go{};
+        decltype(&::JLINKARM_Halt)                Halt{};
+        decltype(&::JLINKARM_IsHalted)            IsHalted{};
+        decltype(&::JLINKARM_SetResetType)        SetResetType{};
+        decltype(&::JLINKARM_DEVICE_SelectDialog) DEVICE_SelectDialog{};
+        decltype(&::JLINKARM_DEVICE_GetInfo)      DEVICE_GetInfo{};
+        decltype(&::JLINK_HSS_Start)              HSS_Start{};
+        decltype(&::JLINK_HSS_Stop)               HSS_Stop{};
+        decltype(&::JLINK_HSS_Read)               HSS_Read{};
+        decltype(&::JLINK_RTTERMINAL_Control)     RTTERMINAL_Control{};
+        decltype(&::JLINK_RTTERMINAL_Read)        RTTERMINAL_Read{};
+        decltype(&::JLINK_RTTERMINAL_Write)       RTTERMINAL_Write{};
+        decltype(&::JLINKARM_SWO_Control)         SWO_Control{};
+        decltype(&::JLINKARM_SWO_DisableTarget)   SWO_DisableTarget{};
+        decltype(&::JLINKARM_SWO_EnableTarget)    SWO_EnableTarget{};
+        decltype(&::JLINKARM_SWO_Read)            SWO_Read{};
+        int(__cdecl *GetDLLVersion)(){};
+
+        std::string resolvedPath() const
+        {
+                if (!dll)
+                        return {};
+                std::vector<char> path(32768);
+                const DWORD       length = GetModuleFileNameA(dll, path.data(), static_cast<DWORD>(path.size()));
+                if (length == 0 || length >= path.size())
+                        return loadedPath;
+                return std::string(path.data(), length);
+        }
+
+        bool load(const std::string &path, std::string &error)
+        {
+                if (dll && loadedPath == path)
+                        return true;
+                if (dll) {
+                        FreeLibrary(dll);
+                        *this = {};
+                }
+#if defined(_M_ARM64)
+                dll = path.empty() ? LoadLibraryW(L"JLink_arm64.dll") : LoadLibraryA(path.c_str());
+#else
+                dll = path.empty() ? LoadLibraryW(L"JLink_x64.dll") : LoadLibraryA(path.c_str());
+#endif
+                if (!dll) {
+                        error = "Cannot load J-Link DLL (Windows error " + std::to_string(GetLastError()) + ")";
+                        return false;
+                }
+                auto symbol = [&](auto &target, const char *name) {
+                        target = reinterpret_cast<std::remove_reference_t<decltype(target)>>(GetProcAddress(dll, name));
+                        if (!target && error.empty())
+                                error = std::string("Missing J-Link DLL export: ") + name;
+                };
+                symbol(Open, "JLINKARM_Open");
+                symbol(Close, "JLINKARM_Close");
+                symbol(IsOpen, "JLINKARM_IsOpen");
+                symbol(Connect, "JLINKARM_Connect");
+                symbol(ReadMemEx, "JLINKARM_ReadMemEx");
+                symbol(WriteMemEx, "JLINKARM_WriteMemEx");
+                symbol(ExecCommand, "JLINKARM_ExecCommand");
+                symbol(TIF_Select, "JLINKARM_TIF_Select");
+                symbol(SetSpeed, "JLINKARM_SetSpeed");
+                symbol(Reset, "JLINKARM_Reset");
+                symbol(Go, "JLINKARM_Go");
+                symbol(Halt, "JLINKARM_Halt");
+                symbol(IsHalted, "JLINKARM_IsHalted");
+                symbol(SetResetType, "JLINKARM_SetResetType");
+                symbol(DEVICE_SelectDialog, "JLINKARM_DEVICE_SelectDialog");
+                symbol(DEVICE_GetInfo, "JLINKARM_DEVICE_GetInfo");
+                symbol(HSS_Start, "JLINK_HSS_Start");
+                symbol(HSS_Stop, "JLINK_HSS_Stop");
+                symbol(HSS_Read, "JLINK_HSS_Read");
+                symbol(RTTERMINAL_Control, "JLINK_RTTERMINAL_Control");
+                symbol(RTTERMINAL_Read, "JLINK_RTTERMINAL_Read");
+                symbol(RTTERMINAL_Write, "JLINK_RTTERMINAL_Write");
+                symbol(SWO_Control, "JLINKARM_SWO_Control");
+                symbol(SWO_DisableTarget, "JLINKARM_SWO_DisableTarget");
+                symbol(SWO_EnableTarget, "JLINKARM_SWO_EnableTarget");
+                symbol(SWO_Read, "JLINKARM_SWO_Read");
+                GetDLLVersion = reinterpret_cast<decltype(GetDLLVersion)>(GetProcAddress(dll, "JLINKARM_GetDLLVersion"));
+                if (!error.empty()) {
+                        FreeLibrary(dll);
+                        *this = {};
+                        return false;
+                }
+                loadedPath = path;
+                return true;
+        }
+};
+
+JLinkRuntimeApi g_jlinkApi;
+} // namespace
+
+#define JLINKARM_Open                g_jlinkApi.Open
+#define JLINKARM_Close               g_jlinkApi.Close
+#define JLINKARM_IsOpen              g_jlinkApi.IsOpen
+#define JLINKARM_Connect             g_jlinkApi.Connect
+#define JLINKARM_ReadMemEx           g_jlinkApi.ReadMemEx
+#define JLINKARM_WriteMemEx          g_jlinkApi.WriteMemEx
+#define JLINKARM_ExecCommand         g_jlinkApi.ExecCommand
+#define JLINKARM_TIF_Select          g_jlinkApi.TIF_Select
+#define JLINKARM_SetSpeed            g_jlinkApi.SetSpeed
+#define JLINKARM_Reset               g_jlinkApi.Reset
+#define JLINKARM_Go                  g_jlinkApi.Go
+#define JLINKARM_Halt                g_jlinkApi.Halt
+#define JLINKARM_IsHalted            g_jlinkApi.IsHalted
+#define JLINKARM_SetResetType        g_jlinkApi.SetResetType
+#define JLINKARM_DEVICE_SelectDialog g_jlinkApi.DEVICE_SelectDialog
+#define JLINKARM_DEVICE_GetInfo      g_jlinkApi.DEVICE_GetInfo
+#define JLINK_HSS_Start              g_jlinkApi.HSS_Start
+#define JLINK_HSS_Stop               g_jlinkApi.HSS_Stop
+#define JLINK_HSS_Read               g_jlinkApi.HSS_Read
+#define JLINK_RTTERMINAL_Control     g_jlinkApi.RTTERMINAL_Control
+#define JLINK_RTTERMINAL_Read        g_jlinkApi.RTTERMINAL_Read
+#define JLINK_RTTERMINAL_Write       g_jlinkApi.RTTERMINAL_Write
+#define JLINKARM_SWO_Control         g_jlinkApi.SWO_Control
+#define JLINKARM_SWO_DisableTarget   g_jlinkApi.SWO_DisableTarget
+#define JLINKARM_SWO_EnableTarget    g_jlinkApi.SWO_EnableTarget
+#define JLINKARM_SWO_Read            g_jlinkApi.SWO_Read
+#endif
 
 JLinkPort &
 JLinkPort::instance()
@@ -31,8 +191,18 @@ JLinkPort::instance()
 
 JLinkPort::~JLinkPort()
 {
+        dllScanCancel_.store(true, std::memory_order_release);
+        if (dllScanThread_.joinable())
+                dllScanThread_.join();
         swoStop();
         rttStop();
+}
+
+std::string
+JLinkPort::selectedDllPath() const
+{
+        std::lock_guard lk(dllMtx_);
+        return selectedDllPath_;
 }
 
 bool
@@ -41,6 +211,19 @@ JLinkPort::open()
         std::lock_guard lk(mtx_);
         if (isOpen_)
                 return true;
+
+#ifdef _WIN32
+        std::string loadError;
+        if (!g_jlinkApi.load(selectedDllPath(), loadError)) {
+                lastErr_ = std::move(loadError);
+                LOG_E("JLinkPort::open() FAILED: %s", lastErr_.c_str());
+                return false;
+        }
+        {
+                std::lock_guard dllLock(dllMtx_);
+                loadedDllPath_ = g_jlinkApi.resolvedPath();
+        }
+#endif
 
         const char *err = JLINKARM_Open();
         if (err && err[0]) {
@@ -2067,6 +2250,7 @@ JLinkPort::saveSession(void *node) const
         cJSON_AddStringToObject(jlink, "device", deviceName().c_str());
         cJSON_AddNumberToObject(jlink, "speedKHz", speed());
         cJSON_AddNumberToObject(jlink, "hssPeriodUs", hssPeriodUs_);
+        cJSON_AddStringToObject(jlink, "dllPath", selectedDllPath().c_str());
 
         cJSON *trace = cJSON_CreateObject();
         cJSON_AddNumberToObject(trace, "cpuMHz", swoCpuMHz_);
@@ -2104,6 +2288,10 @@ JLinkPort::loadSession(const void *node)
                 setSpeed(std::clamp(v->valueint, 1, 50000));
         if (const cJSON *v = cJSON_GetObjectItem(jlink, "hssPeriodUs"); cJSON_IsNumber(v))
                 hssPeriodUs_ = std::max(v->valueint, 1);
+        if (const cJSON *v = cJSON_GetObjectItem(jlink, "dllPath"); cJSON_IsString(v)) {
+                std::lock_guard lk(dllMtx_);
+                selectedDllPath_ = v->valuestring;
+        }
 
         if (const cJSON *trace = cJSON_GetObjectItem(jlink, "trace"); cJSON_IsObject(trace)) {
                 if (const cJSON *v = cJSON_GetObjectItem(trace, "cpuMHz"); cJSON_IsNumber(v))
@@ -2158,18 +2346,31 @@ JLinkPort::drawUI()
         snprintf(
             btnLabel, sizeof(btnLabel), "%s##jlink_port_btn", nameBuf[0] != '\0' ? nameBuf : tr("Select Device", "选择设备"));
         if (ImGui::Button(btnLabel, ImVec2(180.0f, 0))) {
-                JLINKARM_DEVICE_SELECT_INFO sinfo;
-                sinfo.SizeOfStruct = sizeof(sinfo);
-                sinfo.CoreIndex    = 0;
-                int32_t devIdx     = JLINKARM_DEVICE_SelectDialog(nullptr, 0, &sinfo);
-                if (devIdx >= 0) {
-                        JLINKARM_DEVICE_INFO dinfo;
-                        dinfo.SizeOfStruct = sizeof(dinfo);
-                        if (JLINKARM_DEVICE_GetInfo(devIdx, &dinfo) >= 0)
-                                if (deviceName() != dinfo.sName) {
-                                        setDeviceName(dinfo.sName);
-                                        configModified_.store(true, std::memory_order_release);
-                                }
+#ifdef _WIN32
+                std::string loadError;
+                if (!g_jlinkApi.load(selectedDllPath(), loadError)) {
+                        std::lock_guard lk(mtx_);
+                        lastErr_ = std::move(loadError);
+                } else {
+                        std::lock_guard dllLock(dllMtx_);
+                        loadedDllPath_ = g_jlinkApi.resolvedPath();
+                }
+                if (loadError.empty())
+#endif
+                {
+                        JLINKARM_DEVICE_SELECT_INFO sinfo;
+                        sinfo.SizeOfStruct = sizeof(sinfo);
+                        sinfo.CoreIndex    = 0;
+                        int devIdx         = JLINKARM_DEVICE_SelectDialog(nullptr, 0, &sinfo);
+                        if (devIdx >= 0) {
+                                JLINKARM_DEVICE_INFO dinfo;
+                                dinfo.SizeOfStruct = sizeof(dinfo);
+                                if (JLINKARM_DEVICE_GetInfo(devIdx, &dinfo) >= 0)
+                                        if (deviceName() != dinfo.sName) {
+                                                setDeviceName(dinfo.sName);
+                                                configModified_.store(true, std::memory_order_release);
+                                        }
+                        }
                 }
         }
         TutorialGuide::instance().mark("device_btn");
@@ -2235,6 +2436,261 @@ JLinkPort::drawUI()
                             tr("Try reducing the sampling frequency (Hz) if you see 'Low on memory' or 'Start failed'.",
                                "若出现 'Low on memory' 或 'Start failed'，请尝试降低采样频率 (Hz)。"));
                 ImGui::PopStyleColor();
+        }
+}
+
+#ifdef _WIN32
+static std::string
+jlinkDllFileVersion(const std::string &path)
+{
+        DWORD       ignored = 0;
+        const DWORD size    = GetFileVersionInfoSizeA(path.c_str(), &ignored);
+        if (size == 0)
+                return "Unknown";
+        std::vector<unsigned char> data(size);
+        if (!GetFileVersionInfoA(path.c_str(), 0, size, data.data()))
+                return "Unknown";
+
+        struct LanguageAndCodePage {
+                WORD language;
+                WORD codePage;
+        };
+        LanguageAndCodePage *translations    = nullptr;
+        UINT                 translationSize = 0;
+        if (VerQueryValueA(
+                data.data(), "\\VarFileInfo\\Translation", reinterpret_cast<void **>(&translations), &translationSize) &&
+            translations) {
+                const UINT count = translationSize / sizeof(LanguageAndCodePage);
+                for (UINT i = 0; i < count; ++i) {
+                        char query[96];
+                        snprintf(query,
+                                 sizeof(query),
+                                 "\\StringFileInfo\\%04x%04x\\FileVersion",
+                                 translations[i].language,
+                                 translations[i].codePage);
+                        char *text       = nullptr;
+                        UINT  textLength = 0;
+                        if (VerQueryValueA(data.data(), query, reinterpret_cast<void **>(&text), &textLength) && text &&
+                            textLength > 1)
+                                return text;
+                }
+        }
+        VS_FIXEDFILEINFO *info     = nullptr;
+        UINT              infoSize = 0;
+        if (!VerQueryValueA(data.data(), "\\", reinterpret_cast<void **>(&info), &infoSize) || !info)
+                return "Unknown";
+        char version[64];
+        snprintf(version,
+                 sizeof(version),
+                 "%u.%u.%u.%u",
+                 HIWORD(info->dwFileVersionMS),
+                 LOWORD(info->dwFileVersionMS),
+                 HIWORD(info->dwFileVersionLS),
+                 LOWORD(info->dwFileVersionLS));
+        return version;
+}
+
+static const char *
+jlinkDllFileName()
+{
+#if defined(_M_ARM64)
+        return "JLink_arm64.dll";
+#else
+        return "JLink_x64.dll";
+#endif
+}
+
+static std::string
+jlinkBundledDllPath()
+{
+        std::vector<char> executable(32768);
+        const DWORD       length = GetModuleFileNameA(nullptr, executable.data(), static_cast<DWORD>(executable.size()));
+        if (length == 0 || length >= executable.size())
+                return jlinkDllFileName();
+        return (std::filesystem::path(std::string(executable.data(), length)).parent_path() / jlinkDllFileName()).string();
+}
+
+static std::string
+jlinkResolvedDefaultDllPath()
+{
+        const std::string bundled = jlinkBundledDllPath();
+        std::error_code   ec;
+        if (std::filesystem::is_regular_file(bundled, ec))
+                return bundled;
+
+        std::vector<char> resolved(32768);
+        const DWORD       length =
+            SearchPathA(nullptr, jlinkDllFileName(), nullptr, static_cast<DWORD>(resolved.size()), resolved.data(), nullptr);
+        if (length > 0 && length < resolved.size())
+                return std::string(resolved.data(), length);
+        return bundled;
+}
+#endif
+
+void
+JLinkPort::startDllScan()
+{
+#ifndef _WIN32
+        return;
+#else
+        if (dllScanning_.exchange(true, std::memory_order_acq_rel))
+                return;
+        dllScanCompleted_.store(false, std::memory_order_release);
+        dllScanCancel_.store(false, std::memory_order_release);
+        if (dllScanThread_.joinable())
+                dllScanThread_.join();
+        {
+                std::lock_guard lk(dllMtx_);
+                dllCandidates_.clear();
+                dllScanLocation_ = "Preparing drive scan...";
+        }
+        dllScanThread_ = std::thread([this]() {
+                std::vector<DllCandidate>       found;
+                std::unordered_set<std::string> seen;
+#if defined(_M_ARM64)
+                const std::string wanted = "jlink_arm64.dll";
+#else
+                const std::string wanted = "jlink_x64.dll";
+#endif
+                auto addCandidate = [&](const std::filesystem::path &path) {
+                        std::string full = path.lexically_normal().string();
+                        std::string key  = full;
+                        std::ranges::transform(
+                            key, key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                        if (!seen.insert(key).second)
+                                return;
+                        found.push_back({full, jlinkDllFileVersion(full)});
+                        std::sort(found.begin(), found.end(), [](const DllCandidate &a, const DllCandidate &b) {
+                                if (a.version != b.version)
+                                        return a.version > b.version;
+                                return a.path < b.path;
+                        });
+                        std::lock_guard lk(dllMtx_);
+                        dllCandidates_ = found;
+                };
+
+                const DWORD drives = GetLogicalDrives();
+                for (int drive = 0; drive < 26 && !dllScanCancel_.load(std::memory_order_acquire); ++drive) {
+                        if ((drives & (1u << drive)) == 0)
+                                continue;
+                        char rootText[] = "A:\\";
+                        rootText[0]     = static_cast<char>('A' + drive);
+                        const UINT kind = GetDriveTypeA(rootText);
+                        if (kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE)
+                                continue;
+                        std::error_code                               ec;
+                        std::filesystem::recursive_directory_iterator it(
+                            rootText, std::filesystem::directory_options::skip_permission_denied, ec);
+                        std::filesystem::recursive_directory_iterator end;
+                        size_t                                        visited = 0;
+                        while (it != end && !dllScanCancel_.load(std::memory_order_acquire)) {
+                                if (!ec && it->is_regular_file(ec)) {
+                                        std::string fileName = it->path().filename().string();
+                                        std::ranges::transform(fileName, fileName.begin(), [](unsigned char c) {
+                                                return static_cast<char>(std::tolower(c));
+                                        });
+                                        if (fileName == wanted)
+                                                addCandidate(it->path());
+                                }
+                                if ((++visited % 1000) == 0) {
+                                        std::lock_guard lk(dllMtx_);
+                                        dllScanLocation_ = it->path().parent_path().string();
+                                }
+                                it.increment(ec);
+                                if (ec)
+                                        ec.clear();
+                        }
+                }
+                {
+                        std::lock_guard lk(dllMtx_);
+                        dllScanLocation_ = "Scan complete";
+                }
+                dllScanCompleted_.store(true, std::memory_order_release);
+                dllScanning_.store(false, std::memory_order_release);
+        });
+#endif
+}
+
+void
+JLinkPort::drawDllSettingsMenu()
+{
+        const bool  connected = isOpen() || isConnected() || isBusy();
+        std::string selected  = selectedDllPath();
+#ifdef _WIN32
+        const std::string         bundledPath     = jlinkBundledDllPath();
+        const std::string         bundledVersion  = jlinkDllFileVersion(bundledPath);
+        const std::string         selectedPath    = selected.empty() ? jlinkResolvedDefaultDllPath() : selected;
+        const std::string         selectedVersion = jlinkDllFileVersion(selectedPath);
+        std::string               loadedPath;
+        std::vector<DllCandidate> candidates;
+        std::string               location;
+        {
+                std::lock_guard lk(dllMtx_);
+                loadedPath = loadedDllPath_;
+                candidates = dllCandidates_;
+                location   = dllScanLocation_;
+        }
+
+        ImGui::TextDisabled("%s", tr("Current:", "当前："));
+        ImGui::Text("%s", selectedVersion.c_str());
+        ImGui::TextWrapped("%s", selectedPath.c_str());
+        ImGui::TextDisabled(tr("Bundled: %s", "内置：%s"), bundledVersion.c_str());
+        if (!loadedPath.empty())
+                ImGui::TextDisabled(tr("Loaded: %s", "已加载：%s"), jlinkDllFileVersion(loadedPath).c_str());
+#else
+        std::vector<DllCandidate> candidates;
+        std::string               location;
+        {
+                std::lock_guard lk(dllMtx_);
+                candidates = dllCandidates_;
+                location   = dllScanLocation_;
+        }
+        ImGui::TextDisabled("%s", tr("Current:", "当前："));
+        ImGui::TextWrapped("%s", selected.empty() ? tr("Bundled / system default", "内置 / 系统默认") : selected.c_str());
+#endif
+        ImGui::Separator();
+        ImGui::BeginDisabled(connected);
+        if (ImGui::MenuItem(tr("Change...", "更改..."))) {
+                const std::string path = nativeDlgOpen(tr("Select J-Link DLL", "选择 J-Link DLL"), {{"J-Link DLL", {"dll"}}});
+                if (!path.empty()) {
+                        std::lock_guard lk(dllMtx_);
+                        selectedDllPath_ = path;
+                        configModified_.store(true, std::memory_order_release);
+                }
+        }
+        if (ImGui::MenuItem(
+                tr("Reset to bundled / system default", "重置为内置 / 系统默认"), nullptr, false, !selected.empty())) {
+                std::lock_guard lk(dllMtx_);
+                selectedDllPath_.clear();
+                configModified_.store(true, std::memory_order_release);
+        }
+        if (ImGui::BeginMenu(tr("Detected versions", "检测到的版本"), !candidates.empty())) {
+                for (const auto &candidate : candidates) {
+                        std::string label = candidate.version + "##" + candidate.path;
+                        if (ImGui::MenuItem(label.c_str(), nullptr, selected == candidate.path)) {
+                                std::lock_guard lk(dllMtx_);
+                                selectedDllPath_ = candidate.path;
+                                configModified_.store(true, std::memory_order_release);
+                        }
+                        if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("%s", candidate.path.c_str());
+                }
+                ImGui::EndMenu();
+        }
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        if (dllScanning_.load(std::memory_order_acquire)) {
+                ImGui::TextDisabled("%s", tr("Scanning drives...", "正在扫描磁盘..."));
+                if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%s", location.c_str());
+                if (ImGui::MenuItem(tr("Stop Scan", "停止扫描")))
+                        dllScanCancel_.store(true, std::memory_order_release);
+        } else if (ImGui::MenuItem(tr("Scan All Drives", "扫描所有磁盘"))) {
+                startDllScan();
+        }
+        if (connected) {
+                ImGui::Separator();
+                ImGui::TextDisabled("%s", tr("Disconnect J-Link before changing.", "断开 J-Link 后才可更改。"));
         }
 }
 

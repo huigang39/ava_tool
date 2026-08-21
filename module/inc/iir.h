@@ -1,7 +1,9 @@
 #ifndef IIR_H
 #define IIR_H
+#include <stddef.h>
+#include <stdint.h>
 
-#include "typedef.h"
+#include "macrodef.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,51 +13,49 @@ extern "C" {
 /*                                  类型定义                                  */
 /* -------------------------------------------------------------------------- */
 
-typedef enum iir_order {
-        IIR_1 = 1,
-        IIR_2 = 2,
-} iir_order_e;
+enum iir_order {
+    IIR_1 = 1,
+    IIR_2 = 2,
+};
 
-typedef enum iir_type {
-        IIR_LOWPASS,
-        IIR_HIGHPASS,
-        IIR_BANDPASS,
-} iir_type_e;
+enum iir_type {
+    IIR_LOWPASS,
+    IIR_HIGHPASS,
+    IIR_BANDPASS,
+};
 
-typedef struct iif_cfg {
-        f32         fs;
-        f32         fh, fl;
-        iir_order_e order;
-        iir_type_e  type;
-} iir_cfg_t;
+struct iif_cfg {
+    float32_t      fs;
+    float32_t      fh, fl;
+    enum iir_order order;
+    enum iir_type  type;
+};
 
-typedef struct iir_in {
-        f32 x;
-} iir_in_t;
+struct iir_in {
+    float32_t x;
+};
 
-typedef struct iir_out {
-        f32 y;
-} iir_out_t;
+struct iir_out {
+    float32_t y;
+};
 
-typedef struct iir_lo {
-        iir_cfg_t cfg;
+struct iir_lo {
+    float32_t fc;
+    float32_t rc;
+    float32_t alpha;
+    float32_t w0, q;
+    float32_t x1, x2, y1, y2;
+    float32_t b0, b1, b2;
+    float32_t a0, a1, a2;
+    float32_t norm_a0, norm_a1, norm_a2, norm_a3, norm_a4;
+};
 
-        f32 fc;
-        f32 rc;
-        f32 alpha;
-        f32 w0, q;
-        f32 x1, x2, y1, y2;
-        f32 b0, b1, b2;
-        f32 a0, a1, a2;
-        f32 norm_a0, norm_a1, norm_a2, norm_a3, norm_a4;
-} iir_lo_t;
-
-typedef struct iir_filter {
-        iir_cfg_t cfg;
-        iir_in_t  in;
-        iir_out_t out;
-        iir_lo_t  lo;
-} iir_filter_t;
+struct iir_filter {
+    struct iif_cfg cfg;
+    struct iir_in  in;
+    struct iir_out out;
+    struct iir_lo  lo;
+};
 
 /* -------------------------------------------------------------------------- */
 /*                                  接口声明                                  */
@@ -68,7 +68,7 @@ typedef struct iir_filter {
  * @param iir_cfg IIR 滤波器配置
  * @return        int 状态码
  */
-int iir_init(iir_filter_t *iir, iir_cfg_t iir_cfg);
+int iir_init(struct iir_filter *iir, struct iif_cfg iir_cfg);
 
 /**
  * @brief IIR 滤波器单次执行器计算
@@ -76,7 +76,7 @@ int iir_init(iir_filter_t *iir, iir_cfg_t iir_cfg);
  * @param iir IIR 滤波器结构体
  * @return    void
  */
-void iir_exec(iir_filter_t *iir);
+void iir_exec(struct iir_filter *iir);
 
 /**
  * @brief IIR 滤波器单次执行器计算(带输入)
@@ -85,7 +85,7 @@ void iir_exec(iir_filter_t *iir);
  * @param x   待计算的数据
  * @return    void
  */
-void iir_exec_in(iir_filter_t *iir, f32 x);
+void iir_exec_in(struct iir_filter *iir, float32_t x);
 
 #ifdef __cplusplus
 }

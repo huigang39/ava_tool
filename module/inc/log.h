@@ -4,9 +4,14 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+#include "macrodef.h"
+
 #include "mempool.h"
 #include "mpsc.h"
-#include "typedef.h"
+#include <stddef.h>
+#include <stdint.h>
+
+#include "macrodef.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,95 +21,107 @@ extern "C" {
 /*                                  类型定义                                  */
 /* -------------------------------------------------------------------------- */
 
-typedef enum log_format {
-        LOG_FORMAT_TEXT,
-        LOG_FORMAT_BIN,
-} log_format_e;
+enum log_format {
+    LOG_FORMAT_TXT,
+    LOG_FORMAT_BIN,
+    LOG_FORMAT_CSV,
+};
 
-typedef enum log_level {
-        LOG_LEVEL_DATA,
-        LOG_LEVEL_DEBUG,
-        LOG_LEVEL_INFO,
-        LOG_LEVEL_WARN,
-        LOG_LEVEL_ERR,
-} log_level_e;
+enum log_level {
+    LOG_LEVEL_DATA,
+    LOG_LEVEL_DEBUG,
+    LOG_LEVEL_INFO,
+    LOG_LEVEL_WARN,
+    LOG_LEVEL_ERR,
+};
 
-typedef enum log_mode {
-        LOG_MODE_SYNC,
-        LOG_MODE_ASYNC,
-} log_mode_e;
+enum log_mode {
+    LOG_MODE_SYNC,
+    LOG_MODE_ASYNC,
+};
 
-typedef enum log_ring {
-        LOG_RING_TRUNCATE,
-        LOG_RING_ROTATE,
-} log_ring_e;
+enum log_ring {
+    LOG_RING_TRUNCATE,
+    LOG_RING_ROTATE,
+};
 
-typedef struct log_header {
-        u64   ts;
-        usize id;
-        usize size;
-} log_header_t;
+struct log_header {
+    uint64_t ts;
+    size_t   id;
+    size_t   size;
+};
 
-typedef u64 (*log_get_ts_f)(void);
-typedef void (*log_flush_f)(void *fp, const void *src, usize size);
+typedef uint64_t (*log_get_ts_f)(void);
+typedef void (*log_flush_f)(void *fp, const void *src, size_t size);
 
-typedef struct log_cfg {
-        log_mode_e   e_mode;
-        log_level_e  e_level;
-        log_format_e e_format;
-        mempool_t   *mempool;
-        const char  *file_path;
-        void        *fd;
-        usize        file_size;
-        usize        max_files;
-        log_ring_e   e_ring;
-        usize        chunk_size; // 每个线程块的最大尺寸
-        usize        flush_cap;
-        usize        nproducers; // 记录最大线程数
-        log_get_ts_f f_get_ts;
-        log_flush_f  f_flush;
-} log_cfg_t;
+struct log_cfg {
+    enum log_mode   e_mode;
+    enum log_level  e_level;
+    enum log_format e_format;
+    struct mempool *mempool;
+    const char     *file_path;
+    const char     *file_header;
+    void           *fd;
+    size_t          file_size;
+    size_t          max_files;
+    enum log_ring   e_ring;
+    size_t          chunk_size; // 每个线程块的最大尺寸
+    size_t          flush_cap;
+    size_t          nproducers; // 记录最大线程数
+    log_get_ts_f    f_get_ts;
+    log_flush_f     f_flush;
+};
 
-typedef struct log_chunk {
-        mpsc_node_t node;
-        usize       offset;
-} log_chunk_t;
+struct log_chunk {
+    struct mpsc_node node;
+    size_t           offset;
+};
 
-typedef struct log_lo {
-        mpsc_t mpsc;
-        u8     busy;
-        u8    *flush_buf;
-        usize  file_offset;
+struct log_producer {
+    ATOMIC(uint8_t) lock;
+    struct log_chunk *chunk;
+};
 
-        void *mmap_ptr;
-        void *os_file_handle;
-        void *os_map_handle;
-        char  curr_file_path[256];
+struct log_lo {
+    struct mpsc mpsc;
+    uint8_t     busy;
+    uint8_t    *flush_buf;
+    size_t      file_offset;
 
-        // 使用 ID 绑定的私有块数组
-        log_chunk_t **chunks;
-} log_lo_t;
+    void *mmap_ptr;
+    void *os_file_handle;
+    void *os_map_handle;
+    char  curr_file_path[256];
 
-typedef struct log {
-        log_cfg_t cfg;
-        log_lo_t  lo;
-} log_t;
+    // 使用 ID 绑定的私有块,每个 producer 独占一个槽位
+    struct log_producer *producers;
+};
+
+struct log {
+    struct log_cfg cfg;
+    struct log_lo  lo;
+};
 
 /* -------------------------------------------------------------------------- */
 /*                                  接口声明                                  */
 /* -------------------------------------------------------------------------- */
 
-void log_init(log_t *log, log_cfg_t log_cfg);
-void log_deinit(log_t *log);
-void log_write_bin(log_t *log, usize id, const void *header, usize header_size, const void *payload, usize payload_size);
-void log_write(log_t *log, usize idx, const char *fmt, va_list args);
-void log_flush(log_t *log);
+void log_init(struct log *log, struct log_cfg log_cfg);
+void log_deinit(struct log *log);
+void log_write_bin(struct log *log,
+                   size_t      id,
+                   const void *header,
+                   size_t      header_size,
+                   const void *payload,
+                   size_t      payload_size);
+void log_write(struct log *log, size_t idx, const char *fmt, va_list args);
+void log_flush(struct log *log);
 
-void log_data(log_t *log, usize idx, const char *fmt, ...);
-void log_debug(log_t *log, usize idx, const char *fmt, ...);
-void log_info(log_t *log, usize idx, const char *fmt, ...);
-void log_warn(log_t *log, usize idx, const char *fmt, ...);
-void log_error(log_t *log, usize idx, const char *fmt, ...);
+void log_data(struct log *log, size_t idx, const char *fmt, ...);
+void log_debug(struct log *log, size_t idx, const char *fmt, ...);
+void log_info(struct log *log, size_t idx, const char *fmt, ...);
+void log_warn(struct log *log, size_t idx, const char *fmt, ...);
+void log_error(struct log *log, size_t idx, const char *fmt, ...);
 
 #ifdef __cplusplus
 }

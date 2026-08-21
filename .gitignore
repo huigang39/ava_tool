@@ -4,9 +4,47 @@
 /**/.claude/
 
 /**/.cache/
-/**/build/
-/**/bin/
+
+# Build output directories (including build_verify, bin_debug, etc.)
+/**/build*/
+/**/bin*/
+/**/out*/
 /**/cmake-*/
+/**/CMakeFiles/
+/**/[Dd]ebug/
+/**/[Rr]elease/
+
+# Compiler and linker outputs
+*.o
+*.obj
+*.lo
+*.d
+*.dep
+*.pch
+*.gch
+*.res
+*.exe
+*.dll
+*.so
+*.so.*
+*.dylib
+*.lib
+*.a
+*.pdb
+*.ilk
+*.exp
+*.map
+*.idb
+*.iobj
+*.ipdb
+*.dSYM/
+
+# CMake / Ninja generated files
+/**/CMakeCache.txt
+/**/cmake_install.cmake
+/**/CTestTestfile.cmake
+/**/build.ninja
+/**/.ninja_*
 
 /**/compile_commands.json
 /**/*.user

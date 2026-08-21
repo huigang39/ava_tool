@@ -66,13 +66,13 @@ endef
 endif
 
 CC                    := gcc
-INCLUDE_DIRS          := -I"$(MODULE_DIR)"
+INCLUDE_DIRS          := -I"$(MODULE_DIR)" -I"$(MODULE_DIR)/inc"
 CFLAGS                := -Wall -Wextra -g
 LDFLAGS               := -lpthread -lm
 
 ifeq ($(PLATFORM),win)
     CC                := cl.exe
-    INCLUDE_DIRS      := /I"$(MODULE_DIR)"
+    INCLUDE_DIRS      := /I"$(MODULE_DIR)" /I"$(MODULE_DIR)/inc"
     CFLAGS            := /W3 /nologo /TC /MD /std:clatest /utf-8 /experimental:c11atomics /FS
     OUTPUT_STATIC_LIB := $(LIB_DIR)/win/module.lib
     LDFLAGS           := kernel32.lib ws2_32.lib
@@ -101,7 +101,8 @@ CFLAGS                += $(INCLUDE_DIRS)
 SRC_FILES             := $(wildcard *.c)
 TARGETS               := $(SRC_FILES:.c=)
 BINS                  := $(addprefix $(BUILD_DIR)/,$(addsuffix $(EXE_EXT),$(TARGETS)))
-FSA_MEM_SRC_FILES     := ../tool/fsa_rma/fsa_mem.c
+AVA_ECAT_SRC_FILES     := ../sdk/ava_debug/src/ava_ecat.c
+AVA_SDK_SRC_FILES     := ../sdk/ava_debug/src/ava_sdk.c ../sdk/ava_debug/src/elf_parser.c $(AVA_ECAT_SRC_FILES)
 
 .PHONY: all clean $(TARGETS) help
 
@@ -144,15 +145,23 @@ else
 	$(CC) $(CFLAGS) $< -o "$@" "$(OUTPUT_STATIC_LIB)" $(LDFLAGS)
 endif
 
-$(BUILD_DIR)/pdo_pid_param_test$(EXE_EXT): pdo_pid_param_test.c $(FSA_MEM_SRC_FILES) | $(BUILD_DIR)
+$(BUILD_DIR)/pdo_pid_param_test$(EXE_EXT): pdo_pid_param_test.c $(AVA_ECAT_SRC_FILES) | $(BUILD_DIR)
 	@$(ECHO_NL)
 	@echo [test][CC] $<
 ifeq ($(PLATFORM),win)
-	$(CC) $(CFLAGS) "$<" "$(FSA_MEM_SRC_FILES)" /Fo"$(BUILD_DIR)\\" /Fe"$@" /link $(LDFLAGS)
+	$(CC) $(CFLAGS) "$<" "$(AVA_ECAT_SRC_FILES)" /Fo"$(BUILD_DIR)\\" /Fe"$@" /link $(LDFLAGS)
 else
-	$(CC) $(CFLAGS) $< $(FSA_MEM_SRC_FILES) -o "$@" $(LDFLAGS)
+	$(CC) $(CFLAGS) $< $(AVA_ECAT_SRC_FILES) -o "$@" $(LDFLAGS)
 endif
 
+$(BUILD_DIR)/ava_sdk_test$(EXE_EXT): ava_sdk_test.c $(AVA_SDK_SRC_FILES) | $(BUILD_DIR)
+	@$(ECHO_NL)
+	@echo [test][CC] $<
+ifeq ($(PLATFORM),win)
+	$(CC) $(CFLAGS) "$<" $(AVA_SDK_SRC_FILES) /Fo"$(BUILD_DIR)\\" /Fe"$@" /link $(LDFLAGS)
+else
+	$(CC) $(CFLAGS) $< $(AVA_SDK_SRC_FILES) -o "$@" $(LDFLAGS)
+endif
 $(TARGETS): %: $(BUILD_DIR)/%$(EXE_EXT)
 
 $(BUILD_DIR):

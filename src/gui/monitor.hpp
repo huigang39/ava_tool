@@ -88,6 +88,13 @@ class Monitor
         std::atomic<bool> csvLoading_{false};
         std::string       importSourcePath_{};
         std::string       importSourceType_{};
+        // Generic CSV X axis: -2 = auto-detect, -1 = row number, >= 0 = CSV column index.
+        int importTimeColumn_{-2};
+        // 0 = auto, 1 = seconds, 2 = milliseconds, 3 = microseconds.
+        int         importTimeUnit_{0};
+        std::string importTimeOriginText_{};
+        bool        fillAppOnNextDraw_{false};
+        bool        maximizeWhenImportCompletes_{false};
         // Pause acquisition for every scope in this monitor at once (monitor toolbar).
         // The sampler skips the whole monitor while set.
         std::atomic<bool> samplingPaused_{false};
@@ -178,7 +185,11 @@ class Monitor
         bool isPendingDelete() const { return pendingDelete_.load(std::memory_order_acquire); }
 
         bool isSamplingPaused() const { return samplingPaused_.load(std::memory_order_acquire); }
-        void setSamplingPaused(bool p) { samplingPaused_.store(p, std::memory_order_release); }
+        void setSamplingPaused(bool p)
+        {
+                if (samplingPaused_.exchange(p, std::memory_order_acq_rel) != p)
+                        setModified();
+        }
 
         std::string        getName() { return name_; }
         const std::string &getTitle() const { return title_.empty() ? name_ : title_; }

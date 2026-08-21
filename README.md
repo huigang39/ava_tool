@@ -4,7 +4,7 @@ AvA Tool 是一个面向嵌入式调试和电机控制实验的实时变量监�
 
 ## 主要功能
 
-- 变量管理：拖入 ELF/AXF/BIN/CSV 文件，浏览符号并添加变量。
+- 变量管理：拖入 ELF/AXF/BIN/CSV 文件，浏览符号并添加变量；LOCAL 标量可绑定动态库中的 C 读写函数。
 - 设备管理：创建设备类型及其实例，把动态库中的 C 函数绑定为实例方法或发现方法，并将输入、输出或返回值映射到类型化属性。
 - 实时监控：按 Monitor 和 Scope 组织通道，支持表格视图和曲线视图。
 - J-Link 采样与 RTT：支持普通轮询、HSS 高速采样，以及复用当前调试连接的 SEGGER RTT 双向终端。
@@ -37,8 +37,11 @@ AvA Tool 是一个面向嵌入式调试和电机控制实验的实时变量监�
 ### Variables
 
 - `Load File...`：加载 ELF/AXF/BIN。
-- `Add Variable`：手动添加变量，可选择 JLINK、UDP、SHM 端口。
+- `Add Variable`：手动添加变量，可选择 JLINK、LOCAL、SHM 或 AUDIO 数据源。旧会话中的 MANUAL 变量会自动迁移为只读 LOCAL 变量。
+- 属性编辑器会保留当前标量、STRUCT 或 UNION 类型；DWARF 联合体会按 UNION 展示和展开，LOCAL 也可手动创建联合体。
 - `Refresh(ms)`：变量窗口后台轮询刷新周期。
+- `Function Browser`：与符号浏览器堆叠在变量表下方，可独立展开；支持同时加载多组动态库及声明导出函数的 C/C++ 头文件，每个函数和变量绑定都会记录所属动态库。也可以把 DLL/SO/dylib 和头文件直接拖入变量窗口；右键点击 LOCAL 标量后选择 `Bind Read/Write Functions...` 绑定访问器。C++ 类和成员方法可浏览，但变量访问器必须绑定顶层 C ABI 函数。
+- 读取访问器支持 `T read(void)` 或 `status read(T *out)`；写入访问器支持 `status write(T value)` 或 `status write(T *value)`。`status` 可以是 `void` 或整数，负整数表示调用失败。函数在独立工作线程中按 `Refresh(ms)` 周期调用。
 - 从符号表或变量表拖拽条目到 Monitor Scope，可创建监控通道。
 
 ### Monitor 和 Scope
@@ -60,6 +63,11 @@ Scope 工具栏：
 - `Hide line/Show line`：隐藏或显示当前 Scope 内所有曲线。
 - `Hide Scope/Show Scope`：折叠或展开当前 Scope。
 - `Pause/Resume`：暂停或恢复当前 Scope 的采集任务。
+- TABLE 视图中右键通道可通过 `Access mode / 读写模式` 切换只读或读写；该操作会应用到当前选择的通道并随会话保存。JLINK、SHM 和 LOCAL 支持读写，LOCAL 写入会调用变量绑定的写函数；AUDIO 保持只读。
+- 变量管理器与 Monitor TABLE 的右键菜单共享删除、属性编辑、读写模式、DWT 跟踪和枚举编辑功能；LOCAL 通道也可从 Monitor 直接打开所属变量的函数绑定窗口。
+- 各类变量的右键菜单保持固定布局；当前变量不支持的操作会置灰而不是隐藏。ENUM 的类型列会显示底层整数类型，例如 `ENUM (U8)`、`ENUM (I8)` 或 `ENUM (U32)`。
+- 置灰菜单会注明适用条件（如“仅 LOCAL 标量”）；顶层及嵌套变量都可在属性窗口覆盖标量类型，嵌套聚合类型可改成标量并通过“重置”恢复 DWARF 原始类型。
+- 每个 Scope 的 TABLE 列宽、表头升降序或手动拖拽顺序都会随会话保存并在下次加载时恢复。
 
 ### SEGGER RTT 终端
 

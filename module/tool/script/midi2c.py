@@ -21,7 +21,7 @@ def convert_midi_to_c(midi_file_path, output_c_file):
     c_code = "/* 由 Python 脚本自动生成的 MIDI 旋律数组 */\n"
     c_code += "#include <stdint.h>\n\n"
     c_code += "typedef struct {\n"
-    c_code += "    float frequency;     // 频率 (Hz)\n"
+    c_code += "    float32_t frequency;     // 频率 (Hz)\n"
     c_code += "    uint32_t duration_ms; // 持续时间 (毫秒)\n"
     c_code += "} Note_t;\n\n"
     c_code += "const Note_t melody[] = {\n"
