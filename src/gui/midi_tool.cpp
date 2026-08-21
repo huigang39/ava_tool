@@ -76,6 +76,20 @@ csvQuoted(const std::string &text)
         out += '\"';
         return out;
 }
+
+std::string
+cFloatLiteral(double value)
+{
+        if (std::abs(value) < 0.0000005)
+                value = 0.0;
+        char text[64];
+        std::snprintf(text, sizeof(text), "%.6f", value);
+        std::string result(text);
+        while (result.size() > 2 && result.back() == '0' && result[result.size() - 2] != '.')
+                result.pop_back();
+        result += 'F';
+        return result;
+}
 } // namespace
 
 MidiTool::~MidiTool()
@@ -258,21 +272,7 @@ MidiTool::startPlayback()
                 return;
         }
 
-        std::vector<Note> playbackNotes;
-        const double      pitch = std::pow(2.0, transpose_ / 12.0);
-        const double      speed = std::max(0.01, speedScale_);
-        for (std::size_t sourceRow = 0; sourceRow < notes_.size(); ++sourceRow) {
-                Note note = notes_[sourceRow];
-                if (trackFilter_ >= 0 && note.track != static_cast<std::uint32_t>(trackFilter_))
-                        continue;
-                if (channelFilter_ >= 0 && note.channel != static_cast<std::uint8_t>(channelFilter_))
-                        continue;
-                note.startSec    /= speed;
-                note.durationSec /= speed;
-                note.frequencyHz *= pitch;
-                note.sourceRow    = static_cast<int>(sourceRow);
-                playbackNotes.push_back(std::move(note));
-        }
+        std::vector<Note> playbackNotes = makePlaybackNotes();
         if (playbackNotes.empty()) {
                 status_      = tr("No notes match the selected track/channel filter.", "没有音符符合当前轨道/通道筛选条件。");
                 statusError_ = true;
@@ -295,6 +295,28 @@ MidiTool::startPlayback()
                                       minVoltage_,
                                       maxVoltage_,
                                       polyphonyMode_);
+}
+
+std::vector<MidiTool::Note>
+MidiTool::makePlaybackNotes() const
+{
+        std::vector<Note> playbackNotes;
+        playbackNotes.reserve(notes_.size());
+        const double pitch = std::pow(2.0, transpose_ / 12.0);
+        const double speed = std::max(0.01, speedScale_);
+        for (std::size_t sourceRow = 0; sourceRow < notes_.size(); ++sourceRow) {
+                Note note = notes_[sourceRow];
+                if (trackFilter_ >= 0 && note.track != static_cast<std::uint32_t>(trackFilter_))
+                        continue;
+                if (channelFilter_ >= 0 && note.channel != static_cast<std::uint8_t>(channelFilter_))
+                        continue;
+                note.startSec    /= speed;
+                note.durationSec /= speed;
+                note.frequencyHz *= pitch;
+                note.sourceRow    = static_cast<int>(sourceRow);
+                playbackNotes.push_back(std::move(note));
+        }
+        return playbackNotes;
 }
 
 void
@@ -845,6 +867,111 @@ MidiTool::exportCsv(const std::string &path) const
         return std::fclose(file) == 0;
 }
 
+bool
+MidiTool::exportC(const std::string &path) const
+{
+        const std::vector<Note> notes = makePlaybackNotes();
+        if (notes.empty())
+                return false;
+
+        struct Event {
+                double      time;
+                std::size_t note;
+                bool        on;
+        };
+        struct Step {
+                double        frequency;
+                double        voltage;
+                std::uint32_t durationMs;
+        };
+
+        std::vector<Event> events;
+        events.reserve(notes.size() * 2);
+        for (std::size_t i = 0; i < notes.size(); ++i) {
+                events.push_back({notes[i].startSec, i, true});
+                events.push_back({notes[i].startSec + notes[i].durationSec, i, false});
+        }
+        std::sort(events.begin(), events.end(), [](const Event &a, const Event &b) {
+                if (a.time != b.time)
+                        return a.time < b.time;
+                return static_cast<int>(a.on) > static_cast<int>(b.on);
+        });
+
+        constexpr std::size_t           none = std::numeric_limits<std::size_t>::max();
+        std::unordered_set<std::size_t> active;
+        std::vector<Step>               steps;
+        std::size_t                     selected   = none;
+        std::uint64_t                   previousMs = 0;
+
+        auto appendStep = [&](std::size_t noteIndex, std::uint64_t durationMs) {
+                if (durationMs == 0)
+                        return true;
+                if (durationMs > std::numeric_limits<std::uint32_t>::max())
+                        return false;
+                double frequency = 0.0;
+                double voltage   = 0.0;
+                if (noteIndex != none) {
+                        const Note &note = notes[noteIndex];
+                        frequency        = note.frequencyHz;
+                        voltage = minVoltage_ + (maxVoltage_ - minVoltage_) * static_cast<double>(note.velocity) / 127.0;
+                }
+                if (!steps.empty() && steps.back().frequency == frequency && steps.back().voltage == voltage &&
+                    durationMs <= std::numeric_limits<std::uint32_t>::max() - steps.back().durationMs) {
+                        steps.back().durationMs += static_cast<std::uint32_t>(durationMs);
+                } else {
+                        steps.push_back({frequency, voltage, static_cast<std::uint32_t>(durationMs)});
+                }
+                return true;
+        };
+
+        std::size_t eventIndex = 0;
+        while (eventIndex < events.size()) {
+                const double        eventTime = events[eventIndex].time;
+                const std::uint64_t eventMs   = static_cast<std::uint64_t>(std::llround(std::max(0.0, eventTime) * 1000.0));
+                if (eventMs > previousMs && !appendStep(selected, eventMs - previousMs))
+                        return false;
+
+                while (eventIndex < events.size() && std::abs(events[eventIndex].time - eventTime) < 1e-9) {
+                        const Event &event = events[eventIndex++];
+                        if (event.on)
+                                active.insert(event.note);
+                        else
+                                active.erase(event.note);
+                }
+
+                selected = none;
+                for (std::size_t candidate : active) {
+                        if (selected == none || (polyphonyMode_ == 0 && notes[candidate].midiNote > notes[selected].midiNote) ||
+                            (polyphonyMode_ == 1 && notes[candidate].midiNote < notes[selected].midiNote) ||
+                            (polyphonyMode_ == 2 &&
+                             (notes[candidate].startSec > notes[selected].startSec ||
+                              (notes[candidate].startSec == notes[selected].startSec && candidate > selected))))
+                                selected = candidate;
+                }
+                previousMs = eventMs;
+        }
+
+        if (steps.empty())
+                return false;
+        FILE *file = nativeFopen(path, "wb");
+        if (!file)
+                return false;
+        std::fprintf(file,
+                     "#ifndef ALARM_AUDIO_H\r\n"
+                     "#define ALARM_AUDIO_H\r\n"
+                     "\r\n"
+                     "/* frequency (Hz), voltage amplitude (V), duration (ms) */\r\n"
+                     "static const struct alarm_step g_default_alarm_pattern[] = {\r\n");
+        for (const Step &step : steps) {
+                const std::string frequency = cFloatLiteral(step.frequency);
+                const std::string voltage   = cFloatLiteral(step.voltage);
+                std::fprintf(
+                    file, "    {%s, %s, %uU},\r\n", frequency.c_str(), voltage.c_str(), static_cast<unsigned>(step.durationMs));
+        }
+        std::fprintf(file, "};\r\n\r\n#endif // ALARM_AUDIO_H\r\n");
+        return std::fclose(file) == 0;
+}
+
 void
 MidiTool::draw()
 {
@@ -868,6 +995,19 @@ MidiTool::draw()
                                 statusError_ = !exportCsv(path);
                                 status_      = statusError_ ? tr("CSV export failed.", "CSV 导出失败。")
                                                             : tr("CSV exported.", "CSV 已导出。");
+                        }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(tr("Export C header", "导出 C 头文件"))) {
+                        const std::string defaultName = sourcePath_.empty()
+                                                            ? "alarm_audio.h"
+                                                            : std::filesystem::path(sourcePath_).stem().string() + "_alarm.h";
+                        const std::string path =
+                            nativeDlgSave("Export MIDI C Header", {{"C Header Files", {"h"}}}, defaultName);
+                        if (!path.empty()) {
+                                statusError_ = !exportC(path);
+                                status_      = statusError_ ? tr("C header export failed.", "C 头文件导出失败。")
+                                                            : tr("C header exported.", "C 头文件已导出。");
                         }
                 }
                 ImGui::EndDisabled();

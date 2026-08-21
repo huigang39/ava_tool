@@ -60,19 +60,21 @@ class MidiTool
                 bool          writable{true};
         };
 
-        bool exportCsv(const std::string &path) const;
-        void drawTarget(const char *label, const char *id, Target &target);
-        bool acceptTargetDrop(Target &target);
-        bool validateTarget(Target &target, std::string &error);
-        bool writeTarget(const Target &target, float value);
-        void startPlayback();
-        void stopPlayback();
-        void playbackMain(std::vector<Note> notes,
-                          Target            frequency,
-                          Target            amplitude,
-                          double            minVoltage,
-                          double            maxVoltage,
-                          int               polyphonyMode);
+        bool              exportCsv(const std::string &path) const;
+        bool              exportC(const std::string &path) const;
+        std::vector<Note> makePlaybackNotes() const;
+        void              drawTarget(const char *label, const char *id, Target &target);
+        bool              acceptTargetDrop(Target &target);
+        bool              validateTarget(Target &target, std::string &error);
+        bool              writeTarget(const Target &target, float value);
+        void              startPlayback();
+        void              stopPlayback();
+        void              playbackMain(std::vector<Note> notes,
+                                       Target            frequency,
+                                       Target            amplitude,
+                                       double            minVoltage,
+                                       double            maxVoltage,
+                                       int               polyphonyMode);
 
         bool              open_{false};
         bool              modified_{false};
