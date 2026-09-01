@@ -12,11 +12,11 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 // windows.h must precede dbghelp.h — keep the blank line so clang-format
-// treats them as separate include groups and does not re-sort alphabetically.
+// treats them as separate include groups and does not re-sort alphabetically
 #include <windows.h>
 
 #include <dbghelp.h>
-// Link dbghelp.lib via Makefile — do NOT use #pragma comment here.
+// Link dbghelp.lib via Makefile — do NOT use #pragma comment here
 
 #elif defined(__APPLE__)
 #include <cxxabi.h>
@@ -37,30 +37,30 @@
 #include <sys/stat.h>
 #endif
 
-// ─── demangleSymbol ───────────────────────────────────────────────────────────
+// ─── demthetaSymbol ───────────────────────────────────────────────────────────
 
 std::string
-demangleSymbol(const std::string &mangled)
+demthetaSymbol(const std::string &mthetad)
 {
 #if defined(_WIN32)
-        // UnDecorateSymbolName handles MSVC-mangled (decorated) names.
+        // UnDecorateSymbolName handles MSVC-mthetad (decorated) names
         char  buf[2048] = {};
         DWORD r         = UnDecorateSymbolName(
-            mangled.c_str(), buf, static_cast<DWORD>(sizeof(buf)), UNDNAME_COMPLETE | UNDNAME_32_BIT_DECODE);
-        if (r > 0 && strcmp(buf, mangled.c_str()) != 0)
+            mthetad.c_str(), buf, static_cast<DWORD>(sizeof(buf)), UNDNAME_COMPLETE | UNDNAME_32_BIT_DECODE);
+        if (r > 0 && strcmp(buf, mthetad.c_str()) != 0)
                 return buf;
-        return mangled;
+        return mthetad;
 
 #else
-        // abi::__cxa_demangle handles Itanium ABI (GCC/Clang) mangled names.
+        // abi::__cxa_demtheta handles Itanium ABI (GCC/Clang) mthetad names
         int   status = -1;
-        char *dem    = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+        char *dem    = abi::__cxa_demtheta(mthetad.c_str(), nullptr, nullptr, &status);
         if (status == 0 && dem) {
                 std::string r(dem);
                 free(dem);
                 return r;
         }
-        return mangled;
+        return mthetad;
 #endif
 }
 
@@ -72,9 +72,15 @@ std::vector<ExportedSymbol>
 enumerateExports(void *handle, const std::string &path)
 {
         std::vector<ExportedSymbol> result;
-        // If no handle provided, try to get the already-loaded module by path.
-        if (!handle && !path.empty())
-                handle = static_cast<void *>(GetModuleHandleA(path.c_str()));
+        // If no handle provided, try to get the already-loaded module by path
+        if (!handle && !path.empty()) {
+                const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1, nullptr, 0);
+                if (length <= 0)
+                        return result;
+                std::wstring widePath(static_cast<size_t>(length), L'\0');
+                if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path.c_str(), -1, widePath.data(), length))
+                        handle = static_cast<void *>(GetModuleHandleW(widePath.c_str()));
+        }
         if (!handle)
                 return result;
 
@@ -102,13 +108,13 @@ enumerateExports(void *handle, const std::string &path)
                 WORD        ord     = ordinals[i];
                 DWORD       funcRVA = funcRVAs[ord];
 
-                // Skip forwarded exports (their RVA falls inside the export directory).
+                // Skip forwarded exports (their RVA falls inside the export directory)
                 if (funcRVA >= expEntry.VirtualAddress && funcRVA < expEntry.VirtualAddress + expEntry.Size)
                         continue;
 
                 ExportedSymbol sym;
-                sym.mangled   = name;
-                sym.demangled = demangleSymbol(name);
+                sym.mthetad   = name;
+                sym.demthetad = demthetaSymbol(name);
                 result.push_back(std::move(sym));
         }
         return result;
@@ -119,7 +125,8 @@ enumerateExports(void *handle, const std::string &path)
 #elif defined(__linux__)
 
 std::vector<ExportedSymbol>
-enumerateExports(void * /*handle*/, const std::string &path)
+// handle
+enumerateExports(void *, const std::string &path)
 {
         std::vector<ExportedSymbol> result;
 
@@ -178,8 +185,8 @@ enumerateExports(void * /*handle*/, const std::string &path)
                         const char *mang = dynstr + dynsym[i].st_name;
 
                         ExportedSymbol sym;
-                        sym.mangled   = mang;
-                        sym.demangled = demangleSymbol(mang);
+                        sym.mthetad   = mang;
+                        sym.demthetad = demthetaSymbol(mang);
                         result.push_back(std::move(sym));
                 }
         }
@@ -193,7 +200,8 @@ enumerateExports(void * /*handle*/, const std::string &path)
 #elif defined(__APPLE__)
 
 std::vector<ExportedSymbol>
-enumerateExports(void * /*handle*/, const std::string &path)
+// handle
+enumerateExports(void *, const std::string &path)
 {
         std::vector<ExportedSymbol> result;
 
@@ -218,7 +226,7 @@ enumerateExports(void * /*handle*/, const std::string &path)
 
         uint32_t magic = *reinterpret_cast<const uint32_t *>(data);
         if (magic == 0xBEBAFECAu || magic == 0xCAFEBABEu) {
-                // Universal (fat) binary – find the matching architecture slice.
+                // Universal (fat) binary – find the matching architecture slice
                 auto    *fat   = reinterpret_cast<const fat_header *>(data);
                 uint32_t na    = OSSwapBigToHostInt32(fat->nfat_arch);
                 auto    *archs = reinterpret_cast<const fat_arch *>(data + sizeof(fat_header));
@@ -251,7 +259,7 @@ enumerateExports(void * /*handle*/, const std::string &path)
                 auto *lc = reinterpret_cast<const load_command *>(cmd);
                 if (lc->cmd == LC_SYMTAB) {
                         auto *st = reinterpret_cast<const symtab_command *>(cmd);
-                        // symoff/stroff are relative to the start of the Mach-O slice.
+                        // symoff/stroff are relative to the start of the Mach-O slice
                         symtab = reinterpret_cast<const struct nlist_64 *>(machO + st->symoff);
                         strtab = reinterpret_cast<const char *>(machO + st->stroff);
                         nsyms  = st->nsyms;
@@ -274,13 +282,13 @@ enumerateExports(void * /*handle*/, const std::string &path)
                         if (!mang || mang[0] == '\0')
                                 continue;
 
-                        // macOS C++ symbols are `__ZN...` in the binary.
-                        // abi::__cxa_demangle expects `_ZN...` (one leading _ stripped).
+                        // macOS C++ symbols are `__ZN...` in the binary
+                        // abi::__cxa_demtheta expects `_ZN...` (one leading _ stripped)
                         const char *demInput = (mang[0] == '_') ? mang + 1 : mang;
 
                         ExportedSymbol sym;
-                        sym.mangled   = mang;
-                        sym.demangled = demangleSymbol(demInput);
+                        sym.mthetad   = mang;
+                        sym.demthetad = demthetaSymbol(demInput);
                         result.push_back(std::move(sym));
                 }
         }
@@ -292,7 +300,9 @@ enumerateExports(void * /*handle*/, const std::string &path)
 #else
 // ─── Unsupported platform ─────────────────────────────────────────────────────
 std::vector<ExportedSymbol>
-enumerateExports(void * /*handle*/, const std::string & /*path*/)
+// handle
+// path
+enumerateExports(void *, const std::string &)
 {
         return {};
 }

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -45,7 +46,9 @@ isIdChar(char c)
         return std::isalnum((unsigned char)c) || c == '_';
 }
 
-// Strip // and /* */ comments, preserving newlines.
+/**
+ * @brief Remove line and block comments, preserving newlines
+ */
 static std::string
 stripComments(const std::string &src)
 {
@@ -65,7 +68,7 @@ stripComments(const std::string &src)
                         }
                         i += 2;
                 } else if (src[i] == '"') {
-                        // Skip string literals so we don't mistake quoted text for code.
+                        // Skip string literals so we don't mistake quoted text for code
                         out += src[i++];
                         while (i < src.size() && src[i] != '"') {
                                 if (src[i] == '\\' && i + 1 < src.size())
@@ -82,7 +85,9 @@ stripComments(const std::string &src)
         return out;
 }
 
-// Remove preprocessor lines (#...) including line-continuation backslashes.
+/**
+ * @brief Remove preprocessor lines (#...) including line-continuation backslashes
+ */
 static std::string
 stripPreprocessor(const std::string &src)
 {
@@ -117,7 +122,9 @@ stripPreprocessor(const std::string &src)
         return out;
 }
 
-// Remove `extern "C" { ... }` wrapper braces while keeping content inside.
+/**
+ * @brief Remove `extern "C" { ... }` wrapper braces while keeping content inside
+ */
 static std::string
 stripExternCBraces(const std::string &src)
 {
@@ -135,7 +142,7 @@ stripExternCBraces(const std::string &src)
                                         ++j;
                                 if (j < src.size() && src[j] == '{') {
                                         ++j; // consume '{'
-                                        // Find matching '}' and include inner content, dropping just the braces.
+                                        // Find matching '}' and include inner content, dropping just the braces
                                         int depth = 1;
                                         while (j < src.size() && depth > 0) {
                                                 if (src[j] == '{')
@@ -204,9 +211,10 @@ static const std::unordered_map<std::string, CType> kTypeTable = {
 };
 
 static CType
-normalizeType(const std::string &raw)
+normalizeBaseType(const std::string &raw, bool referencesArePointers)
 {
-        if (raw.find('*') != std::string::npos || raw.find('[') != std::string::npos)
+        if (raw.find('*') != std::string::npos || raw.find('[') != std::string::npos ||
+            (referencesArePointers && raw.find('&') != std::string::npos))
                 return CType::Ptr;
 
         static const char *quals[] = {
@@ -227,7 +235,30 @@ normalizeType(const std::string &raw)
         }
         s       = collapseSpaces(s);
         auto it = kTypeTable.find(s);
+        if (it != kTypeTable.end())
+                return it->second;
+
+        // Export/import decoration macros commonly prefix public SDK declarations,
+        // for example `DYN200_API float read_value(void)`
+        std::istringstream tokens(s);
+        std::string        token;
+        std::string        undecorated;
+        while (tokens >> token) {
+                const bool decoration = token.ends_with("_API") || token.ends_with("_EXPORT") || token.ends_with("_IMPORT");
+                if (!decoration) {
+                        if (!undecorated.empty())
+                                undecorated += ' ';
+                        undecorated += token;
+                }
+        }
+        it = kTypeTable.find(undecorated);
         return it != kTypeTable.end() ? it->second : CType::Unknown;
+}
+
+static CType
+normalizeType(const std::string &raw)
+{
+        return normalizeBaseType(raw, false);
 }
 
 // ─── split "rettype funcname" ──────────────────────────────────────────────────
@@ -342,8 +373,8 @@ parseHeader(const std::string &src)
         s             = stripPreprocessor(s);
         s             = stripExternCBraces(s);
 
-        // Collect ';' positions at brace depth 0.
-        // Brace depth > 0 means we're inside struct/union/enum/function bodies.
+        // Collect ';' positions at brace depth 0
+        // Brace depth > 0 means we're inside struct/union/enum/function bodies
         std::vector<size_t> semis;
         {
                 int depth = 0;
@@ -367,7 +398,7 @@ parseHeader(const std::string &src)
                 if (decl.empty())
                         continue;
 
-                // Skip keywords that begin struct/union/enum/typedef declarations.
+                // Skip keywords that begin struct/union/enum/typedef declarations
                 {
                         std::string        first;
                         std::istringstream ss(decl);
@@ -376,12 +407,12 @@ parseHeader(const std::string &src)
                                 continue;
                 }
 
-                // Must contain '(' to be a function declaration.
+                // Must contain '(' to be a function declaration
                 size_t lp = decl.find('(');
                 if (lp == std::string::npos)
                         continue;
 
-                // Find the matching closing ')' at depth 0 from lp.
+                // Find the matching closing ')' at depth 0 from lp
                 size_t rp    = std::string::npos;
                 int    depth = 0;
                 for (size_t k = lp; k < decl.size(); ++k) {
@@ -401,7 +432,7 @@ parseHeader(const std::string &src)
                 std::string beforeParen = trim(decl.substr(0, lp));
                 std::string paramStr    = trim(decl.substr(lp + 1, rp - lp - 1));
 
-                // Skip if the return-type area contains a function pointer indicator.
+                // Skip if the return-type area contains a function pointer indicator
                 if (beforeParen.find("(*") != std::string::npos)
                         continue;
 
@@ -541,37 +572,15 @@ ctypeAlign(CType t)
         return (sz == 0) ? 1 : sz;
 }
 
-// Also add & → Ptr to normalizeType (patch applied inline below via separate function).
-// normalizeType is already defined above; we replicate its updated version:
-
 static CType
 normalizeTypeCpp(const std::string &raw)
 {
-        if (raw.find('*') != std::string::npos || raw.find('[') != std::string::npos || raw.find('&') != std::string::npos)
-                return CType::Ptr;
-
-        static const char *quals[] = {
-            "const", "volatile", "restrict", "extern", "static", "inline", "__cdecl", "__stdcall", "__fastcall", nullptr};
-        std::string s = raw;
-        for (int q = 0; quals[q]; ++q) {
-                std::string qw(quals[q]);
-                size_t      pos = 0;
-                while ((pos = s.find(qw, pos)) != std::string::npos) {
-                        bool   before = (pos == 0 || !isIdChar(s[pos - 1]));
-                        size_t end    = pos + qw.size();
-                        bool   after  = (end >= s.size() || !isIdChar(s[end]));
-                        if (before && after)
-                                s.replace(pos, qw.size(), " ");
-                        else
-                                pos += qw.size();
-                }
-        }
-        s       = collapseSpaces(s);
-        auto it = kTypeTable.find(s);
-        return it != kTypeTable.end() ? it->second : CType::Unknown;
+        return normalizeBaseType(raw, true);
 }
 
-// Strip "= default_value" from a parameter string (handles depth of parentheses).
+/**
+ * @brief Strip "= default_value" from a parameter string (handles depth of parentheses)
+ */
 static std::string
 stripDefault(const std::string &param)
 {
@@ -607,12 +616,14 @@ findMatchingBrace(const std::string &s, size_t openPos)
         return std::string::npos;
 }
 
-// Replace every character inside {..} blocks with a space (preserves newlines).
-// The closing '}' is replaced with ';' so that inline method bodies act as
-// natural ';'-terminators for the declaration that precedes them:
-//   FSA() { body }  →  FSA()        ;
-// Without this, FSA() and ~FSA() (which has its own ';') would merge into
-// one chunk and the destructor would never be parsed.
+/**
+ * @brief Replace every character inside {..} blocks with a space (preserves newlines)
+ *        The closing '}' is replaced with ';' so that inline method bodies act as
+ *        natural ';'-terminators for the declaration that precedes them:
+ *        FSA() { body }  →  FSA()        ;
+ *        Without this, FSA() and ~FSA() (which has its own ';') would merge into
+ *        one chunk and the destructor would never be parsed
+ */
 static std::string
 stripBlocks(const std::string &text)
 {
@@ -638,7 +649,7 @@ stripBlocks(const std::string &text)
         return out;
 }
 
-// Scope type for the recursive scope parser.
+// Scope type for the recursive scope parser
 enum class ScopeKind { Unknown, Namespace, Class, Struct, Enum };
 struct ScopeInfo {
         ScopeKind   kind{ScopeKind::Unknown};
@@ -647,7 +658,9 @@ struct ScopeInfo {
         bool        isPublicDefault{false}; // true for struct, false for class
 };
 
-// Tokenize text into identifier tokens and single-character tokens.
+/**
+ * @brief Tokenize text into identifier tokens and single-character tokens
+ */
 static std::vector<std::string>
 tokenize(const std::string &s)
 {
@@ -669,16 +682,18 @@ tokenize(const std::string &s)
         return toks;
 }
 
-// Classify what type of scope a block-preamble introduces.
-// preamble = all text between the previous '};' and the opening '{'.
+/**
+ * @brief Classify what type of scope a block-preamble introduces
+ *        preamble = all text between the prev '};' and the opening '{'
+ */
 static ScopeInfo
 classifyPreamble(const std::string &preamble)
 {
         ScopeInfo info;
 
-        // Take the text after the LAST ';' in the preamble (that's the new declaration).
-        size_t      lastSemi = preamble.rfind(';');
-        std::string stmt     = trim(lastSemi == std::string::npos ? preamble : preamble.substr(lastSemi + 1));
+        // Take the text after the LAST ';' in the preamble (that's the new declaration)
+        size_t      prevSemi = preamble.rfind(';');
+        std::string stmt     = trim(prevSemi == std::string::npos ? preamble : preamble.substr(prevSemi + 1));
         stmt                 = collapseSpaces(stmt);
 
         auto toks = tokenize(stmt);
@@ -713,7 +728,7 @@ classifyPreamble(const std::string &preamble)
                         info.isPublicDefault = toks[idx] == "struct";
                         // The class/struct name is the LAST identifier before the base-clause
                         // ':' (or end of preamble), skipping any leading export/attribute
-                        // macros such as `class NEOFSA_API NeoFSA` or `struct __declspec(...) S`.
+                        // macros such as `class NEOFSA_API NeoFSA` or `struct __declspec(...) S`
                         for (size_t k = idx + 1; k < toks.size(); ++k) {
                                 if (toks[k] == ":") // start of base-clause → name already found
                                         break;
@@ -754,11 +769,11 @@ parseEnumContent(const std::string &body, const std::string &name, const std::st
                         int64_t     v   = (vs.size() > 2 && vs[0] == '0' && (vs[1] == 'x' || vs[1] == 'X'))
                                               ? (int64_t)strtoull(vs.c_str(), &end, 16)
                                               : strtoll(vs.c_str(), &end, 10);
-                        val.value       = v;
+                        val.val         = v;
                         nextVal         = v + 1;
                 } else {
-                        val.name  = p;
-                        val.value = nextVal++;
+                        val.name = p;
+                        val.val  = nextVal++;
                 }
                 if (!val.name.empty() && (std::isalpha((unsigned char)val.name[0]) || val.name[0] == '_'))
                         ed.values.push_back(val);
@@ -790,7 +805,7 @@ parseStructContent(const std::string &body, const std::string &name, const std::
         size_t offset   = 0;
         size_t maxAlign = 1;
 
-        // Collect ';'-terminated field declarations at brace depth 0.
+        // Collect ';'-terminated field declarations at brace depth 0
         std::vector<std::string> fieldDecls;
         {
                 int    depth = 0;
@@ -812,7 +827,7 @@ parseStructContent(const std::string &body, const std::string &name, const std::
                 if (fd.empty())
                         continue;
 
-                // Skip nested type definitions.
+                // Skip nested type definitions
                 {
                         std::string        first;
                         std::istringstream ss(fd);
@@ -874,7 +889,7 @@ parseStructContent(const std::string &body, const std::string &name, const std::
                         continue;
                 }
 
-                // Skip fields with complex C++ types.
+                // Skip fields with complex C++ types
                 if (fd.find("std::") != std::string::npos) {
                         sd.isPOD = false;
                         continue;
@@ -912,7 +927,7 @@ parseStructContent(const std::string &body, const std::string &name, const std::
                 sd.fields.push_back(f);
         }
 
-        // Round total size up to struct alignment.
+        // Round total size up to struct alignment
         if (maxAlign > 0 && offset > 0)
                 sd.totalSize = (offset + maxAlign - 1) & ~(maxAlign - 1);
         else
@@ -930,20 +945,20 @@ parseMethodDecl(const std::string &rawDecl, const std::string &className, const 
         if (decl.empty())
                 return false;
 
-        // Skip deleted/defaulted functions.
+        // Skip deleted/defaulted functions
         if (decl.find("= delete") != std::string::npos)
                 return false;
         if (decl.find("= default") != std::string::npos)
                 return false;
 
-        // Remove pure-virtual marker.
+        // Remove pure-virtual marker
         if (decl.size() >= 3 && decl.back() == '0') {
                 size_t ep = decl.rfind("= 0");
                 if (ep != std::string::npos)
                         decl = trim(decl.substr(0, ep));
         }
 
-        // Strip trailing modifiers after the last ')'.
+        // Strip trailing modifiers after the prev ')'
         auto stripTrailing = [&](const std::string &kw) {
                 size_t rp = decl.rfind(')');
                 if (rp == std::string::npos)
@@ -957,7 +972,7 @@ parseMethodDecl(const std::string &rawDecl, const std::string &className, const 
         stripTrailing("override");
         stripTrailing("final");
 
-        // Strip leading modifiers.
+        // Strip leading modifiers
         bool isStatic = false;
         for (bool changed = true; changed;) {
                 changed = false;
@@ -974,12 +989,12 @@ parseMethodDecl(const std::string &rawDecl, const std::string &className, const 
                 }
         }
 
-        // Must contain '('.
+        // Must contain '('
         size_t lp = decl.find('(');
         if (lp == std::string::npos)
                 return false;
 
-        // Find matching ')'.
+        // Find matching ')'
         size_t rp = std::string::npos;
         {
                 int d = 0;
@@ -1011,7 +1026,7 @@ parseMethodDecl(const std::string &rawDecl, const std::string &className, const 
         }
 
         // ── Constructor ── (beforeParen == className or ends with className)
-        // Strip any namespace prefix to get just the simple name.
+        // Strip any namespace prefix to get just the simple name
         {
                 std::string simple = beforeParen;
                 size_t      ns     = simple.rfind("::");
@@ -1044,7 +1059,7 @@ parseMethodDecl(const std::string &rawDecl, const std::string &className, const 
         method.retType       = normalizeTypeCpp(retRaw);
         method.isStatic      = isStatic;
 
-        // Parse params with default-value stripping.
+        // Parse params with default-value stripping
         std::vector<std::string> rawParts;
         {
                 int    depth2 = 0;
@@ -1085,13 +1100,15 @@ parseMethodDecl(const std::string &rawDecl, const std::string &className, const 
 
 // ─── field declaration parser (for class allFields) ──────────────────────────
 
-// Parse one field declaration string into a CFieldDecl and update the running
-// byte offset.  Handles std::array<T,N>, pointers, and plain scalar types.
+/**
+ * @brief Parse one field declaration string into a CFieldDecl and update the running
+ *        byte offset.  Handles std::array<T,N>, pointers, and plain scalar types
+ */
 static void
-parseOneField(const std::string &rawPart, std::vector<CFieldDecl> &fields, size_t &offset)
+parseOneField(const std::string &rawPart, std::vector<CFieldDecl> &fields, size_t &offset, const ParseResult &knownTypes)
 {
         std::string part = stripDefault(trim(rawPart));
-        // Strip leading non-type qualifiers.
+        // Strip leading non-type qualifiers
         for (const char *kw :
              {"static", "constexpr", "const", "volatile", "mutable", "friend", "extern", "inline", "explicit"}) {
                 std::string kws(kw);
@@ -1106,8 +1123,10 @@ parseOneField(const std::string &rawPart, std::vector<CFieldDecl> &fields, size_
         }
         if (part.empty())
                 return;
-        // Skip type declarations and function-pointer lines.
-        for (const char *kw : {"struct ", "enum ", "class ", "union ", "typedef ", "using "}) {
+        // Skip declarations which cannot be data members.  A leading `struct`
+        // or `class` is intentionally accepted: C headers commonly spell an
+        // embedded POD field as `struct foo value`
+        for (const char *kw : {"union ", "typedef ", "using "}) {
                 if (part.size() >= strlen(kw) && part.substr(0, strlen(kw)) == kw)
                         return;
         }
@@ -1150,7 +1169,41 @@ parseOneField(const std::string &rawPart, std::vector<CFieldDecl> &fields, size_
                 return;
         }
 
-        // General case: extract name as last identifier, rest is type.
+        // Handle a C-style array: `type name[N]`.  The count may be an integer
+        // expression (for example 0x400U - 0x144U), so use the same evaluator
+        // as macro/constexpr expressions instead of strtoul
+        if (!part.empty() && part.back() == ']') {
+                const size_t lb = part.rfind('[');
+                if (lb != std::string::npos) {
+                        const std::string before    = trim(part.substr(0, lb));
+                        const std::string countExpr = trim(part.substr(lb + 1, part.size() - lb - 2));
+                        std::string       elemRaw, fieldName;
+                        int64_t           countValue = 0;
+                        if (splitReturnAndName(before, elemRaw, fieldName) &&
+                            evalIntExpr(countExpr, knownTypes.macros, countValue) && countValue > 0) {
+                                const CType  elemType = normalizeTypeCpp(elemRaw);
+                                const size_t elemSize = ctypeSize(elemType);
+                                if (elemSize > 0) {
+                                        const size_t align = std::max<size_t>(1, ctypeAlign(elemType));
+                                        offset             = (offset + align - 1) & ~(align - 1);
+                                        CFieldDecl field;
+                                        field.name           = fieldName;
+                                        field.rawType        = elemRaw;
+                                        field.type           = CType::Unknown;
+                                        field.isArray        = true;
+                                        field.arrayCount     = static_cast<size_t>(countValue);
+                                        field.arrayElemType  = elemType;
+                                        field.offset         = offset;
+                                        field.size           = elemSize * field.arrayCount;
+                                        offset              += field.size;
+                                        fields.push_back(std::move(field));
+                                }
+                        }
+                        return;
+                }
+        }
+
+        // General case: extract name as prev identifier, rest is type
         size_t end = part.size();
         while (end > 0 && std::isspace((unsigned char)part[end - 1]))
                 --end;
@@ -1161,7 +1214,7 @@ parseOneField(const std::string &rawPart, std::vector<CFieldDecl> &fields, size_
                 return;
         std::string name    = part.substr(k, end - k);
         std::string rawType = trim(part.substr(0, k));
-        // Absorb leading * or & on name into type.
+        // Absorb leading * or & on name into type
         while (!name.empty() && (name.front() == '*' || name.front() == '&')) {
                 rawType += name.front();
                 name     = name.substr(1);
@@ -1170,12 +1223,39 @@ parseOneField(const std::string &rawPart, std::vector<CFieldDecl> &fields, size_
                 rawType.pop_back();
         if (name.empty() || rawType.empty())
                 return;
-        // Skip obvious non-field names.
+        // Skip obvious non-field names
         for (const char *kw : {"nullptr", "NULL", "true", "false"})
                 if (name == kw)
                         return;
 
-        CType  ct = normalizeTypeCpp(rawType);
+        CType ct = normalizeTypeCpp(rawType);
+        if (ct == CType::Unknown) {
+                std::string nestedType = rawType;
+                for (const char *tag : {"struct ", "class ", "enum "}) {
+                        const size_t len = strlen(tag);
+                        if (nestedType.size() > len && nestedType.substr(0, len) == tag)
+                                nestedType = trim(nestedType.substr(len));
+                }
+                if (const CEnumDecl *enumeration = findEnum(knownTypes, nestedType))
+                        ct = enumeration->baseType;
+                if (const CStructDecl *nested = findStruct(knownTypes, nestedType)) {
+                        size_t nestedAlign = 1;
+                        for (const auto &child : nested->fields) {
+                                const CType childType = child.isArray ? child.arrayElemType : child.type;
+                                nestedAlign           = std::max(nestedAlign, ctypeAlign(childType));
+                        }
+                        offset                  = (offset + nestedAlign - 1) & ~(nestedAlign - 1);
+                        const size_t baseOffset = offset;
+                        for (const auto &child : nested->fields) {
+                                CFieldDecl flattened = child;
+                                flattened.name       = name + "." + child.name;
+                                flattened.offset     = baseOffset + child.offset;
+                                fields.push_back(std::move(flattened));
+                        }
+                        offset += nested->totalSize;
+                        return;
+                }
+        }
         size_t sz = ctypeSize(ct);
         if (sz == 0)
                 sz = sizeof(void *);
@@ -1225,8 +1305,8 @@ parseClassContent(const std::string &body,
                         if (cl == std::string::npos)
                                 break;
 
-                        // Preamble: text since the previous '}' (or start of body).
-                        // Find the previous closing brace before position i.
+                        // Preamble: text since the prev '}' (or start of body)
+                        // Find the prev closing brace before position i
                         size_t prevClose = 0;
                         for (size_t k = 0; k < i;) {
                                 if (body[k] == '{') {
@@ -1260,7 +1340,7 @@ parseClassContent(const std::string &body,
                                             parseClassContent(blockBody, info.name, innerFull, false, outerResult));
                                         break;
                                 default:
-                                        // Inline method definition: extract function name from preamble.
+                                        // Inline method definition: extract function name from preamble
                                         if (preamble.find('(') != std::string::npos) {
                                                 size_t lp = preamble.rfind('(');
                                                 size_t k  = lp;
@@ -1281,13 +1361,13 @@ parseClassContent(const std::string &body,
         }
 
         // ── Pass 2: parse method declarations and collect all data fields ──
-        // Strip nested blocks (inline bodies replaced by ';') so only declarations remain.
+        // Strip nested blocks (inline bodies replaced by ';') so only declarations remain
         {
                 std::string stripped    = stripBlocks(body);
                 bool        isPublic    = isPublicDefault;
                 size_t      fieldOffset = 0; // running byte offset for allFields
 
-                // Process ';'-terminated declarations.
+                // Process ';'-terminated declarations
                 size_t start = 0;
                 for (size_t k = 0; k <= stripped.size(); ++k) {
                         bool atEnd = (k == stripped.size());
@@ -1299,7 +1379,7 @@ parseClassContent(const std::string &body,
                         if (part.empty())
                                 continue;
 
-                        // Update access level from any specifiers in this part.
+                        // Update access level from any specifiers in this part
                         auto checkSpec = [&](const std::string &kw, bool pub) {
                                 size_t p = 0;
                                 while ((p = part.find(kw, p)) != std::string::npos) {
@@ -1315,9 +1395,9 @@ parseClassContent(const std::string &body,
                         checkSpec("private", false);
                         checkSpec("protected", false);
 
-                        // Strip leading access-specifier content up to the last occurrence.
+                        // Strip leading access-specifier content up to the prev occurrence
                         {
-                                size_t lastSpec = 0;
+                                size_t prevSpec = 0;
                                 bool   found    = false;
                                 for (const char *kw : {"public:", "private:", "protected:"}) {
                                         size_t p = 0;
@@ -1325,8 +1405,8 @@ parseClassContent(const std::string &body,
                                                 bool before = (p == 0 || !isIdChar(part[p - 1]));
                                                 if (before) {
                                                         size_t ep = p + strlen(kw);
-                                                        if (!found || ep > lastSpec) {
-                                                                lastSpec = ep;
+                                                        if (!found || ep > prevSpec) {
+                                                                prevSpec = ep;
                                                                 found    = true;
                                                         }
                                                 }
@@ -1334,19 +1414,19 @@ parseClassContent(const std::string &body,
                                         }
                                 }
                                 if (found)
-                                        part = collapseSpaces(trim(part.substr(lastSpec)));
+                                        part = collapseSpaces(trim(part.substr(prevSpec)));
                         }
 
                         if (part.empty())
                                 continue;
 
                         if (part.find('(') == std::string::npos) {
-                                // No '(' → could be a data field (public or private).
-                                parseOneField(part, cls.allFields, fieldOffset);
+                                // No '(' → could be a data field (public or private)
+                                parseOneField(part, cls.allFields, fieldOffset, outerResult);
                                 continue;
                         }
 
-                        // Method declaration: only public ones go into cls.methods.
+                        // Method declaration: only public ones go into cls.methods
                         if (!isPublic)
                                 continue;
 
@@ -1381,10 +1461,10 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
                 if (cl == std::string::npos)
                         break;
 
-                // All text from prevEnd to i is the preamble.
+                // All text from prevEnd to i is the preamble
                 std::string preamble = text.substr(prevEnd, i - prevEnd);
 
-                // Parse any ';'-terminated C-style declarations in the preamble.
+                // Parse any ';'-terminated C-style declarations in the preamble
                 {
                         int    depth = 0;
                         size_t st    = 0;
@@ -1401,7 +1481,7 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
                                                 continue;
                                         if (decl.find('(') == std::string::npos)
                                                 continue;
-                                        // Use existing function-decl logic.
+                                        // Use existing function-decl logic
                                         size_t lp = decl.find('(');
                                         size_t rp = std::string::npos;
                                         {
@@ -1454,13 +1534,21 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
                                 if (!info.name.empty()) {
                                         auto cls = parseClassContent(blockBody, info.name, fullName, true, result);
                                         // Mirror allFields into a CStructDecl so findStruct() can find
-                                        // this type by name (e.g. for constexpr-var field lookup).
+                                        // this type by name (e.g. for constexpr-var field lookup)
                                         CStructDecl sd;
-                                        sd.name      = cls.name;
-                                        sd.fullName  = cls.fullName;
-                                        sd.fields    = cls.allFields;
-                                        sd.totalSize = cls.instanceSize;
-                                        sd.isPOD     = true;
+                                        sd.name          = cls.name;
+                                        sd.fullName      = cls.fullName;
+                                        sd.fields        = cls.allFields;
+                                        size_t exactSize = 0;
+                                        size_t maxAlign  = 1;
+                                        for (const auto &field : cls.allFields) {
+                                                exactSize             = std::max(exactSize, field.offset + field.size);
+                                                const CType fieldType = field.isArray ? field.arrayElemType : field.type;
+                                                maxAlign              = std::max(maxAlign, ctypeAlign(fieldType));
+                                        }
+                                        sd.totalSize =
+                                            exactSize == 0 ? cls.instanceSize : (exactSize + maxAlign - 1) & ~(maxAlign - 1);
+                                        sd.isPOD = true;
                                         result.structs.push_back(std::move(sd));
                                         result.classes.push_back(std::move(cls));
                                 }
@@ -1478,7 +1566,7 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
                                 std::string tp = trim(preamble);
                                 if (!tp.empty() && tp.back() == '=') {
                                         std::string declPart = trim(tp.substr(0, tp.size() - 1));
-                                        // Strip leading qualifiers.
+                                        // Strip leading qualifiers
                                         for (const char *q : {"static ", "constexpr ", "const ", "inline ", "extern "}) {
                                                 std::string qs(q);
                                                 for (bool ch = true; ch;) {
@@ -1490,7 +1578,7 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
                                                         }
                                                 }
                                         }
-                                        // Last identifier = var name; rest = type name.
+                                        // Last identifier = var name; rest = type name
                                         size_t vEnd = declPart.size();
                                         while (vEnd > 0 && std::isspace((unsigned char)declPart[vEnd - 1]))
                                                 --vEnd;
@@ -1500,7 +1588,7 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
                                         std::string varName  = declPart.substr(vk, vEnd - vk);
                                         std::string typeName = trim(declPart.substr(0, vk));
                                         if (!varName.empty() && !typeName.empty()) {
-                                                // Parse the brace-initializer as comma-separated values.
+                                                // Parse the brace-initializer as comma-separated values
                                                 std::vector<std::string> vals;
                                                 int                      d  = 0;
                                                 size_t                   vs = 0;
@@ -1526,7 +1614,7 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
                         }
                 }
 
-                // Advance past closing '}' and optional ';'.
+                // Advance past closing '}' and optional ';'
                 prevEnd = cl + 1;
                 while (prevEnd < text.size() && std::isspace((unsigned char)text[prevEnd]))
                         ++prevEnd;
@@ -1535,10 +1623,10 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
                 i = prevEnd;
         }
 
-        // Remaining text after all blocks.
+        // Remaining text after all blocks
         if (prevEnd < text.size()) {
                 std::string tail = text.substr(prevEnd);
-                // Parse any remaining C-style function declarations.
+                // Parse any remaining C-style function declarations
                 int    depth = 0;
                 size_t st    = 0;
                 for (size_t k = 0; k < tail.size(); ++k) {
@@ -1595,7 +1683,7 @@ parseScopeContent(const std::string &text, const std::string &nsPrefix, ParseRes
 
 // ─── parseHeaderFull ─────────────────────────────────────────────────────────
 
-// Forward declarations for helpers defined later in this file.
+// Forward declarations for helpers defined later in this file
 static std::string                        joinContinuationLines(const std::string &);
 std::unordered_map<std::string, MacroDef> parseMacroTable(const std::string &);
 
@@ -1637,10 +1725,10 @@ parseMacroTable(const std::string &src)
         std::unordered_map<std::string, MacroDef> result;
 
         // Work on a line-continuation-joined copy, with block comments stripped
-        // (but keep line structure so we can split on '\n').
+        // (but keep line structure so we can split on '\n')
         std::string work = joinContinuationLines(src);
 
-        // Minimal block-comment strip: replace /* ... */ with spaces.
+        // Minimal block-comment strip: replace /* ... */ with spaces
         for (size_t i = 0; i < work.size();) {
                 if (i + 1 < work.size() && work[i] == '/' && work[i + 1] == '*') {
                         work[i]      = ' ';
@@ -1665,7 +1753,7 @@ parseMacroTable(const std::string &src)
         std::istringstream ss(work);
         std::string        line;
         while (std::getline(ss, line)) {
-                // Strip line comment.
+                // Strip line comment
                 {
                         size_t lc = line.find("//");
                         if (lc != std::string::npos)
@@ -1675,7 +1763,7 @@ parseMacroTable(const std::string &src)
                 if (tl.empty() || tl[0] != '#')
                         continue;
 
-                // Strip '#' and optional whitespace.
+                // Strip '#' and optional whitespace
                 std::string rest = trim(tl.substr(1));
                 if (rest.size() < 6 || rest.substr(0, 6) != "define")
                         continue;
@@ -1683,7 +1771,7 @@ parseMacroTable(const std::string &src)
                 if (rest.empty())
                         continue;
 
-                // Extract macro name (and optional parameter list).
+                // Extract macro name (and optional parameter list)
                 size_t nend = 0;
                 while (nend < rest.size() && (isIdChar(rest[nend]) || rest[nend] == '$'))
                         ++nend;
@@ -1695,7 +1783,7 @@ parseMacroTable(const std::string &src)
 
                 MacroDef def;
                 if (!rest.empty() && rest[0] == '(') {
-                        // Function-like macro.
+                        // Function-like macro
                         def.isFunctionLike = true;
                         size_t rp          = rest.find(')');
                         if (rp == std::string::npos)
@@ -1703,7 +1791,7 @@ parseMacroTable(const std::string &src)
                         std::string paramStr = rest.substr(1, rp - 1);
                         rest                 = trim(rest.substr(rp + 1));
 
-                        // Split params by ','.
+                        // Split params by ','
                         std::istringstream ps(paramStr);
                         std::string        p;
                         while (std::getline(ps, p, ',')) {
@@ -1733,7 +1821,7 @@ expandMacros(const std::string &expr, const std::unordered_map<std::string, Macr
         size_t i = 0;
 
         while (i < expr.size()) {
-                // Read an identifier.
+                // Read an identifier
                 if (std::isalpha((unsigned char)expr[i]) || expr[i] == '_') {
                         size_t j = i;
                         while (j < expr.size() && isIdChar(expr[j]))
@@ -1749,24 +1837,24 @@ expandMacros(const std::string &expr, const std::unordered_map<std::string, Macr
                         const MacroDef &def = it->second;
 
                         if (!def.isFunctionLike) {
-                                // Simple replacement.
+                                // Simple replacement
                                 out += expandMacros(def.body, macros, depth + 1);
                                 i    = j;
                                 continue;
                         }
 
-                        // Function-like: consume argument list.
+                        // Function-like: consume argument list
                         size_t k = j;
                         while (k < expr.size() && std::isspace((unsigned char)expr[k]))
                                 ++k;
                         if (k >= expr.size() || expr[k] != '(') {
-                                // No argument list — emit as-is.
+                                // No argument list — emit as-is
                                 out += ident;
                                 i    = j;
                                 continue;
                         }
 
-                        // Find matching ')'.
+                        // Find matching ')'
                         int    depth2   = 0;
                         size_t argStart = k + 1;
                         size_t kk       = k;
@@ -1788,7 +1876,7 @@ expandMacros(const std::string &expr, const std::unordered_map<std::string, Macr
                                 continue;
                         }
 
-                        // Split argument list (respecting nested parens).
+                        // Split argument list (respecting nested parens)
                         std::vector<std::string> args;
                         {
                                 int    d2 = 0;
@@ -1807,7 +1895,7 @@ expandMacros(const std::string &expr, const std::unordered_map<std::string, Macr
                                         args.push_back(trim(expr.substr(s2, rp - s2)));
                         }
 
-                        // Substitute parameters into body.
+                        // Substitute parameters into body
                         std::string expanded = def.body;
                         for (size_t pi = 0; pi < def.params.size() && pi < args.size(); ++pi) {
                                 std::string        replaced;
@@ -1819,7 +1907,7 @@ expandMacros(const std::string &expr, const std::unordered_map<std::string, Macr
                                                 replaced += expanded.substr(pos);
                                                 break;
                                         }
-                                        // Ensure word boundary.
+                                        // Ensure word boundary
                                         bool leftOk  = (found == 0 || !isIdChar(expanded[found - 1]));
                                         bool rightOk = (found + pname.size() >= expanded.size() ||
                                                         !isIdChar(expanded[found + pname.size()]));
@@ -1861,7 +1949,9 @@ struct ExprParser {
                 return s >= end;
         }
 
-        // Parse an optional leading cast like (uint32_t) or (int) and discard it.
+        /**
+         * @brief Parse an optional leading cast like (uint32_t) or (int) and discard it
+         */
         void tryCast()
         {
                 skipWs();
@@ -1881,7 +1971,7 @@ struct ExprParser {
                 while (after < end && std::isspace((unsigned char)*after))
                         ++after;
                 if (after < end && *after == ')') {
-                        // Check if it looks like a type (not an expression start).
+                        // Check if it looks like a type (not an expression start)
                         std::string        tok(s, nlen);
                         static const char *types[] = {"int",
                                                       "uint8_t",
@@ -1917,7 +2007,7 @@ struct ExprParser {
                 if (s >= end)
                         return 0;
 
-                // Parenthesized expression.
+                // Parenthesized expression
                 if (*s == '(') {
                         ++s;
                         int64_t v = parseExpr();
@@ -1927,7 +2017,7 @@ struct ExprParser {
                         return v;
                 }
 
-                // Unary operators.
+                // Unary operators
                 if (*s == '-') {
                         ++s;
                         return -parsePrimary();
@@ -1945,7 +2035,7 @@ struct ExprParser {
                         return !parsePrimary();
                 }
 
-                // Hex literal.
+                // Hex literal
                 if (s + 1 < end && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
                         s         += 2;
                         int64_t v  = 0;
@@ -1955,13 +2045,13 @@ struct ExprParser {
                                 v = v * 16 + d;
                                 ++s;
                         }
-                        // Strip optional UL suffix.
+                        // Strip optional UL suffix
                         while (s < end && (*s == 'u' || *s == 'U' || *s == 'l' || *s == 'L'))
                                 ++s;
                         return v;
                 }
 
-                // Decimal literal.
+                // Decimal literal
                 if (std::isdigit((unsigned char)*s)) {
                         int64_t v = 0;
                         while (s < end && std::isdigit((unsigned char)*s))
@@ -1971,7 +2061,7 @@ struct ExprParser {
                         return v;
                 }
 
-                // Identifier – treat as 0 (already expanded by expandMacros before eval).
+                // Identifier – treat as 0 (already expanded by expandMacros before eval)
                 while (s < end && isIdChar(*s))
                         ++s;
                 return 0;
@@ -2083,11 +2173,11 @@ applyInlineBody(void *buf, size_t bufSize, const CClassDecl &cls, const CMethodD
                 return 0;
 
         int written = 0;
-        // Split body on ';' and process each statement.
+        // Split body on ';' and process each statement
         const std::string &body = method.inlineBody;
         size_t             i    = 0;
         while (i < body.size()) {
-                // Find next ';'.
+                // Find next ';'
                 size_t      semi = body.find(';', i);
                 std::string stmt = trim(body.substr(i, semi == std::string::npos ? body.size() - i : semi - i));
                 i                = (semi == std::string::npos) ? body.size() : semi + 1;
@@ -2095,11 +2185,11 @@ applyInlineBody(void *buf, size_t bufSize, const CClassDecl &cls, const CMethodD
                         continue;
 
                 // We only handle simple assignments: lhs = rhs
-                // The lhs is a plain member name (no dereference, no indexing).
+                // The lhs is a plain member name (no dereference, no indexing)
                 size_t eq = stmt.find('=');
                 if (eq == std::string::npos)
                         continue;
-                // Avoid '==' and '!=' etc.
+                // Avoid '==' and '!=' etc
                 if (eq + 1 < stmt.size() && stmt[eq + 1] == '=')
                         continue;
                 if (eq > 0 && (stmt[eq - 1] == '!' || stmt[eq - 1] == '<' || stmt[eq - 1] == '>' || stmt[eq - 1] == '+' ||
@@ -2111,11 +2201,11 @@ applyInlineBody(void *buf, size_t bufSize, const CClassDecl &cls, const CMethodD
                 if (lhs.empty() || rhs.empty())
                         continue;
 
-                // Strip leading "this->" from lhs.
+                // Strip leading "this->" from lhs
                 if (lhs.size() > 6 && lhs.substr(0, 6) == "this->")
                         lhs = trim(lhs.substr(6));
 
-                // Find the field in cls.allFields.
+                // Find the field in cls.allFields
                 const CFieldDecl *field = nullptr;
                 for (const auto &f : cls.allFields) {
                         if (f.name == lhs) {
@@ -2128,8 +2218,8 @@ applyInlineBody(void *buf, size_t bufSize, const CClassDecl &cls, const CMethodD
                 if (field->offset + field->size > bufSize)
                         continue;
 
-                // Resolve the rhs value.
-                // Handle "VAR.MEMBER" lookups into constexprVars.
+                // Resolve the rhs value
+                // Handle "VAR.MEMBER" lookups into constexprVars
                 std::string resolvedRhs = rhs;
                 {
                         size_t dot = rhs.find('.');
@@ -2140,7 +2230,7 @@ applyInlineBody(void *buf, size_t bufSize, const CClassDecl &cls, const CMethodD
                                 if (cvit != pr.constexprVars.end()) {
                                         const std::string &typeName = cvit->second.first;
                                         const auto        &vals     = cvit->second.second;
-                                        // Find field index in the struct definition.
+                                        // Find field index in the struct definition
                                         const CStructDecl *sd = findStruct(pr, typeName);
                                         if (sd) {
                                                 for (size_t fi = 0; fi < sd->fields.size(); ++fi) {
@@ -2151,7 +2241,7 @@ applyInlineBody(void *buf, size_t bufSize, const CClassDecl &cls, const CMethodD
                                                 }
                                         } else {
                                                 // typeName not found as struct — try index via name pattern
-                                                // or just use first value as fallback.
+                                                // or just use first value as fallback
                                                 if (!vals.empty())
                                                         resolvedRhs = vals[0];
                                         }
@@ -2162,7 +2252,7 @@ applyInlineBody(void *buf, size_t bufSize, const CClassDecl &cls, const CMethodD
                 int64_t val = 0;
                 evalIntExpr(resolvedRhs, pr.macros, val);
 
-                // Write the value into the buffer respecting field size.
+                // Write the value into the buffer respecting field size
                 uint8_t *dest = static_cast<uint8_t *>(buf) + field->offset;
                 switch (field->size) {
                         case 1: {
@@ -2211,7 +2301,7 @@ findStruct(const ParseResult &pr, const std::string &name)
 const CEnumDecl *
 findEnum(const ParseResult &pr, const std::string &name, const std::string &classFullName)
 {
-        // Prefer inner enums of the specified class.
+        // Prefer inner enums of the specified class
         if (!classFullName.empty()) {
                 for (const auto &cls : pr.classes) {
                         if (cls.fullName != classFullName)
@@ -2221,11 +2311,11 @@ findEnum(const ParseResult &pr, const std::string &name, const std::string &clas
                                         return &e;
                 }
         }
-        // Fall back to global enums.
+        // Fall back to global enums
         for (const auto &e : pr.enums)
                 if (e.name == name || e.fullName == name)
                         return &e;
-        // Finally, any class's inner enums.
+        // Finally, any class's inner enums
         for (const auto &cls : pr.classes)
                 for (const auto &e : cls.innerEnums)
                         if (e.name == name || e.fullName == name)

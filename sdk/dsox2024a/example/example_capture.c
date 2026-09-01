@@ -35,7 +35,7 @@ main(int argc, char **argv)
                 printf("%s\n", id);
         if (dsox2024a_set_channel_enabled(1, 1))
                 goto error;
-        /* AUTO sweep guarantees a trigger even when no valid edge is present. */
+        // AUTO sweep guarantees a trigger even when no valid edge is present
         if (dsox2024a_write(":TRIGger:SWEep AUTO"))
                 goto error;
         printf("Triggering SINGLE every 10 seconds. Press Ctrl+C to stop.\n");
@@ -43,7 +43,7 @@ main(int argc, char **argv)
                 char completed[16];
                 if (dsox2024a_single())
                         goto error;
-                /* Wait until this single acquisition has completed. */
+                // Wait until this single acquisition has completed
                 if (dsox2024a_query("*OPC?", completed, sizeof(completed)))
                         goto error;
                 printf("SINGLE acquisition complete.\n");

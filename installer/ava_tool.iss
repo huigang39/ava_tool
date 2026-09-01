@@ -1,4 +1,4 @@
-; Inno Setup script for ava_tool.
+﻿; Inno Setup script for ava_tool.
 ;
 ; Build the app first (`make`), then compile this installer with:
 ;   make package            (runs ISCC for you)   -- or --
@@ -8,8 +8,11 @@
 ; release tag (v<version>). Output: dist\ava_tool_setup_<version>.exe.
 
 #define MyAppName    "ava_tool"
-#define MyAppVersion "0.1.10"
+#define MyAppVersion "0.2.1"
 #define MyAppExeName "ava_tool.exe"
+#ifndef MyAppBinDir
+#define MyAppBinDir "..\bin\win"
+#endif
 #define MyAppPublisher "huigang39"
 #define MyAppURL     "https://github.com/huigang39/ava_tool"
 
@@ -51,11 +54,20 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "..\bin\win\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\bin\win\updater.exe";     DestDir: "{app}"; Flags: ignoreversion
-Source: "..\bin\win\JLink_x64.dll";   DestDir: "{app}"; Flags: ignoreversion
-Source: "..\bin\win\glfw3.dll";       DestDir: "{app}"; Flags: ignoreversion
-Source: "..\bin\win\libfftw3f-3.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppBinDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppBinDir}\updater.exe";     DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppBinDir}\JLink_x64.dll";   DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppBinDir}\glfw3.dll";       DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppBinDir}\mujoco.dll"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#MyAppBinDir}\mujoco_single_joint.xml"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#MyAppBinDir}\mujoco_actuator.xml"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#MyAppBinDir}\Spice64\*"; DestDir: "{app}\Spice64"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "{#MyAppBinDir}\SpiceModels\*"; DestDir: "{app}\SpiceModels"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "{#MyAppBinDir}\MuJoCo_LICENSE.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#MyAppBinDir}\MuJoCo_THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
+Source: "{#MyAppBinDir}\libfftw3f-3.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#MyAppBinDir}\sdk\*"; DestDir: "{app}\sdk"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#MyAppBinDir}\config\STM32H7_LiveAttach.JLinkScript"; DestDir: "{app}\config"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}";            Filename: "{app}\{#MyAppExeName}"

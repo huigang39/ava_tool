@@ -5,45 +5,55 @@
 #ifndef MONITOR_TYPES_HPP
 #define MONITOR_TYPES_HPP
 
-#include "module.h"
+#include "ckit.h"
+#include "core/unit_conversion.hpp"
+#include <array>
 #include <string>
 #include <vector>
 
 class MonitorScope;
 
+// GUI-only time ruler shared by every time-domain scope in one monitor
+struct MonitorTimeMeasurement {
+        bool                  enabled{false};
+        int                   count{0};
+        std::array<double, 2> cursors{};
+};
+
 // Full DWARF paths can become long after several nested structs/arrays. Keep
 // drag/drop payloads large enough that the canonical symbol name used for
-// address re-resolution is not silently truncated.
+// address re-resolution is not silently truncated
 static constexpr usize kMaxMonitorSymbolPath = 1024;
 
 // Payload carried when dragging a single scalar symbol from the symbol browser
-// onto a monitor scope. Serialised into the ImGui drag-drop system as POD.
+// onto a monitor scope. Serialised into the ImGui drag-drop system as POD
 struct ChannelDropPayload {
         static constexpr int kMaxEnums = 16;
         struct EnumEntry {
                 char name[64];
-                i64  value;
+                i64  val;
         };
 
-        char      name[kMaxMonitorSymbolPath];
-        u64       addr;
-        char      type[8];     // "F32"/"F64"/"I8"/"I16"/"I32"/"I64"/"U8"/"U16"/"U32"/"U64"
-        char      device[8];   // "SHM" / "JLINK" / "UDP" / "AUDIO"
-        char      shmName[64]; // SHM region name, or audio device name when device=="AUDIO"
-        u8        numBytes;    // 1/2/4/8 - derived from type
-        u8        numEnums;    // 0 = not an enum
-        u64       typeOff;     // DWARF type offset
-        u32       bitOffset;
-        u32       bitSize;
-        bool      writable;
-        EnumEntry enums[kMaxEnums];
+        char                      name[kMaxMonitorSymbolPath];
+        u64                       addr;
+        char                      type[8];     // "f16"/"f32"/"f64"/"i8"/"i16"/"i32"/"i64"/"u8"/"u16"/"u32"/"u64"
+        char                      device[8];   // "SHM" / "JLINK" / "UDP" / "AUDIO"
+        char                      shmName[64]; // SHM region name, or audio device name when device=="AUDIO"
+        u8                        numBytes;    // 1/2/4/8 - derived from type
+        u8                        numEnums;    // 0 = not an enum
+        u64                       typeOff;     // DWARF type offset
+        u32                       bitOffset;
+        u32                       bitSize;
+        bool                      writable;
+        unit_conversion::Settings unitConversion{};
+        EnumEntry                 enums[kMaxEnums];
         // Source Variable (its watch list) when the drag started in a symbol browser;
-        // null otherwise. Lets a monitor drop mirror the symbol back into that watch list.
+        // null otherwise. Lets a monitor drop mirror the symbol back into that watch list
         const void *srcWatch{nullptr};
 };
 
-// Payload for dragging a struct/array from the variable window to a monitor scope.
-// Each entry is one scalar leaf member, flattened from the struct/array tree.
+// Payload for dragging a struct/array from the variable window to a monitor scope
+// Each entry is one scalar leaf member, flattened from the struct/array tree
 struct StructChannelPayload {
         static constexpr int kMaxEntries = 48;
         static constexpr int kMaxEnums   = ChannelDropPayload::kMaxEnums;
@@ -55,6 +65,7 @@ struct StructChannelPayload {
                 u32                           bitOffset;
                 u32                           bitSize;
                 bool                          writable;
+                unit_conversion::Settings     unitConversion{};
                 ChannelDropPayload::EnumEntry enums[kMaxEnums];
         };
         int  count;
@@ -63,27 +74,27 @@ struct StructChannelPayload {
         bool writable;
         // Root struct/array metadata, so a drop target (e.g. the variable watch
         // list) can add the whole struct as a single expandable entry instead of
-        // the flattened scalar leaves the monitor consumes.
+        // the flattened scalar leaves the monitor consumes
         char  rootName[kMaxMonitorSymbolPath];
         u64   rootAddr;
         u64   rootTypeOff;
         Entry entries[kMaxEntries];
-        // See ChannelDropPayload::srcWatch.
+        // See ChannelDropPayload::srcWatch
         const void *srcWatch{nullptr};
 };
 
 struct ChannelMovePayload {
         MonitorScope *srcScope;
-        // When isGroup is false: the exact channel key to move.
-        // When isGroup is true: a struct/array group path prefix; every channel whose
-        // key equals it or starts with "<chName>." is moved together.
+        // When isGroup is false: the exact ch key to move
+        // When isGroup is true: a struct/array group path prefix; every ch whose
+        // key equals it or starts with "<chName>." is moved together
         char chName[kMaxMonitorSymbolPath];
         bool isGroup{false};
 };
 
 // A request, queued when a symbol-browser drag is dropped on a monitor, to mirror
 // that symbol into the originating Variable's watch list. Drained once per frame by
-// Gui::loop(), which dispatches it to the Variable whose pointer matches `target`.
+// Gui::loop(), which dispatches it to the Variable whose pointer matches `target`
 struct WatchMirrorRequest {
         const void          *target{nullptr}; // the Variable* that should receive it
         bool                 isStruct{false};

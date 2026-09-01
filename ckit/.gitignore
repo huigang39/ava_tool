@@ -1,0 +1,13 @@
+/**/.cache/
+/**/__pycache__/
+/**/build**/
+/**/compile_commands.json
+
+/**/.zed/
+/**/.idea/
+/**/.vscode/
+/**/.venv/
+
+/lib/ckit/
+
+/**/**.log

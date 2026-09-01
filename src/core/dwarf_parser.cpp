@@ -1,5 +1,6 @@
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <unordered_map>
 #include <vector>
 
@@ -97,8 +98,9 @@ constexpr u64 DW_FORM_addrx2         = 0x2a;
 constexpr u64 DW_FORM_addrx3         = 0x2b;
 constexpr u64 DW_FORM_addrx4         = 0x2c;
 
-constexpr u8 DW_OP_addr  = 0x03;
-constexpr u8 DW_OP_addrx = 0xa1;
+constexpr u8 DW_OP_addr        = 0x03;
+constexpr u8 DW_OP_plus_uconst = 0x23;
+constexpr u8 DW_OP_addrx       = 0xa1;
 
 struct AttrValue {
         enum Kind { INVALID, U64V, S64V, STR, BLOCK };
@@ -123,18 +125,26 @@ struct Abbrev {
 
 using AbbrevTable = std::unordered_map<u64, Abbrev>;
 
+struct BitFieldFixup {
+        Type  *parent{};
+        size_t member{};
+        bool   fromHigh{};
+        u64    offset{}, storageSize{};
+};
+
 struct CuCtx {
-        const u8      *info{nullptr};
-        u64            cuStart{0};
-        u64            cuEnd{0};
-        u64            dieStart{0};
-        u8             version{0};
-        u8             addrSize{4};
-        u8             offsetSize{4};
-        const ElfInfo *elf{nullptr};
-        AbbrevTable    abbrev{};
-        u64            strOffsetsBase{0};
-        u64            addrBase{0};
+        const u8                   *info{nullptr};
+        u64                         cuStart{0};
+        u64                         cuEnd{0};
+        u64                         dieStart{0};
+        u8                          version{0};
+        u8                          addrSize{4};
+        u8                          offsetSize{4};
+        const ElfInfo              *elf{nullptr};
+        AbbrevTable                 abbrev{};
+        u64                         strOffsetsBase{0};
+        u64                         addrBase{0};
+        std::vector<BitFieldFixup> *bitFields{};
 };
 
 inline u8
@@ -510,29 +520,61 @@ parseLocationAddr(const CuCtx &ctx, const std::vector<u8> &blk)
 {
         if (blk.empty())
                 return 0;
-        const u8 op = blk[0];
-        if (op == DW_OP_addr) {
-                if (blk.size() < 1u + ctx.addrSize)
-                        return 0;
-                u64 addr = 0;
-                for (u8 i = 0; i < ctx.addrSize; ++i)
-                        addr |= static_cast<u64>(blk[1 + i]) << (i * 8);
-                return addr;
+
+        const u8 *expr     = blk.data();
+        const u64 exprSize = blk.size();
+        u64       off      = 0;
+        u64       val      = 0;
+        bool      hasValue = false;
+
+        // Static variables normally use a short DWARF expression such as
+        // DW_OP_addr + DW_OP_plus_uconst. Execute the complete expression
+        // instead of returning after the first address-producing opcode
+        while (off < exprSize) {
+                const u8 op = readU8(expr, off, exprSize);
+                switch (op) {
+                        case DW_OP_addr:
+                                if (hasValue || off + ctx.addrSize > exprSize)
+                                        return 0;
+                                val      = readAddr(expr, off, exprSize, ctx.addrSize);
+                                hasValue = true;
+                                break;
+
+                        case DW_OP_addrx: {
+                                if (hasValue)
+                                        return 0;
+                                const u64 idx = readULEB(expr, off, exprSize);
+                                if (ctx.elf->debug_addr.empty() ||
+                                    idx > (std::numeric_limits<u64>::max() - ctx.addrBase) / ctx.addrSize)
+                                        return 0;
+                                const u8 *ad       = ctx.elf->debug_addr.data();
+                                const u64 adSize   = ctx.elf->debug_addr.size();
+                                const u64 entryOff = ctx.addrBase + idx * ctx.addrSize;
+                                u64       addrOff  = entryOff;
+                                if (entryOff > adSize || ctx.addrSize > adSize - entryOff)
+                                        return 0;
+                                val      = readAddr(ad, addrOff, adSize, ctx.addrSize);
+                                hasValue = true;
+                                break;
+                        }
+
+                        case DW_OP_plus_uconst: {
+                                if (!hasValue)
+                                        return 0;
+                                const u64 addend = readULEB(expr, off, exprSize);
+                                if (addend > std::numeric_limits<u64>::max() - val)
+                                        return 0;
+                                val += addend;
+                                break;
+                        }
+
+                        default:
+                                // Do not return a plausible-but-wrong partial
+                                // address when an expression is unsupported
+                                return 0;
+                }
         }
-        if (op == DW_OP_addrx) {
-                u64       o   = 1;
-                const u64 idx = readULEB(blk.data(), o, blk.size());
-                if (ctx.elf->debug_addr.empty())
-                        return 0;
-                const u8 *ad       = ctx.elf->debug_addr.data();
-                const u64 adSize   = ctx.elf->debug_addr.size();
-                const u64 entryOff = ctx.addrBase + idx * ctx.addrSize;
-                u64       o2       = entryOff;
-                if (entryOff + ctx.addrSize > adSize)
-                        return 0;
-                return readAddr(ad, o2, adSize, ctx.addrSize);
-        }
-        return 0;
+        return hasValue ? val : 0;
 }
 
 const AttrValue *
@@ -588,7 +630,8 @@ attrMemberOffset(const std::unordered_map<u64, AttrValue> &m)
                 u64       o   = 0;
                 const u8 *bp  = v->block.data();
                 const u64 bsz = v->block.size();
-                if (bp[0] == 0x23 /* DW_OP_plus_uconst */) {
+                // DW_OP_plus_uconst
+                if (bp[0] == 0x23) {
                         o = 1;
                         return readULEB(bp, o, bsz);
                 }
@@ -625,6 +668,27 @@ walkChildren(CuCtx &ctx, u64 &off, Type *parent, u64 parentTag, int depth, Info 
                                 ctx.addrBase = v->u;
                 }
 
+                // Definitions may inherit name/type from a declaration DIE (GCC).
+                // Resolve references directly, including forward declarations, with a
+                // bounded walk so malformed reference cycles cannot hang parsing.
+                auto inherited = attrs;
+                for (unsigned hop = 0; hop < 32; ++hop) {
+                        u64 ref = attrU64(inherited, 0x47, 0); // DW_AT_specification
+                        if (!ref)
+                                ref = attrU64(inherited, 0x31, 0); // DW_AT_abstract_origin
+                        if (!ref || ref < ctx.dieStart || ref >= ctx.cuEnd)
+                                break;
+                        u64        cursor = ref;
+                        const auto decl   = ctx.abbrev.find(readULEB(p, cursor, ctx.cuEnd));
+                        if (decl == ctx.abbrev.end())
+                                break;
+                        inherited.clear();
+                        for (const auto &aa : decl->second.attrs)
+                                inherited[aa.attr] = readAttr(ctx, cursor, aa.form, aa.implicitConst);
+                        for (const auto &[key, value] : inherited)
+                                attrs.try_emplace(key, value);
+                }
+
                 Type *myType = nullptr;
 
                 switch (ab.tag) {
@@ -649,11 +713,24 @@ walkChildren(CuCtx &ctx, u64 &off, Type *parent, u64 parentTag, int depth, Info 
                         case DW_TAG_member: {
                                 if (parent && (parent->kind == TypeKind::STRUCT || parent->kind == TypeKind::UNION)) {
                                         Type::Member m;
-                                        m.name      = attrStr(attrs, DW_AT_name);
-                                        m.type      = attrU64(attrs, DW_AT_type, 0);
-                                        m.offset    = attrMemberOffset(attrs);
-                                        m.bitOffset = static_cast<u32>(attrU64(attrs, DW_AT_data_bit_offset, 0));
-                                        m.bitSize   = static_cast<u32>(attrU64(attrs, DW_AT_bit_size, 0));
+                                        m.name    = attrStr(attrs, DW_AT_name);
+                                        m.type    = attrU64(attrs, DW_AT_type, 0);
+                                        m.offset  = attrMemberOffset(attrs);
+                                        m.bitSize = static_cast<u32>(attrU64(attrs, DW_AT_bit_size, 0));
+                                        if (m.bitSize && ctx.bitFields) {
+                                                if (findAttr(attrs, DW_AT_data_bit_offset))
+                                                        ctx.bitFields->push_back({parent,
+                                                                                  parent->members.size(),
+                                                                                  false,
+                                                                                  attrU64(attrs, DW_AT_data_bit_offset),
+                                                                                  0});
+                                                else if (findAttr(attrs, DW_AT_bit_offset))
+                                                        ctx.bitFields->push_back({parent,
+                                                                                  parent->members.size(),
+                                                                                  true,
+                                                                                  attrU64(attrs, DW_AT_bit_offset),
+                                                                                  attrU64(attrs, DW_AT_byte_size)});
+                                        }
                                         parent->members.push_back(std::move(m));
                                 }
                                 break;
@@ -679,8 +756,8 @@ walkChildren(CuCtx &ctx, u64 &off, Type *parent, u64 parentTag, int depth, Info 
                         case DW_TAG_enumerator: {
                                 if (parent && parent->kind == TypeKind::ENUM) {
                                         Type::Enumerator e;
-                                        e.name  = attrStr(attrs, DW_AT_name);
-                                        e.value = attrS64(attrs, DW_AT_const_value, 0);
+                                        e.name = attrStr(attrs, DW_AT_name);
+                                        e.val  = attrS64(attrs, DW_AT_const_value, 0);
                                         parent->enums.push_back(std::move(e));
                                 }
                                 break;
@@ -728,12 +805,13 @@ walkChildren(CuCtx &ctx, u64 &off, Type *parent, u64 parentTag, int depth, Info 
                                 break;
                         }
                         case DW_TAG_enumeration_type: {
-                                Type &t = out.types[dieOff];
-                                t.kind  = TypeKind::ENUM;
-                                t.name  = attrStr(attrs, DW_AT_name);
-                                t.size  = attrU64(attrs, DW_AT_byte_size, 0);
-                                t.inner = attrU64(attrs, DW_AT_type, 0);
-                                myType  = &t;
+                                Type &t    = out.types[dieOff];
+                                t.kind     = TypeKind::ENUM;
+                                t.name     = attrStr(attrs, DW_AT_name);
+                                t.size     = attrU64(attrs, DW_AT_byte_size, 0);
+                                t.inner    = attrU64(attrs, DW_AT_type, 0);
+                                t.encoding = static_cast<u32>(attrU64(attrs, DW_AT_encoding, 0));
+                                myType     = &t;
                                 break;
                         }
                         case DW_TAG_typedef: {
@@ -770,7 +848,7 @@ walkChildren(CuCtx &ctx, u64 &off, Type *parent, u64 parentTag, int depth, Info 
 }
 
 bool
-parseCu(const ElfInfo &elf, u64 &cuOff, Info &out)
+parseCu(const ElfInfo &elf, u64 &cuOff, Info &out, std::vector<BitFieldFixup> &bitFields)
 {
         const u8 *info  = elf.debug_info.data();
         const u64 total = elf.debug_info.size();
@@ -815,6 +893,7 @@ parseCu(const ElfInfo &elf, u64 &cuOff, Info &out)
         ctx.offsetSize = offsetSize;
         ctx.elf        = &elf;
         ctx.abbrev     = parseAbbrev(elf.debug_abbrev, abbrevOffset);
+        ctx.bitFields  = &bitFields;
 
         u64 dieOff = o;
         walkChildren(ctx, dieOff, nullptr, 0, 0, out);
@@ -832,11 +911,43 @@ parse(const ElfInfo &elf, Info &out)
         if (elf.debug_info.empty() || elf.debug_abbrev.empty())
                 return false;
 
-        u64       off   = 0;
-        const u64 total = elf.debug_info.size();
+        u64                        off   = 0;
+        const u64                  total = elf.debug_info.size();
+        std::vector<BitFieldFixup> bitFields;
         while (off < total) {
-                if (!parseCu(elf, off, out))
+                if (!parseCu(elf, off, out, bitFields))
                         break;
+        }
+        // All consumers use a byte address and a least-significant-bit offset
+        // DWARF 5 offsets are relative to the whole containing object; older
+        // DWARF describes the distance from the high end of the storage unit
+        for (const auto &fix : bitFields) {
+                auto &member    = fix.parent->members[fix.member];
+                u64   bitOffset = fix.offset;
+                if (fix.fromHigh) {
+                        u64 size = fix.storageSize, id = member.type;
+                        for (unsigned depth = 0; !size && depth < 64; ++depth) {
+                                const auto found = out.types.find(id);
+                                if (found == out.types.end())
+                                        break;
+                                size = found->second.size;
+                                id   = found->second.inner;
+                        }
+                        const auto highOffset = static_cast<i64>(fix.offset);
+                        if (!size || size > 8 || highOffset < -64 || highOffset > 64 || member.bitSize > 64 ||
+                            i64(size * 8) - highOffset - i64(member.bitSize) < 0) {
+                                member.bitOffset = UINT32_MAX;
+                                continue;
+                        }
+                        bitOffset = u64(i64(size * 8) - highOffset - i64(member.bitSize));
+                } else
+                        member.offset = 0;
+                if (bitOffset / 8 > UINT64_MAX - member.offset) {
+                        member.bitOffset = UINT32_MAX;
+                        continue;
+                }
+                member.offset    += bitOffset / 8;
+                member.bitOffset  = u32(bitOffset % 8);
         }
         out.present = true;
         return true;

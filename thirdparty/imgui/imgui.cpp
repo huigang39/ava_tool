@@ -19650,6 +19650,10 @@ static void ImGui::DockNodeCalcTabBarLayout(const ImGuiDockNode* node, ImRect* o
         window_menu_button_pos = ImVec2(r.Max.x - button_sz, r.Min.y + style.FramePadding.y);
         r.Max.x -= button_sz + style.ItemInnerSpacing.x;
     }
+    // AvA: keep an empty double-click target for pane folding, including narrow
+    // folded panes whose tabs otherwise consume the entire title bar.
+    if (node->ParentNode)
+        r.Max.x = ImMax(r.Min.x, r.Max.x - GetFrameHeight());
     if (out_tab_bar_rect) { *out_tab_bar_rect = r; }
     if (out_window_menu_button_pos) { *out_window_menu_button_pos = window_menu_button_pos; }
 }

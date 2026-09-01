@@ -18,12 +18,14 @@
 
 enum class Lang { EN, ZH };
 
-// Active UI language. Defined inline (C++17) so every TU shares one instance.
+// Active UI language. Defined inline (C++17) so every TU shares one instance
 inline Lang g_lang = Lang::EN;
 
-// Returns the string for the active language. The English text doubles as the
-// stable key, so untranslated call sites can simply pass the same string twice
-// (or be left as plain literals) and still render correctly in English.
+/**
+ * @brief Returns the string for the active language. The English text doubles as the
+ *        stable key, so untranslated call sites can simply pass the same string twice
+ *        (or be left as plain literals) and still render correctly in English
+ */
 inline const char *
 tr(const char *en, const char *zh)
 {

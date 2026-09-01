@@ -2,8 +2,11 @@
  * @file  sampler.cpp
  * @brief Sampler thread implementation — HSS / POLL / SHM / Wave processing.
  */
+#include "core/hss_stream.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <map>
 #include <ranges>
 #include <unordered_map>
 #include <unordered_set>
@@ -28,13 +31,13 @@
 #endif
 
 #include "app_log.hpp"
+#include "ckit.h"
 #include "core/jlink_port.hpp"
 #include "core/sampler.hpp"
 #include "core/session_time.hpp"
 #include "core/type_codec.hpp"
 #include "gui/gui.hpp"
 #include "gui/monitor.hpp"
-#include "module.h"
 #include "timeops.h"
 #include "wave.h"
 
@@ -48,17 +51,17 @@ std::atomic<int>  g_samplerBoundCore{-1}; // -1=uninit, -2=no binding, >=0=core 
 std::atomic<int>  g_samplerCoreReq{-1};   // -1=auto (highest), >=0=user-picked core
 
 // ---------------------------------------------------------------------------
-// Apply the requested run mode to the calling (sampler) thread.
+// Apply the requested run mode to the calling (sampler) thread
 //
-//  0 = Low      : normal priority, no affinity binding, always sleep 1ms.
-//  1 = Normal   : ABOVE_NORMAL priority, no affinity, adaptive sleep.
-//  2 = CPUBound : ABOVE_NORMAL + HIGHEST priority, pinned to highest core,
-//                 spin-loop (no sleep) for minimum jitter.
+// 0 = Low      : normal priority, no affinity binding, always sleep 1ms
+// 1 = Normal   : ABOVE_NORMAL priority, no affinity, adaptive sleep
+// 2 = CPUBound : ABOVE_NORMAL + HIGHEST priority, pinned to highest core,
+// spin-loop (no sleep) for minimum jitter
 //
 // g_samplerBoundCore is set to:
-//   >= 0  in CPUBound mode (the actual core); main.cpp uses this to isolate
-//         GUI / flusher threads away from that core.
-//   -2    in Low / Normal mode (no pinning); main.cpp skips isolation.
+// >= 0  in CPUBound mode (the actual core); main.cpp uses this to isolate
+// GUI / flusher threads away from that core
+// -2    in Low / Normal mode (no pinning); main.cpp skips isolation
 // ---------------------------------------------------------------------------
 static void
 setupThread(int mode)
@@ -73,7 +76,7 @@ setupThread(int mode)
                 SetThreadPriority(hThread, THREAD_PRIORITY_NORMAL);
                 DWORD_PTR procMask = 0, sysMask = 0;
                 GetProcessAffinityMask(hProc, &procMask, &sysMask);
-                SetThreadAffinityMask(hThread, procMask); // clear any previous pinning
+                SetThreadAffinityMask(hThread, procMask); // clear any prev pinning
                 g_samplerBoundCore.store(-2);
                 LOG_I("Sampler: Low mode (normal priority, no affinity)");
 
@@ -93,7 +96,7 @@ setupThread(int mode)
                 SetThreadPriority(hThread, THREAD_PRIORITY_HIGHEST);
 
                 // Note: pinning a thread of *our own* process needs no elevation;
-                // SetThreadAffinityMask / THREAD_PRIORITY_HIGHEST work for any user.
+                // SetThreadAffinityMask / THREAD_PRIORITY_HIGHEST work for any user
                 // (Only REALTIME_PRIORITY_CLASS would require admin, which we avoid.)
                 DWORD_PTR procMask = 0, sysMask = 0;
                 GetProcessAffinityMask(hProc, &procMask, &sysMask);
@@ -102,11 +105,11 @@ setupThread(int mode)
 
                 const int reqCore = g_samplerCoreReq.load();
                 if (reqCore >= 0 && reqCore < 64 && (procMask & (1ull << reqCore))) {
-                        // User explicitly picked a core that this process may run on.
+                        // User explicitly picked a core that this process may run on
                         targetCore = reqCore;
                         targetMask = (1ull << reqCore);
                 } else {
-                        // Auto: pin to the highest available core.
+                        // Auto: pin to the highest available core
                         for (int b = 63; b >= 0; --b) {
                                 if (procMask & (1ull << b)) {
                                         targetCore = b;
@@ -160,7 +163,7 @@ setupThread(int mode)
                         pthread_setschedparam(pthread_self(), SCHED_RR, &sp);
                 }
                 // Affinity itself needs no privileges; only SCHED_FIFO above does
-                // (handled with the SCHED_RR/SCHED_OTHER fallback when not permitted).
+                // (handled with the SCHED_RR/SCHED_OTHER fallback when not permitted)
                 const int n    = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
                 const int req  = g_samplerCoreReq.load();
                 const int core = (req >= 0 && req < n) ? req : ((n > 1) ? (n - 1) : 0);
@@ -199,17 +202,18 @@ threadFunc(Gui *gui)
 {
         setupThread(g_samplerRunMode.load());
         LOG_I("Sampler thread started.");
-        u64                                          lastTime = get_mono_ts_us();
-        std::vector<HssBlock>                        lastBlocks;
-        std::vector<std::shared_ptr<MonitorChannel>> lastChans;
-        std::vector<std::shared_ptr<Monitor>>        lastChMonitors;
-        std::vector<std::string>                     lastTypes;
-        std::vector<u32>                             lastOffsets;
-        i32                                          lastPeriodUs = 0;
+        u64                                          prevTime = get_mono_ts_us();
+        std::vector<HssBlock>                        prevBlocks;
+        std::vector<std::shared_ptr<MonitorChannel>> prevChans;
+        std::vector<std::shared_ptr<Monitor>>        prevChMonitors;
+        std::vector<std::string>                     prevTypes;
+        std::vector<u32>                             prevOffsets;
+        std::vector<u32>                             prevBitOffsets, prevBitSizes;
+        i32                                          prevPeriodUs = 0;
 
-        // Per-monitor last-wave-tick. Wave generation is driven from this thread
-        // to keep tick spacing regular: no separate thread fighting for JLink mtx.
-        std::unordered_map<std::shared_ptr<Monitor>, u64> lastMonitorWaveTicks;
+        // Per-monitor prev-wave-tick. Wave generation is driven from this thread
+        // to keep tick spacing regular: no separate thread fighting for JLink mtx
+        std::unordered_map<std::shared_ptr<Monitor>, u64> prevMonitorWaveTicks;
 
         // -------------------- Diagnostics --------------------
         struct WaveDiag {
@@ -252,17 +256,19 @@ threadFunc(Gui *gui)
         u64      hbLastDumpMs    = get_mono_ts_ms();
         u64      sessionStartMs  = get_mono_ts_ms();
         u64      iterCounter     = 0;
-        u64      lastRefreshOkUs = get_mono_ts_us();
+        u64      prevRefreshOkUs = get_mono_ts_us();
 
         static constexpr usize kBufCap = 64 * 1024;
         static u8              buf[kBufCap];
         usize                  carryLen     = 0;
         bool                   discardFirst = false;
 
-        u64 hzFrameAccum       = 0;
-        u64 hzLastTick         = get_mono_ts_ms();
-        u64 lastHssStart       = get_mono_ts_ms();
-        f64 lastHssSessionTime = 0;
+        u64                    hzFrameAccum    = 0;
+        u64                    sampleByteAccum = 0;
+        u64                    hzLastTick      = get_mono_ts_ms();
+        hss_stream::StartRetry hssStartRetry;
+        u64                    lastHssZeroLogMs   = 0;
+        f64                    prevHssSessionTime = 0;
 
         // HSS health watchdog. The J-Link HSS hardware FIFO can wedge into a
         // backlogged/overflowed state in which JLINK_HSS_Read either returns no
@@ -272,16 +278,17 @@ threadFunc(Gui *gui)
         // the render frame rate — exactly the symptom a manual disconnect/connect
         // cured by restarting the stream. We reproduce that recovery automatically:
         // drain the FIFO fully each iteration (below) so a backlog can't persist,
-        // and force a clean HSS restart if no frames arrive for a sustained window.
-        u64 lastHssFrameMs    = get_mono_ts_ms();
-        u64 lastHssWatchdogMs = 0;
+        // and force a clean HSS restart if no frames arrive for a sustained window
+        u64 prevHssFrameMs    = get_mono_ts_ms();
+        u64 prevHssWatchdogMs = 0;
 
         f64  hssBaseWallTime = 0; // session time captured at HSS (re)sync
-        u32  hssLastHwTs     = 0; // previous raw 32-bit µs counter (for wrap detection)
+        u32  hssLastHwTs     = 0; // prev raw 32-bit µs counter (for wrap detection)
         u64  hssAccumUs      = 0; // elapsed µs since sync, accumulated across 2^32 wraps
         bool hssTimeSynced   = false;
 
         // Internal task structs
+        u64 taskEpoch = 0;
         struct TempCh {
                 std::shared_ptr<MonitorChannel> ch;
                 std::shared_ptr<Monitor>        monitor;
@@ -321,18 +328,32 @@ threadFunc(Gui *gui)
 
         // Task lists persist across iterations. They're refreshed under
         // mtxMonitors_ when the lock is available; otherwise the sampler
-        // reuses the previous iteration's snapshot. This keeps wave/POLL
+        // reuses the prev iteration's snapshot. This keeps wave/POLL
         // timing tight even while the GUI thread holds the lock during
         // rendering. Captured fields (addr/nb/type) live in the task structs,
-        // so the lock-free hot path never touches live channel state besides
-        // atomic flags (isPendingDelete, consumeWValDirty, waveEnable_).
+        // so the lock-free hot path never touches live ch state besides
+        // atomic flags (isPendingDelete, consumeWValDirty, waveEnable_)
         std::vector<TempCh>   tempChs;
         std::vector<TempCh>   pollTasks;
         std::vector<ShmTask>  shmTasks;
         std::vector<WaveTask> waveTasks;
-        i32                   maxHssHz      = 1;
-        u64                   lastRefreshUs = 0;
-        constexpr u64         kRefreshMaxUs = 50000; // force a blocking refresh after 50ms
+        struct SimStreamState {
+                ava_sim::Reader    reader;
+                ava_sim::Publisher commands;
+                ava_sim::Cursor    cursor;
+                u64                lastOpenMs{}, lastFrameMs{};
+                u64                lastCommandOpenMs{}, commandSequence{};
+                struct PendingCommand {
+                        f32 val;
+                        u64 epoch;
+                };
+                std::map<unsigned, PendingCommand> pendingCommands;
+                bool                               warnedInvalid{false};
+        };
+        std::unordered_map<std::string, std::unique_ptr<SimStreamState>> simStreams;
+        i32                                                              maxHssHz      = 1;
+        u64                                                              prevRefreshUs = 0;
+        constexpr u64 kRefreshMaxUs = 50000; // force a blocking refresh after 50ms
 
         while (g_appRunning.load()) {
                 if (g_samplerRebind.exchange(false, std::memory_order_acq_rel)) {
@@ -341,17 +362,17 @@ threadFunc(Gui *gui)
                 const u64 iterStartUs = get_mono_ts_us();
                 iterCounter++;
                 // Pause is display-only: acquisition keeps running so data is still
-                // captured into each channel's store; only the publish-to-GUI step is
+                // captured into each ch's store; only the publish-to-GUI step is
                 // skipped (see below). HSS therefore stays running across pause and
-                // needs no stop/restart on resume.
+                // needs no stop/restart on resume
                 bool isPaused        = g_monitorPaused.load();
                 bool jlinkSampPaused = g_jlinkSamplingPaused.load();
 
-                std::vector<WValTask> wvalTasks; // built fresh each iter from cached channels
+                std::vector<WValTask> wvalTasks; // built fresh each iter from cached chs
 
                 {
                         std::unique_lock<std::mutex> lk(gui->getMonitorMtx(), std::try_to_lock);
-                        const bool                   overdue   = (iterStartUs - lastRefreshUs) > kRefreshMaxUs;
+                        const bool                   overdue   = (iterStartUs - prevRefreshUs) > kRefreshMaxUs;
                         const bool                   tryFailed = !lk.owns_lock();
                         if (tryFailed && overdue) {
                                 const u64 waitStart = get_mono_ts_us();
@@ -365,15 +386,177 @@ threadFunc(Gui *gui)
 
                         if (lk.owns_lock()) {
                                 loopDiag.refreshTryOk++;
-                                const u64 staleUs = iterStartUs - lastRefreshOkUs;
+                                const u64 staleUs = iterStartUs - prevRefreshOkUs;
                                 if (staleUs > loopDiag.maxStaleRefreshUs)
                                         loopDiag.maxStaleRefreshUs = staleUs;
-                                lastRefreshOkUs = iterStartUs;
+                                prevRefreshOkUs = iterStartUs;
+                                taskEpoch       = JLinkPort::instance().targetEpoch();
                                 tempChs.clear();
                                 pollTasks.clear();
                                 shmTasks.clear();
                                 waveTasks.clear();
                                 maxHssHz = 1;
+                                struct SimTarget {
+                                        std::shared_ptr<MonitorChannel> ch;
+                                        std::shared_ptr<Monitor>        monitor;
+                                        bool                            enabled;
+                                };
+                                std::unordered_map<std::string, std::vector<SimTarget>> simTargets;
+                                for (const auto &monitor : gui->getMonitors() | std::views::values) {
+                                        monitor->simConnected_.store(false);
+                                        if (monitor->isPendingDelete())
+                                                continue;
+                                        for (auto &scope : monitor->getScopes() | std::views::values) {
+                                                if (scope->isPendingDelete())
+                                                        continue;
+                                                for (auto &ch : scope->getChannels() | std::views::values) {
+                                                        if (ch->isPendingDelete() || ch->getDevice() != ava_sim::device)
+                                                                continue;
+                                                        const auto       &configured = ch->getShmRegionName();
+                                                        const std::string region =
+                                                            configured.empty() ? ava_sim::defaultRegion : configured;
+                                                        simTargets[region].push_back(
+                                                            {ch, monitor, !monitor->isSamplingPaused() && !scope->isPaused()});
+                                                }
+                                        }
+                                }
+                                // All scopes share one consumer. Drain even when acquisition is
+                                // paused so resuming cannot replay stale frames or fill the FIFO
+                                for (auto it = simStreams.begin(); it != simStreams.end();) {
+                                        if (!simTargets.count(it->first))
+                                                it = simStreams.erase(it);
+                                        else
+                                                ++it;
+                                }
+                                const u64 simNowMs = get_mono_ts_ms();
+                                for (auto &[region, targets] : simTargets) {
+                                        auto &entry = simStreams[region];
+                                        if (!entry)
+                                                entry = std::make_unique<SimStreamState>();
+                                        auto &stream = *entry;
+                                        // Collect writes before reading a possible reset frame so
+                                        // pending commands keep the epoch the user was editing
+                                        for (auto &target : targets) {
+                                                f32 requested;
+                                                if (target.ch->consumeWValDirty(requested) && target.ch->isWritable() &&
+                                                    ava_sim::writableField(target.ch->getSimField()) &&
+                                                    std::isfinite(requested)) {
+                                                        stream.pendingCommands[target.ch->getSimField()] = {
+                                                            requested, stream.cursor.initialized ? stream.cursor.epoch : 0};
+                                                        target.ch->simWriteSent(
+                                                            stream.cursor.initialized ? stream.cursor.epoch : 0, requested);
+                                                        // An explicit manual target takes control from any
+                                                        // generator producing the same field on this stream
+                                                        for (auto &other : targets)
+                                                                if (other.ch->getSimField() == target.ch->getSimField())
+                                                                        other.ch->waveEnable_ = false;
+                                                }
+                                        }
+                                        for (auto &target : targets)
+                                                if (!target.ch->waveEnable_ || !target.ch->isWritable())
+                                                        target.ch->simWaveInitialized_ = false;
+                                        if (!stream.reader.isOpen() && simNowMs - stream.lastOpenMs >= 500) {
+                                                stream.lastOpenMs = simNowMs;
+                                                if (stream.reader.open(region))
+                                                        LOG_I("Simulation SHM connected: %s", region.c_str());
+                                        }
+                                        ava_sim::Sample sample;
+                                        // Bound work under the GUI lock; continue draining next iteration
+                                        for (unsigned n = 0; n < 256 && stream.reader.read(sample); ++n) {
+                                                if (!ava_sim::valid(sample)) {
+                                                        if (!stream.warnedInvalid) {
+                                                                LOG_W("Invalid simulation frame: %s", region.c_str());
+                                                                stream.warnedInvalid = true;
+                                                        }
+                                                        continue;
+                                                }
+                                                bool streamReset = false;
+                                                if (!stream.cursor.accept(sample, streamReset))
+                                                        continue;
+                                                if (streamReset) {
+                                                        for (auto it = stream.pendingCommands.begin();
+                                                             it != stream.pendingCommands.end();) {
+                                                                if (it->second.epoch && it->second.epoch != sample.epoch)
+                                                                        it = stream.pendingCommands.erase(it);
+                                                                else
+                                                                        ++it;
+                                                        }
+                                                }
+                                                stream.lastFrameMs = simNowMs;
+                                                std::unordered_set<Monitor *> counted;
+                                                for (auto &target : targets) {
+                                                        if (counted.insert(target.monitor.get()).second) {
+                                                                target.monitor->simEpoch_.store(sample.epoch);
+                                                                target.monitor->simFramesReceived_.fetch_add(1);
+                                                                target.monitor->simDroppedFrames_.store(sample.dropped);
+                                                        }
+                                                        if (!target.enabled)
+                                                                continue;
+                                                        bool reset = false;
+                                                        if (!target.ch->simCursor_.accept(sample, reset))
+                                                                continue;
+                                                        if (reset)
+                                                                target.ch->clearData();
+                                                        target.ch->setRVal(ava_sim::val(sample, target.ch->getSimField()),
+                                                                           sample.time);
+                                                        target.monitor->addPoints(1);
+                                                        ++hzFrameAccum;
+                                                        ++loopDiag.shmSamples;
+                                                }
+                                        }
+                                        // Use simulation time for SIM_SHM waveform commands
+                                        for (auto &target : targets) {
+                                                auto &ch = *target.ch;
+                                                if (!ch.waveEnable_ || !ch.isWritable() || !stream.cursor.initialized)
+                                                        continue;
+                                                const bool restart =
+                                                    !ch.simWaveInitialized_ || ch.simWaveEpoch_ != stream.cursor.epoch;
+                                                if (!restart && stream.cursor.time <= ch.simWaveTime_)
+                                                        continue;
+                                                const f32 dt =
+                                                    restart ? 0.001f : static_cast<f32>(stream.cursor.time - ch.simWaveTime_);
+                                                if (restart) {
+                                                        ch.wave_.cfg.phase = 0;
+                                                        ch.waveCfgPending_.restart.store(true);
+                                                }
+                                                ch.applyPendingWaveCfg();
+                                                ch.applyDynamicWaveCfg(dt);
+                                                ch.wave_.cfg.fs = 1.0f / dt;
+                                                wave_exec(&ch.wave_);
+                                                ch.simWaveInitialized_ = true;
+                                                ch.simWaveEpoch_       = stream.cursor.epoch;
+                                                ch.simWaveTime_        = stream.cursor.time;
+                                                if (std::isfinite(ch.wave_.out.val))
+                                                        stream.pendingCommands[ch.getSimField()] = {ch.wave_.out.val,
+                                                                                                    stream.cursor.epoch};
+                                        }
+                                        if (stream.lastFrameMs && simNowMs - stream.lastFrameMs < 1000) {
+                                                if (!stream.commands.isOpen() && simNowMs - stream.lastCommandOpenMs >= 500) {
+                                                        stream.lastCommandOpenMs = simNowMs;
+                                                        stream.commands.open(ava_sim::commandRegion(region));
+                                                }
+                                                if (stream.commands.isOpen()) {
+                                                        for (auto it = stream.pendingCommands.begin();
+                                                             it != stream.pendingCommands.end();) {
+                                                                ava_sim::Command command;
+                                                                command.epoch    = stream.cursor.epoch;
+                                                                command.sequence = stream.commandSequence;
+                                                                command.field    = it->first;
+                                                                command.val      = it->second.val;
+                                                                if (!stream.commands.publish(command))
+                                                                        break; // Retry latest values after backpressure
+                                                                for (auto &target : targets)
+                                                                        if (target.ch->getSimField() == command.field)
+                                                                                target.ch->simWriteSent(command.epoch,
+                                                                                                        command.val);
+                                                                ++stream.commandSequence;
+                                                                it = stream.pendingCommands.erase(it);
+                                                        }
+                                                }
+                                                for (auto &target : targets)
+                                                        target.monitor->simConnected_.store(true);
+                                        }
+                                }
 
                                 for (const auto &monitor : gui->getMonitors() | std::views::values) {
                                         if (monitor->consumeClearDataRequest()) {
@@ -385,8 +568,13 @@ threadFunc(Gui *gui)
                                                 hssTimeSynced = false;
                                         }
 
+                                        // History mutations are serialized with GUI/FFT readers
+                                        // here, after previous writes and before building new tasks
+                                        // A paused monitor must still accept an explicit discard
+                                        monitor->processDiscardRequests();
+
                                         // Monitor-level master pause: skip acquisition for all of
-                                        // this monitor's scopes at once.
+                                        // this monitor's scopes at once
                                         if (monitor->isSamplingPaused())
                                                 continue;
 
@@ -417,10 +605,11 @@ threadFunc(Gui *gui)
                                                                                              "SHM",
                                                                                              ch->getBitOffset(),
                                                                                              ch->getBitSize()});
-                                                        } else if (dev == "JLINK" && ch->getAddr() != 0) {
+                                                        } else if (dev == "JLINK" && !ch->isAddrUnknown() &&
+                                                                   ch->getAddr() != 0) {
                                                                 // Global "pause all J-Link sampling": drop read tasks so
                                                                 // HSS auto-stops (blocks become empty). Wave output below
-                                                                // is unaffected — this pauses acquisition only.
+                                                                // is unaffected — this pauses acquisition only
                                                                 if (!jlinkSampPaused) {
                                                                         if (monitor->samplingMode_ ==
                                                                             Monitor::SamplingMode::HSS) {
@@ -464,20 +653,20 @@ threadFunc(Gui *gui)
                                 }
                                 // Sort by address so block order is stable regardless of
                                 // unordered_map iteration order (which can change after
-                                // channel insertions trigger a rehash). Without this, adding
-                                // a LOCAL channel reshuffles JLINK entries, producing a
-                                // spurious `blocks != lastBlocks` → unnecessary HSS restart
-                                // and data gap.
+                                // ch insertions trigger a rehash). Without this, adding
+                                // a LOCAL ch reshuffles JLINK entries, producing a
+                                // spurious `blocks != prevBlocks` → unnecessary HSS restart
+                                // and data gap
                                 std::sort(tempChs.begin(), tempChs.end(), [](const TempCh &a, const TempCh &b) {
                                         return a.addr < b.addr;
                                 });
-                                lastRefreshUs = iterStartUs;
+                                prevRefreshUs = iterStartUs;
                         } else {
                                 loopDiag.refreshTryFail++;
                         }
                 }
 
-                // wValDirty is an atomic — check cached channels lock-free.
+                // wValDirty is an atomic — check cached chs lock-free
                 auto collectJlinkWVal = [&](const std::vector<TempCh> &src) {
                         for (const auto &t : src) {
                                 if (t.ch->isPendingDelete())
@@ -501,21 +690,22 @@ threadFunc(Gui *gui)
                 collectShmWVal();
 
                 // Drain SHM buffers outside the monitor lock. Cached entries
-                // may include channels that GUI just marked for deletion;
-                // skip those (the atomic pendingDelete is the gate).
+                // may include chs that GUI just marked for deletion;
+                // skip those (the atomic pendingDelete is the gate)
                 for (auto &st : shmTasks) {
                         if (st.ch->isPendingDelete())
                                 continue;
                         u8 raw[8];
                         while (shm_read(&st.ch->getShm(), raw, st.nb) == st.nb) {
                                 st.ch->setRVal(decodeAs(raw, st.type, st.bitOffset, st.bitSize), sessionTimeSec());
+                                st.ch->setLatestRawBytes(raw, st.nb);
                                 st.monitor->addPoints(1);
                                 hzFrameAccum++;
                                 loopDiag.shmSamples++;
                         }
                 }
 
-                // Write wVal dirty values (wvalTasks already filtered by collectWVal).
+                // Write wVal dirty values (wvalTasks already filtered by collectWVal)
                 for (auto &wt : wvalTasks) {
                         u8 wbuf[8] = {0};
                         encodeFromF32(wt.wv, wt.type, wbuf);
@@ -523,12 +713,14 @@ threadFunc(Gui *gui)
                                 if (!JLinkPort::instance().isConnected())
                                         continue;
                                 if (wt.bitSize > 0)
-                                        JLinkPort::instance().writeMemBitfield(wt.addr, wt.nb, wbuf, wt.bitOffset, wt.bitSize);
+                                        JLinkPort::instance().writeMemBitfield(
+                                            wt.addr, wt.nb, wbuf, wt.bitOffset, wt.bitSize, taskEpoch);
                                 else
-                                        JLinkPort::instance().writeMem(wt.addr, wt.nb, wbuf);
+                                        JLinkPort::instance().writeMemAtEpoch(taskEpoch, wt.addr, wt.nb, wbuf);
                         } else if (wt.device == "SHM") {
                                 shm_write(&wt.ch->getShm(), wbuf, wt.nb);
                                 wt.ch->setRVal(decodeAs(wbuf, wt.type, 0, 0), sessionTimeSec());
+                                wt.ch->setLatestRawBytes(wbuf, wt.nb);
                         } else {
                                 continue;
                         }
@@ -562,10 +754,10 @@ threadFunc(Gui *gui)
                                 if (targetPeriodUs < 20)
                                         targetPeriodUs = 20; // honor up to 50kHz (matches UI cap)
 
-                                auto tickIt = lastMonitorWaveTicks.find(m);
-                                if (tickIt == lastMonitorWaveTicks.end()) {
-                                        lastMonitorWaveTicks[m] = waveNow;
-                                        LOG_I("[WAVE-INIT] iter=%llu mon=%s tNow_ms=%llu target=%dus channels=%zu",
+                                auto tickIt = prevMonitorWaveTicks.find(m);
+                                if (tickIt == prevMonitorWaveTicks.end()) {
+                                        prevMonitorWaveTicks[m] = waveNow;
+                                        LOG_I("[WAVE-INIT] iter=%llu mon=%s tNow_ms=%llu target=%dus chs=%zu",
                                               iterCounter,
                                               m->getName().c_str(),
                                               get_mono_ts_ms() - sessionStartMs,
@@ -597,6 +789,7 @@ threadFunc(Gui *gui)
                                                 continue;
                                         // Apply any pending config from GUI (lock-free)
                                         wt.ch->applyPendingWaveCfg();
+                                        wt.ch->applyDynamicWaveCfg(dt);
                                         wt.ch->wave_.cfg.fs = 1.0f / dt;
                                         f32 phaseSnapshot   = wt.ch->wave_.cfg.phase;
                                         wave_exec(&wt.ch->wave_);
@@ -610,14 +803,15 @@ threadFunc(Gui *gui)
                                                 encodeFromF32(outVal, wt.type, wbuf);
                                                 if (wt.bitSize > 0)
                                                         JLinkPort::instance().writeMemBitfield(
-                                                            wt.addr, wt.nb, wbuf, wt.bitOffset, wt.bitSize);
+                                                            wt.addr, wt.nb, wbuf, wt.bitOffset, wt.bitSize, taskEpoch);
                                                 else
-                                                        JLinkPort::instance().writeMem(wt.addr, wt.nb, wbuf);
+                                                        JLinkPort::instance().writeMemAtEpoch(taskEpoch, wt.addr, wt.nb, wbuf);
                                         } else if (wt.device == "SHM") {
                                                 u8 wbuf[8] = {0};
                                                 encodeFromF32(outVal, wt.type, wbuf);
                                                 shm_write(&wt.ch->getShm(), wbuf, wt.nb);
                                                 wt.ch->setRVal(decodeAs(wbuf, wt.type, 0, 0), sessionTimeSec());
+                                                wt.ch->setLatestRawBytes(wbuf, wt.nb);
                                         } else {
                                                 continue;
                                         }
@@ -651,8 +845,8 @@ threadFunc(Gui *gui)
                         }
                 }
 
-                // Drop tick entries for monitors that no longer have wave-enabled channels
-                for (auto it = lastMonitorWaveTicks.begin(); it != lastMonitorWaveTicks.end();) {
+                // Drop tick entries for monitors that no longer have wave-enabled chs
+                for (auto it = prevMonitorWaveTicks.begin(); it != prevMonitorWaveTicks.end();) {
                         bool stillActive = false;
                         for (const auto &wt : waveTasks) {
                                 if (wt.monitor == it->first) {
@@ -661,14 +855,14 @@ threadFunc(Gui *gui)
                                 }
                         }
                         if (!stillActive)
-                                it = lastMonitorWaveTicks.erase(it);
+                                it = prevMonitorWaveTicks.erase(it);
                         else
                                 ++it;
                 }
                 // Same prune for waveDiag — without this, every deleted Monitor
                 // stays pinned alive by its shared_ptr key (along with all its
-                // scopes/channels/MmapVector files), leaking commit on every
-                // add/remove cycle.
+                // scopes/chs/MmapVector files), leaking commit on every
+                // add/remove cycle
                 for (auto it = waveDiag.begin(); it != waveDiag.end();) {
                         bool stillActive = false;
                         for (const auto &wt : waveTasks) {
@@ -697,14 +891,14 @@ threadFunc(Gui *gui)
                 static std::vector<HssBlock>                        blocks;
                 static std::vector<std::shared_ptr<MonitorChannel>> chans;
                 static std::vector<std::shared_ptr<Monitor>>        chMonitors;
-                static std::vector<std::string>                     lastTypes_current;
+                static std::vector<std::string>                     prevTypes_current;
                 static std::vector<u32>                             offsets;
                 static std::vector<u32>                             bitOffsets;
                 static std::vector<u32>                             bitSizes;
                 blocks.clear();
                 chans.clear();
                 chMonitors.clear();
-                lastTypes_current.clear();
+                prevTypes_current.clear();
                 offsets.clear();
                 bitOffsets.clear();
                 bitSizes.clear();
@@ -713,7 +907,7 @@ threadFunc(Gui *gui)
                         blocks.push_back({tc.addr, tc.nb});
                         chans.push_back(tc.ch);
                         chMonitors.push_back(tc.monitor);
-                        lastTypes_current.push_back(tc.type);
+                        prevTypes_current.push_back(tc.type);
                         offsets.push_back(curOff);
                         bitOffsets.push_back(tc.bitOffset);
                         bitSizes.push_back(tc.bitSize);
@@ -721,11 +915,13 @@ threadFunc(Gui *gui)
                 }
                 i32 periodUs = 1000000 / maxHssHz;
 
-                static bool lastConnected = false;
+                static bool prevConnected = false;
                 bool        isConnected   = JLinkPort::instance().isConnected();
-                bool        changed       = (blocks != lastBlocks || periodUs != lastPeriodUs || isConnected != lastConnected ||
-                                JLinkPort::instance().hasRestartReq());
-                lastConnected             = isConnected;
+                bool        changed =
+                    (blocks != prevBlocks || chans != prevChans || chMonitors != prevChMonitors ||
+                     prevTypes_current != prevTypes || bitOffsets != prevBitOffsets || bitSizes != prevBitSizes ||
+                     periodUs != prevPeriodUs || isConnected != prevConnected || JLinkPort::instance().hasRestartReq());
+                prevConnected = isConnected;
 
                 bool desiredRunning = !blocks.empty() && isConnected; // keep sampling even when paused
                 if (desiredRunning && !JLinkPort::instance().isHssRunning()) {
@@ -738,40 +934,40 @@ threadFunc(Gui *gui)
                 }
 
                 if (desiredRunning && !JLinkPort::instance().isHssRunning()) {
-                        auto nowTick     = get_mono_ts_ms();
-                        bool justStopped = ((nowTick - lastHssStart) < 200);
-
-                        if (!justStopped || changed) {
+                        if (hssStartRetry.allow(get_mono_ts_ms())) {
                                 LOG_I("Attempting hssStart with %zu blocks, period %d us", blocks.size(), periodUs);
-                                if (JLinkPort::instance().hssStart(blocks, periodUs)) {
+                                if (JLinkPort::instance().hssStart(blocks, periodUs, taskEpoch)) {
                                         LOG_I("hssStart SUCCEEDED");
-                                        lastHssStart       = nowTick;
-                                        lastHssSessionTime = sessionTimeSec();
-                                        lastBlocks         = blocks;
-                                        lastChans          = chans;
-                                        lastChMonitors     = chMonitors;
-                                        lastTypes          = lastTypes_current;
-                                        lastOffsets        = offsets;
-                                        lastPeriodUs       = periodUs;
+                                        prevHssSessionTime = sessionTimeSec();
+                                        prevBlocks         = blocks;
+                                        prevChans          = chans;
+                                        prevChMonitors     = chMonitors;
+                                        prevTypes          = prevTypes_current;
+                                        prevOffsets        = offsets;
+                                        prevBitOffsets     = bitOffsets;
+                                        prevBitSizes       = bitSizes;
+                                        prevPeriodUs       = periodUs;
                                         carryLen           = 0;
                                         discardFirst       = true;
                                         hssTimeSynced      = false;
                                 } else {
                                         LOG_E("hssStart FAILED");
-                                        lastBlocks.clear();
-                                        lastChans.clear();
-                                        lastChMonitors.clear();
-                                        lastTypes.clear();
-                                        lastOffsets.clear();
+                                        prevBlocks.clear();
+                                        prevChans.clear();
+                                        prevChMonitors.clear();
+                                        prevTypes.clear();
+                                        prevOffsets.clear();
                                 }
                         }
                 } else if (changed) {
-                        lastBlocks     = blocks;
-                        lastChans      = chans;
-                        lastChMonitors = chMonitors;
-                        lastTypes      = lastTypes_current;
-                        lastOffsets    = offsets;
-                        lastPeriodUs   = periodUs;
+                        prevBlocks     = blocks;
+                        prevChans      = chans;
+                        prevChMonitors = chMonitors;
+                        prevTypes      = prevTypes_current;
+                        prevOffsets    = offsets;
+                        prevBitOffsets = bitOffsets;
+                        prevBitSizes   = bitSizes;
+                        prevPeriodUs   = periodUs;
                         carryLen       = 0;
                         discardFirst   = true;
                         hssTimeSynced  = false;
@@ -779,16 +975,18 @@ threadFunc(Gui *gui)
 
                 // Returns true if the host read buffer came back full, i.e. the
                 // device FIFO likely still holds more frames and processHss should
-                // be invoked again this iteration to fully drain it.
+                // be invoked again this iteration to fully drain it
                 auto processHss = [&]() -> bool {
-                        if (!JLinkPort::instance().isHssRunning() || lastChans.empty())
+                        if (!JLinkPort::instance().isHssRunning() || prevChans.empty())
                                 return false;
 
                         const u32 reqBytes     = static_cast<u32>(kBufCap - carryLen);
                         const u64 hssReadStart = get_mono_ts_us();
                         i32       total        = JLinkPort::instance().hssRead(buf + carryLen, reqBytes);
-                        const u64 hssReadDur   = get_mono_ts_us() - hssReadStart;
-                        // A full buffer means more frames are queued on the device.
+                        if (total > 0)
+                                sampleByteAccum += static_cast<u64>(total);
+                        const u64 hssReadDur = get_mono_ts_us() - hssReadStart;
+                        // A full buffer means more frames are queued on the device
                         const bool bufferFull = (total > 0 && static_cast<u32>(total) >= reqBytes);
                         loopDiag.hssReads++;
                         loopDiag.sumHssUs += hssReadDur;
@@ -802,41 +1000,46 @@ threadFunc(Gui *gui)
                                          hssReadDur,
                                          total);
                         }
-                        if (total < 0)
-                                total = 0;
+                        if (total < 0 || static_cast<u32>(total) > reqBytes) {
+                                // After a transport error the next byte's frame position
+                                // is unknown. Never join it to an old partial frame
+                                carryLen      = 0;
+                                discardFirst  = true;
+                                hssTimeSynced = false;
+                                JLinkPort::instance().reqRestart();
+                                return false;
+                        }
                         total += static_cast<i32>(carryLen);
 
                         const i32 frameSize = JLinkPort::instance().hssFrameSize();
-                        if (frameSize <= 0)
+                        if (frameSize <= JLinkPort::kHssHeaderBytes || static_cast<usize>(frameSize) > kBufCap)
                                 return false;
 
-                        i32 frames = total / frameSize;
+                        i32  frames       = total / frameSize;
+                        bool invalidFrame = false;
                         if (frames > 0) {
                                 // After HSS restart the J-Link hardware buffer may still
-                                // contain stale frames from the previous session.  Drop
+                                // contain stale frames from the prev session.  Drop
                                 // the entire first batch so these don't create a glitch
-                                // point on the waveform.
+                                // point on the waveform
                                 if (discardFirst) {
                                         discardFirst  = false;
                                         hssTimeSynced = false;
                                         LOG_I("[HSS-DISCARD] dropping first %d frames (%d bytes) after restart",
                                               frames,
                                               frames * frameSize);
-                                        const usize consumed = frames * static_cast<usize>(frameSize);
-                                        carryLen             = total - consumed;
-                                        if (carryLen > 0 && consumed > 0)
-                                                std::memmove(buf, buf + consumed, carryLen);
-                                        lastHssFrameMs = get_mono_ts_ms(); // stream is alive
+                                        carryLen       = hss_stream::retainTail(buf, total, frameSize);
+                                        prevHssFrameMs = get_mono_ts_ms(); // stream is alive
                                         return bufferFull;                 // skip this batch entirely
                                 }
 
-                                lastHssFrameMs  = get_mono_ts_ms(); // stream is alive
-                                hzFrameAccum   += static_cast<u64>(frames);
+                                prevHssFrameMs = get_mono_ts_ms(); // stream is alive
                                 static std::vector<std::vector<f32>> pVals;
                                 static std::vector<std::vector<f64>> pTs;
-                                pVals.resize(lastChans.size());
-                                pTs.resize(lastChans.size());
-                                for (usize i = 0; i < lastChans.size(); ++i) {
+                                std::vector<std::array<u8, 8>>       latestRaw(prevChans.size());
+                                pVals.resize(prevChans.size());
+                                pTs.resize(prevChans.size());
+                                for (usize i = 0; i < prevChans.size(); ++i) {
                                         pVals[i].clear();
                                         pTs[i].clear();
                                         pVals[i].reserve(frames);
@@ -848,6 +1051,17 @@ threadFunc(Gui *gui)
                                         u32       hwTs;
                                         std::memcpy(&hwTs, pFrame, 4);
 
+                                        if (hssTimeSynced && !hss_stream::timestampAdvances(hssLastHwTs, hwTs)) {
+                                                LOG_W("[HSS-INVALID-FRAME] timestamp=%u previous=%u frame=%zu/%d; restarting "
+                                                      "stream",
+                                                      hwTs,
+                                                      hssLastHwTs,
+                                                      f,
+                                                      frames);
+                                                invalidFrame = true;
+                                                break;
+                                        }
+
                                         if (!hssTimeSynced) {
                                                 hssLastHwTs     = hwTs;
                                                 hssAccumUs      = 0;
@@ -855,10 +1069,10 @@ threadFunc(Gui *gui)
                                                 hssTimeSynced   = true;
                                         }
 
-                                        // The J-Link HSS hardware timestamp is a 32-bit microsecond counter
+                                        // The J-Link HSS hardware ts is a 32-bit microsecond counter
                                         // that wraps every 2^32 µs (~71.6 min). Accumulate the wrap-safe
                                         // per-frame delta into a 64-bit total so the timeline stays correct
-                                        // over arbitrarily long runs. (The previous single-wrap diff was a
+                                        // over arbitrarily long runs. (The prev single-wrap diff was a
                                         // u32, so after ~71 min it overflowed — pinning the time axis to a
                                         // ~4295 s window and breaking history pruning → runaway memory.)
                                         const u32 deltaUs  = hwTs - hssLastHwTs; // modular u32 sub handles wrap
@@ -868,54 +1082,88 @@ threadFunc(Gui *gui)
                                         const f64 ts = hssBaseWallTime + (static_cast<f64>(hssAccumUs) * 1e-6);
 
                                         const u8 *pData = pFrame + JLinkPort::kHssHeaderBytes;
-                                        for (usize i = 0; i < lastChans.size(); ++i) {
-                                                u8  raw[8]  = {0};
-                                                u32 varSize = typeBytes(lastTypes[i]);
-                                                std::memcpy(raw, pData + lastOffsets[i], varSize);
-                                                pVals[i].push_back(decodeAs(raw, lastTypes[i], bitOffsets[i], bitSizes[i]));
+                                        for (usize i = 0; i < prevChans.size(); ++i) {
+                                                u8        raw[8]   = {0};
+                                                u32       varSize  = typeBytes(prevTypes[i]);
+                                                const u32 copySize = std::min({varSize, prevBlocks[i].numBytes, u32{8}});
+                                                std::memcpy(raw, pData + prevOffsets[i], copySize);
+                                                std::copy_n(raw, 8, latestRaw[i].begin());
+                                                const f32 val = decodeAs(raw, prevTypes[i], prevBitOffsets[i], prevBitSizes[i]);
+                                                const f32 previous =
+                                                    pVals[i].empty() ? prevChans[i]->getRVal() : pVals[i].back();
+                                                // 保留真实零值, 记录原始采样以区分设备数据与绘图问题
+                                                if (val == 0.0f && previous != 0.0f && std::isfinite(previous)) {
+                                                        const u64 nowMs = get_mono_ts_ms();
+                                                        if (nowMs - lastHssZeroLogMs >= 1000) {
+                                                                u64 bits = 0;
+                                                                std::memcpy(&bits, raw, copySize);
+                                                                LOG_W("[HSS-ZERO] addr=0x%08X type=%s raw=0x%016llX "
+                                                                      "timestamp=%u frame=%zu/%d previous=%g",
+                                                                      prevBlocks[i].addr,
+                                                                      prevTypes[i].c_str(),
+                                                                      bits,
+                                                                      hwTs,
+                                                                      f,
+                                                                      frames,
+                                                                      previous);
+                                                                lastHssZeroLogMs = nowMs;
+                                                        }
+                                                }
+                                                pVals[i].push_back(val);
                                                 pTs[i].push_back(ts);
                                         }
                                 }
 
-                                for (usize i = 0; i < lastChans.size(); ++i) {
-                                        if (lastChans[i]->isPendingDelete())
+                                for (usize i = 0; i < prevChans.size(); ++i) {
+                                        if (prevChans[i]->isPendingDelete())
                                                 continue;
-                                        lastChans[i]->pushBatch(pVals[i].data(), pTs[i].data(), pVals[i].size());
+                                        prevChans[i]->pushBatch(pVals[i].data(), pTs[i].data(), pVals[i].size());
+                                        if (!pVals[i].empty())
+                                                prevChans[i]->setLatestRawBytes(
+                                                    latestRaw[i].data(),
+                                                    std::min(typeBytes(prevTypes[i]), prevBlocks[i].numBytes));
                                         loopDiag.hssSamples += pVals[i].size();
                                 }
 
                                 static std::vector<std::shared_ptr<Monitor>> uniqueMonitors;
                                 uniqueMonitors.clear();
-                                for (const auto &m : lastChMonitors) {
+                                for (const auto &m : prevChMonitors) {
                                         if (std::find(uniqueMonitors.begin(), uniqueMonitors.end(), m) ==
                                             uniqueMonitors.end()) {
                                                 uniqueMonitors.push_back(m);
                                         }
                                 }
+                                const auto acceptedFrames  = pVals.front().size();
+                                hzFrameAccum              += static_cast<u64>(acceptedFrames);
                                 for (const auto &m : uniqueMonitors)
-                                        m->addPoints(static_cast<u64>(frames));
+                                        m->addPoints(static_cast<u64>(acceptedFrames));
 
-                                JLinkPort::instance().addPoints(static_cast<u64>(frames) * static_cast<u64>(lastChans.size()));
-                                const usize consumed = frames * static_cast<usize>(frameSize);
-                                carryLen             = total - consumed;
-                                if (carryLen > 0 && consumed > 0)
-                                        std::memmove(buf, buf + consumed, carryLen);
+                                JLinkPort::instance().addPoints(static_cast<u64>(acceptedFrames) *
+                                                                static_cast<u64>(prevChans.size()));
                         }
+                        if (invalidFrame) {
+                                carryLen      = 0;
+                                discardFirst  = true;
+                                hssTimeSynced = false;
+                                JLinkPort::instance().reqRestart();
+                                return false;
+                        }
+                        carryLen = hss_stream::retainTail(buf, total, frameSize);
                         return bufferFull;
                 };
 
-                // Execute POLL tasks.
+                // Execute POLL tasks
                 // Cap reads per monitor to kMaxPollPerIter to bound iteration
-                // time and prevent wave-write starvation on the J-Link bus.
+                // time and prevent wave-write starvation on the J-Link bus
                 static constexpr i32 kMaxPollPerIter = 4;
                 // Hoisted out of the inner for-loop so we can prune entries
                 // whose Monitor no longer has poll tasks (otherwise the
                 // shared_ptr key keeps the deleted Monitor — and its entire
-                // scope/channel/MmapVector graph — alive forever, leaking
-                // commit on every Monitor add/remove cycle).
-                static std::unordered_map<std::shared_ptr<Monitor>, u64>   lastMonitorPollTicks;
+                // scope/ch/MmapVector graph — alive forever, leaking
+                // commit on every Monitor add/remove cycle)
+                static std::unordered_map<std::shared_ptr<Monitor>, u64>   prevMonitorPollTicks;
                 static std::unordered_map<std::shared_ptr<Monitor>, usize> pollRoundRobin;
-                for (auto it = lastMonitorPollTicks.begin(); it != lastMonitorPollTicks.end();) {
+                for (auto it = prevMonitorPollTicks.begin(); it != prevMonitorPollTicks.end();) {
                         bool stillActive = false;
                         for (const auto &pt : pollTasks) {
                                 if (pt.monitor == it->first) {
@@ -925,7 +1173,7 @@ threadFunc(Gui *gui)
                         }
                         if (!stillActive) {
                                 pollRoundRobin.erase(it->first);
-                                it = lastMonitorPollTicks.erase(it);
+                                it = prevMonitorPollTicks.erase(it);
                         } else {
                                 ++it;
                         }
@@ -956,14 +1204,14 @@ threadFunc(Gui *gui)
                                 if (targetPeriodUs < 20)
                                         targetPeriodUs = 20; // best-effort up to 50kHz; real rate limited by USB latency
 
-                                if (lastMonitorPollTicks.find(m) == lastMonitorPollTicks.end()) {
-                                        lastMonitorPollTicks[m] = nowPoll;
+                                if (prevMonitorPollTicks.find(m) == prevMonitorPollTicks.end()) {
+                                        prevMonitorPollTicks[m] = nowPoll;
                                         pollRoundRobin[m]       = 0;
                                         continue;
                                 }
-                                auto elapsedUs = nowPoll - lastMonitorPollTicks[m];
+                                auto elapsedUs = nowPoll - prevMonitorPollTicks[m];
                                 if (elapsedUs >= (u64)targetPeriodUs) {
-                                        lastMonitorPollTicks[m] = nowPoll;
+                                        prevMonitorPollTicks[m] = nowPoll;
 
                                         const usize total   = tasks.size();
                                         usize      &rrIdx   = pollRoundRobin[m];
@@ -981,10 +1229,13 @@ threadFunc(Gui *gui)
                                                                 counted = true;
                                                         }
                                                         u8 rbuf[8] = {0};
-                                                        if (JLinkPort::instance().readMem(pt.addr, pt.nb, rbuf)) {
+                                                        if (JLinkPort::instance().readMemAtEpoch(
+                                                                taskEpoch, pt.addr, pt.nb, rbuf)) {
                                                                 pt.ch->setRVal(
                                                                     decodeAs(rbuf, pt.type, pt.bitOffset, pt.bitSize),
                                                                     sessionTimeSec());
+                                                                pt.ch->setLatestRawBytes(rbuf, pt.nb);
+                                                                sampleByteAccum += pt.nb;
                                                                 loopDiag.pollSamples++;
                                                         }
                                                 }
@@ -999,33 +1250,33 @@ threadFunc(Gui *gui)
                 // still has queued frames. Looping here prevents a backlog from
                 // persisting across frames (each call still takes the J-Link lock
                 // independently, so GUI-thread reads interleave between drains). The
-                // cap bounds worst-case iteration time.
+                // cap bounds worst-case iteration time
                 static constexpr int kMaxHssDrains = 8;
                 for (int d = 0; d < kMaxHssDrains && processHss(); ++d) {
                 }
 
                 // HSS watchdog: if the stream is supposed to be running but no
-                // frames have arrived for a sustained window, the FIFO has wedged.
+                // frames have arrived for a sustained window, the FIFO has wedged
                 // Force a clean restart (same recovery a manual reconnect performs),
-                // rate-limited so a genuinely silent target can't thrash the link.
+                // rate-limited so a genuinely silent target can't thrash the link
                 if (desiredRunning && JLinkPort::instance().isHssRunning()) {
                         const u64 nowMs = get_mono_ts_ms();
-                        if (nowMs - lastHssFrameMs > 2000 && nowMs - lastHssWatchdogMs > 5000) {
+                        if (nowMs - prevHssFrameMs > 2000 && nowMs - prevHssWatchdogMs > 5000) {
                                 LOG_W("[HSS-WATCHDOG] no frames for %llums while streaming — forcing HSS restart",
-                                      nowMs - lastHssFrameMs);
+                                      nowMs - prevHssFrameMs);
                                 JLinkPort::instance().reqRestart();
-                                lastHssWatchdogMs = nowMs;
-                                lastHssFrameMs    = nowMs; // avoid immediate re-trigger before restart settles
+                                prevHssWatchdogMs = nowMs;
+                                prevHssFrameMs    = nowMs; // avoid immediate re-trigger before restart settles
                         }
                 } else {
-                        // Not streaming (paused/disconnected/no channels): keep the
-                        // frame clock fresh so the watchdog doesn't fire on resume.
-                        lastHssFrameMs = get_mono_ts_ms();
+                        // Not streaming (paused/disconnected/no chs): keep the
+                        // frame clock fresh so the watchdog doesn't fire on resume
+                        prevHssFrameMs = get_mono_ts_ms();
                 }
 
                 // Publish snapshots — try_lock only. If GUI is holding the
                 // lock (rendering), skip this iteration; publishSnapshot is
-                // incremental so the next successful publish catches up.
+                // incremental so the next successful publish catches up
                 {
                         std::unique_lock<std::mutex> lk(gui->getMonitorMtx(), std::try_to_lock);
                         if (lk.owns_lock()) {
@@ -1034,10 +1285,15 @@ threadFunc(Gui *gui)
                                         monitor->updateHz();
                                         for (auto &scope : monitor->getScopes() | std::views::values) {
                                                 // While paused, keep capturing but don't push new
-                                                // samples to the GUI view (freezes the plot/table).
+                                                // samples to the GUI view (freezes the plot/table)
                                                 if (!isPaused)
-                                                        for (auto &[_, ch] : scope->getChannels())
+                                                        for (auto &[_, ch] : scope->getChannels()) {
                                                                 ch->publishSnapshot();
+                                                                if (ch->getDevice() == ava_sim::device &&
+                                                                    ch->simCursor_.initialized)
+                                                                        ch->confirmSimWrite(ch->simCursor_.epoch,
+                                                                                            ch->getDispRawVal());
+                                                        }
                                                 scope->purgeDeleted();
                                         }
                                         monitor->purgeDeletedScopes();
@@ -1054,8 +1310,10 @@ threadFunc(Gui *gui)
                                 const f32 hz =
                                     static_cast<f32>(static_cast<f64>(hzFrameAccum) * 1000.0 / static_cast<f64>(dtMs));
                                 JLinkPort::instance().setActualHz(hz);
-                                hzFrameAccum = 0;
-                                hzLastTick   = now;
+                                JLinkPort::instance().setSampleBytesPerSecond(sampleByteAccum * 1000.0 / dtMs);
+                                sampleByteAccum = 0;
+                                hzFrameAccum    = 0;
+                                hzLastTick      = now;
                         }
                 }
 
@@ -1157,7 +1415,7 @@ threadFunc(Gui *gui)
 
                         // 1Hz heartbeat — proves the sampler is alive and gives a
                         // snapshot of session state so post-crash log analysis
-                        // shows what the app was doing right before the crash.
+                        // shows what the app was doing right before the crash
                         if (nowMs - hbLastDumpMs >= 1000) {
                                 usize totalChans = 0, totalScopes = 0, totalMons = 0;
                                 u64   totalPts = 0;
@@ -1178,7 +1436,7 @@ threadFunc(Gui *gui)
                                 }
                                 // Process memory + sampler-side container sizes — surfaces
                                 // any growth that's invisible from the GUI side (leaked
-                                // shared_ptr<Monitor> keys, etc).
+                                // shared_ptr<Monitor> keys, etc)
                                 size_t privBytes = 0, wsBytes = 0;
 #ifdef _WIN32
                                 PROCESS_MEMORY_COUNTERS_EX pmc{};
@@ -1188,16 +1446,16 @@ threadFunc(Gui *gui)
                                 }
 #endif
                                 LOG_PERF("[HB-MEM] privBytes=%zu wsBytes=%zu "
-                                         "waveDiag=%zu lastWaveT=%zu lastPollT=%zu pollRR=%zu",
+                                         "waveDiag=%zu prevWaveT=%zu prevPollT=%zu pollRR=%zu",
                                          privBytes,
                                          wsBytes,
                                          waveDiag.size(),
-                                         lastMonitorWaveTicks.size(),
-                                         lastMonitorPollTicks.size(),
+                                         prevMonitorWaveTicks.size(),
+                                         prevMonitorPollTicks.size(),
                                          pollRoundRobin.size());
 
                                 LOG_PERF("[HB tNow_ms=%llu] connected=%d hssRunning=%d paused=%d "
-                                         "monitors=%zu scopes=%zu channels=%zu pts=%llu "
+                                         "monitors=%zu scopes=%zu chs=%zu pts=%llu "
                                          "shmTasks=%zu pollTasks=%zu waveTasks=%zu tempChs=%zu runMode=%d",
                                          nowMs - sessionStartMs,
                                          (int)JLinkPort::instance().isConnected(),
@@ -1216,17 +1474,17 @@ threadFunc(Gui *gui)
                         }
                 }
 
-                // Sleep strategy depends on run mode.
+                // Sleep strategy depends on run mode
                 const int runMode = g_samplerRunMode.load(std::memory_order_relaxed);
                 if (runMode == 0) {
-                        // Low: always sleep 1ms — minimal CPU footprint.
+                        // Low: always sleep 1ms — minimal CPU footprint
 #ifdef _WIN32
                         Sleep(1);
 #else
                         usleep(1000);
 #endif
                 } else if (runMode == 1) {
-                        // Normal: adaptive — sleep when idle, yield when active.
+                        // Normal: adaptive — sleep when idle, yield when active
                         if (waveTasks.empty() && !JLinkPort::instance().isHssRunning() && pollTasks.empty()) {
 #ifdef _WIN32
                                 Sleep(1);
@@ -1241,9 +1499,9 @@ threadFunc(Gui *gui)
 #endif
                         }
                 } else {
-                        // CPUBound: spin — no sleep, minimum jitter.
+                        // CPUBound: spin — no sleep, minimum jitter
                         // The J-Link USB I/O already blocks 200-500µs per call so
-                        // throughput is not affected; we just skip voluntary yields.
+                        // throughput is not affected; we just skip voluntary yields
 #ifdef _WIN32
                         YieldProcessor();
 #elif defined(__GNUC__)
@@ -1253,10 +1511,12 @@ threadFunc(Gui *gui)
         }
 }
 
-// Background FFT worker. Each pass: snapshot the FFT-enabled scopes (holding
-// shared_ptrs so they stay alive), then run each scope's transform off the GUI
-// thread. Capped at ~60 Hz — recomputing faster than the display refreshes is
-// wasted work, and the GUI always draws the most recent published spectrum.
+/**
+ * @brief Background FFT worker. Each pass: snapshot the FFT-enabled scopes (holding
+ *        shared_ptrs so they stay alive), then run each scope's transform off the GUI
+ *        thread. Capped at ~60 Hz — recomputing faster than the display refreshes is
+ *        wasted work, and the GUI always draws the most recent published spectrum
+ */
 void
 fftThreadFunc(Gui *gui)
 {
@@ -1264,7 +1524,7 @@ fftThreadFunc(Gui *gui)
         while (g_appRunning.load()) {
                 // Hold both the scope AND its owning monitor alive (scope->parent_ is a
                 // raw Monitor*; keeping the monitor shared_ptr prevents it dangling if
-                // the monitor is removed between enumeration and processing).
+                // the monitor is removed between enumeration and processing)
                 std::vector<std::pair<std::shared_ptr<Monitor>, std::shared_ptr<MonitorScope>>> work;
                 {
                         std::lock_guard lk(gui->getMonitorMtx());

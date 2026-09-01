@@ -30,7 +30,7 @@ struct AudioInput::Stream {
         std::vector<AudioSample> samples;
         AudioSample              latest;
         bool                     hasLatest{false};
-        std::string              lastError;
+        std::string              prevError;
         bool                     running{false};
 };
 
@@ -55,7 +55,7 @@ audioInputWaveProc(HWAVEIN, UINT msg, DWORD_PTR instance, DWORD_PTR param1, DWOR
                 for (int i = 0; i < n; ++i) {
                         auto &dst = s->samples[oldSize + static_cast<size_t>(i)];
                         dst.ts    = t0 + static_cast<double>(i) * dt;
-                        dst.value = static_cast<float>(raw[i]) * (1.0f / 32768.0f);
+                        dst.val   = static_cast<float>(raw[i]) * (1.0f / 32768.0f);
                 }
                 s->latest              = s->samples.back();
                 s->hasLatest           = true;
@@ -172,7 +172,7 @@ AudioInput::startDevice(int index)
         if (res != MMSYSERR_NOERROR) {
                 char err[256]{};
                 waveInGetErrorTextA(res, err, sizeof(err));
-                s->lastError    = err;
+                s->prevError    = err;
                 streams_[index] = std::move(s);
                 LOG_E("AudioInput start failed: device=%d err=%s", index, err);
                 return false;
@@ -247,11 +247,11 @@ AudioInput::latestSample(int deviceIndex, AudioSample &out) const
 }
 
 std::string
-AudioInput::lastError(int deviceIndex) const
+AudioInput::prevError(int deviceIndex) const
 {
         auto it = streams_.find(deviceIndex);
         if (it == streams_.end())
                 return {};
         std::lock_guard<std::mutex> lk(it->second->mtx);
-        return it->second->lastError;
+        return it->second->prevError;
 }

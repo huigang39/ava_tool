@@ -28,6 +28,19 @@ class DeviceManager
         void draw();
         void clear();
 
+        // Metadata only: the manager never invokes or takes ownership of an SDK
+        // caller's library. Opening the caller is always an explicit user action.
+        struct SdkCatalogEntry {
+                int         id{0};
+                std::string name;
+                std::string libraryPath;
+                std::string headerPath;
+                bool        loaded{false};
+                size_t      functionCount{0};
+        };
+        void setSdkCatalog(std::vector<SdkCatalogEntry> entries) { sdkCatalog_ = std::move(entries); }
+        void setOpenSdkHandler(std::function<void(int)> handler) { openSdk_ = std::move(handler); }
+
         bool isOpen() const { return open_; }
         void setOpen(bool open) { open_ = open; }
         bool isModified() const { return modified_; }
@@ -40,12 +53,16 @@ class DeviceManager
         }
         void clearModified() { modified_ = false; }
 
-        // Session persistence. node is cJSON*, while baseDir is the directory
-        // containing the .ava file. Runtime library handles are never persisted.
+        /**
+         * @brief Session persistence. node is cJSON*, while baseDir is the directory
+         * containing the .ava file. Runtime library handles are never persisted
+         */
         void save(void *node, const std::string &baseDir) const;
         bool load(const void *node, const std::string &baseDir);
 
-        // Applies dropped DLL/header files to the currently selected device type.
+        /**
+         * @brief Applies dropped DLL/header files to the currently selected device type
+         */
         void pushDroppedFiles(const std::vector<std::string> &paths);
         void setSymbolResolver(std::function<bool(const std::string &, uint32_t &)> resolver)
         {
@@ -70,7 +87,7 @@ class DeviceManager
                 uint32_t       bitSize{0};
                 bool           writable{true};
 
-                // UI-only edit state. Persisted values always come from data.
+                // UI-only edit state. Persisted values always come from data
                 std::string editValue;
                 bool        editValueInvalid{false};
                 bool        editActive{false};
@@ -78,7 +95,7 @@ class DeviceManager
                 bool        liveReadOk{false};
                 bool        symbolResolved{true};
                 bool        writePending{false};
-                bool        lastWriteOk{true};
+                bool        prevWriteOk{true};
                 uint64_t    writeToken{0};
         };
 
@@ -110,8 +127,8 @@ class DeviceManager
                 int                          discoveryBufferArg{-1};
                 int                          discoveryCapacityArg{-1};
                 uint32_t                     discoveryBufferSize{65536};
-                std::string                  lastResult;
-                bool                         lastResultOk{false};
+                std::string                  prevResult;
+                bool                         prevResultOk{false};
         };
 
         struct Device {
@@ -147,11 +164,18 @@ class DeviceManager
         uint64_t                             pendingDeletePropertyId_{0};
         uint64_t                             pendingDeleteMethodId_{0};
         char                                 newDeviceName_[96]{};
+        char                                 deviceSearch_[192]{};
+        bool                                 showOverview_{true};
+        bool                                 compactLibrary_{true};
+        int                                  requestedDetailTab_{-1};
+        std::vector<SdkCatalogEntry>         sdkCatalog_;
+        std::function<void(int)>             openSdk_;
         std::vector<std::string>             pendingDropFiles_;
         std::string                          managerStatus_;
         bool                                 managerStatusIsError_{false};
 
         struct PollReq {
+                uint64_t epoch{0};
                 uint32_t address{0};
                 uint32_t size{0};
         };
@@ -161,6 +185,7 @@ class DeviceManager
                 bool                   ok{false};
         };
         struct WriteReq {
+                uint64_t               epoch{0};
                 uint64_t               token{0};
                 uint32_t               address{0};
                 uint32_t               size{0};
@@ -180,7 +205,8 @@ class DeviceManager
         std::shared_ptr<PollState>                           poll_{};
         std::thread                                          pollThread_{};
         uint64_t                                             nextWriteToken_{1};
-        uint64_t                                             lastSymbolResolveMs_{0};
+        uint64_t                                             resolvedSymbolEpoch_{0};
+        uint64_t                                             prevSymbolResolveMs_{0};
         std::function<bool(const std::string &, uint32_t &)> symbolResolver_{};
 
         void createDevice(const std::string &requestedName);
@@ -194,6 +220,13 @@ class DeviceManager
         bool applyDiscoveryJson(Device &device, const char *json, uint32_t expectedCount, std::string &error, bool &changed);
 
         void drawDeviceList();
+        void drawOverview();
+        void drawDeviceSummary(Device &device, DeviceInstance *instance);
+        void drawSdkAssociation(Device &device);
+        void drawDeviceSettings(Device &device);
+        void drawInstanceSettings(Device &device, DeviceInstance &instance);
+        void selectDevice(int device, int instance = -1);
+        void createFromSdk(const SdkCatalogEntry &sdk);
         void drawDevice(Device &device);
         void drawProperties(Device &device);
         void drawMethods(Device &device, DeviceInstance *instance = nullptr);
@@ -228,7 +261,7 @@ class DeviceManager
         static std::string      functionSignature(const CFuncDecl &function);
         static std::string      functionLabel(const CFuncDecl &function);
         static std::string      propertyValueString(const Property &property);
-        static bool             setPropertyValue(Property &property, const std::string &value);
+        static bool             setPropertyValue(Property &property, const std::string &val);
         static bool             assignResult(Property &property, const CallResult &result, CType returnType);
 };
 

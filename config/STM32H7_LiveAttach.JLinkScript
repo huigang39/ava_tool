@@ -1,0 +1,8 @@
+// STM32H7 live monitoring: retain application-owned debug and timing state.
+// The device-specific default callback resets DBGMCU before generic de-init.
+// Only override disconnect; retain the vendor's connect and reset sequences.
+// Reference: https://kb.segger.com/images/e/e7/Example_SkipDebugDeInit.JLinkScript
+int OnDisconnectTarget(void) {
+  JLINK_ExecCommand("SetSkipDebugDeInit=1");
+  return 0;
+}

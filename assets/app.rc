@@ -5,3 +5,6 @@
 // executable icon shown in Explorer. The .ico is generated from assets/icon.png
 // by tools/make_icon.ps1 (run `make icon`).
 GLFW_ICON ICON "icon.ico"
+// Motor runtime and its MinGW dependency are carried by the executable.
+AVA_ETH_SDK RCDATA "../sdk/ava_eth/bin/win/ava_eth_sdk.dll"
+AVA_ETH_PTHREAD RCDATA "../sdk/ava_eth/bin/win/libwinpthread-1.dll"

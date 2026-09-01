@@ -1,7 +1,7 @@
 #ifndef PARSER_HPP
 #define PARSER_HPP
 
-#include "module.h"
+#include "ckit.h"
 #include <algorithm>
 #include <string>
 #include <variant>
@@ -20,6 +20,7 @@ enum class DataType {
         I32,
         I64,
         ARRAY,
+        F16,
 };
 
 struct DataTree {
@@ -36,35 +37,40 @@ class Parser
         virtual bool               parse(const std::string &path) = 0;
         virtual const DataTree    &getDataTree() const            = 0;
         virtual const std::string &getPath() const                = 0;
-        virtual void               setTemplate(const DataTree               &/*tree*/) {}
+        /**
+         * @brief tree
+         */
+        virtual void setTemplate(const DataTree &) {}
 
         static const char *dataTypeToStr(DataType type)
         {
                 switch (type) {
+                        case DataType::F16:
+                                return "f16";
                         case DataType::F32:
-                                return "F32";
+                                return "f32";
                         case DataType::F64:
-                                return "F64";
+                                return "f64";
                         case DataType::U8:
-                                return "U8";
+                                return "u8";
                         case DataType::U16:
-                                return "U16";
+                                return "u16";
                         case DataType::U32:
-                                return "U32";
+                                return "u32";
                         case DataType::U64:
-                                return "U64";
+                                return "u64";
                         case DataType::I8:
-                                return "I8";
+                                return "i8";
                         case DataType::I16:
-                                return "I16";
+                                return "i16";
                         case DataType::I32:
-                                return "I32";
+                                return "i32";
                         case DataType::I64:
-                                return "I64";
+                                return "i64";
                         case DataType::ARRAY:
-                                return "ARRAY";
+                                return "array";
                         default:
-                                return "UNKNOWN";
+                                return "unknown";
                 }
         }
 
@@ -72,6 +78,8 @@ class Parser
         {
                 std::string s = str;
                 std::transform(s.begin(), s.end(), s.begin(), ::toupper);
+                if (s == "F16")
+                        return DataType::F16;
                 if (s == "F32")
                         return DataType::F32;
                 if (s == "F64")
@@ -105,6 +113,7 @@ class Parser
                                 return 1;
                         case DataType::U16:
                         case DataType::I16:
+                        case DataType::F16:
                                 return 2;
                         case DataType::F32:
                         case DataType::U32:

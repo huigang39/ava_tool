@@ -15,13 +15,16 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
-#include "module.h"
+#include "ckit.h"
+#include "core/firmware_match.hpp"
+#include "core/remote_device.hpp"
 
 struct HssBlock {
         u32  addr;
@@ -34,7 +37,7 @@ struct HssBlock {
 // already-waiting threads. The HSS sampler issues back-to-back JLink ops at
 // high rates, which can starve the lower-frequency wave-gen writer and make
 // its output stutter. FairMutex enforces strict acquisition order so every
-// caller gets its share.
+// caller gets its share
 class FairMutex
 {
       public:
@@ -70,46 +73,112 @@ class FairMutex
 
 class JLinkPort
 {
+        friend struct RttReconnectTestAccess;
+
       public:
-        // J-Link HSS firmware prepends a 4-byte timestamp/sequence header to
-        // every frame, regardless of the JLINK_HSS_FLAG_TIMESTAMP_US flag.
+        // J-Link HSS firmware prepends a 4-byte ts/sequence header to
+        // every frame, regardless of the JLINK_HSS_FLAG_TIMESTAMP_US flag
         static constexpr int kHssHeaderBytes = 4;
 
         static JLinkPort &instance();
 
-        bool isOpen() const { return isOpen_.load(std::memory_order_acquire); }
-        bool isConnected() const { return isConnected_.load(std::memory_order_acquire); }
+        bool usingRemote() const { return remoteSelected_.load() && !ava_peer::backendCall(); }
+        bool isOpen() const { return usingRemote() ? ava_peer::client().connected() : isOpen_.load(std::memory_order_acquire); }
+        bool isConnected() const
+        {
+                return usingRemote() ? ava_peer::client().connected() : isConnected_.load(std::memory_order_acquire);
+        }
+        void drawRemoteDevices();
+        void startDeviceSharing(const std::string &name, int port, const std::string &key, bool writes);
+        void connectRemoteDevice(const std::string &host, int port, const std::string &key);
+        void selectLocalDevice();
         u64  targetEpoch() const { return targetEpoch_.load(std::memory_order_acquire); }
+        u64  symbolEpoch() const { return symbolEpoch_.load(std::memory_order_acquire); }
 
         bool open();
         void close();
-        bool connect(); // uses deviceName_ + speed_
-        bool resetTarget();
+        bool connect(bool resetOnConnect = false); // uses deviceName_ + speed_
+        bool resetTarget(u64 epoch = 0);
+        // Programs BIN/HEX directly through the DLL and ELF/AXF PT_LOAD
+        // segments through the flash download API. This call is blocking and
+        // serialised with all other J-Link traffic; invoke it from a worker
+        bool programFile(const std::string                &path,
+                         u32                               binAddress,
+                         bool                              eraseChip,
+                         bool                              resetAfter,
+                         std::string                      &error,
+                         const std::function<void(float)> &onProgress = {});
+        /**
+         * @brief Runs SEGGER Commander with the current probe serial number and target
+         * Leaves the target halted and the application disconnected after erase
+         */
+        bool eraseFlash(const std::string &expectedDevice,
+                        u64                expectedEpoch,
+                        bool               entireChip,
+                        uint32_t           sectorMask,
+                        int                speedKHz,
+                        std::string       &error,
+                        std::string       &logPath);
 
-        // Async wrappers: run the blocking USB operation on a detached worker so
-        // the GUI thread never stalls. isBusy() reflects an in-flight operation.
-        void connectAsync();
+        /**
+         * @brief Async wrappers: run the blocking USB operation on a detached worker so
+         * the GUI thread never stalls. isBusy() reflects an in-flight operation
+         */
+        void connectAsync(bool resetOnConnect = false);
         void disconnectAsync();
         void resetAsync();
         bool isBusy() const { return busy_.load(std::memory_order_acquire); }
+        void setFirmwareSource(uintptr_t owner, std::optional<firmware_match::Image> image, bool loading = false);
+        void removeFirmwareSource(uintptr_t owner);
+        firmware_match::Status firmwareStatus() const;
+        /**
+         * @brief 显式放行本次连接的固件不匹配, 换文件或设备后失效
+         */
+        bool setFirmwareMismatchOverride(bool enabled);
         bool readMem(u32 addr, u32 numBytes, void *dst);
+        bool readFlash(u32                               addr,
+                       u32                               numBytes,
+                       std::vector<uint8_t>             &out,
+                       std::string                      &error,
+                       const std::atomic<bool>          &cancel,
+                       const std::function<void(float)> &progress);
         bool writeMem(u32 addr, u32 numBytes, const void *src);
-        // Atomically with respect to other host-side J-Link operations, preserve
-        // every bit outside [bitOffset, bitOffset + bitSize) in the storage unit.
-        bool writeMemBitfield(u32 addr, u32 numBytes, const void *encodedValue, u32 bitOffset, u32 bitSize);
+        bool readMemAtEpoch(u64 epoch, u32 addr, u32 numBytes, void *dst);
+        bool writeMemAtEpoch(u64 epoch, u32 addr, u32 numBytes, const void *src);
+        /**
+         * @brief Atomically with respect to other host-side J-Link operations, preserve
+         * every bit outside [bitOffset, bitOffset + bitSize) in the storage unit
+         */
+        bool writeMemBitfield(u32 addr, u32 numBytes, const void *encodedValue, u32 bitOffset, u32 bitSize, u64 epoch = 0);
 
         u32  readReg(u32 regIndex);
         bool isHalted();
         bool halt();
         bool resume();
 
-        bool hssStart(const std::vector<HssBlock> &blocks, int periodUs);
+        bool hssStart(const std::vector<HssBlock> &blocks, int periodUs, u64 epoch = 0);
         void hssStop();
         int  hssRead(void *buf, u32 bufSize);
-        bool isHssRunning() const { return hssRunning_; }
-        int  hssFrameSize() const { return hssFrameSize_; }
+        bool isHssRunning() const
+        {
+                return usingRemote() ? remoteSampling_.load() && ava_peer::client().connected() : hssRunning_;
+        }
+        int hssFrameSize() const { return usingRemote() ? remoteFrameSize_.load() : hssFrameSize_; }
 
-        // Actual sample rate (Hz). Fed by the sampler thread periodically.
+        /**
+         * @brief Actual sample rate (Hz). Fed by the sampler thread periodically
+         */
+        double sampleBytesPerSecond() const
+        {
+                return isConnected() && get_mono_ts_ms() - sampleRateTick_.load(std::memory_order_relaxed) < 1500
+                           ? sampleBytesPerSecond_.load(std::memory_order_relaxed)
+                           : 0;
+        }
+        void setSampleBytesPerSecond(double rate)
+        {
+                sampleBytesPerSecond_.store(rate, std::memory_order_relaxed);
+                sampleRateTick_.store(get_mono_ts_ms(), std::memory_order_relaxed);
+        }
         f32  actualHz() const { return hssActualHz_.load(std::memory_order_relaxed); }
         void setActualHz(f32 hz) { hssActualHz_.store(hz, std::memory_order_relaxed); }
 
@@ -117,9 +186,11 @@ class JLinkPort
         void addPoints(u64 n) { totalPoints_.fetch_add(n, std::memory_order_relaxed); }
         void resetPoints() { totalPoints_.store(0, std::memory_order_relaxed); }
 
-        // Config getters/setters use a lightweight mutex (cfgMtx_) separate from the
-        // J-Link I/O FairMutex. The GUI reads these every frame; using the I/O lock
-        // would stall the render thread behind slow J-Link reads (low SWD speed).
+        /**
+         * @brief Config getters/setters use a lightweight mutex (cfgMtx_) separate from the
+         *        J-Link I/O FairMutex. The GUI reads these every frame; using the I/O lock
+         *        would stall the render thread behind slow J-Link reads (low SWD speed)
+         */
         std::string deviceName() const
         {
                 std::lock_guard lk(cfgMtx_);
@@ -140,9 +211,9 @@ class JLinkPort
                         configModified_.store(true, std::memory_order_release);
         }
         int        &hssPeriodUs() { return hssPeriodUs_; }
-        std::string lastError() const;
+        std::string prevError() const;
 
-        void drawUI();
+        void drawUI(bool stacked = false);
         void drawWindows();
         void drawDllSettingsMenu();
         void openTraceWindow();
@@ -156,20 +227,49 @@ class JLinkPort
       private:
         JLinkPort() = default;
         ~JLinkPort();
+        std::atomic<bool> remoteSelected_{false}, remoteSampling_{false};
+        std::atomic<int>  remoteFrameSize_{0};
+        bool              remoteWindowOpen_{false};
+        struct RemoteUiResult {
+                std::string                 message;
+                std::vector<ava_peer::Peer> peers;
+                bool                        error = false;
+        };
+        std::future<RemoteUiResult> remoteJob_;
+        // Keep a routed operation and its generation check on the same source.
+        // Export callbacks use the physical device and must bypass this lock,
+        // including when this instance connects to its own exported endpoint.
+        mutable std::recursive_mutex           routeMtx_;
+        std::unique_lock<std::recursive_mutex> lockRoute() const
+        {
+                std::unique_lock<std::recursive_mutex> lock(routeMtx_, std::defer_lock);
+                if (!ava_peer::backendCall())
+                        lock.lock();
+                return lock;
+        }
 
         mutable FairMutex  mtx_{};       // serialises J-Link SDK I/O (held during slow reads)
         mutable std::mutex cfgMtx_{};    // guards deviceName_ only (never held during I/O)
         std::atomic<bool>  busy_{false}; // an async connect/disconnect/reset is in flight
         std::atomic<bool>  isOpen_{false};
         std::atomic<bool>  isConnected_{false};
-        // Incremented after every successful target connection/reset. Clients
+        // Incremented after target connection/reset and symbol-table changes. Clients
         // whose target-side control blocks live in volatile RAM use this to
-        // re-submit their configuration after the MCU has restarted.
-        std::atomic<u64>  targetEpoch_{0};
-        std::string       deviceName_{""};
-        std::atomic<int>  speedKHz_{4000};
-        std::atomic<bool> configModified_{false};
-        std::string       lastErr_{};
+        // re-submit their configuration after the MCU has restarted
+        std::atomic<u64>                      targetEpoch_{0};
+        std::atomic<u64>                      symbolEpoch_{0};
+        std::atomic<u64>                      deviceEpoch_{0};
+        std::string                           deviceName_{""};
+        std::string                           connectedDeviceName_;
+        std::atomic<int>                      speedKHz_{4000};
+        std::atomic<bool>                     configModified_{false};
+        std::string                           prevErr_{};
+        firmware_match::Gate                  firmwareGate_;
+        mutable std::mutex                    firmwareStatusMtx_;
+        firmware_match::Status                firmwareStatus_;
+        std::chrono::steady_clock::time_point firmwareCheckedAt_{};
+        u64                                   firmwareCheckedEpoch_{};
+        bool                                  firmwareAllowsAccessLocked(bool refresh);
 
         struct DllCandidate {
                 std::string path;
@@ -191,17 +291,19 @@ class JLinkPort
         std::atomic<int>     readFailCount_{0};
         // The public flags can be cleared after a USB/firmware-update failure
         // while the J-Link DLL still owns its old USB session. The next connect
-        // must close that SDK session even though isOpen_ is already false.
+        // must close that SDK session even though isOpen_ is already false
         std::atomic<bool> sdkSessionDirty_{false};
 
         void recordTransportResultLocked(bool success, const char *operation);
 
-        bool              hssRunning_{false};
-        int               hssPeriodUs_{1000};
-        int               hssFrameSize_{0};
-        std::atomic<f32>  hssActualHz_{0.0f};
-        std::atomic<u64>  totalPoints_{0};
-        std::atomic<bool> hssReqRestart_{false};
+        bool                hssRunning_{false};
+        int                 hssPeriodUs_{1000};
+        int                 hssFrameSize_{0};
+        std::atomic<f32>    hssActualHz_{0.0f};
+        std::atomic<double> sampleBytesPerSecond_{0};
+        std::atomic<u64>    sampleRateTick_{0};
+        std::atomic<u64>    totalPoints_{0};
+        std::atomic<bool>   hssReqRestart_{false};
 
         enum class RttStatus { Stopped, Searching, Running, UpChannelUnavailable, Disconnected, Error };
 
@@ -213,8 +315,8 @@ class JLinkPort
         bool                    rttWindowOpen_{false};
         bool                    rttWindowFocusRequested_{false};
         bool                    rttAutoScroll_{true};
-        float                   rttLastScrollY_{0.0f};
         std::atomic<bool>       rttActive_{false};
+        std::atomic<bool>       rttResumeRequested_{false}; // enabled by START, cleared only by explicit STOP
         std::atomic<bool>       rttReaderRunning_{false};
         std::atomic<RttStatus>  rttStatus_{RttStatus::Stopped};
         std::atomic<int>        rttUpBufferCount_{-1};
@@ -230,7 +332,7 @@ class JLinkPort
         std::string             rttTxPending_{};
         std::string             rttError_{};
 
-        bool        rttStart();
+        bool        rttStart(bool resumeOnly = false);
         void        rttStop();
         void        rttStopImpl(); // caller holds rttLifecycleMtx_
         void        rttReaderLoop();
@@ -249,13 +351,13 @@ class JLinkPort
                 TraceEventKind kind{TraceEventKind::Exception};
                 double         timeUs{0.0};
                 u32            pc{0};
-                u64            value{0};
+                u64            val{0};
                 u16            exceptionNumber{0};
                 u8             action{0};
                 u8             valueSize{0};
         };
 
-        // Avoid J-Link's blocking CPU-clock auto measurement on STM32H7.
+        // Avoid J-Link's blocking CPU-clock auto measurement on STM32H7
         int                                   swoCpuMHz_{200};
         int                                   swoSpeedKHz_{1000};
         int                                   swoItmPort_{0};
@@ -270,7 +372,6 @@ class JLinkPort
         bool                                  swoWindowOpen_{false};
         bool                                  swoWindowFocusRequested_{false};
         bool                                  swoAutoScroll_{true};
-        float                                 swoLastScrollY_{0.0f};
         bool                                  swoTimelineFollow_{true};
         int                                   swoTimelineScrollFrames_{3};
         std::atomic<bool>                     swoActive_{false};

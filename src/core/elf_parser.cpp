@@ -1,8 +1,9 @@
+#include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <vector>
 
 #include "core/elf_parser.hpp"
+#include "platform/native_dlg.hpp"
 
 namespace
 {
@@ -24,7 +25,7 @@ constexpr u32 SHT_DYNSYM = 11;
 #pragma pack(push, 1)
 struct Elf32_Ehdr {
         u8  e_ident[16];
-        u16 e_type;
+        u16 type;
         u16 e_machine;
         u32 e_version;
         u32 e_entry;
@@ -41,7 +42,7 @@ struct Elf32_Ehdr {
 
 struct Elf64_Ehdr {
         u8  e_ident[16];
-        u16 e_type;
+        u16 type;
         u16 e_machine;
         u32 e_version;
         u64 e_entry;
@@ -112,19 +113,27 @@ strFromTbl(const std::vector<char> &tbl, const u32 off)
 bool
 loadFile(const std::string &path, std::vector<u8> &buf)
 {
-        std::ifstream ifs(path, std::ios::binary | std::ios::ate);
-        if (!ifs.is_open())
+        FILE *file = nativeFopen(path, "rb");
+        if (!file)
                 return false;
 
-        const std::streamsize sz = ifs.tellg();
-        if (sz <= 0)
+        if (fseek(file, 0, SEEK_END) != 0) {
+                fclose(file);
                 return false;
+        }
 
-        ifs.seekg(0, std::ios::beg);
-        buf.resize(static_cast<usize>(sz));
-        if (!ifs.read(reinterpret_cast<char *>(buf.data()), sz))
+        const long size = ftell(file);
+        if (size <= 0 || fseek(file, 0, SEEK_SET) != 0) {
+                fclose(file);
                 return false;
-        return true;
+        }
+
+        buf.resize(static_cast<usize>(size));
+        const bool readOk = fread(buf.data(), 1, buf.size(), file) == buf.size();
+        fclose(file);
+        if (!readOk)
+                buf.clear();
+        return readOk;
 }
 
 template <typename Ehdr, typename Shdr, typename Sym>

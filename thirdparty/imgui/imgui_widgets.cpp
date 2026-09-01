@@ -7452,7 +7452,10 @@ bool ImGui::Selectable(const char* label, bool selected, ImGuiSelectableFlags fl
         {
             // Between 1.91.0 and 1.91.4 we made selected Selectable use an arbitrary lerp between _Header and _HeaderHovered. Removed that now. (#8106)
             ImU32 col = GetColorU32((held && highlighted) ? ImGuiCol_HeaderActive : highlighted ? ImGuiCol_HeaderHovered : ImGuiCol_Header);
-            RenderFrame(bb.Min, bb.Max, col, false, 0.0f);
+            // AvA: popup rows follow the application's rounded controls. Tables
+            // keep their own structure-card selection rendering.
+            const float rounding = (window->Flags & ImGuiWindowFlags_Popup) ? style.FrameRounding : 0.0f;
+            RenderFrame(bb.Min, bb.Max, col, false, rounding);
         }
         if (g.NavId == id)
         {
@@ -10844,6 +10847,14 @@ void ImGui::TabItemBackground(ImDrawList* draw_list, const ImRect& bb, ImGuiTabI
     const float rounding = ImMax(0.0f, ImMin((flags & ImGuiTabItemFlags_Button) ? g.Style.FrameRounding : g.Style.TabRounding, width * 0.5f - 1.0f));
     const float y1 = bb.Min.y + 1.0f;
     const float y2 = bb.Max.y - g.Style.TabBarBorderSize;
+    // App dock tabs use the same four rounded corners as the surrounding controls.
+    if (g.CurrentTabBar && (g.CurrentTabBar->Flags & ImGuiTabBarFlags_DockNode))
+    {
+        draw_list->AddRectFilled(ImVec2(bb.Min.x, y1), ImVec2(bb.Max.x, y2), col, rounding);
+        if (g.Style.TabBorderSize > 0.0f)
+            draw_list->AddRect(ImVec2(bb.Min.x + 0.5f, y1 + 0.5f), ImVec2(bb.Max.x - 0.5f, y2 - 0.5f), GetColorU32(ImGuiCol_Border), rounding, 0, g.Style.TabBorderSize);
+        return;
+    }
     draw_list->PathLineTo(ImVec2(bb.Min.x, y2));
     draw_list->PathArcToFast(ImVec2(bb.Min.x + rounding, y1 + rounding), rounding, 6, 9);
     draw_list->PathArcToFast(ImVec2(bb.Max.x - rounding, y1 + rounding), rounding, 9, 12);

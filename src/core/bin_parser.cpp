@@ -11,6 +11,9 @@ BinParser::parseRecursive(std::ifstream &ifs, DataTree &node)
                         return false;
 
                 switch (node.type) {
+                        case DataType::F16:
+                                node.val = fast_f16_to_f32(*(u16 *)buf);
+                                break;
                         case DataType::F32:
                                 node.val = *(f32 *)buf;
                                 break;

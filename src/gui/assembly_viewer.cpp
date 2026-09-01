@@ -1,6 +1,8 @@
 #include "gui/assembly_viewer.hpp"
+#include "gui/dock_close.hpp"
 #include "gui/gui.hpp"
 #include "gui/i18n.hpp"
+#include "gui/ui_theme.hpp"
 #include "imgui.h"
 
 #include <algorithm>
@@ -15,20 +17,18 @@ AssemblyViewer::draw(Gui *gui)
         if (!show_)
                 return;
 
-        if (ImGui::Begin(tr("Assembly Viewer###AsmViewer", "汇编查看器###AsmViewer"), &show_)) {
+        if (dock_close::begin(tr("Assembly Viewer###AsmViewer", "汇编查看器###AsmViewer"), &show_)) {
                 // Find all ELF paths
                 std::vector<std::string> elfPaths;
                 for (const auto &[name, var] : gui->getVars()) {
-                        const std::string &path = var->getElfPath();
+                        const std::string path = var->getLocalElfPath();
                         if (!path.empty() && std::find(elfPaths.begin(), elfPaths.end(), path) == elfPaths.end()) {
                                 elfPaths.push_back(path);
                         }
                 }
 
                 if (elfPaths.empty()) {
-                        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
-                                           "%s",
-                                           tr("No ELF/AXF files loaded in Variables.", "变量窗口中未加载 ELF/AXF 文件。"));
+                        ui::ErrorText("%s", tr("No ELF/AXF files loaded in Variables.", "变量窗口中未加载 ELF/AXF 文件。"));
                         ImGui::End();
                         return;
                 }

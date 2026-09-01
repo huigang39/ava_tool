@@ -13,11 +13,12 @@
 #ifndef TIME_SERIES_BUFFER_HPP
 #define TIME_SERIES_BUFFER_HPP
 
-#include "module.h"
+#include "ckit.h"
 
 #include "delta_ts_buffer.hpp"
 #include "mmap_vector.hpp"
 #include <algorithm>
+#include <cmath>
 #include <limits>
 
 struct LodSample {
@@ -49,7 +50,7 @@ class TimeSeriesBuffer
         usize rawSize() const { return rawTs_.size(); }
         bool  rawEmpty() const { return rawTs_.empty(); }
         f64   firstTs() const { return rawTs_.empty() ? -1.0 : rawTs_.front(); }
-        f64   lastTs() const { return rawTs_.empty() ? -1.0 : rawTs_.back(); }
+        f64   prevTs() const { return rawTs_.empty() ? -1.0 : rawTs_.back(); }
         f64   rawTs(usize i) const { return rawTs_[i]; }
         f32   rawVal(usize i) const { return rawVals_[i]; }
 
@@ -73,8 +74,37 @@ class TimeSeriesBuffer
                 feedLevel_(0, v, v, t);
         }
 
-        // Drop n samples from the raw front. LOD heads are left alone so
-        // historical coarse data remains queryable after raw aged out.
+        void preserveExactTimestamps() { rawTs_.preserveExactTimestamps(); }
+
+        /**
+         * @brief Erase the closed time interval and rebuild every LOD bucket, including
+         *        partially accumulated buckets, so discarded extrema cannot reappear
+         *        No-op requests leave the raw buffer and LOD hierarchy untouched
+         */
+        usize discardTimeRange(f64 tMin, f64 tMax)
+        {
+                if (!std::isfinite(tMin) || !std::isfinite(tMax) || tMin > tMax)
+                        return 0;
+                const usize first = rawLowerBound(tMin);
+                const usize last  = rawUpperBound(tMax);
+                if (first >= last)
+                        return 0;
+                const usize removed = rawTs_.eraseRange(first, last);
+                rawVals_.eraseRange(first, last);
+                firstAbsIdx_ += removed;
+                for (auto &level : levels_) {
+                        level.data.clear();
+                        level.pending = PendingBucket{};
+                }
+                for (usize i = 0; i < rawSize(); ++i)
+                        feedLevel_(0, rawVal(i), rawVal(i), rawTs(i));
+                return removed;
+        }
+
+        /**
+         * @brief Drop n samples from the raw front. LOD heads are left alone so
+         *        historical coarse data remains queryable after raw aged out
+         */
         void dropFront(usize n)
         {
                 n = std::min(n, rawTs_.size());
@@ -89,7 +119,7 @@ class TimeSeriesBuffer
                 // Also drop LOD samples that are now older than the oldest remaining
                 // raw sample. Without this the LOD pyramid grows without bound even
                 // though the raw window is pruned — the single largest source of the
-                // mmap cache ballooning over long runs.
+                // mmap cache ballooning over long runs
                 const f64 cutoff = rawTs_.empty() ? std::numeric_limits<f64>::infinity() : rawTs_.front();
                 for (int k = 0; k < kMaxLevels; ++k) {
                         auto &data = levels_[k].data;
@@ -98,9 +128,11 @@ class TimeSeriesBuffer
                 }
         }
 
-        // Advance the raw front past samples with ts < cutoff. minKeep keeps
-        // at least N raw samples (mainly to satisfy FFT). LOD heads are also
-        // advanced for memory reclamation.
+        /**
+         * @brief Advance the raw front past samples with ts < cutoff. minKeep keeps
+         *        at least N raw samples (mainly to satisfy FFT). LOD heads are also
+         *        advanced for memory reclamation
+         */
         void pruneByTime(f64 cutoff, usize minKeep)
         {
                 while (rawTs_.size() > minKeep && rawTs_.front() < cutoff) {
@@ -140,8 +172,10 @@ class TimeSeriesBuffer
                 return static_cast<usize>(std::distance(data.begin(), it));
         }
 
-        // Pick the LOD level whose bucket count in [tMin, tMax] fits the budget.
-        // Returns -1 to indicate the raw level is fine.
+        /**
+         * @brief Pick the LOD level whose bucket count in [tMin, tMax] fits the budget
+         *        Returns -1 to indicate the raw level is fine
+         */
         int pickLevel(f64 tMin, f64 tMax, usize budget) const
         {
                 if (budget < 2)
@@ -204,7 +238,7 @@ class TimeSeriesBuffer
                 return (hi > lo) ? (hi - lo) : 0;
         }
 
-        DeltaTsBuffer   rawTs_; // block-anchored f32-delta timestamps (compact)
+        DeltaTsBuffer   rawTs_; // block-anchored f32-delta tss (compact)
         MmapVector<f32> rawVals_;
         Level           levels_[kMaxLevels];
         u64             firstAbsIdx_{0};

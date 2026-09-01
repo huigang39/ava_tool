@@ -109,6 +109,7 @@
 #include "imgui.h"
 #ifndef IMGUI_DISABLE
 #include "imgui_impl_glfw.h"
+#include <float.h> // for FLT_MAX
 
 // Clang warnings with -Weverything
 #if defined(__clang__)
@@ -1074,17 +1075,16 @@ static void ImGui_ImplGlfw_UpdateMonitors()
 
     int monitors_count = 0;
     GLFWmonitor** glfw_monitors = glfwGetMonitors(&monitors_count);
-    if (monitors_count == 0) // Preserve existing monitor list if there are none. Happens on macOS sleeping (#5683)
-        return;
-
-    platform_io.Monitors.resize(0);
-    for (int n = 0; n < monitors_count; n++)
+    // A display transition may return monitors but no usable modes/DPI. Build
+    // the replacement first so NewFrame never observes an empty monitor list.
+    ImVector<ImGuiPlatformMonitor> monitors;
+    for (int n = 0; glfw_monitors != nullptr && n < monitors_count; n++)
     {
         ImGuiPlatformMonitor monitor;
         int x, y;
         glfwGetMonitorPos(glfw_monitors[n], &x, &y);
         const GLFWvidmode* vid_mode = glfwGetVideoMode(glfw_monitors[n]);
-        if (vid_mode == nullptr)
+        if (vid_mode == nullptr || vid_mode->width <= 0 || vid_mode->height <= 0)
             continue; // Failed to get Video mode (e.g. Emscripten does not support this function)
         monitor.MainPos = monitor.WorkPos = ImVec2((float)x, (float)y);
         monitor.MainSize = monitor.WorkSize = ImVec2((float)vid_mode->width, (float)vid_mode->height);
@@ -1098,10 +1098,32 @@ static void ImGui_ImplGlfw_UpdateMonitors()
         }
 #endif
         float scale = ImGui_ImplGlfw_GetContentScaleForMonitor(glfw_monitors[n]);
-        if (scale == 0.0f)
+        if (!(scale > 0.0f && scale <= FLT_MAX))
             continue; // Some accessibility applications are declaring virtual monitors with a DPI of 0, see #7902.
         monitor.DpiScale = scale;
         monitor.PlatformHandle = (void*)glfw_monitors[n]; // [...] GLFW doc states: "guaranteed to be valid only until the monitor configuration changes"
+        monitors.push_back(monitor);
+    }
+    if (monitors.Size > 0)
+        platform_io.Monitors.swap(monitors);
+    else if (platform_io.Monitors.Size > 0)
+    {
+        // Keep geometry, but never retain GLFW handles across a topology change.
+        for (ImGuiPlatformMonitor& monitor : platform_io.Monitors)
+            monitor.PlatformHandle = nullptr;
+    }
+    else
+    {
+        // Startup can also happen while displays are unavailable. Use valid
+        // window geometry until a later frame can enumerate real monitors.
+        GLFWwindow* window = ImGui_ImplGlfw_GetBackendData()->Window;
+        int x = 0, y = 0, w = 1, h = 1;
+        glfwGetWindowPos(window, &x, &y);
+        glfwGetWindowSize(window, &w, &h);
+        ImGuiPlatformMonitor monitor;
+        monitor.MainPos = monitor.WorkPos = ImVec2((float)x, (float)y);
+        monitor.MainSize = monitor.WorkSize = ImVec2((float)(w > 0 ? w : 1), (float)(h > 0 ? h : 1));
+        monitor.DpiScale = 1.0f;
         platform_io.Monitors.push_back(monitor);
     }
 }

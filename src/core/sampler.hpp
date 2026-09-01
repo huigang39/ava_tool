@@ -13,32 +13,36 @@
 
 class Gui;
 
-// Entry point for the sampler thread. Runs until g_appRunning is set to false.
+/**
+ * @brief Entry point for the sampler thread. Runs until g_appRunning is set to false
+ */
 void threadFunc(Gui *gui);
 
-// Entry point for the FFT worker thread. Computes scope spectra off the render
-// thread so heavy fft_exec calls don't drag down the GUI frame rate. Runs until
-// g_appRunning is set to false.
+/**
+ * @brief Entry point for the FFT worker thread. Computes scope spectra off the render
+ *        thread so heavy fft_exec calls don't drag down the GUI frame rate. Runs until
+ *        g_appRunning is set to false
+ */
 void fftThreadFunc(Gui *gui);
 
 // Sampler run mode.  Written by GUI; sampler thread re-applies on next
-// iteration after g_samplerRebind is set.
-//   0 = Low      : normal priority, no affinity, always Sleep(1ms)
-//   1 = Normal   : slightly elevated priority, no affinity, adaptive sleep
-//   2 = CPUBound : realtime priority + core pinning + spin-loop
+// iteration after g_samplerRebind is set
+// 0 = Low      : normal priority, no affinity, always Sleep(1ms)
+// 1 = Normal   : slightly elevated priority, no affinity, adaptive sleep
+// 2 = CPUBound : realtime priority + core pinning + spin-loop
 extern std::atomic<int>  g_samplerRunMode; // default 1
 extern std::atomic<bool> g_samplerRebind;
 
-// User-selected core for CPUBound mode.
-//   -1 : auto — pin to the highest available core (default)
-//   >=0: pin to this specific core (if available to the process)
-// Only consulted when g_samplerRunMode == 2. Set g_samplerRebind after changing.
+// User-selected core for CPUBound mode
+// -1 : auto — pin to the highest available core (default)
+// >=0: pin to this specific core (if available to the process)
+// Only consulted when g_samplerRunMode == 2. Set g_samplerRebind after changing
 extern std::atomic<int> g_samplerCoreReq;
 
 // After setupThread() runs:
-//   >= 0 : sampler is pinned to this core (CPUBound mode)
-//   -2   : running in Low/Normal mode (no core pinning)
-//   -1   : not yet initialised (initial value — main.cpp waits on this)
+// >= 0 : sampler is pinned to this core (CPUBound mode)
+// -2   : running in Low/Normal mode (no core pinning)
+// -1   : not yet initialised (initial value — main.cpp waits on this)
 extern std::atomic<int> g_samplerBoundCore;
 
 #endif // !SAMPLER_HPP

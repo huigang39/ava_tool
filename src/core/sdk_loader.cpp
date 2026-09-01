@@ -1,13 +1,16 @@
 #include "core/sdk_loader.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ffi.h>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -15,7 +18,47 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#define SDK_LOAD(p)   (void *)LoadLibraryA(p)
+
+static void *
+sdkLoadWindows(const char *utf8Path)
+{
+        if (!utf8Path || !utf8Path[0]) {
+                SetLastError(ERROR_INVALID_PARAMETER);
+                return nullptr;
+        }
+        const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Path, -1, nullptr, 0);
+        if (length <= 0)
+                return nullptr;
+        std::wstring widePath(static_cast<size_t>(length), L'\0');
+        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8Path, -1, widePath.data(), length))
+                return nullptr;
+        HMODULE module =
+            LoadLibraryExW(widePath.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        if (module)
+                return reinterpret_cast<void *>(module);
+
+        // Some vendor SDKs load their own secondary dependencies from DllMain
+        // and fail with ERROR_MOD_NOT_FOUND under the restricted search flags
+        // Temporarily add the selected DLL's directory for legacy dependency
+        // lookup, then restore the process setting immediately afterwards
+        static std::mutex directorySearchMutex;
+        std::lock_guard   lock(directorySearchMutex);
+        const size_t      slash = widePath.find_last_of(L"\\/");
+        if (slash == std::wstring::npos)
+                return reinterpret_cast<void *>(LoadLibraryW(widePath.c_str()));
+
+        const std::wstring   directory = widePath.substr(0, slash);
+        const DWORD          oldLength = GetDllDirectoryW(0, nullptr);
+        std::vector<wchar_t> oldDirectory(oldLength > 0 ? oldLength + 1 : 1, L'\0');
+        if (oldLength > 0)
+                GetDllDirectoryW(static_cast<DWORD>(oldDirectory.size()), oldDirectory.data());
+        SetDllDirectoryW(directory.c_str());
+        module = LoadLibraryW(widePath.c_str());
+        SetDllDirectoryW(oldLength > 0 ? oldDirectory.data() : nullptr);
+        return reinterpret_cast<void *>(module);
+}
+
+#define SDK_LOAD(p)   sdkLoadWindows(p)
 #define SDK_SYM(h, n) (void *)GetProcAddress((HMODULE)(h), (n))
 #define SDK_FREE(h)   FreeLibrary((HMODULE)(h))
 #else
@@ -26,15 +69,17 @@
 #endif
 
 // ─── crash-guarded ffi_call ───────────────────────────────────────────────────
-// A misbehaving SDK function (bad pointer, wrong struct size, null deref) raises a
-// hardware exception that would otherwise tear down the whole app. On Windows we
-// wrap the call in SEH so an access violation (etc.) is turned into a clean error
-// return instead of a crash. This MUST stay in its own function with no C++ objects
-// that require unwinding (a hard requirement for __try/__except).
-//
-// Caveat: SEH catches the fault at the moment it happens. It cannot undo heap/stack
-// corruption a buggy callee may have already done, so a later crash is still
-// possible — but the common "the SDK call itself segfaults" case no longer kills us.
+/**
+ * @brief A misbehaving SDK function (bad pointer, wrong struct size, null deref) raises a
+ *        hardware exception that would otherwise tear down the whole app. On Windows we
+ *        wrap the call in SEH so an access violation (etc.) is turned into a clean error
+ *        return instead of a crash. This MUST stay in its own function with no C++ objects
+ *        that require unwinding (a hard requirement for __try/__except)
+ *
+ *        Caveat: SEH catches the fault at the moment it happens. It cannot undo heap/stack
+ *        corruption a buggy callee may have already done, so a later crash is still
+ *        possible — but the common "the SDK call itself segfaults" case no longer kills us
+ */
 static bool
 guardedFfiCall(ffi_cif *cif, void (*fn)(void), void *retBuf, void **argPtrs) noexcept
 {
@@ -51,6 +96,27 @@ guardedFfiCall(ffi_cif *cif, void (*fn)(void), void *retBuf, void **argPtrs) noe
 #endif
 }
 
+struct SdkLoader::PreparedCall {
+        void                   *fn{nullptr};
+        CType                   returnType{CType::Void};
+        bool                    implicitThis{false};
+        std::vector<CType>      paramTypes;
+        std::vector<ffi_type *> argTypes;
+        ffi_cif                 cif{};
+};
+
+struct SdkLoader::CallCache {
+        std::unordered_map<std::string, std::vector<std::unique_ptr<PreparedCall>>> calls;
+        std::unordered_map<std::string, size_t>                                     methodSymbols;
+};
+
+SdkLoader::SdkLoader() : callCache_(std::make_unique<CallCache>()) {}
+
+SdkLoader::~SdkLoader()
+{
+        unload();
+}
+
 // ─── load / unload ────────────────────────────────────────────────────────────
 
 bool
@@ -60,24 +126,38 @@ SdkLoader::load(const std::string &path)
         handle_ = SDK_LOAD(path.c_str());
         if (!handle_) {
 #if defined(_WIN32)
-                char buf[256];
-                snprintf(buf, sizeof(buf), "LoadLibraryA failed (error %lu)", GetLastError());
-                lastError_ = buf;
+                const DWORD error = GetLastError();
+                char        buf[512];
+                snprintf(buf,
+                         sizeof(buf),
+                         "LoadLibraryExW failed (error %lu). Check that dependent DLLs are beside the selected DLL.",
+                         error);
+                prevError_ = buf;
 #else
                 const char *e = dlerror();
-                lastError_    = e ? e : "dlopen failed";
+                prevError_    = e ? e : "dlopen failed";
 #endif
                 return false;
         }
         path_      = path;
-        lastError_ = {};
+        prevError_ = {};
         return true;
 }
 
 void
 SdkLoader::unload()
 {
+        callCache_->calls.clear();
+        callCache_->methodSymbols.clear();
+        exports_.clear();
         if (handle_) {
+                // Opt-in plugin contract: void ava_tool_sdk_shutdown(void)
+                // Close cyclic sessions outside DllMain, before releasing the DLL
+                if (void *shutdown = SDK_SYM(handle_, "ava_tool_sdk_shutdown")) {
+                        ffi_cif cif{};
+                        if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, 0, &ffi_type_void, nullptr) == FFI_OK)
+                                guardedFfiCall(&cif, reinterpret_cast<void (*)(void)>(shutdown), nullptr, nullptr);
+                }
                 SDK_FREE(handle_);
                 handle_ = nullptr;
                 path_.clear();
@@ -94,10 +174,10 @@ SdkLoader::resolve(const std::string &name)
 #if defined(_WIN32)
                 char buf[256];
                 snprintf(buf, sizeof(buf), "symbol '%s' not found (error %lu)", name.c_str(), GetLastError());
-                lastError_ = buf;
+                prevError_ = buf;
 #else
                 const char *e = dlerror();
-                lastError_    = e ? e : ("symbol '" + name + "' not found");
+                prevError_    = e ? e : ("symbol '" + name + "' not found");
 #endif
         }
         return sym;
@@ -141,6 +221,49 @@ toFfiType(CType t)
         return &ffi_type_pointer;
 }
 
+SdkLoader::PreparedCall *
+SdkLoader::prepareCall(const std::string &name, CType returnType, const std::vector<CParam> &params, bool implicitThis)
+{
+        auto found = callCache_->calls.find(name);
+        if (found != callCache_->calls.end()) {
+                for (const auto &candidate : found->second) {
+                        if (candidate->returnType != returnType || candidate->implicitThis != implicitThis ||
+                            candidate->paramTypes.size() != params.size())
+                                continue;
+                        bool same = true;
+                        for (size_t i = 0; i < params.size(); ++i)
+                                same = same && candidate->paramTypes[i] == params[i].type;
+                        if (same)
+                                return candidate.get();
+                }
+        }
+        void *fn = resolve(name);
+        if (!fn)
+                return nullptr;
+        auto prepared          = std::make_unique<PreparedCall>();
+        prepared->fn           = fn;
+        prepared->returnType   = returnType;
+        prepared->implicitThis = implicitThis;
+        prepared->argTypes.reserve(params.size() + (implicitThis ? 1 : 0));
+        if (implicitThis)
+                prepared->argTypes.push_back(&ffi_type_pointer);
+        for (const auto &param : params) {
+                prepared->paramTypes.push_back(param.type);
+                prepared->argTypes.push_back(toFfiType(param.type));
+        }
+        if (ffi_prep_cif(&prepared->cif,
+                         FFI_DEFAULT_ABI,
+                         static_cast<unsigned>(prepared->argTypes.size()),
+                         toFfiType(returnType),
+                         prepared->argTypes.empty() ? nullptr : prepared->argTypes.data()) != FFI_OK) {
+                prevError_ = "ffi_prep_cif failed";
+                return nullptr;
+        }
+        auto *result = prepared.get();
+        callCache_->calls[name].push_back(std::move(prepared));
+        return result;
+}
+
 // ─── argument marshaling ──────────────────────────────────────────────────────
 
 struct ArgStore {
@@ -160,6 +283,25 @@ struct ArgStore {
         std::vector<char> strBuf; // keeps char* alive during the call
 };
 
+// Most SDK functions take only a handful of arguments. Keep those calls off
+// the allocator while retaining support for arbitrary parsed signatures
+struct CallArguments {
+        static constexpr size_t           kInlineArgs = 8;
+        std::array<ArgStore, kInlineArgs> inlineStores;
+        std::array<void *, kInlineArgs>   inlinePointers{};
+        std::vector<ArgStore>             extraStores;
+        std::vector<void *>               extraPointers;
+        ArgStore                         *stores;
+        void                            **pointers;
+
+        explicit CallArguments(size_t count)
+            : extraStores(count > kInlineArgs ? count : 0), extraPointers(count > kInlineArgs ? count : 0),
+              stores(count > kInlineArgs ? extraStores.data() : inlineStores.data()),
+              pointers(count > kInlineArgs ? extraPointers.data() : inlinePointers.data())
+        {
+        }
+};
+
 static bool
 marshalArg(const CParam &param, const std::string &str, ArgStore &store)
 {
@@ -174,11 +316,11 @@ marshalArg(const CParam &param, const std::string &str, ArgStore &store)
 
         if (param.type == CType::Ptr || param.type == CType::Unknown) {
                 if (!str.empty()) {
-                        // Try to parse as a numeric pointer address (e.g. "0x12345678").
-                        // If the ENTIRE string is consumed, use it as-is.
+                        // Try to parse as a numeric pointer address (e.g. "0x12345678")
+                        // If the ENTIRE string is consumed, use it as-is
                         // Otherwise (e.g. "192.168.137.53", "hello") treat it as a C string —
                         // this covers Windows typedef strings (LPCSTR, LPSTR, PSTR …) that the
-                        // header parser doesn't recognise as char* from the raw type name alone.
+                        // header parser doesn't recognise as char* from the raw type name alone
                         char    *endp = nullptr;
                         uint64_t val  = strtoull(str.c_str(), &endp, 0);
                         if (endp && *endp == '\0') {
@@ -259,9 +401,9 @@ SdkLoader::call(const CFuncDecl &decl, const std::vector<std::string> &argStrs, 
 {
         CallResult res;
 
-        void *fn = resolve(decl.name);
-        if (!fn) {
-                res.error = lastError_;
+        auto *prepared = prepareCall(decl.name, decl.retType, decl.params);
+        if (!prepared) {
+                res.error = prevError_;
                 return res;
         }
 
@@ -271,23 +413,10 @@ SdkLoader::call(const CFuncDecl &decl, const std::vector<std::string> &argStrs, 
                 return res;
         }
 
-        // Build ffi_type arrays
-        std::vector<ffi_type *> argTypes(nArgs);
-        for (size_t i = 0; i < nArgs; ++i)
-                argTypes[i] = toFfiType(decl.params[i].type);
-
-        ffi_cif    cif;
-        ffi_status status =
-            ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)nArgs, toFfiType(decl.retType), nArgs ? argTypes.data() : nullptr);
-
-        if (status != FFI_OK) {
-                res.error = "ffi_prep_cif failed";
-                return res;
-        }
-
         // Marshal arguments
-        std::vector<ArgStore> stores(nArgs);
-        std::vector<void *>   argPtrs(nArgs);
+        CallArguments arguments(nArgs);
+        auto         *stores  = arguments.stores;
+        auto        **argPtrs = arguments.pointers;
         for (size_t i = 0; i < nArgs; ++i) {
                 if (i < pointerOverrides.size() && pointerOverrides[i] != nullptr) {
                         if (decl.params[i].type != CType::Ptr) {
@@ -302,11 +431,11 @@ SdkLoader::call(const CFuncDecl &decl, const std::vector<std::string> &argStrs, 
                 argPtrs[i] = &stores[i].v;
         }
 
-        // Return value storage — large enough for any return type.
-        // libffi stores small integer returns zero/sign-extended in ffi_arg.
+        // Return value storage — large enough for any return type
+        // libffi stores small integer returns zero/sign-extended in ffi_arg
         alignas(16) uint8_t retBuf[16] = {};
 
-        if (!guardedFfiCall(&cif, (void (*)(void))fn, retBuf, nArgs ? argPtrs.data() : nullptr)) {
+        if (!guardedFfiCall(&prepared->cif, (void (*)(void))prepared->fn, retBuf, nArgs ? argPtrs : nullptr)) {
                 res.ok    = false;
                 res.error = "SDK function crashed (access violation) — call aborted, app kept alive";
                 return res;
@@ -431,6 +560,8 @@ SdkLoader::call(const CFuncDecl &decl, const std::vector<std::string> &argStrs, 
 void
 SdkLoader::setExports(const std::vector<ExportedSymbol> &syms)
 {
+        callCache_->calls.clear();
+        callCache_->methodSymbols.clear();
         exports_ = syms;
 }
 
@@ -441,21 +572,33 @@ isIdChar2(char c)
 }
 
 const std::string *
-SdkLoader::findMangledForMethod(const CMethodDecl &method) const
+SdkLoader::findMthetadForMethod(const CMethodDecl &method) const
 {
-        // Build the qualified name we expect to appear in the demangled symbol.
+        std::string cacheKey  = method.fullClassName;
+        cacheKey             += '\0';
+        cacheKey             += method.className;
+        cacheKey             += '\0';
+        cacheKey             += method.name;
+        for (const auto &param : method.params) {
+                cacheKey += '\0';
+                cacheKey += param.rawType;
+                cacheKey += static_cast<char>(param.type);
+        }
+        if (auto cached = callCache_->methodSymbols.find(cacheKey); cached != callCache_->methodSymbols.end())
+                return &exports_[cached->second].mthetad;
+        // Build the qualified name we expect to appear in the demthetad symbol
         // Constructor: "ClassName::ClassName"  Destructor: "ClassName::~ClassName"
         std::string qualName  = method.fullClassName + "::" + method.name;
         std::string shortName = method.className + "::" + method.name;
 
         // Score-based matching: prefer full qualified-name match (scores ≥ 10),
         // then fall back to class-name + method-name match ignoring outer namespace
-        // (scores 1–5, used when the DLL was compiled with a different namespace).
+        // (scores 1–5, used when the DLL was compiled with a different namespace)
         const ExportedSymbol *best      = nullptr;
         int                   bestScore = 0;
 
         auto scoreAndUpdate = [&](const ExportedSymbol &sym, const std::string &needle, int baseScore) {
-                const std::string &dem = sym.demangled;
+                const std::string &dem = sym.demthetad;
                 size_t             pos = dem.find(needle);
                 if (pos == std::string::npos)
                         return;
@@ -467,7 +610,7 @@ SdkLoader::findMangledForMethod(const CMethodDecl &method) const
                 if (dem == needle || dem.find(needle + "(") != std::string::npos)
                         score = baseScore + 2;
 
-                // Prefer matching parameter count when we can parse it quickly.
+                // Prefer matching parameter count when we can parse it quickly
                 size_t lp = dem.rfind('(');
                 size_t rp = dem.rfind(')');
                 if (lp != std::string::npos && rp != std::string::npos && rp > lp) {
@@ -496,18 +639,21 @@ SdkLoader::findMangledForMethod(const CMethodDecl &method) const
                 }
         };
 
-        // First pass: full qualified name (namespace included) — high base score.
+        // First pass: full qualified name (namespace included) — high base score
         for (const auto &sym : exports_)
                 scoreAndUpdate(sym, qualName, 10);
 
-        // Second pass: class name only, ignoring outer namespace — lower base score.
-        // Only runs when the first pass found nothing (DLL compiled with different namespace).
+        // Second pass: class name only, ignoring outer namespace — lower base score
+        // Only runs when the first pass found nothing (DLL compiled with different namespace)
         if (!best && shortName != qualName) {
                 for (const auto &sym : exports_)
                         scoreAndUpdate(sym, shortName, 1);
         }
 
-        return best ? &best->mangled : nullptr;
+        if (!best)
+                return nullptr;
+        callCache_->methodSymbols.emplace(std::move(cacheKey), static_cast<size_t>(best - exports_.data()));
+        return &best->mthetad;
 }
 
 // ─── C++ method call ──────────────────────────────────────────────────────────
@@ -520,68 +666,60 @@ SdkLoader::callMethod(void                           *thisPtr,
 {
         CallResult res;
 
-        // Find the symbol.
-        const std::string *mangled = findMangledForMethod(method);
-        if (!mangled) {
+        // Find the symbol
+        const std::string *mthetad = findMthetadForMethod(method);
+        if (!mthetad) {
                 res.error = "symbol for " + method.fullClassName + "::" + method.name + " not found";
                 return res;
         }
 
-        void *fn = resolve(*mangled);
-        if (!fn) {
-                res.error = lastError_;
+        const bool implicitThis = !method.isStatic || method.isCtor || method.isDtor;
+        auto      *prepared = prepareCall(*mthetad, method.isCtor ? CType::Void : method.retType, method.params, implicitThis);
+        if (!prepared) {
+                res.error = prevError_;
                 return res;
         }
 
         // Build the full argument list: [this, param0, param1, ...]
-        // Static methods and constructors (called on a raw buffer) still pass `this`.
-        const size_t nUser = method.params.size();
-        const size_t nAll  = nUser + 1; // +1 for hidden `this`
+        // Static methods have no hidden `this`; constructors use the raw buffer
+        const size_t nUser     = method.params.size();
+        const size_t firstUser = implicitThis ? 1 : 0;
+        const size_t nAll      = nUser + firstUser;
 
-        std::vector<ffi_type *> argTypes(nAll);
-        argTypes[0] = &ffi_type_pointer; // `this`
-        for (size_t i = 0; i < nUser; ++i)
-                argTypes[i + 1] = toFfiType(method.params[i].type);
-
-        ffi_cif    cif;
-        ffi_type  *retFfi = method.isCtor ? &ffi_type_void : toFfiType(method.retType);
-        ffi_status status = ffi_prep_cif(&cif, FFI_DEFAULT_ABI, (unsigned)nAll, retFfi, argTypes.data());
-        if (status != FFI_OK) {
-                res.error = "ffi_prep_cif failed for method call";
-                return res;
-        }
-
-        // Marshal arguments.
-        std::vector<ArgStore> stores(nAll);
-        std::vector<void *>   argPtrs(nAll);
+        // Marshal arguments
+        CallArguments arguments(nAll);
+        auto         *stores  = arguments.stores;
+        auto        **argPtrs = arguments.pointers;
 
         // Slot 0: `this`
-        stores[0].v.ptr = thisPtr;
-        argPtrs[0]      = &stores[0].v.ptr;
+        if (implicitThis) {
+                stores[0].v.ptr = thisPtr;
+                argPtrs[0]      = &stores[0].v.ptr;
+        }
 
         for (size_t i = 0; i < nUser; ++i) {
                 if (i < structPtrs.size() && structPtrs[i] != nullptr) {
-                        // Struct-reference param: pass the buffer address as a pointer.
-                        stores[i + 1].v.ptr = structPtrs[i];
-                        argPtrs[i + 1]      = &stores[i + 1].v.ptr;
+                        // Struct-reference param: pass the buffer address as a pointer
+                        stores[i + firstUser].v.ptr = structPtrs[i];
+                        argPtrs[i + firstUser]      = &stores[i + firstUser].v.ptr;
                 } else {
                         const std::string &s = (i < argStrs.size()) ? argStrs[i] : std::string();
-                        if (!marshalArg(method.params[i], s, stores[i + 1])) {
+                        if (!marshalArg(method.params[i], s, stores[i + firstUser])) {
                                 res.error = "failed to marshal arg " + std::to_string(i);
                                 return res;
                         }
-                        argPtrs[i + 1] = &stores[i + 1].v;
+                        argPtrs[i + firstUser] = &stores[i + firstUser].v;
                 }
         }
 
         alignas(16) uint8_t retBuf[16] = {};
-        if (!guardedFfiCall(&cif, reinterpret_cast<void (*)(void)>(fn), retBuf, argPtrs.data())) {
+        if (!guardedFfiCall(&prepared->cif, reinterpret_cast<void (*)(void)>(prepared->fn), retBuf, nAll ? argPtrs : nullptr)) {
                 res.ok    = false;
                 res.error = "SDK method crashed (access violation) — call aborted, app kept alive";
                 return res;
         }
 
-        // Format result (reuse the same logic as call()).
+        // Format result (reuse the same logic as call())
         res.ok = true;
         char  fmt[128];
         CType rt = method.isCtor ? CType::Void : method.retType;

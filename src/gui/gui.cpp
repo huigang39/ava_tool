@@ -1,3 +1,5 @@
+#include "gui/choice_control.hpp"
+#include "gui/dock_close.hpp"
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -30,11 +32,13 @@
 #include <ranges>
 #include <sstream>
 
+#include "ImGuiNotify.hpp"
 #include "cJSON.h"
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include "implot.h"
+#include "platform/elevation.hpp"
 #include "platform/native_dlg.hpp"
 
 #include "app_log.hpp"
@@ -42,12 +46,24 @@
 #include "core/mmap_vector.hpp"
 #include "core/sampler.hpp"
 #include "core/session_time.hpp"
+#include "gui/app_shortcuts.hpp"
+#include "gui/fault_decoder.hpp"
 #include "gui/gui.hpp"
+#include "gui/help_manual.hpp"
 #include "gui/i18n.hpp"
+#include "gui/interaction_history.hpp"
 #include "gui/monitor.hpp"
+#include "gui/notification_icons.hpp"
+#include "gui/numeric_format.hpp"
+#include "gui/platform_fonts.hpp"
+#include "gui/plot_style.hpp"
 #include "gui/tutorial_guide.hpp"
 #include "gui/ui_theme.hpp"
+#include "gui/unit_conversion_json.hpp"
+#include "gui/unit_conversion_ui.hpp"
 #include "gui/variable.hpp"
+#include "gui/window_corners.hpp"
+#include "platform/native_appearance.hpp"
 #include "platform/native_dlg.hpp"
 #include "version.hpp"
 #include <cstdlib>
@@ -58,11 +74,11 @@ std::vector<std::string> Gui::sDroppedFiles_{};
 
 // ── Efficiency tab persistent state ──────────────────────────────────────────
 // Shared by drawCalculator(), saveSession(), and loadSession() so the selected
-// channels, units, map range, and recorded data survive save/load round-trips.
+// chs, units, map range, and recorded data survive save/load round-trips
 static struct {
-        std::string torqueLink, speedLink, voltageLink, currentLink;
+        std::string torqueLink, speedLink, volLink, currentLink;
         int         refreshMs  = 200;
-        int         torqueUnit = 0, speedUnit = 0, voltageUnit = 0, currentUnit = 0;
+        int         torqueUnit = 0, speedUnit = 0, volUnit = 0, currentUnit = 0;
         float       spdMin = 0.f, spdMax = 6000.f, tqMin = 0.f, tqMax = 50.f;
         int         activeTab = 0;
         bool        forceTab  = false;
@@ -71,6 +87,22 @@ static struct {
         };
         std::vector<EffPoint> rawData; // raw recorded (speed, torque, eta) table
 } s_eff;
+
+// loadSession() owns mtxMonitors_ while reconstructing every monitor/variable
+// SDK restore callbacks run synchronously on that same thread and must not try
+// to acquire the non-recursive mutex a second time. Other threads keep their
+// normal locking behaviour because this marker is thread-local
+static thread_local bool s_monitorMutexOwnedBySessionLoad = false;
+
+class ScopedSessionMonitorLockOwner
+{
+      public:
+        ScopedSessionMonitorLockOwner() : prev_(s_monitorMutexOwnedBySessionLoad) { s_monitorMutexOwnedBySessionLoad = true; }
+        ~ScopedSessionMonitorLockOwner() { s_monitorMutexOwnedBySessionLoad = prev_; }
+
+      private:
+        bool prev_;
+};
 
 static bool
 hasAudioExtension(const std::string &path)
@@ -85,7 +117,7 @@ sanitizeRecentPath(std::string path)
 {
         // A recent.txt accidentally saved as UTF-16 contains embedded NULs.  Such
         // a string is non-empty to C++, but becomes an empty label when passed to
-        // ImGui as a C string, causing its root-window empty-ID assertion.
+        // ImGui as a C string, causing its root-window empty-ID assertion
         if (path.find('\0') != std::string::npos)
                 return {};
         if (path.size() >= 3 && static_cast<unsigned char>(path[0]) == 0xEF && static_cast<unsigned char>(path[1]) == 0xBB &&
@@ -96,8 +128,8 @@ sanitizeRecentPath(std::string path)
         const auto first    = std::ranges::find_if(path, notSpace);
         if (first == path.end())
                 return {};
-        const auto last = std::find_if(path.rbegin(), path.rend(), notSpace).base();
-        path            = std::string(first, last);
+        const auto prev = std::find_if(path.rbegin(), path.rend(), notSpace).base();
+        path            = std::string(first, prev);
         if (std::ranges::any_of(path, [](unsigned char c) { return c < 0x20; }))
                 return {};
         return path;
@@ -108,6 +140,26 @@ pathToUtf8(const std::filesystem::path &path)
 {
         const std::u8string utf8 = path.u8string();
         return std::string(utf8.begin(), utf8.end());
+}
+
+static std::string
+utf8Filename(const std::string &path)
+{
+        try {
+                return pathToUtf8(std::filesystem::u8path(path).filename());
+        } catch (const std::filesystem::filesystem_error &) {
+                return path;
+        }
+}
+
+static std::string
+utf8Stem(const std::string &path)
+{
+        try {
+                return pathToUtf8(std::filesystem::u8path(path).stem());
+        } catch (const std::filesystem::filesystem_error &) {
+                return {};
+        }
 }
 
 static std::string
@@ -127,6 +179,8 @@ recentDisplayName(const std::string &path)
 static bool
 recentPathExists(const std::string &path)
 {
+        if (remote::isUrl(path))
+                return true;
         try {
                 std::error_code ec;
                 return std::filesystem::exists(std::filesystem::u8path(path), ec) && !ec;
@@ -142,7 +196,8 @@ Gui::glfwErrCb(const i32 err, const char *desc)
 }
 
 void
-Gui::glfwDropCb(GLFWwindow * /*window*/, const i32 count, const char **paths)
+// window
+Gui::glfwDropCb(GLFWwindow *, const i32 count, const char **paths)
 {
         for (i32 i = 0; i < count; ++i)
                 sDroppedFiles_.emplace_back(paths[i]);
@@ -150,6 +205,7 @@ Gui::glfwDropCb(GLFWwindow * /*window*/, const i32 count, const char **paths)
 
 Gui::Gui(const std::string &initialPath)
 {
+        dock_close::reset();
         LOG_I("Gui(%s)", initialPath.c_str());
 
         loadCacheDirSetting(); // apply the saved mmap cache dir before any buffers are created
@@ -187,41 +243,66 @@ Gui::Gui(const std::string &initialPath)
 
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
+        ui::interaction::reset();
+        ui::InstallNotificationIcons();
+        dock_fold::registerSettings();
         ImGuiIO &io     = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
+        io.ConfigFlags |= ImGuiConfigFlags_DockingEnable | ImGuiConfigFlags_NavEnableKeyboard;
         io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
 
         // On macOS Retina the GLFW backend already sets DisplayFramebufferScale = 2,
-        // so ImGui renders in logical pixels and the backend up-scales to physical.
+        // so ImGui renders in logical pixels and the backend up-scales to physical
         // On Windows/Linux the framebuffer equals the window in pixels, so we must
-        // bake the DPI scale into the font ourselves.
+        // bake the DPI scale into the font ourselves
         // uiScale = contentScale / (fb/window), e.g. 1.0 on macOS Retina, 1.5 on Win 150%
         int winW = 1, fbW = 1;
         glfwGetWindowSize(window_, &winW, nullptr);
         glfwGetFramebufferSize(window_, &fbW, nullptr);
         const float fbRatio = (winW > 0) ? static_cast<float>(fbW) / static_cast<float>(winW) : 1.0f;
         const float uiScale = xScale_ / fbRatio;
+        uiScale_            = uiScale;
 
-        const float fontSize = std::round(18.0f * uiScale);
-        // Build the atlas with both Latin and common Simplified-Chinese glyphs so the
-        // UI can switch languages at runtime without rebuilding the font.
-        if (!io.Fonts->AddFontFromFileTTF(
-                fontFile_.c_str(), fontSize, nullptr, io.Fonts->GetGlyphRangesChineseSimplifiedCommon())) {
-                ImFontConfig cfg;
-                cfg.SizePixels = fontSize;
-                io.Fonts->AddFontDefault(&cfg);
-        }
+        const float fontSize = ui::design::FontSize(ui::design::body, uiScale);
+        ui::LoadPlatformFonts(*io.Fonts, fontSize);
 
-        // Restore the persisted UI language (defaults to English on first launch).
+        // Restore the persisted UI language (defaults to English on first launch)
         loadLangSetting();
-
-        ImGui::StyleColorsDark();
-        ImGui::GetStyle().ScaleAllSizes(uiScale);
-        if (io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
-                ImGuiStyle &style                 = ImGui::GetStyle();
-                style.WindowRounding              = 0.0f;
-                style.Colors[ImGuiCol_WindowBg].w = 1.0f;
+#ifdef _WIN32
+        {
+                std::ifstream     file(getAppDir() + "/window_preferences.json");
+                const std::string text((std::istreambuf_iterator<char>(file)), {});
+                if (auto *root = cJSON_Parse(text.c_str())) {
+                        if (auto *val = cJSON_GetObjectItemCaseSensitive(root, "closeBehavior"); cJSON_IsString(val)) {
+                                if (std::string(val->valuestring) == "exit")
+                                        closeBehavior_ = CloseBehavior::Exit;
+                                if (std::string(val->valuestring) == "tray")
+                                        closeBehavior_ = CloseBehavior::Tray;
+                        }
+                        cJSON_Delete(root);
+                }
         }
+#endif
+        remote::loadDefaults(getAppDir() + "/remote_files.json");
+        localFileServer_.loadSettings(getAppDir() + "/local_file_server.json");
+        if (localFileServer_.config.autoStart)
+                localFileServer_.start();
+        websiteServer_.config.port = 8091;
+        websiteServer_.loadSettings(getAppDir() + "/website_server.json");
+        if (websiteServer_.config.autoStart)
+                websiteServer_.start();
+
+        {
+                // Appearance belongs to this computer, not to a portable .ava session.
+                std::ifstream file(getAppDir() + "/color_scheme.txt");
+                int           saved = 0;
+                if (file >> saved && saved >= 0 && saved < static_cast<int>(ui::ColorScheme::Count))
+                        colorScheme_ = static_cast<ui::ColorScheme>(saved);
+        }
+        loadAppearance();
+        ui::ApplyAppStyle(colorScheme_, uiScale_, io.ConfigFlags & ImGuiConfigFlags_ViewportsEnable, appearanceDark_);
+#ifdef _WIN32
+        native_appearance::applyWindow(glfwGetWin32Window(window_), appearanceDark_);
+#endif
 
         static std::string iniPath = getAppDir() + "/imgui.ini";
         io.IniFilename             = iniPath.c_str();
@@ -230,20 +311,19 @@ Gui::Gui(const std::string &initialPath)
         ImGui_ImplOpenGL3_Init(glslVer_);
 
         ImPlot::CreateContext();
+        ui::ApplyPlotStyle(appearanceDark_);
 
         if (!initialPath.empty()) {
                 LOG_I("Startup session explicitly requested: %s", initialPath.c_str());
                 loadSession(initialPath);
         } else {
-                std::error_code ec;
-                const bool      hasDefaultSession = std::filesystem::is_regular_file(currentSessionPath_, ec);
-                if (hasDefaultSession) {
-                        LOG_I("Startup auto-loading default session: %s", currentSessionPath_.c_str());
-                        loadSession();
-                } else {
-                        LOG_I(
-                            "Startup cold state: no default session at '%s' (ec=%d)", currentSessionPath_.c_str(), ec.value());
-                }
+                startupSessionPickerPending_ = true;
+                startupSessionSelection_     = static_cast<size_t>(std::distance(
+                    recentSessions_.begin(),
+                    std::ranges::find_if(recentSessions_, [](const std::string &path) { return recentPathExists(path); })));
+                if (startupSessionSelection_ >= recentSessions_.size())
+                        startupSessionSelection_ = 0;
+                LOG_I("Startup waiting for session selection (%zu recent sessions)", recentSessions_.size());
         }
 
         if (motorProfiles_.empty())
@@ -271,6 +351,14 @@ Gui::Gui(const std::string &initialPath)
                 }
                 return false;
         });
+        deviceManager_.setOpenSdkHandler([this](int id) {
+                for (const auto &panel : sdkPanels_)
+                        if (panel->getWinId() == id) {
+                                panel->open_ = true;
+                                ImGui::SetWindowFocus(panel->title());
+                                break;
+                        }
+        });
         midiTool_.setSymbolResolver([this](const std::string &name, std::uint32_t &address) {
                 for (const auto &variableWindow : vars_ | std::views::values) {
                         if (variableWindow->findElfSymbolAddress(name, address))
@@ -280,11 +368,22 @@ Gui::Gui(const std::string &initialPath)
         });
 
         TutorialGuide::instance().loadState(getAppDir());
+        if (isFirstSave_)
+                showHome_ = vars_.empty() && monitors_.empty() && sdkPanels_.empty();
+        captureSessionBaseline(true);
+        // Help retains the explicit tour; the home surface does not cover controls with an automatic overlay.
+        TutorialGuide::instance().dismiss();
 }
 
 Gui::~Gui()
 {
         LOG_I("~Gui()");
+        recorder_.finish();
+        systemTray_.remove();
+        localFileServer_.stop();
+        websiteServer_.stop();
+        motorControl_.shutdown();
+        dsoScope_.shutdown();
         midiTool_.stop();
         JLinkPort::instance().setTraceAddressResolver({});
         bkpSramDebugger_.setSymbolResolver({});
@@ -297,12 +396,16 @@ Gui::~Gui()
         }
 
         // imgui.ini owns ordinary window/dock layout persistence.  WantSaveIniSettings
-        // is not a session-data edit and must not create/overwrite a .ava file.
+        // is not a session-data edit and must not create/overwrite a .ava file
         if (!skipAutoSave_ && isModified_) {
                 saveSession();
         }
+        rememberLastSession();
 
         ImPlot::DestroyContext();
+
+        for (auto &[name, monitor] : monitors_)
+                monitor->mujocoView_.reset();
 
         ImGui_ImplOpenGL3_Shutdown();
         ImGui_ImplGlfw_Shutdown();
@@ -320,6 +423,243 @@ Gui::hide()
 {
         if (window_) {
                 glfwHideWindow(window_);
+        }
+}
+
+bool
+Gui::minimizeToTray()
+{
+        if (inTray_)
+                return true;
+        if (!systemTray_.show()) {
+                LOG_W("Cannot create tray icon; keeping ordinary window close/minimize behavior");
+                return false;
+        }
+        trayViewportIds_.clear();
+        for (auto *viewport : ImGui::GetPlatformIO().Viewports) {
+                auto *window = static_cast<GLFWwindow *>(viewport->PlatformHandle);
+                if (window && glfwGetWindowAttrib(window, GLFW_VISIBLE)) {
+                        trayViewportIds_.push_back(viewport->ID);
+                        glfwHideWindow(window);
+                }
+        }
+        glfwHideWindow(window_);
+        glfwSetWindowShouldClose(window_, GLFW_FALSE);
+        inTray_ = true;
+        return true;
+}
+
+void
+Gui::restoreFromTray()
+{
+        if (!inTray_)
+                return;
+        // A dock/popup viewport can disappear during background data updates
+        // Restore only current viewports, rather than retaining native pointers
+        for (auto *viewport : ImGui::GetPlatformIO().Viewports)
+                if (viewport->PlatformHandle &&
+                    std::find(trayViewportIds_.begin(), trayViewportIds_.end(), viewport->ID) != trayViewportIds_.end())
+                        glfwShowWindow(static_cast<GLFWwindow *>(viewport->PlatformHandle));
+        trayViewportIds_.clear();
+        glfwRestoreWindow(window_);
+        glfwShowWindow(window_);
+        glfwFocusWindow(window_);
+        inTray_ = false;
+        systemTray_.remove();
+}
+
+void
+Gui::requestExit()
+{
+        showCloseChoice_ = false;
+        restoreFromTray();
+        exitRequested_ = true;
+        glfwSetWindowShouldClose(window_, GLFW_TRUE);
+}
+
+void
+Gui::drawElevationPrompt()
+{
+#ifdef _WIN32
+        if (motorControl_.consumeElevationRequest()) {
+                showElevationPrompt_ = true;
+                elevationError_.clear();
+        }
+        const char *title = tr("Device permissions###DeviceElevation", "设备访问权限###DeviceElevation");
+        if (showElevationPrompt_) {
+                ImGui::OpenPopup(title);
+                showElevationPrompt_ = false;
+        }
+        if (!ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+                return;
+        ImGui::TextUnformatted(tr("Device access was denied. Administrator rights may be required.",
+                                  "设备访问被拒绝，当前驱动可能需要管理员权限。"));
+        ImGui::TextUnformatted(
+            tr("Save the session and restart with administrator rights?", "是否保存当前会话，并以管理员权限重启？"));
+        ImGui::TextUnformatted(tr("Device connections will close. The motor will not reconnect or enable automatically.",
+                                  "重启将关闭设备连接，电机不会自动重连或使能。"));
+        if (!elevationError_.empty())
+                ui::ErrorTextWrapped("%s", elevationError_.c_str());
+        if (ImGui::Button(tr("Save and restart", "保存并重启"))) {
+                // Force a checked save even when connection settings were the only edits
+                isModified_ = true;
+                saveSession();
+                if (isModified_ || isFirstSave_)
+                        elevationError_ = tr("Session was not saved; restart cancelled.", "会话未保存，已取消重启。");
+                else {
+                        const auto path = std::filesystem::absolute(
+                            std::filesystem::path(std::u8string(currentSessionPath_.begin(), currentSessionPath_.end())));
+                        unsigned long error  = 0;
+                        const auto    result = elevation::relaunchAsAdministrator(error, path.wstring());
+                        if (result == elevation::Result::Relaunched) {
+                                // The new process waits for our exit before loading the session
+                                skipAutoSave_ = true;
+                                wantsToQuit_  = true;
+                                ImGui::CloseCurrentPopup();
+                        } else if (result == elevation::Result::Failed) {
+                                elevationError_ =
+                                    error == ERROR_CANCELLED
+                                        ? tr("Authorization cancelled; continue using the current window.",
+                                             "已取消授权，可继续使用当前窗口。")
+                                        : std::string(tr("Restart failed, Windows error: ", "重启失败，Windows 错误：")) +
+                                              std::to_string(error);
+                        }
+                }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Cancel", "取消")))
+                ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+#endif
+}
+
+void
+Gui::processWindowActions()
+{
+        switch (systemTray_.takeAction()) {
+                case SystemTray::Action::Restore:
+                        restoreFromTray();
+                        break;
+                case SystemTray::Action::Exit:
+                        requestExit();
+                        break;
+                default:
+                        break;
+        }
+#ifdef _WIN32
+        const bool closing = glfwWindowShouldClose(window_) && !exitRequested_ && !wantsToQuit_ && !showQuitModal_;
+        if (closing && !localFileServer_.running() && !websiteServer_.running()) {
+                // Only keep the application in the background when it is serving files
+                requestExit();
+        } else if (closing) {
+                glfwSetWindowShouldClose(window_, GLFW_FALSE);
+                if (!showCloseChoice_) {
+                        if (closeBehavior_ == CloseBehavior::Ask) {
+                                showCloseChoice_     = true;
+                                rememberCloseChoice_ = closeChoiceError_ = false;
+                        } else
+                                chooseCloseBehavior(closeBehavior_, false);
+                }
+        }
+        if (minimizeRequested_)
+                minimizeToTray();
+#endif
+        minimizeRequested_ = false;
+}
+
+void
+Gui::updatePlatformWindows()
+{
+        if (!(ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable))
+                return;
+        auto &platform   = ImGui::GetPlatformIO();
+        auto  showWindow = platform.Platform_ShowWindow;
+        if (inTray_)
+                platform.Platform_ShowWindow = [](ImGuiViewport *viewport) {
+                        if (viewport->PlatformHandle)
+                                glfwHideWindow(static_cast<GLFWwindow *>(viewport->PlatformHandle));
+                };
+        GLFWwindow *context = glfwGetCurrentContext();
+        // Required after every rendered frame, even when all windows are hidden
+        ImGui::UpdatePlatformWindows();
+        for (auto *viewport : platform.Viewports)
+                native_appearance::applyWindow(viewport->PlatformHandleRaw, appearanceDark_);
+        platform.Platform_ShowWindow = showWindow;
+        glfwMakeContextCurrent(context);
+        if (inTray_) {
+                trayViewportIds_.clear();
+                for (auto *viewport : platform.Viewports) {
+                        if (!viewport->PlatformHandle)
+                                continue;
+                        glfwHideWindow(static_cast<GLFWwindow *>(viewport->PlatformHandle));
+                        trayViewportIds_.push_back(viewport->ID);
+                }
+        }
+}
+
+void
+Gui::saveWindowPreferences()
+{
+        std::ofstream file(getAppDir() + "/window_preferences.json", std::ios::trunc);
+        const char   *behavior = closeBehavior_ == CloseBehavior::Tray   ? "tray"
+                                 : closeBehavior_ == CloseBehavior::Exit ? "exit"
+                                                                         : "ask";
+        file << "{\"closeBehavior\":\"" << behavior << "\"}";
+        if (!file)
+                LOG_W("Cannot save window preferences");
+}
+
+bool
+Gui::chooseCloseBehavior(CloseBehavior behavior, bool remember)
+{
+        if (behavior == CloseBehavior::Tray && !minimizeToTray()) {
+                closeChoiceError_ = true;
+                showCloseChoice_  = true;
+                return false;
+        }
+        showCloseChoice_ = false;
+        if (remember) {
+                closeBehavior_ = behavior;
+                saveWindowPreferences();
+        }
+        if (behavior == CloseBehavior::Exit)
+                requestExit();
+        return true;
+}
+
+void
+Gui::drawCloseChoicePopup()
+{
+        if (!showCloseChoice_)
+                return;
+        const char *title = tr("Close AvA Tool###CloseAction", "关闭 AvA Tool###CloseAction");
+        ImGui::OpenPopup(title);
+        if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextUnformatted(
+                    tr("Exit the application or minimize it to the system tray?", "退出程序，还是缩小到系统托盘？"));
+                ImGui::TextDisabled("%s", tr("File sharing continues while in the tray.", "缩小到托盘后，文件共享继续运行。"));
+                ImGui::Checkbox(tr("Remember my choice as the default", "记住我的选择，设为默认行为"), &rememberCloseChoice_);
+                if (closeChoiceError_)
+                        ImGui::TextWrapped("%s",
+                                           tr("Cannot create the tray icon. Try again or exit the application.",
+                                              "无法创建托盘图标，请重试或选择退出程序。"));
+                ImGui::Separator();
+                if (ImGui::Button(tr("Exit application", "退出程序"), ImVec2(120, 0))) {
+                        if (chooseCloseBehavior(CloseBehavior::Exit, rememberCloseChoice_))
+                                ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(tr("Minimize to tray", "缩小到托盘"), ImVec2(120, 0))) {
+                        if (chooseCloseBehavior(CloseBehavior::Tray, rememberCloseChoice_))
+                                ImGui::CloseCurrentPopup();
+                }
+                ImGui::SameLine();
+                if (ImGui::Button(tr("Cancel", "取消"), ImVec2(120, 0)) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+                        showCloseChoice_ = false;
+                        ImGui::CloseCurrentPopup();
+                }
+                ImGui::SetItemDefaultFocus();
+                ImGui::EndPopup();
         }
 }
 
@@ -354,6 +694,19 @@ Gui::loadRecentList()
                         break;
                 }
         }
+
+        // Older builds recorded only last_session.txt. Keep that file available
+        // in the startup chooser without loading it automatically.
+        std::ifstream lastFile(getAppDir() + "/last_session.txt");
+        if (std::getline(lastFile, line)) {
+                std::string last = sanitizeRecentPath(std::move(line));
+                if (!last.empty() && std::ranges::find(recentSessions_, last) == recentSessions_.end()) {
+                        recentSessions_.insert(recentSessions_.begin(), std::move(last));
+                        if (recentSessions_.size() > 10)
+                                recentSessions_.resize(10);
+                        repaired = true;
+                }
+        }
         if (repaired)
                 saveRecentList();
 }
@@ -367,6 +720,19 @@ Gui::saveRecentList()
 }
 
 void
+Gui::rememberLastSession()
+{
+        if (isFirstSave_ || remote::isUrl(currentSessionPath_))
+                return;
+        std::error_code ec;
+        const auto      path = std::filesystem::absolute(std::filesystem::u8path(currentSessionPath_), ec);
+        if (ec || !std::filesystem::is_regular_file(path, ec))
+                return;
+        std::ofstream file(getAppDir() + "/last_session.txt", std::ios::trunc);
+        file << pathToUtf8(path) << '\n';
+}
+
+void
 Gui::addRecent(const std::string &path)
 {
         const std::string cleanPath = sanitizeRecentPath(path);
@@ -375,13 +741,15 @@ Gui::addRecent(const std::string &path)
         std::string abs = cleanPath;
         try {
                 std::error_code ec;
-                const auto      absPath = std::filesystem::absolute(std::filesystem::u8path(cleanPath), ec);
-                if (!ec)
+                const auto      absPath = remote::isUrl(cleanPath)
+                                              ? std::filesystem::u8path(cleanPath)
+                                              : std::filesystem::absolute(std::filesystem::u8path(cleanPath), ec);
+                if (!ec && !remote::isUrl(cleanPath))
                         abs = pathToUtf8(absPath);
         } catch (const std::filesystem::filesystem_error &) {
         }
 
-        // Move to front, de-duplicated, capped at 10 entries.
+        // Move to front, de-duplicated, capped at 10 entries
         for (auto it = recentSessions_.begin(); it != recentSessions_.end();) {
                 if (*it == abs)
                         it = recentSessions_.erase(it);
@@ -392,6 +760,151 @@ Gui::addRecent(const std::string &path)
         if (recentSessions_.size() > 10)
                 recentSessions_.resize(10);
         saveRecentList();
+}
+
+bool
+Gui::chooseStartupSession(const std::string &path)
+{
+        if (path.empty() || !recentPathExists(path))
+                return false;
+        startupSessionPickerPending_ = false;
+        sessionChange_               = SessionChange::Open;
+        sessionChangePath_           = path;
+        sessionChangeSource_.clear();
+        sessionChangeReady_ = true;
+        LOG_I("Startup session selected: %s", path.c_str());
+        return true;
+}
+
+void
+Gui::startBlankStartupSession()
+{
+        startupSessionPickerPending_ = false;
+        showHome_                    = true;
+        LOG_I("Startup session selection skipped; using a blank workspace");
+}
+
+void
+Gui::drawStartupSessionPicker()
+{
+        if (!startupSessionPickerPending_)
+                return;
+
+        const char *title = tr("Open AVA session###StartupSessionPicker", "打开 AVA 会话###StartupSessionPicker");
+        if (!ImGui::IsPopupOpen("###StartupSessionPicker"))
+                ImGui::OpenPopup("###StartupSessionPicker");
+        ImGui::SetNextWindowSizeConstraints(ImVec2(560 * uiScale_, 0), ImVec2(760 * uiScale_, 620 * uiScale_));
+        if (!ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+                return;
+
+        ImGui::Spacing();
+
+        std::string sessionToOpen;
+        bool        startBlank = false;
+        if (recentSessions_.empty()) {
+                ImGui::TextDisabled("%s", tr("No recent AVA sessions.", "没有最近使用的 AVA 会话。"));
+        } else {
+                if (startupSessionSelection_ >= recentSessions_.size())
+                        startupSessionSelection_ = 0;
+                const auto  &style       = ImGui::GetStyle();
+                const float  rowHeight   = ImGui::GetTextLineHeight() * 2.0f + style.FramePadding.y * 2.0f + 4.0f;
+                const size_t visibleRows = std::min<size_t>(recentSessions_.size(), 8);
+                const float  listHeight  = visibleRows * rowHeight + (visibleRows - 1) * style.ItemSpacing.y + 4.0f;
+                ImGui::BeginChild("##startup_recent_sessions", ImVec2(0.0f, listHeight), true);
+                for (size_t i = 0; i < recentSessions_.size(); ++i) {
+                        const std::string &path      = recentSessions_[i];
+                        const bool         available = recentPathExists(path);
+                        const bool         selected  = i == startupSessionSelection_;
+                        ImGui::PushID(static_cast<int>(i));
+                        const float width = ImGui::GetContentRegionAvail().x;
+                        ImGui::InvisibleButton("##session", ImVec2(width, rowHeight));
+                        const bool hovered = ImGui::IsItemHovered();
+                        const auto min     = ImGui::GetItemRectMin();
+                        const auto max     = ImGui::GetItemRectMax();
+                        auto      *draw    = ImGui::GetWindowDrawList();
+                        const auto accent  = ImGui::GetStyleColorVec4(ImGuiCol_CheckMark);
+                        const auto base    = ImGui::GetStyleColorVec4(ImGuiCol_FrameBg);
+                        auto       fill    = selected
+                                                 ? ui::MixSurface(base, accent, .34f)
+                                                 : (available && hovered ? ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered) : base);
+                        if (!available)
+                                fill = ui::MixSurface(base, ImGui::GetStyleColorVec4(ImGuiCol_WindowBg), .35f);
+                        const float radius = ImGui::GetStyle().FrameRounding;
+                        draw->AddRectFilled(min, max, ImGui::GetColorU32(fill), radius);
+                        if (selected)
+                                draw->AddRect(min, max, ImGui::GetColorU32(accent), radius, 0, 1.0f);
+
+                        const float  inset = style.FramePadding.x + 3.0f;
+                        const ImVec4 clipMin(min.x + inset, min.y, max.x - inset, max.y);
+                        const auto   textColor = ImGui::GetStyleColorVec4(available ? ImGuiCol_Text : ImGuiCol_TextDisabled);
+                        std::string  name      = recentDisplayName(path);
+                        if (!available)
+                                name += std::string("  (") + tr("missing", "文件不存在") + ")";
+                        draw->AddText(ImGui::GetFont(),
+                                      ImGui::GetFontSize(),
+                                      ImVec2(min.x + inset, min.y + style.FramePadding.y),
+                                      ImGui::GetColorU32(textColor),
+                                      name.c_str(),
+                                      nullptr,
+                                      0.0f,
+                                      &clipMin);
+                        std::string parent = path;
+                        if (!remote::isUrl(path)) {
+                                try {
+                                        parent = pathToUtf8(std::filesystem::u8path(path).parent_path());
+                                } catch (const std::filesystem::filesystem_error &) {
+                                }
+                        }
+                        draw->AddText(ImGui::GetFont(),
+                                      ImGui::GetFontSize(),
+                                      ImVec2(min.x + inset, min.y + style.FramePadding.y + ImGui::GetTextLineHeight()),
+                                      ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                                      parent.c_str(),
+                                      nullptr,
+                                      0.0f,
+                                      &clipMin);
+
+                        if (available && hovered)
+                                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                        if (available && ImGui::IsItemClicked()) {
+                                startupSessionSelection_ = i;
+                                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                                        sessionToOpen = path;
+                        }
+                        if (hovered)
+                                ImGui::SetTooltip("%s%s", path.c_str(), available ? "" : "  (missing)");
+                        ImGui::PopID();
+                }
+                ImGui::EndChild();
+        }
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        if (ImGui::Button(tr("Open another file...", "打开其他文件...")))
+                sessionToOpen = nativeDlgOpen(tr("Open Session", "打开会话"), {{"Session Files", {"ava", "json"}}});
+        ImGui::SameLine();
+        if (ImGui::Button(tr("Start blank", "空白工作区")) || ImGui::IsKeyPressed(ImGuiKey_Escape))
+                startBlank = true;
+
+        const bool hasSelection =
+            startupSessionSelection_ < recentSessions_.size() && recentPathExists(recentSessions_[startupSessionSelection_]);
+        const float openWidth = 152.0f * uiScale_;
+        const float buttonX   = ImGui::GetWindowContentRegionMax().x - openWidth;
+        if (ImGui::GetCursorPosX() < buttonX)
+                ImGui::SameLine(buttonX);
+        ImGui::BeginDisabled(!hasSelection);
+        if (ui::Button(tr("Open selected", "打开选中会话"), ui::BtnStyle::Primary, ImVec2(openWidth, 0.0f)) && hasSelection)
+                sessionToOpen = recentSessions_[startupSessionSelection_];
+        ImGui::SetItemDefaultFocus();
+        ImGui::EndDisabled();
+
+        if (!sessionToOpen.empty() && chooseStartupSession(sessionToOpen)) {
+                ImGui::CloseCurrentPopup();
+        } else if (startBlank) {
+                startBlankStartupSession();
+                ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
 }
 
 void
@@ -443,14 +956,14 @@ Gui::setLang(Lang lang)
 bool
 Gui::shouldAutoCheckUpdate()
 {
-        // Skip the startup check if we already checked within the last 6 hours.
+        // Skip the startup check if we already checked within the prev 6 hours
         // GitHub's unauthenticated API allows only 60 requests/hour per IP, so an
-        // app that checks on every launch can trip a 403 across repeated launches.
+        // app that checks on every launch can trip a 403 across repeated launches
         std::ifstream f(getAppDir() + "/update_check.txt");
-        long long     last = 0;
-        if (f >> last) {
+        long long     prev = 0;
+        if (f >> prev) {
                 const long long now = static_cast<long long>(std::time(nullptr));
-                if (now - last < 6 * 3600)
+                if (now - prev < 6 * 3600)
                         return false;
         }
         return true;
@@ -463,28 +976,30 @@ Gui::recordUpdateCheck()
         f << static_cast<long long>(std::time(nullptr));
 }
 
-void
+bool
 Gui::saveSession(const std::string &path)
 {
-        if (path.empty() && isFirstSave_) {
-                saveSessionAs();
-                return;
+        if ((path.empty() && (isFirstSave_ || remote::isUrl(currentSessionPath_))) || remote::isUrl(path)) {
+                return saveSessionAs();
         }
         u64 start = get_mono_ts_ms();
 
         std::lock_guard lk(mtxMonitors_);
         std::string     targetPath = path.empty() ? currentSessionPath_ : path;
         cJSON          *root       = cJSON_CreateObject();
+        remote::save(root);
+        flashTool_.saveSession(root);
 
-        const std::filesystem::path monitorBaseDir = std::filesystem::path(targetPath).parent_path();
+        const std::filesystem::path monitorBaseDir = std::filesystem::u8path(targetPath).parent_path();
         auto                        monitorToRel   = [&](const std::string &p) -> std::string {
-                if (p.empty() || monitorBaseDir.empty())
+                if (p.empty() || remote::isUrl(p) || monitorBaseDir.empty())
                         return p;
                 std::error_code ec;
-                auto            rel = std::filesystem::relative(p, monitorBaseDir, ec);
+                auto            rel = std::filesystem::relative(std::filesystem::u8path(p), monitorBaseDir, ec);
                 if (ec || rel.empty())
                         return p;
-                return rel.generic_string();
+                const auto utf8 = rel.generic_u8string();
+                return std::string(utf8.begin(), utf8.end());
         };
 
         cJSON *jlink = cJSON_CreateObject();
@@ -493,6 +1008,7 @@ Gui::saveSession(const std::string &path)
         cJSON_AddItemToObject(root, "jlink", jlink);
 
         cJSON_AddBoolToObject(root, "showCalculator", showCalculator_);
+        cJSON_AddBoolToObject(root, "showHome", showHome_);
 
         {
                 cJSON *eff = cJSON_CreateObject();
@@ -500,11 +1016,11 @@ Gui::saveSession(const std::string &path)
                 cJSON_AddNumberToObject(eff, "refreshMs", s_eff.refreshMs);
                 cJSON_AddStringToObject(eff, "torqueLink", s_eff.torqueLink.c_str());
                 cJSON_AddStringToObject(eff, "speedLink", s_eff.speedLink.c_str());
-                cJSON_AddStringToObject(eff, "voltageLink", s_eff.voltageLink.c_str());
+                cJSON_AddStringToObject(eff, "volLink", s_eff.volLink.c_str());
                 cJSON_AddStringToObject(eff, "currentLink", s_eff.currentLink.c_str());
                 cJSON_AddNumberToObject(eff, "torqueUnit", s_eff.torqueUnit);
                 cJSON_AddNumberToObject(eff, "speedUnit", s_eff.speedUnit);
-                cJSON_AddNumberToObject(eff, "voltageUnit", s_eff.voltageUnit);
+                cJSON_AddNumberToObject(eff, "volUnit", s_eff.volUnit);
                 cJSON_AddNumberToObject(eff, "currentUnit", s_eff.currentUnit);
                 cJSON_AddNumberToObject(eff, "spdMin", static_cast<double>(s_eff.spdMin));
                 cJSON_AddNumberToObject(eff, "spdMax", static_cast<double>(s_eff.spdMax));
@@ -531,7 +1047,28 @@ Gui::saveSession(const std::string &path)
                 cJSON_AddBoolToObject(mObj, "jlinkSamplingPaused", m->isSamplingPaused());
                 cJSON_AddNumberToObject(mObj, "maxSampleHz", m->maxSampleHz_);
                 cJSON_AddNumberToObject(mObj, "historySeconds", static_cast<f64>(m->historySeconds_));
+                cJSON_AddNumberToObject(mObj, "scopeLayout", static_cast<int>(m->scopeLayout()));
+                cJSON_AddBoolToObject(mObj, "linkScopeCursor", m->linkScopeCursor_);
+                cJSON_AddBoolToObject(mObj, "mujocoEnabled", m->mujocoEnabled_);
+                cJSON_AddStringToObject(mObj, "mujocoModelPath", m->mujocoModelPath_.c_str());
+                cJSON_AddNumberToObject(mObj, "mujocoHeight", m->mujocoHeight_);
+                if (m->mujocoEnabled_) {
+                        const auto &control = m->mujocoView_ ? m->mujocoView_->control() : m->mujocoControl_;
+                        auto       *obj     = cJSON_AddObjectToObject(mObj, "mujocoControl");
+                        cJSON_AddNumberToObject(obj, "mode", static_cast<int>(control.mode));
+                        for (auto [name, member] : {std::pair{"positionKp", &ava_mujoco::Control::positionKp},
+                                                    {"velocityKp", &ava_mujoco::Control::velocityKp},
+                                                    {"velocityKi", &ava_mujoco::Control::velocityKi},
+                                                    {"pdKp", &ava_mujoco::Control::pdKp},
+                                                    {"pdKd", &ava_mujoco::Control::pdKd},
+                                                    {"positionTarget", &ava_mujoco::Control::positionTarget},
+                                                    {"velocityTarget", &ava_mujoco::Control::velocityTarget},
+                                                    {"velocityFeedforward", &ava_mujoco::Control::velocityFeedforward},
+                                                    {"torqueFeedforward", &ava_mujoco::Control::torqueFeedforward}})
+                                cJSON_AddNumberToObject(obj, name, control.*member);
+                }
                 cJSON_AddNumberToObject(mObj, "maxDisplayPoints", static_cast<f64>(m->maxDisplayPoints_));
+                cJSON_AddNumberToObject(mObj, "timeAxisFormat", m->timeAxisFormat_);
                 if (!m->importSourcePath_.empty()) {
                         const std::string importType = !m->importSourceType_.empty()
                                                            ? m->importSourceType_
@@ -546,7 +1083,7 @@ Gui::saveSession(const std::string &path)
 
                 cJSON *scopesArr = cJSON_CreateArray();
                 // Persist scopes in their user-defined display order so it survives a
-                // save/load round-trip (the map itself is unordered).
+                // save/load round-trip (the map itself is unordered)
                 std::vector<MonitorScope *> orderedScopes;
                 for (auto &s : m->getScopes() | std::views::values)
                         orderedScopes.push_back(s.get());
@@ -565,6 +1102,7 @@ Gui::saveSession(const std::string &path)
                         cJSON_AddBoolToObject(sObj, "showFft", s->getShowFft());
                         cJSON_AddBoolToObject(sObj, "fftBars", s->getFftBars());
                         cJSON_AddBoolToObject(sObj, "showSidePanel", s->getShowSidePanel());
+                        cJSON_AddBoolToObject(sObj, "compareStatistics", s->getCompareStatistics());
                         cJSON_AddNumberToObject(sObj, "fftPoints", static_cast<f64>(s->getFftPoints()));
                         cJSON_AddNumberToObject(sObj, "fftPeakCount", static_cast<f64>(s->getFftPeakCount()));
 
@@ -586,8 +1124,8 @@ Gui::saveSession(const std::string &path)
                         }
 
                         cJSON *chsArr = cJSON_CreateArray();
-                        // Persist channels in insertion order so the order survives a
-                        // save/load round-trip (the map itself is unordered).
+                        // Persist chs in insertion order so the order survives a
+                        // save/load round-trip (the map itself is unordered)
                         std::vector<MonitorChannel *> orderedChs;
                         for (auto &ch : s->getChannels() | std::views::values)
                                 orderedChs.push_back(ch.get());
@@ -603,6 +1141,10 @@ Gui::saveSession(const std::string &path)
                                 snprintf(addrHex, sizeof(addrHex), "0x%zX", ch->getAddr());
                                 cJSON_AddStringToObject(chObj, "addr", addrHex);
                                 cJSON_AddStringToObject(chObj, "device", ch->getDevice().c_str());
+                                if (ch->getDevice() == ava_sim::device) {
+                                        cJSON_AddNumberToObject(chObj, "simField", ch->getSimField());
+                                        cJSON_AddBoolToObject(chObj, "simReferenceControl", true);
+                                }
                                 if (!ch->getShmRegionName().empty())
                                         cJSON_AddStringToObject(chObj, "shmRegionName", ch->getShmRegionName().c_str());
 
@@ -622,21 +1164,55 @@ Gui::saveSession(const std::string &path)
                                 cJSON_AddBoolToObject(chObj, "showMarkers", ch->showMarkers());
                                 cJSON_AddBoolToObject(chObj, "show", ch->show());
                                 cJSON_AddBoolToObject(chObj, "writable", ch->isWritable());
+                                cJSON_AddNumberToObject(chObj, "displayRadix", ch->getDisplayRadix());
+                                unit_conversion::SaveSettings(chObj, "unitConversion", ch->unitConversion_);
                                 cJSON_AddNumberToObject(chObj, "bitOffset", ch->getBitOffset());
                                 cJSON_AddNumberToObject(chObj, "bitSize", ch->getBitSize());
+
+                                {
+                                        const auto &wave    = ch->waveCfgPending_;
+                                        cJSON      *waveObj = cJSON_CreateObject();
+                                        cJSON_AddNumberToObject(waveObj, "mode", wave.mode.load());
+                                        cJSON_AddNumberToObject(waveObj, "type", wave.type.load());
+                                        cJSON_AddNumberToObject(waveObj, "frequency", wave.freq.load());
+                                        cJSON_AddNumberToObject(waveObj, "amplitude", wave.amp.load());
+                                        cJSON_AddNumberToObject(waveObj, "offset", wave.offset.load());
+                                        cJSON_AddNumberToObject(waveObj, "duty", wave.duty.load());
+
+                                        static constexpr const char *paramNames[] = {
+                                            "frequency", "amplitude", "phase", "offset", "duty"};
+                                        cJSON *paramsObj = cJSON_CreateObject();
+                                        for (usize i = 0; i < MonitorChannel::WaveCfgPending::PARAM_COUNT; ++i) {
+                                                const auto &param    = wave.params[i];
+                                                cJSON      *paramObj = cJSON_CreateObject();
+                                                cJSON_AddNumberToObject(paramObj, "law", param.law.load());
+                                                cJSON_AddNumberToObject(paramObj, "start", param.start.load());
+                                                cJSON_AddNumberToObject(paramObj, "end", param.end.load());
+                                                cJSON_AddNumberToObject(paramObj, "duration", param.duration.load());
+                                                cJSON_AddNumberToObject(paramObj, "step", param.step.load());
+                                                cJSON_AddNumberToObject(paramObj, "interval", param.interval.load());
+                                                cJSON_AddBoolToObject(paramObj, "repeat", param.repeat.load());
+                                                cJSON_AddItemToObject(paramsObj, paramNames[i], paramObj);
+                                        }
+                                        cJSON_AddItemToObject(waveObj, "params", paramsObj);
+                                        cJSON_AddItemToObject(chObj, "waveGenerator", waveObj);
+                                }
 
                                 if (ch->isEnum()) {
                                         cJSON *enumsArr = cJSON_CreateArray();
                                         for (const auto &e : ch->getEnums()) {
                                                 cJSON *eObj = cJSON_CreateObject();
                                                 cJSON_AddStringToObject(eObj, "name", e.name.c_str());
-                                                cJSON_AddNumberToObject(eObj, "value", static_cast<f64>(e.value));
+                                                cJSON_AddNumberToObject(eObj, "value", static_cast<f64>(e.val));
                                                 cJSON_AddItemToArray(enumsArr, eObj);
                                         }
                                         cJSON_AddItemToObject(chObj, "enums", enumsArr);
                                 }
                                 cJSON_AddItemToArray(chsArr, chObj);
                         }
+                        // The persisted key is "channels" (the pre-rewrite session
+                        // format used that name).  Keep it stable so old .ava files
+                        // still load their monitor channels
                         cJSON_AddItemToObject(sObj, "channels", chsArr);
                         cJSON_AddItemToArray(scopesArr, sObj);
                 }
@@ -646,16 +1222,17 @@ Gui::saveSession(const std::string &path)
         cJSON_AddItemToObject(root, "monitors", monitorsArr);
 
         // Store file paths relative to the .ava file so the session stays portable
-        // when the project folder is moved. Cross-drive paths fall back to absolute.
-        const std::filesystem::path baseDir = std::filesystem::path(targetPath).parent_path();
+        // when the project folder is moved. Cross-drive paths fall back to absolute
+        const std::filesystem::path baseDir = std::filesystem::u8path(targetPath).parent_path();
         auto                        toRel   = [&](const std::string &p) -> std::string {
-                if (p.empty() || baseDir.empty())
+                if (p.empty() || remote::isUrl(p) || baseDir.empty())
                         return p;
                 std::error_code ec;
-                auto            rel = std::filesystem::relative(p, baseDir, ec);
+                auto            rel = std::filesystem::relative(std::filesystem::u8path(p), baseDir, ec);
                 if (ec || rel.empty())
                         return p;
-                return rel.generic_string();
+                const auto utf8 = rel.generic_u8string();
+                return std::string(utf8.begin(), utf8.end());
         };
 
         cJSON *VariableArr = cJSON_CreateArray();
@@ -687,18 +1264,23 @@ Gui::saveSession(const std::string &path)
         cJSON_AddItemToObject(root, "motorProfiles", motorsArr);
         cJSON_AddNumberToObject(root, "currentMotorProfile", currentMotorProfile_);
         cJSON_AddStringToObject(root, "imguiLayout", ImGui::SaveIniSettingsToMemory());
+        dockSession_.save(root);
         seqEditor_.saveSession(root);
 
         // Tool page visibility
         cJSON_AddBoolToObject(root, "showBode", bode_.show_);
         bode_.saveSession(root);
+        inverterSimulator_.saveSession(root);
         bkpSramDebugger_.saveSession(root);
         cJSON_AddBoolToObject(root, "showAsmViewer", asmViewer_.show_);
         cJSON_AddBoolToObject(root, "showSeqEditor", seqEditor_.isOpen());
         midiTool_.save(root);
+        motorControl_.save(root);
+        faultDecoder().save(root);
+        dsoScope_.save(root);
 
         // SDK panels
-        const std::string sdkBaseDir = std::filesystem::path(targetPath).parent_path().string();
+        const std::string sdkBaseDir = pathToUtf8(std::filesystem::u8path(targetPath).parent_path());
         cJSON_AddNumberToObject(root, "nextSdkWinId", nextSdkWinId_);
         cJSON *sdkArr = cJSON_CreateArray();
         for (const auto &sp : sdkPanels_) {
@@ -710,7 +1292,7 @@ Gui::saveSession(const std::string &path)
 
         // Device definitions, typed property values, and native-function
         // bindings live with the session. External file paths are stored
-        // relative to the .ava file by DeviceManager.
+        // relative to the .ava file by DeviceManager
         cJSON *deviceManagerObj = cJSON_CreateObject();
         deviceManager_.save(deviceManagerObj, sdkBaseDir);
         cJSON_AddItemToObject(root, "deviceManager", deviceManagerObj);
@@ -719,10 +1301,27 @@ Gui::saveSession(const std::string &path)
         char                 *out    = cJSON_Print(root); // formatted/pretty-printed for human readability
         u64                   pEnd   = get_mono_ts_ms();
         std::filesystem::path p(reinterpret_cast<const char8_t *>(targetPath.c_str()));
-        std::ofstream         ofs(p);
+        // Write beside the destination, then replace it only after a complete flush.
+        // A failed save must preserve both the old file and the dirty session.
+        auto temp            = p;
+        temp                += ".saving-" + std::to_string(get_mono_ts_ms());
+        bool          saved  = false;
+        std::ofstream ofs;
+        if (out)
+                ofs.open(temp, std::ios::binary | std::ios::trunc);
         if (ofs && out) {
                 ofs << out;
+                ofs.close(); // Check the flush before reporting success or restarting
                 if (ofs.good()) {
+#ifdef _WIN32
+                        saved = MoveFileExW(temp.c_str(), p.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+                        std::error_code error;
+                        std::filesystem::rename(temp, p, error);
+                        saved = !error;
+#endif
+                }
+                if (saved) {
                         for (const auto &v : vars_ | std::views::values)
                                 v->clearModified();
                         for (const auto &m : monitors_ | std::views::values)
@@ -730,6 +1329,7 @@ Gui::saveSession(const std::string &path)
                         seqEditor_.clearModified();
                         deviceManager_.clearModified();
                         bode_.clearModified();
+                        inverterSimulator_.clearModified();
                         bkpSramDebugger_.clearModified();
                         for (const auto &panel : sdkPanels_)
                                 panel->clearModified();
@@ -738,14 +1338,29 @@ Gui::saveSession(const std::string &path)
                         isModified_         = false;
                         isFirstSave_        = false;
                         addRecent(targetPath);
+                        captureSessionBaseline();
                 }
         }
         size_t outLen = out ? strlen(out) : 0;
         cJSON_free(out);
         cJSON_Delete(root);
+        if (!saved) {
+                std::error_code ignored;
+                std::filesystem::remove(temp, ignored);
+                ImGui::InsertNotification(
+                    {ImGuiToastType::Error,
+                     7000,
+                     "%s",
+                     tr("Session could not be saved. Check the folder and available space; your changes are still open.",
+                        "会话保存失败。请检查目录和剩余空间；当前更改仍保留在应用中。")});
+        } else {
+                ImGui::InsertNotification(
+                    {ImGuiToastType::Success, 3500, "%s", tr("Session saved successfully.", "会话保存成功。")});
+        }
 
         u64 end = get_mono_ts_ms();
         LOG_I("SaveSession Profile: Total %llu ms, JSON Print %llu ms, Size %zu bytes", end - start, pEnd - pStart, outLen);
+        return saved;
 }
 
 bool
@@ -754,56 +1369,94 @@ Gui::saveSessionAs()
         std::string path = nativeDlgSave("Save Session As", {{"Session Files", {"ava"}}}, "session.ava");
         if (path.empty())
                 return false;
-        if (path.find(".ava") == std::string::npos)
+        if (std::filesystem::u8path(path).extension() != ".ava")
                 path += ".ava";
-        saveSession(path);
-        saveToastAlpha_ = 2.0f;
-        LOG_I("Session saved As: %s", path.c_str());
-        return true;
+        return saveSession(path);
 }
 
 void
-Gui::loadSession(const std::string &path)
+Gui::loadSession(const std::string &path, const std::string &sourceUrl)
 {
-        u64                   start = get_mono_ts_ms();
-        std::lock_guard       lk(mtxMonitors_);
-        std::string           targetPath = path.empty() ? currentSessionPath_ : path;
+        u64         start      = get_mono_ts_ms();
+        std::string targetPath = path.empty() ? currentSessionPath_ : path;
+        if (remote::isUrl(targetPath)) {
+                if (remoteSessionDownload_.valid()) {
+                        ImGui::InsertNotification(
+                            {ImGuiToastType::Info,
+                             3000,
+                             "%s",
+                             tr("A remote session is already downloading.", "正在下载远程会话，请稍候。")});
+                        return;
+                }
+                remoteSessionUrl_ = targetPath;
+                const auto config = remote::settings();
+                remoteSessionDownload_ =
+                    std::async(std::launch::async, [targetPath, config] { return remote::download(targetPath, config); });
+                return;
+        }
+        remoteSessionUrl_.clear(); // A local open supersedes a pending remote open
         std::filesystem::path p(reinterpret_cast<const char8_t *>(targetPath.c_str()));
         std::ifstream         ifs(p);
-        if (!ifs.is_open())
+        if (!ifs.is_open()) {
+                ImGui::InsertNotification({ImGuiToastType::Error,
+                                           5000,
+                                           "%s",
+                                           tr("Cannot open this session. Check that the file still exists and is readable.",
+                                              "无法打开会话，请检查文件是否存在且可读取。")});
                 return;
-
-        isFirstSave_        = false;
-        currentSessionPath_ = targetPath;
-        addRecent(targetPath);
+        }
 
         std::stringstream ss;
         ss << ifs.rdbuf();
         const std::string content = ss.str();
         u64               fEnd    = get_mono_ts_ms();
-        if (content.empty())
+        if (content.empty()) {
+                ImGui::InsertNotification(
+                    {ImGuiToastType::Error, 5000, "%s", tr("This session file is empty.", "会话文件为空。")});
                 return;
+        }
 
         cJSON *root = cJSON_Parse(content.c_str());
         u64    pEnd = get_mono_ts_ms();
-        if (!root)
+        if (!cJSON_IsObject(root)) {
+                cJSON_Delete(root);
+                ImGui::InsertNotification(
+                    {ImGuiToastType::Error, 5000, "%s", tr("Invalid session file.", "会话文件格式无效。")});
                 return;
+        }
+        isFirstSave_        = !sourceUrl.empty();
+        currentSessionPath_ = sourceUrl.empty() ? targetPath : sourceUrl;
+        addRecent(currentSessionPath_);
+        remote::load(root);
+        flashTool_.loadSession(root);
+
+        // Stop sequence execution before clearing its SDK panels and LOCAL buffers
+        seqEditor_.stop();
+        // Stop SDK workers before taking mtxMonitors_. A worker may itself be
+        // waiting to publish LOCAL data under that mutex, so clearing panels
+        // after locking can deadlock while joining its thread
+        sdkPanels_.clear();
+        std::lock_guard               lk(mtxMonitors_);
+        ScopedSessionMonitorLockOwner monitorLockOwner;
 
         u64 monitorStart = get_mono_ts_ms();
+        ui::interaction::reset();
         monitors_.clear();
         vars_.clear();
         bool sessionMigrated = false;
 
         // Resolve file paths that were stored relative to the .ava file back to
-        // absolute paths. Already-absolute paths (old sessions) are used as-is.
-        const std::filesystem::path baseDir = std::filesystem::path(targetPath).parent_path();
+        // absolute paths. Already-absolute paths (old sessions) are used as-is
+        const std::filesystem::path baseDir = std::filesystem::u8path(targetPath).parent_path();
         auto                        toAbs   = [&](const std::string &p) -> std::string {
-                if (p.empty() || baseDir.empty())
+                if (p.empty() || remote::isUrl(p) || baseDir.empty())
                         return p;
-                std::filesystem::path fp(p);
+                std::filesystem::path fp = std::filesystem::u8path(p);
                 if (fp.is_absolute())
                         return p;
-                return (baseDir / fp).lexically_normal().string();
+                if (!sourceUrl.empty())
+                        return remote::resolve(sourceUrl, p);
+                return pathToUtf8((baseDir / fp).lexically_normal());
         };
 
         struct PendingImportSource {
@@ -821,6 +1474,10 @@ Gui::loadSession(const std::string &path)
                         g_maxHssHz.store(hz->valueint, std::memory_order_relaxed);
         }
 
+        if (const cJSON *home = cJSON_GetObjectItem(root, "showHome"); cJSON_IsBool(home))
+                showHome_ = cJSON_IsTrue(home);
+        else
+                showHome_ = false;
         if (const cJSON *sc = cJSON_GetObjectItem(root, "showCalculator")) {
                 showCalculator_ = cJSON_IsTrue(sc);
         }
@@ -840,12 +1497,19 @@ Gui::loadSession(const std::string &path)
                 };
                 getStr("torqueLink", s_eff.torqueLink);
                 getStr("speedLink", s_eff.speedLink);
-                getStr("voltageLink", s_eff.voltageLink);
+                // Accept both the current "volLink"/"volUnit" names and the
+                // pre-rewrite "voltageLink"/"voltageUnit" names so old sessions
+                // keep their efficiency-tab voltage channel selection
+                getStr("volLink", s_eff.volLink);
+                if (s_eff.volLink.empty())
+                        getStr("voltageLink", s_eff.volLink);
                 getStr("currentLink", s_eff.currentLink);
                 getInt("refreshMs", s_eff.refreshMs);
                 getInt("torqueUnit", s_eff.torqueUnit);
                 getInt("speedUnit", s_eff.speedUnit);
-                getInt("voltageUnit", s_eff.voltageUnit);
+                getInt("volUnit", s_eff.volUnit);
+                if (s_eff.volUnit == 0)
+                        getInt("voltageUnit", s_eff.volUnit);
                 getInt("currentUnit", s_eff.currentUnit);
                 getFlt("spdMin", s_eff.spdMin);
                 getFlt("spdMax", s_eff.spdMax);
@@ -882,21 +1546,69 @@ Gui::loadSession(const std::string &path)
                         }
                         monitors_[mName] = std::make_shared<Monitor>(mName);
                         Monitor *monitor = monitors_[mName].get();
+                        if (const auto *layout = cJSON_GetObjectItem(mItem, "scopeLayout"); cJSON_IsNumber(layout))
+                                monitor->setScopeLayout(layout->valueint == 1 ? Monitor::ScopeLayout::Grid
+                                                                              : Monitor::ScopeLayout::Stacked);
+                        const auto *mujocoEnabled = cJSON_GetObjectItem(mItem, "mujocoEnabled");
+                        monitor->mujocoEnabled_   = mujocoEnabled ? cJSON_IsTrue(mujocoEnabled) : mName.starts_with("MuJoCo");
+                        if (const auto *path = cJSON_GetObjectItem(mItem, "mujocoModelPath"); cJSON_IsString(path))
+                                monitor->mujocoModelPath_ = path->valuestring;
+                        if (const auto *height = cJSON_GetObjectItem(mItem, "mujocoHeight");
+                            cJSON_IsNumber(height) && std::isfinite(height->valuedouble))
+                                monitor->mujocoHeight_ = std::clamp(static_cast<float>(height->valuedouble), 120.0f, 1000.0f);
+
+                        if (auto *obj = cJSON_GetObjectItemCaseSensitive(mItem, "mujocoControl"); cJSON_IsObject(obj)) {
+                                auto &control = monitor->mujocoControl_;
+                                if (auto *mode = cJSON_GetObjectItemCaseSensitive(obj, "mode"); cJSON_IsNumber(mode))
+                                        control.mode = static_cast<ava_mujoco::Mode>(mode->valueint);
+                                for (auto [name, member] : {std::pair{"positionKp", &ava_mujoco::Control::positionKp},
+                                                            {"velocityKp", &ava_mujoco::Control::velocityKp},
+                                                            {"velocityKi", &ava_mujoco::Control::velocityKi},
+                                                            {"pdKp", &ava_mujoco::Control::pdKp},
+                                                            {"pdKd", &ava_mujoco::Control::pdKd},
+                                                            {"positionTarget", &ava_mujoco::Control::positionTarget},
+                                                            {"velocityTarget", &ava_mujoco::Control::velocityTarget},
+                                                            {"velocityFeedforward", &ava_mujoco::Control::velocityFeedforward},
+                                                            {"torqueFeedforward", &ava_mujoco::Control::torqueFeedforward}})
+                                        if (auto *val = cJSON_GetObjectItemCaseSensitive(obj, name); cJSON_IsNumber(val))
+                                                control.*member = val->valuedouble;
+                                if (!ava_mujoco::valid(control)) {
+                                        control         = {};
+                                        sessionMigrated = true;
+                                }
+                        }
 
                         if (const cJSON *titleItem = cJSON_GetObjectItem(mItem, "title");
                             cJSON_IsString(titleItem) && titleItem->valuestring[0] != '\0') {
-                                monitor->setTitle(titleItem->valuestring);
+                                std::string title = titleItem->valuestring;
+                                for (const auto *prefix :
+                                     {"变量监视器_", "变量监视器 ", "监视器 ", "Variable Monitor ", "Monitor "}) {
+                                        const std::string oldPrefix = prefix;
+                                        if (title.starts_with(oldPrefix) && title.size() > oldPrefix.size() &&
+                                            std::all_of(title.begin() + oldPrefix.size(), title.end(), [](unsigned char c) {
+                                                    return c >= '0' && c <= '9';
+                                            }))
+                                                title = std::string(tr("Variable Recorder ", "变量记录器 ")) +
+                                                        title.substr(oldPrefix.size());
+                                }
+                                monitor->setTitle(title);
                                 monitor->clearModified(); // loading is not a user edit
                         }
 
+                        monitor->linkScopeCursor_ = cJSON_IsTrue(cJSON_GetObjectItem(mItem, "linkScopeCursor"));
                         if (const cJSON *hSec = cJSON_GetObjectItem(mItem, "historySeconds"); cJSON_IsNumber(hSec))
                                 monitor->historySeconds_ = static_cast<f32>(hSec->valuedouble);
 
                         if (const cJSON *mHz = cJSON_GetObjectItem(mItem, "maxSampleHz"); cJSON_IsNumber(mHz))
                                 monitor->maxSampleHz_ = mHz->valueint;
+                        if (const cJSON *radix = cJSON_GetObjectItem(mItem, "displayRadix"); cJSON_IsNumber(radix))
+                                monitor->displayRadix_ = normalizeDisplayRadix(radix->valueint);
 
                         if (const cJSON *mPts = cJSON_GetObjectItem(mItem, "maxDisplayPoints"); cJSON_IsNumber(mPts))
                                 monitor->maxDisplayPoints_ = static_cast<u32>(mPts->valueint);
+
+                        if (const cJSON *timeFormat = cJSON_GetObjectItem(mItem, "timeAxisFormat"); cJSON_IsNumber(timeFormat))
+                                monitor->timeAxisFormat_ = std::clamp(timeFormat->valueint, -1, 1);
 
                         if (const cJSON *sMode = cJSON_GetObjectItem(mItem, "samplingMode"); cJSON_IsString(sMode)) {
                                 if (std::string(sMode->valuestring) == "POLL")
@@ -945,7 +1657,7 @@ Gui::loadSession(const std::string &path)
                                                 sName = "scope_" + std::to_string(suffix++);
                                         } while (monitor->getScopes().find(sName) != monitor->getScopes().end());
                                         // Keep loading the legacy session instead of crashing or
-                                        // silently losing the scope and all of its channels.
+                                        // silently losing the scope and all of its chs
                                         sessionMigrated = true;
                                 }
                                 if (monitor->addScope(sName) != 0)
@@ -953,14 +1665,14 @@ Gui::loadSession(const std::string &path)
                                 MonitorScope *scope = monitor->getScopes()[sName].get();
 
                                 // Restore the saved display order (older sessions without it
-                                // keep the default insertion order from addScope).
+                                // keep the default insertion order from addScope)
                                 if (const cJSON *orderItem = cJSON_GetObjectItem(sItem, "order"); cJSON_IsNumber(orderItem)) {
                                         const i64 ord = static_cast<i64>(orderItem->valuedouble);
                                         scope->setOrder(ord);
                                         monitor->noteScopeOrder(ord);
                                 }
 
-                                // Restore the saved label alias.
+                                // Restore the saved label alias
                                 if (const cJSON *labelItem = cJSON_GetObjectItem(sItem, "label");
                                     cJSON_IsString(labelItem) && labelItem->valuestring[0] != '\0') {
                                         scope->setLabel(labelItem->valuestring);
@@ -987,6 +1699,10 @@ Gui::loadSession(const std::string &path)
                                 if (const cJSON *sidePanelItem = cJSON_GetObjectItem(sItem, "showSidePanel");
                                     cJSON_IsBool(sidePanelItem))
                                         scope->getShowSidePanel() = cJSON_IsTrue(sidePanelItem);
+
+                                if (const cJSON *compare = cJSON_GetObjectItem(sItem, "compareStatistics");
+                                    cJSON_IsBool(compare))
+                                        scope->getCompareStatistics() = cJSON_IsTrue(compare);
 
                                 if (const cJSON *fftPtsItem = cJSON_GetObjectItem(sItem, "fftPoints");
                                     cJSON_IsNumber(fftPtsItem)) {
@@ -1033,7 +1749,12 @@ Gui::loadSession(const std::string &path)
                                         }
                                 }
 
+                                // Accept both the canonical "channels" key and the
+                                // short-lived "chs" key emitted by an intermediate
+                                // build, so neither format silently drops channels
                                 const cJSON *chsArr = cJSON_GetObjectItem(sItem, "channels");
+                                if (!cJSON_IsArray(chsArr))
+                                        chsArr = cJSON_GetObjectItem(sItem, "chs");
                                 if (!cJSON_IsArray(chsArr))
                                         continue;
                                 for (const cJSON *chItem = chsArr->child; chItem; chItem = chItem->next) {
@@ -1044,7 +1765,7 @@ Gui::loadSession(const std::string &path)
                                         if (chName.empty()) {
                                                 size_t suffix = scope->getChannels().size();
                                                 do {
-                                                        chName = "channel_" + std::to_string(suffix++);
+                                                        chName = "ch_" + std::to_string(suffix++);
                                                 } while (scope->getChannels().find(chName) != scope->getChannels().end());
                                                 sessionMigrated = true;
                                         }
@@ -1054,6 +1775,9 @@ Gui::loadSession(const std::string &path)
                                         if (!ch)
                                                 continue;
                                         ch->historySeconds_ = monitor->historySeconds_;
+                                        // Older sessions stored one monitor-wide radix. Keep it
+                                        // only as the migration default for chs without one
+                                        ch->setDisplayRadix(monitor->displayRadix_);
                                         if (const cJSON *orderItem = cJSON_GetObjectItem(chItem, "order");
                                             cJSON_IsNumber(orderItem)) {
                                                 const i64 order = static_cast<i64>(orderItem->valuedouble);
@@ -1070,24 +1794,39 @@ Gui::loadSession(const std::string &path)
                                                 if (d.empty())
                                                         d = "JLINK";
                                                 ch->setDevice(d);
-                                                LOG_I("Loaded channel '%s' with device '%s'",
+                                                LOG_I("Loaded ch '%s' with device '%s'",
                                                       ch->getSymbolName().c_str(),
                                                       ch->getDevice().c_str());
                                         } else {
                                                 ch->setDevice("JLINK");
-                                                LOG_I("Loaded channel '%s' with device 'JLINK' (default)",
+                                                LOG_I("Loaded ch '%s' with device 'JLINK' (default)",
                                                       ch->getSymbolName().c_str());
                                         }
 
                                         if (const cJSON *t = cJSON_GetObjectItem(chItem, "type"); cJSON_IsString(t))
                                                 ch->setType(t->valuestring);
+                                        ch->setAddrUnknown(true);
                                         if (const cJSON *a = cJSON_GetObjectItem(chItem, "addr")) {
+                                                usize address      = 0;
+                                                bool  validAddress = false;
                                                 if (cJSON_IsString(a)) {
-                                                        usize addrVal = 0;
-                                                        if (sscanf(a->valuestring, "%zx", &addrVal) == 1)
-                                                                ch->setAddr(addrVal);
-                                                } else if (cJSON_IsNumber(a)) {
-                                                        ch->setAddr(static_cast<usize>(a->valuedouble));
+                                                        const char *begin = a->valuestring;
+                                                        const char *end   = begin + strlen(begin);
+                                                        if (end - begin >= 2 && begin[0] == '0' &&
+                                                            (begin[1] == 'x' || begin[1] == 'X'))
+                                                                begin += 2;
+                                                        const auto parsed = std::from_chars(begin, end, address, 16);
+                                                        validAddress      = parsed.ec == std::errc{} && parsed.ptr == end;
+                                                } else if (cJSON_IsNumber(a) && std::isfinite(a->valuedouble) &&
+                                                           a->valuedouble >= 0.0 &&
+                                                           a->valuedouble < std::ldexp(1.0, sizeof(usize) * 8) &&
+                                                           std::floor(a->valuedouble) == a->valuedouble) {
+                                                        address      = static_cast<usize>(a->valuedouble);
+                                                        validAddress = true;
+                                                }
+                                                if (validAddress) {
+                                                        ch->setAddr(address);
+                                                        ch->setAddrUnknown(false);
                                                 }
                                         }
                                         if (const cJSON *colArr = cJSON_GetObjectItem(chItem, "color"); cJSON_IsArray(colArr)) {
@@ -1113,10 +1852,75 @@ Gui::loadSession(const std::string &path)
                                                 ch->show() = cJSON_IsTrue(sh);
                                         if (const cJSON *wrt = cJSON_GetObjectItem(chItem, "writable"); cJSON_IsBool(wrt))
                                                 ch->setWritable(cJSON_IsTrue(wrt));
+                                        if (const cJSON *radix = cJSON_GetObjectItem(chItem, "displayRadix");
+                                            cJSON_IsNumber(radix))
+                                                ch->setDisplayRadix(radix->valueint);
+                                        ch->unitConversion_ = unit_conversion::LoadSettings(chItem, "unitConversion");
                                         if (const cJSON *bo = cJSON_GetObjectItem(chItem, "bitOffset"); cJSON_IsNumber(bo))
                                                 ch->setBitOffset(static_cast<u32>(bo->valueint));
                                         if (const cJSON *bsz = cJSON_GetObjectItem(chItem, "bitSize"); cJSON_IsNumber(bsz))
                                                 ch->setBitSize(static_cast<u32>(bsz->valueint));
+
+                                        if (const cJSON *waveObj = cJSON_GetObjectItem(chItem, "waveGenerator");
+                                            cJSON_IsObject(waveObj)) {
+                                                auto &wave = ch->waveCfgPending_;
+                                                if (const cJSON *v = cJSON_GetObjectItem(waveObj, "mode"); cJSON_IsNumber(v))
+                                                        wave.mode.store(std::clamp(v->valueint, 0, 1));
+                                                if (const cJSON *v = cJSON_GetObjectItem(waveObj, "type"); cJSON_IsNumber(v))
+                                                        wave.type.store(std::clamp(v->valueint,
+                                                                                   static_cast<int>(WAVE_TYPE_SINE),
+                                                                                   static_cast<int>(WAVE_TYPE_TRIANGLE)));
+                                                if (const cJSON *v = cJSON_GetObjectItem(waveObj, "frequency");
+                                                    cJSON_IsNumber(v))
+                                                        wave.freq.store(static_cast<f32>(v->valuedouble));
+                                                if (const cJSON *v = cJSON_GetObjectItem(waveObj, "amplitude");
+                                                    cJSON_IsNumber(v))
+                                                        wave.amp.store(static_cast<f32>(v->valuedouble));
+                                                if (const cJSON *v = cJSON_GetObjectItem(waveObj, "offset"); cJSON_IsNumber(v))
+                                                        wave.offset.store(static_cast<f32>(v->valuedouble));
+                                                if (const cJSON *v = cJSON_GetObjectItem(waveObj, "duty"); cJSON_IsNumber(v))
+                                                        wave.duty.store(static_cast<f32>(v->valuedouble));
+
+                                                static constexpr const char *paramNames[] = {
+                                                    "frequency", "amplitude", "phase", "offset", "duty"};
+                                                if (const cJSON *paramsObj = cJSON_GetObjectItem(waveObj, "params");
+                                                    cJSON_IsObject(paramsObj)) {
+                                                        for (usize i = 0; i < MonitorChannel::WaveCfgPending::PARAM_COUNT;
+                                                             ++i) {
+                                                                const cJSON *paramObj =
+                                                                    cJSON_GetObjectItem(paramsObj, paramNames[i]);
+                                                                if (!cJSON_IsObject(paramObj))
+                                                                        continue;
+                                                                auto &param = wave.params[i];
+                                                                if (const cJSON *v = cJSON_GetObjectItem(paramObj, "law");
+                                                                    cJSON_IsNumber(v))
+                                                                        param.law.store(std::clamp(v->valueint, 0, 2));
+                                                                if (const cJSON *v = cJSON_GetObjectItem(paramObj, "start");
+                                                                    cJSON_IsNumber(v))
+                                                                        param.start.store(static_cast<f32>(v->valuedouble));
+                                                                if (const cJSON *v = cJSON_GetObjectItem(paramObj, "end");
+                                                                    cJSON_IsNumber(v))
+                                                                        param.end.store(static_cast<f32>(v->valuedouble));
+                                                                if (const cJSON *v = cJSON_GetObjectItem(paramObj, "duration");
+                                                                    cJSON_IsNumber(v))
+                                                                        param.duration.store(std::max(
+                                                                            0.000001f, static_cast<f32>(v->valuedouble)));
+                                                                if (const cJSON *v = cJSON_GetObjectItem(paramObj, "step");
+                                                                    cJSON_IsNumber(v))
+                                                                        param.step.store(static_cast<f32>(v->valuedouble));
+                                                                if (const cJSON *v = cJSON_GetObjectItem(paramObj, "interval");
+                                                                    cJSON_IsNumber(v))
+                                                                        param.interval.store(std::max(
+                                                                            0.000001f, static_cast<f32>(v->valuedouble)));
+                                                                if (const cJSON *v = cJSON_GetObjectItem(paramObj, "repeat");
+                                                                    cJSON_IsBool(v))
+                                                                        param.repeat.store(cJSON_IsTrue(v));
+                                                        }
+                                                }
+                                                wave.dynamicInitialized.store(true);
+                                                wave.dirty.store(true);
+                                                wave.restart.store(true);
+                                        }
 
                                         if (const cJSON *enumsArr = cJSON_GetObjectItem(chItem, "enums");
                                             cJSON_IsArray(enumsArr)) {
@@ -1134,6 +1938,23 @@ Gui::loadSession(const std::string &path)
                                         if (const cJSON *shmRN = cJSON_GetObjectItem(chItem, "shmRegionName");
                                             cJSON_IsString(shmRN))
                                                 ch->setShmRegionName(shmRN->valuestring);
+                                        if (ch->getDevice() == ava_sim::device) {
+                                                const cJSON *field = cJSON_GetObjectItem(chItem, "simField");
+                                                ch->setSimField(cJSON_IsNumber(field)
+                                                                    ? static_cast<unsigned>(std::clamp(
+                                                                          field->valueint, 0, int(ava_sim::fieldCount - 1)))
+                                                                    : 0);
+                                                ch->setType("f32");
+                                                if (!cJSON_IsTrue(cJSON_GetObjectItem(chItem, "simReferenceControl"))) {
+                                                        // Older simulation sessions made all fields read-only
+                                                        ch->setWritable(ava_sim::writableField(ch->getSimField()));
+                                                        sessionMigrated = true;
+                                                } else {
+                                                        const cJSON *writable = cJSON_GetObjectItem(chItem, "writable");
+                                                        ch->setWritable(cJSON_IsTrue(writable));
+                                                }
+                                                ch->setAddrUnknown(false);
+                                        }
                                         if (ch->getDevice() == "SHM")
                                                 MonitorScope::shmInit(*ch);
                                 }
@@ -1141,8 +1962,68 @@ Gui::loadSession(const std::string &path)
                 }
         }
 
+        // Keep generated PD controls separate from reference targets, including
+        // sessions saved by the previous combined Targets/PD template
+        for (auto &monitor : monitors_ | std::views::values) {
+                if (!monitor)
+                        continue;
+                std::string region;
+                bool        hasKp = false, hasKd = false, combined = false;
+                for (auto &[scopeName, scope] : monitor->getScopes())
+                        for (auto &ch : scope->getChannels() | std::views::values) {
+                                if (ch->getDevice() != ava_sim::device)
+                                        continue;
+                                if (region.empty())
+                                        region = ch->getShmRegionName();
+                                hasKp    |= ch->getSimField() == 6;
+                                hasKd    |= ch->getSimField() == 7;
+                                combined |= scopeName == "Targets" && ch->getSimField() >= 6;
+                        }
+                if (region.empty() || (hasKp && hasKd && !combined))
+                        continue;
+                if (!monitor->getScopes().count("PD Parameters"))
+                        monitor->addScope("PD Parameters");
+                auto scope = monitor->getScopes().at("PD Parameters");
+                scope->setLabel(tr("PD Parameters", "PD 参数"));
+                scope->setDraw(MonitorScope::DrawEnum::TABLE);
+                if (combined) {
+                        auto targets = monitor->getScopes().at("Targets");
+                        targets->setLabel(tr("Reference Targets", "目标设置"));
+                        auto &channels = targets->getChannels();
+                        for (auto it = channels.begin(); it != channels.end();) {
+                                auto ch = it->second;
+                                if (ch->getDevice() != ava_sim::device || ch->getSimField() < 6) {
+                                        ++it;
+                                        continue;
+                                }
+                                std::string name = it->first;
+                                while (scope->findChannel(name))
+                                        name += "_";
+                                scope->getChannels()[name] = ch;
+                                scope->noteChannelOrder(ch->getOrder());
+                                it = channels.erase(it);
+                        }
+                }
+                for (unsigned field : {6u, 7u}) {
+                        if ((field == 6 && hasKp) || (field == 7 && hasKd))
+                                continue;
+                        std::string name = ava_sim::fields[field];
+                        while (scope->findChannel(name))
+                                name += "_";
+                        scope->addChannel(name);
+                        auto *ch = scope->findChannel(name);
+                        ch->setDevice(ava_sim::device);
+                        ch->setType("f32");
+                        ch->setShmRegionName(region);
+                        ch->setSimField(field);
+                        ch->setWritable(true);
+                        ch->historySeconds_ = monitor->historySeconds_;
+                }
+                sessionMigrated = true;
+        }
+
         // The top-bar switch represents the aggregate monitor state. Mixed
-        // per-monitor states intentionally show as "Pause all".
+        // per-monitor states intentionally show as "Pause all"
         bool hasMonitor        = false;
         bool allMonitorsPaused = true;
         for (const auto &monitor : monitors_ | std::views::values) {
@@ -1180,9 +2061,9 @@ Gui::loadSession(const std::string &path)
                                 v->loadCfg(cfg);
                         if (!bin.empty())
                                 v->loadBin(bin);
+                        v->load(pItem);
                         if (!elf.empty())
                                 v->loadElf(elf);
-                        v->load(pItem);
                 }
         }
 
@@ -1213,6 +2094,8 @@ Gui::loadSession(const std::string &path)
         if (const cJSON *layout = cJSON_GetObjectItem(root, "imguiLayout"); cJSON_IsString(layout)) {
                 ImGui::LoadIniSettingsFromMemory(layout->valuestring);
         }
+        dock_close::reset();
+        dockSession_.load(root);
 
         seqEditor_.loadSession(root);
 
@@ -1220,23 +2103,26 @@ Gui::loadSession(const std::string &path)
         if (const cJSON *v = cJSON_GetObjectItem(root, "showBode"); cJSON_IsBool(v))
                 bode_.show_ = cJSON_IsTrue(v);
         bode_.loadSession(root);
+        inverterSimulator_.loadSession(root);
         bkpSramDebugger_.loadSession(root);
         if (const cJSON *v = cJSON_GetObjectItem(root, "showAsmViewer"); cJSON_IsBool(v))
                 asmViewer_.show_ = cJSON_IsTrue(v);
         if (const cJSON *v = cJSON_GetObjectItem(root, "showSeqEditor"); cJSON_IsBool(v))
                 seqEditor_.setOpen(cJSON_IsTrue(v));
         midiTool_.load(root);
+        motorControl_.load(root);
+        faultDecoder().load(root);
+        dsoScope_.load(root);
 
         // SDK panels
-        sdkPanels_.clear();
-        const std::string sdkBaseDir = std::filesystem::path(targetPath).parent_path().string();
+        const std::string sdkBaseDir = pathToUtf8(std::filesystem::u8path(targetPath).parent_path());
         if (const cJSON *sdkArr = cJSON_GetObjectItem(root, "sdkPanels"); cJSON_IsArray(sdkArr)) {
                 for (const cJSON *spObj = sdkArr->child; spObj; spObj = spObj->next) {
                         newSdkPanel();
                         sdkPanels_.back()->load(spObj, sdkBaseDir);
                 }
         }
-        // nextSdkWinId_ must be > any restored winId so new panels don't collide.
+        // nextSdkWinId_ must be > any restored winId so new panels don't collide
         if (const cJSON *n = cJSON_GetObjectItem(root, "nextSdkWinId"); cJSON_IsNumber(n))
                 nextSdkWinId_ = std::max(nextSdkWinId_, n->valueint);
 
@@ -1248,7 +2134,7 @@ Gui::loadSession(const std::string &path)
         deviceManager_.clearModified();
         // Loading, compatibility migration and unavailable external bindings are not
         // user edits.  Keep the loaded session clean; a later real edit will save the
-        // migrated representation naturally.
+        // migrated representation naturally
         isModified_ = false;
         if (!deviceManagerLoaded)
                 LOG_E("Device manager session data was only partially restored; session remains unmodified");
@@ -1278,6 +2164,7 @@ Gui::loadSession(const std::string &path)
 
         cJSON_Delete(root);
 
+        captureSessionBaseline(true);
         u64 end = get_mono_ts_ms();
         LOG_I("LoadSession Profile Detail: Parse %llu ms, Monitors %llu ms, Variables %llu ms, Layout %llu ms",
               pEnd - fEnd,
@@ -1287,38 +2174,105 @@ Gui::loadSession(const std::string &path)
 }
 
 void
+Gui::pollRemoteSession()
+{
+        if (!remoteSessionDownload_.valid() ||
+            remoteSessionDownload_.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+                return;
+        const auto source = remoteSessionUrl_;
+        remoteSessionUrl_.clear();
+        try {
+                const auto local = remoteSessionDownload_.get();
+                if (!source.empty())
+                        requestSessionChange(SessionChange::Open, local, source);
+        } catch (const std::exception &e) {
+                if (!source.empty())
+                        ImGui::InsertNotification({ImGuiToastType::Error, 7000, "%s", e.what()});
+        }
+}
+
+void
+Gui::newSession()
+{
+        ui::interaction::reset();
+        remoteSessionUrl_.clear();
+        // Workers may publish LOCAL values under mtxMonitors_. Stop and join
+        // them before taking that mutex, while their variable buffers still exist
+        seqEditor_.loadSession(nullptr);
+        sdkPanels_.clear();
+        motorControl_.load(nullptr);
+        faultDecoder().load(nullptr);
+        dsoScope_.load(nullptr);
+        midiTool_.clear();
+        midiTool_.setOpen(false);
+        midiTool_.consumeModified();
+        deviceManager_.clear();
+        bkpSramDebugger_.resetSession();
+        {
+                std::lock_guard lock(mtxMonitors_);
+                // The sampler/FFT worker may still own a shared snapshot. Retire
+                // its objects before removing them from the live container
+                for (auto &monitorEntry : monitors_) {
+                        auto &monitor = monitorEntry.second;
+                        monitor->markPendingDelete();
+                        for (auto &scopeEntry : monitor->getScopes()) {
+                                auto &scope = scopeEntry.second;
+                                scope->markPendingDelete();
+                                for (auto &channelEntry : scope->getChannels())
+                                        channelEntry.second->markPendingDelete();
+                        }
+                }
+                monitors_.clear();
+                vars_.clear();
+        }
+        dock_close::reset();
+        currentSessionPath_ = "session.ava";
+        // Retained tool/device preferences become the new session's baseline.
+        bode_.clearModified();
+        inverterSimulator_.clearModified();
+        JLinkPort::instance().clearConfigModified();
+        isModified_  = false;
+        isFirstSave_ = true;
+        showHome_    = true;
+        captureSessionBaseline(true);
+}
+
+void
 Gui::drawBar()
 {
+        pollRemoteSession();
+        if (!remoteSessionUrl_.empty()) {
+                ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_Always);
+                ImGui::Begin(tr("Remote Session", "远程会话"), nullptr, ImGuiWindowFlags_AlwaysAutoResize);
+                ImGui::TextUnformatted(tr("Downloading session...", "正在下载会话……"));
+                if (ImGui::Button(tr("Cancel", "取消")))
+                        remoteSessionUrl_.clear();
+                ImGui::End();
+        }
         if (ImGui::BeginMainMenuBar()) {
                 // A recent session chosen from the submenu is loaded after the menu is
-                // built (loadSession mutates recentSessions_, so we can't load mid-iteration).
+                // built (loadSession mutates recentSessions_, so we can't load mid-iteration)
                 std::string sessionToOpen;
                 if (ImGui::BeginMenu(tr("File", "文件"))) {
                         if (ImGui::MenuItem(tr("New Session", "新建会话"))) {
-                                monitors_.clear();
-                                vars_.clear();
-                                deviceManager_.clear();
-                                bkpSramDebugger_.resetSession();
-                                midiTool_.clear();
-                                midiTool_.setOpen(false);
-                                midiTool_.consumeModified();
-                                currentSessionPath_ = "session.ava";
-                                isModified_         = false;
-                                isFirstSave_        = true;
+                                pendingCommand_ = AppCommand::New;
                         }
                         if (ImGui::MenuItem(tr("Open Session...", "打开会话..."))) {
                                 std::string p = nativeDlgOpen("Open Session", {{"Session Files", {"ava", "json"}}});
                                 if (!p.empty())
-                                        loadSession(p);
+                                        requestSessionChange(SessionChange::Open, p);
                         }
-                        if (ImGui::BeginMenu(tr("Recent Sessions", "最近会话"), !recentSessions_.empty())) {
+                        if (ImGui::BeginMenu(tr("Recent Sessions", "最近会话"))) {
+                                ImGui::TextDisabled("%s", tr("Remote AVA sessions", "远程 AVA 会话"));
+                                sessionToOpen = remoteSessions_.draw(remote::settings().sessionsUrl, {".ava"});
+                                ImGui::Separator();
                                 for (size_t i = 0; i < recentSessions_.size(); ++i) {
                                         const std::string &p      = recentSessions_[i];
                                         const bool         exists = recentPathExists(p);
                                         const std::string  label  = recentDisplayName(p);
                                         // Keep the ID independent of file-name bytes. This also
                                         // protects against malformed legacy entries containing an
-                                        // early C-string terminator.
+                                        // early C-string terminator
                                         ImGui::PushID(static_cast<int>(i));
                                         if (ImGui::MenuItem(label.c_str(), nullptr, false, exists))
                                                 sessionToOpen = p;
@@ -1333,51 +2287,54 @@ Gui::drawBar()
                                 }
                                 ImGui::EndMenu();
                         }
-                        if (ImGui::MenuItem(tr("Save Session", "保存会话"), "Ctrl+S")) {
-                                saveSession();
-                                saveToastAlpha_ = 2.0f;
-                                LOG_I("Session saved via Menu");
+                        if (ImGui::MenuItem(tr("Save Session", "保存会话"), ui::ShortcutLabel("Ctrl+S", "Cmd+S"))) {
+                                pendingCommand_ = AppCommand::Save;
                         }
                         if (ImGui::MenuItem(tr("Save Session As...", "会话另存为..."))) {
-                                saveSessionAs();
+                                pendingCommand_ = AppCommand::SaveAs;
                         }
                         ImGui::Separator();
-                        if (ImGui::MenuItem(tr("Exit", "退出"), "Alt+F4")) {
-                                glfwSetWindowShouldClose(window_, GLFW_TRUE);
+#ifdef _WIN32
+                        if (ImGui::MenuItem(tr("Minimize to system tray", "最小化到系统托盘")))
+                                minimizeRequested_ = true;
+#endif
+                        if (ImGui::MenuItem(tr("Exit", "退出"))) {
+                                requestExit();
                         }
                         ImGui::EndMenu();
                 }
                 if (!sessionToOpen.empty())
-                        loadSession(sessionToOpen);
+                        requestSessionChange(SessionChange::Open, sessionToOpen);
+
+                if (ImGui::BeginMenu(tr("Edit", "编辑"))) {
+                        if (ImGui::MenuItem(tr("Undo", "撤销"),
+                                            ui::ShortcutLabel("Ctrl+Z", "Cmd+Z"),
+                                            false,
+                                            ui::interaction::undoAvailable))
+                                ui::interaction::requested = ui::interaction::Action::Undo;
+                        if (ImGui::MenuItem(tr("Redo", "重做"),
+                                            ui::ShortcutLabel("Ctrl+Y", "Cmd+Shift+Z"),
+                                            false,
+                                            ui::interaction::redoAvailable))
+                                ui::interaction::requested = ui::interaction::Action::Redo;
+                        ImGui::EndMenu();
+                }
 
                 // mark() right after BeginMenu so the highlight tracks the (closed) menu
-                // header — guiding the user to open it, not just appearing once it's open.
+                // header — guiding the user to open it, not just appearing once it's open
                 const bool windowMenuOpen = ImGui::BeginMenu(tr("Window", "窗口"));
                 TutorialGuide::instance().mark("menu_window");
                 if (windowMenuOpen) {
-                        if (ImGui::MenuItem(tr("Add Variable Monitor", "添加变量监视器"))) {
-                                std::string monitorName;
-                                size_t      idx = monitors_.size();
-                                do {
-                                        monitorName = "变量监视器_" + std::to_string(idx++);
-                                } while (monitors_.count(monitorName));
-                                monitors_[monitorName] = std::make_shared<Monitor>(monitorName);
-                                monitors_[monitorName]->setTitle("变量监视器 [" + std::to_string(idx - 1) + "]");
-                                isModified_ = true;
-                                LOG_I("Add Variable Monitor: %s", monitorName.c_str());
-                        }
-                        if (ImGui::MenuItem(tr("Add Variable Manager", "添加变量管理器"))) {
-                                std::string varName;
-                                size_t      idx = vars_.size();
-                                do {
-                                        varName = "变量管理器_" + std::to_string(idx++);
-                                } while (vars_.count(varName));
-                                vars_[varName] = std::make_shared<Variable>(varName);
-                                vars_[varName]->setTitle("变量管理器 [" + std::to_string(idx - 1) + "]");
-                                isModified_ = true;
-                                LOG_I("Add Variable Manager Window: %s", varName.c_str());
-                        }
-                        if (ImGui::MenuItem(tr("Add SDK Caller", "添加 SDK 调用器")))
+                        if (ImGui::MenuItem(tr("Workspace home", "工作区首页")))
+                                pendingCommand_ = AppCommand::Home;
+                        if (ImGui::MenuItem(tr("Find command...", "查找功能..."), ui::ShortcutLabel("Ctrl+K", "Cmd+K")))
+                                pendingCommand_ = AppCommand::Commands;
+                        ImGui::Separator();
+                        if (ImGui::MenuItem(tr("Add Variable Recorder", "添加变量记录器")))
+                                pendingCommand_ = AppCommand::Monitor;
+                        if (ImGui::MenuItem(tr("Add Variable Manager", "添加变量管理器")))
+                                pendingCommand_ = AppCommand::Variables;
+                        if (ImGui::MenuItem(tr("Add Dynamic Library Caller", "添加动态库调用器")))
                                 newSdkPanel();
                         ImGui::EndMenu();
                 }
@@ -1385,18 +2342,79 @@ Gui::drawBar()
                 const bool toolsMenuOpen = ImGui::BeginMenu(tr("Tools", "工具"));
                 TutorialGuide::instance().mark("menu_tools");
                 if (toolsMenuOpen) {
+                        if (ImGui::MenuItem("MuJoCo")) {
+                                std::lock_guard lk(mtxMonitors_);
+                                std::string     name = "MuJoCo";
+                                for (unsigned i = 2; monitors_.count(name); ++i)
+                                        name = "MuJoCo " + std::to_string(i);
+                                auto monitor = std::make_shared<Monitor>(name);
+                                monitor->setTitle(name);
+                                monitor->mujocoEnabled_  = true;
+                                monitor->historySeconds_ = 10.0f;
+                                monitor->addScope("Targets");
+                                auto targetScope = monitor->getScopes().at("Targets");
+                                targetScope->setLabel(tr("Reference Targets", "目标设置"));
+                                targetScope->setDraw(MonitorScope::DrawEnum::TABLE);
+                                monitor->addScope("PD Parameters");
+                                auto pdScope = monitor->getScopes().at("PD Parameters");
+                                pdScope->setLabel(tr("PD Parameters", "PD 参数"));
+                                pdScope->setDraw(MonitorScope::DrawEnum::TABLE);
+                                for (unsigned field : {0u, 2u, 6u, 7u}) {
+                                        auto targetScope = field < 6 ? monitor->getScopes().at("Targets") : pdScope;
+                                        targetScope->addChannel(ava_sim::fields[field]);
+                                        auto *ch = targetScope->findChannel(ava_sim::fields[field]);
+                                        ch->setDevice(ava_sim::device);
+                                        ch->setType("f32");
+                                        ch->setShmRegionName(ava_sim::defaultRegion);
+                                        ch->setSimField(field);
+                                        ch->setWritable(true);
+                                        ch->historySeconds_ = 10.0f;
+                                }
+                                const char *scopeNames[] = {"Position (rad)", "Velocity (rad/s)", "Torque (Nm)", "Error (rad)"};
+                                for (const char *scopeName : scopeNames)
+                                        monitor->addScope(scopeName);
+                                const unsigned fieldScopes[] = {0, 0, 1, 1, 2, 3};
+                                for (unsigned field = 0; field < 6; ++field) {
+                                        auto scope = monitor->getScopes().at(scopeNames[fieldScopes[field]]);
+                                        scope->addChannel(ava_sim::fields[field]);
+                                        auto *ch = scope->findChannel(ava_sim::fields[field]);
+                                        ch->setDevice(ava_sim::device);
+                                        ch->setType("f32");
+                                        ch->setShmRegionName(ava_sim::defaultRegion);
+                                        ch->setSimField(field);
+                                        ch->setWritable(ava_sim::writableField(field));
+                                        ch->historySeconds_ = 10.0f;
+                                }
+                                monitors_[name] = std::move(monitor);
+                                isModified_     = true;
+                        }
                         bool deviceManagerOpen = deviceManager_.isOpen();
                         if (ImGui::MenuItem(tr("Device Manager", "设备管理器"), nullptr, &deviceManagerOpen))
                                 deviceManager_.setOpen(deviceManagerOpen);
+                        if (ImGui::MenuItem("J-Flash"))
+                                flashTool_.open();
+                        if (ImGui::MenuItem(tr("Parameter Configuration", "参数配置"))) {
+                                if (vars_.empty()) {
+                                        const std::string key = "parameter_editor";
+                                        vars_[key]            = std::make_shared<Variable>(key);
+                                        vars_[key]->setTitle("变量管理器");
+                                }
+                                vars_.begin()->second->openParameterEditor();
+                        }
                         ImGui::MenuItem(tr("Joint Calculator", "电机参数计算器"), nullptr, &showCalculator_);
+                        ImGui::MenuItem(tr("Safety", "功能安全"), nullptr, &faultDecoder().open);
                         ImGui::MenuItem(tr("Bode Plot", "伯德图"), nullptr, &bode_.show_);
+                        ImGui::MenuItem(tr("Inverter Simulation", "逆变器仿真"), nullptr, &inverterSimulator_.show_);
                         ImGui::MenuItem(tr("Assembly Viewer", "汇编查看器"), nullptr, &asmViewer_.show_);
                         if (ImGui::MenuItem(tr("SWO / ITM Trace", "SWO / ITM 跟踪")))
                                 JLinkPort::instance().openTraceWindow();
-                        if (ImGui::MenuItem(tr("BKP SRAM Capture", "BKP SRAM 实时采集")))
+                        if (ImGui::MenuItem(tr("Ring Buffer Capture", "环形数据采集")))
                                 bkpSramDebugger_.open();
+                        bool motorOpen = motorControl_.isOpen();
+                        if (ImGui::MenuItem(tr("Motor Control", "电机控制"), nullptr, &motorOpen))
+                                motorControl_.setOpen(motorOpen);
                         bool midiOpen = midiTool_.isOpen();
-                        if (ImGui::MenuItem(tr("MIDI Injection Parser", "MIDI 注入解析"), nullptr, &midiOpen))
+                        if (ImGui::MenuItem(tr("MIDI Player", "MIDI播放器"), nullptr, &midiOpen))
                                 midiTool_.setOpen(midiOpen);
                         bool seqOpen = seqEditor_.isOpen();
                         if (ImGui::MenuItem(tr("Sequence Editor", "序列编辑器"), nullptr, &seqOpen)) {
@@ -1406,35 +2424,54 @@ Gui::drawBar()
                 }
 
                 if (ImGui::BeginMenu(tr("Settings", "设置"))) {
+                        drawAppearanceMenu();
+
+#ifdef _WIN32
+                        if (ImGui::BeginMenu(tr("Window close behavior", "窗口关闭行为"))) {
+                                const char *labels[] = {tr("Ask every time", "每次询问"),
+                                                        tr("Exit application", "退出程序"),
+                                                        tr("Minimize to tray", "缩小到托盘")};
+                                int         behavior = static_cast<int>(closeBehavior_);
+                                if (ui::Choice("##close_behavior", &behavior, labels, 3)) {
+                                        closeBehavior_ = static_cast<CloseBehavior>(behavior);
+                                        saveWindowPreferences();
+                                }
+                                ImGui::EndMenu();
+                        }
+#endif
+                        if (ImGui::BeginMenu(tr("Server", "服务器"))) {
+                                if (drawServerSettings(localFileServer_, websiteServer_, getAppDir())) {
+                                        isModified_ = true;
+                                        if (!remote::saveDefaults(getAppDir() + "/remote_files.json"))
+                                                ImGui::InsertNotification(
+                                                    {ImGuiToastType::Error,
+                                                     4000,
+                                                     "%s",
+                                                     tr("Cannot save remote file settings.", "无法保存远程文件设置。")});
+                                }
+                                ImGui::EndMenu();
+                        }
                         if (ImGui::BeginMenu(tr("J-Link DLL", "J-Link DLL"))) {
                                 JLinkPort::instance().drawDllSettingsMenu();
                                 ImGui::EndMenu();
                         }
                         if (ImGui::BeginMenu(tr("Sampler Run Mode", "采样器运行模式"))) {
-                                const int cur       = g_samplerRunMode.load();
-                                auto      applyMode = [&](int m) {
-                                        g_samplerRunMode.store(m);
+                                int         cur     = g_samplerRunMode.load();
+                                const char *modes[] = {tr("Low CPU Usage", "低占用模式"),
+                                                       tr("Normal", "普通模式"),
+                                                       tr("CPU-Bound", "CPU 绑定模式")};
+                                if (ui::Choice("##sampler_run_mode", &cur, modes, 3)) {
+                                        g_samplerRunMode.store(cur);
                                         g_samplerRebind.store(true);
-                                };
-                                if (ImGui::MenuItem(tr("Low CPU Usage", "低占用模式"), nullptr, cur == 0))
-                                        applyMode(0);
-                                if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip(
-                                            "%s", tr("Sleep 1ms per iter, normal priority", "每次迭代睡眠 1ms，普通优先级"));
-                                if (ImGui::MenuItem(tr("Normal", "普通模式"), nullptr, cur == 1))
-                                        applyMode(1);
-                                if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip(
-                                            "%s", tr("Adaptive sleep, slightly elevated priority", "自适应睡眠，稍高优先级"));
-                                if (ImGui::MenuItem(tr("CPU-Bound (High Perf)", "CPU 绑定高占用模式"), nullptr, cur == 2))
-                                        applyMode(2);
-                                if (ImGui::IsItemHovered())
-                                        ImGui::SetTooltip("%s",
-                                                          tr("Spin-loop, highest priority, core pinned",
-                                                             "自旋循环，最高优先级，绑定 CPU 核心"));
+                                }
+                                const char *details[] = {
+                                    tr("Sleep 1ms per iter, normal priority", "每次迭代睡眠 1ms，普通优先级"),
+                                    tr("Adaptive sleep, slightly elevated priority", "自适应睡眠，稍高优先级"),
+                                    tr("Spin-loop, highest priority, core pinned", "自旋循环，最高优先级，绑定 CPU 核心")};
+                                ImGui::TextDisabled("%s", details[std::clamp(cur, 0, 2)]);
 
-                                // Core selection — only meaningful in CPU-Bound mode.
-                                // Pinning our own thread needs no admin rights.
+                                // Core selection — only meaningful in CPU-Bound mode
+                                // Pinning our own thread needs no admin rights
                                 ImGui::Separator();
                                 const unsigned hc       = std::thread::hardware_concurrency();
                                 const int      nCores   = hc > 0 ? static_cast<int>(hc) : 1;
@@ -1464,37 +2501,24 @@ Gui::drawBar()
                                 ImGui::EndMenu();
                         }
 
-                        if (ImGui::BeginMenu(tr("Disk Cache Folder", "磁盘缓存目录"))) {
-                                const std::string cur = mmapVectorCacheDir();
-                                ImGui::TextDisabled("%s", tr("Current:", "当前："));
-                                ImGui::TextWrapped("%s", cur.empty() ? tr("(system temp)", "（系统临时目录）") : cur.c_str());
-                                ImGui::Separator();
-                                if (ImGui::MenuItem(tr("Change...", "更改..."))) {
-                                        std::string d = nativeDlgPickDir("Select disk-cache folder");
-                                        if (!d.empty())
-                                                setCacheDir(d);
-                                }
-                                if (ImGui::MenuItem(
-                                        tr("Reset to system temp", "重置为系统临时目录"), nullptr, false, !cur.empty()))
-                                        setCacheDir("");
-                                ImGui::Separator();
-                                ImGui::TextDisabled("%s",
-                                                    tr("Applies to newly created buffers.\nRestart to move all cache here.",
-                                                       "应用于新创建的缓冲区。\n重启后所有缓存迁移至此。"));
+                        if (ImGui::BeginMenu(tr("Storage and cleanup", "存储与清理"))) {
+                                drawStorageSettings();
                                 ImGui::EndMenu();
                         }
 
                         if (ImGui::BeginMenu(tr("Language", "语言"))) {
-                                if (ImGui::MenuItem("English", nullptr, g_lang == Lang::EN))
-                                        setLang(Lang::EN);
-                                if (ImGui::MenuItem("中文", nullptr, g_lang == Lang::ZH))
-                                        setLang(Lang::ZH);
+                                int         language    = g_lang == Lang::EN ? 0 : 1;
+                                const char *languages[] = {"English", "中文"};
+                                if (ui::Choice("##language", &language, languages, 2))
+                                        setLang(language == 0 ? Lang::EN : Lang::ZH);
                                 ImGui::EndMenu();
                         }
                         ImGui::EndMenu();
                 }
 
-                if (ImGui::BeginMenu(tr("Help", "帮助"))) {
+                const bool helpMenuOpen = ImGui::BeginMenu(tr("Help", "帮助"));
+                TutorialGuide::instance().mark("menu_help");
+                if (helpMenuOpen) {
                         ImGui::MenuItem("Version " AVA_VERSION, nullptr, false, false);
                         ImGui::Separator();
                         const bool checking = updater_.isChecking();
@@ -1507,145 +2531,18 @@ Gui::drawBar()
                         if (checking)
                                 ImGui::TextDisabled("%s", tr("  checking...", "  检查中..."));
                         ImGui::Separator();
-                        if (ImGui::MenuItem(tr("Show Tutorial", "显示新手引导"))) {
+                        if (ImGui::MenuItem(tr("Keyboard shortcuts", "快捷键手册")))
+                                ui::shortcutManualOpen = true;
+                        TutorialGuide::instance().mark("shortcut_manual");
+                        if (ImGui::MenuItem(tr("Panel guides", "面板指南")))
+                                TutorialGuide::instance().openCatalog();
+                        if (ImGui::MenuItem(tr("Current panel guide", "当前面板引导"), "F1"))
+                                TutorialGuide::instance().showForCurrentDock();
+                        if (ImGui::MenuItem(tr("Getting started", "新手引导"))) {
                                 TutorialGuide::instance().start();
                         }
                         ImGui::EndMenu();
                 }
-
-                ImGui::Separator();
-                bool wasConnected = JLinkPort::instance().isConnected();
-                JLinkPort::instance().drawUI();
-                if (!wasConnected && JLinkPort::instance().isConnected()) {
-                        Monitor::clearAll();
-                }
-                // Resume = go (green); Pause = caution (amber).
-                const bool paused = g_monitorPaused.load();
-                if (paused) {
-                        if (ui::SmallButton(tr("RESUME", "继续"), ui::BtnStyle::Success))
-                                g_monitorPaused.store(false);
-                        TutorialGuide::instance().mark("pause_btn");
-                } else {
-                        if (ui::SmallButton(tr("PAUSE", "暂停"), ui::BtnStyle::Warning))
-                                g_monitorPaused.store(true);
-                        TutorialGuide::instance().mark("pause_btn");
-                }
-
-                // Pause all J-Link acquisition (separate from the display-only pause above).
-                ImGui::SameLine();
-                const bool jlinkPaused = g_jlinkSamplingPaused.load();
-                if (jlinkPaused) {
-                        if (ui::SmallButton(tr("RESUME J-Link", "恢复 J-Link 采样"), ui::BtnStyle::Success)) {
-                                {
-                                        std::lock_guard lk(mtxMonitors_);
-                                        for (auto &m : monitors_ | std::views::values)
-                                                if (m)
-                                                        m->setSamplingPaused(false);
-                                }
-                                g_jlinkSamplingPaused.store(false);
-                        }
-                } else {
-                        if (ui::SmallButton(tr("PAUSE J-Link", "暂停 J-Link 采样"), ui::BtnStyle::Warning)) {
-                                {
-                                        std::lock_guard lk(mtxMonitors_);
-                                        for (auto &m : monitors_ | std::views::values)
-                                                if (m)
-                                                        m->setSamplingPaused(true);
-                                }
-                                g_jlinkSamplingPaused.store(true);
-                        }
-                }
-                if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("%s",
-                                          tr("Pause/resume all J-Link sampling (acquisition stops; display pause is separate)",
-                                             "暂停/恢复所有 J-Link 采样（停止采集；与显示暂停相互独立）"));
-
-                // HSS global sample rate — shared by all monitors in HSS mode.
-                ImGui::SameLine();
-                {
-                        int hssHz = g_maxHssHz.load(std::memory_order_relaxed);
-                        ImGui::SetNextItemWidth(100);
-                        if (ImGui::SliderInt("##HssHz", &hssHz, 1, 50000, "%d Hz", ImGuiSliderFlags_Logarithmic)) {
-                                g_maxHssHz.store(hssHz, std::memory_order_relaxed);
-                                isModified_ = true;
-                        }
-                        if (ImGui::IsItemDeactivatedAfterEdit())
-                                JLinkPort::instance().reqRestart();
-                        if (ImGui::IsItemHovered())
-                                ImGui::SetTooltip("%s",
-                                                  tr("HSS sample rate (Hz) — applies to all J-Link monitors in HSS mode",
-                                                     "HSS 采样率 (Hz) — 对所有处于 HSS 模式的监视器生效"));
-                }
-                ImGui::SameLine();
-                {
-                        static f32 s_smoothHssHz = 0.0f;
-                        const f32  rawHz         = Monitor::getGlobalHssHz();
-                        if (rawHz > 0.1f)
-                                s_smoothHssHz = s_smoothHssHz * 0.85f + rawHz * 0.15f;
-                        else
-                                s_smoothHssHz = 0.0f;
-                        if (s_smoothHssHz > 0.1f)
-                                ImGui::TextColored(ImVec4(0.4f, 0.6f, 1.0f, 1.0f), "%.0f Hz", s_smoothHssHz);
-                        else
-                                ImGui::TextDisabled("-- Hz");
-                }
-
-                // Total points currently in memory (across all channels)
-                u64 totalPts = 0;
-                {
-                        std::lock_guard lk(mtxMonitors_);
-                        for (const auto &m : monitors_ | std::views::values)
-                                for (const auto &s : m->getScopes() | std::views::values)
-                                        for (const auto &ch : s->getChannels() | std::views::values)
-                                                totalPts += ch->storedCount();
-                }
-                char ptsBuf[32];
-                if (totalPts >= 1000000)
-                        snprintf(ptsBuf, sizeof(ptsBuf), "%.2f M pts", totalPts / 1000000.0);
-                else if (totalPts >= 1000)
-                        snprintf(ptsBuf, sizeof(ptsBuf), "%.1f k pts", totalPts / 1000.0);
-                else
-                        snprintf(ptsBuf, sizeof(ptsBuf), "%llu pts", totalPts);
-
-                char fpsBuf[32];
-                snprintf(fpsBuf, sizeof(fpsBuf), "%.0f FPS", ImGui::GetIO().Framerate);
-
-                // Download progress indicator (shown between normal content and pts/fps)
-                char       dlBuf[48] = {0};
-                f32        dlWidth   = 0.0f;
-                const auto dlState   = updater_.getDownloadState();
-                if (dlState == Updater::DownloadState::Downloading) {
-                        const int pct = updater_.getDownloadProgress();
-                        snprintf(dlBuf, sizeof(dlBuf), tr("Updating: %d%%", "更新中：%d%%"), pct);
-                        dlWidth = ImGui::CalcTextSize(dlBuf).x;
-                }
-
-                const f32 ptsWidthFixed = ImGui::CalcTextSize("999.99 M pts").x;
-                const f32 fpsWidthFixed = ImGui::CalcTextSize("9999 FPS").x;
-                const f32 spacing       = ImGui::GetStyle().ItemSpacing.x;
-
-                const f32 totalWidth = fpsWidthFixed + ptsWidthFixed + spacing + (dlWidth > 0 ? dlWidth + spacing : 0);
-                const f32 startX     = ImGui::GetWindowWidth() - totalWidth - spacing * 2;
-
-                // Download progress (Cyan, pulsing)
-                if (dlWidth > 0) {
-                        ImGui::SetCursorPosX(startX);
-                        const float t     = (float)ImGui::GetTime();
-                        const float alpha = 0.6f + 0.4f * sinf(t * 3.0f);
-                        ImGui::TextColored(ImVec4(0.2f, 0.8f, 1.0f, alpha), "%s", dlBuf);
-                        ImGui::SameLine();
-                }
-
-                const f32 ptsStartX = startX + (dlWidth > 0 ? dlWidth + spacing : 0);
-
-                // PTS (Green, Right-aligned in its block)
-                ImGui::SetCursorPosX(ptsStartX + ptsWidthFixed - ImGui::CalcTextSize(ptsBuf).x);
-                ImGui::TextColored(ImVec4(0.3f, 1.0f, 0.3f, 1.0f), "%s", ptsBuf);
-
-                // FPS (Red, Right-aligned in its block)
-                ImGui::SameLine();
-                ImGui::SetCursorPosX(ptsStartX + ptsWidthFixed + spacing + fpsWidthFixed - ImGui::CalcTextSize(fpsBuf).x);
-                ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s", fpsBuf);
 
                 ImGui::EndMainMenuBar();
         }
@@ -1655,47 +2552,15 @@ void
 Gui::loop()
 {
         LOG_I("Gui::loop start");
-        while (!glfwWindowShouldClose(window_) || showQuitModal_) {
+        while (!wantsToQuit_) {
                 glfwPollEvents();
+                processWindowActions();
+                // Session loads rebuild docking/layout state; only apply between frames.
+                if (sessionChangeReady_)
+                        applySessionChange();
 
                 if (glfwWindowShouldClose(window_) && !showQuitModal_ && !wantsToQuit_) {
-                        bool anyModified = isModified_;
-                        if (!anyModified) {
-                                for (const auto &v : vars_ | std::views::values) {
-                                        if (v->isModified()) {
-                                                anyModified = true;
-                                                break;
-                                        }
-                                }
-                        }
-                        if (!anyModified) {
-                                std::lock_guard lk(mtxMonitors_);
-                                for (const auto &m : monitors_ | std::views::values) {
-                                        if (m->isModified()) {
-                                                anyModified = true;
-                                                break;
-                                        }
-                                }
-                        }
-                        if (!anyModified) {
-                                if (seqEditor_.isModified()) {
-                                        anyModified = true;
-                                }
-                        }
-                        if (!anyModified && (JLinkPort::instance().isConfigModified() || bode_.isModified()))
-                                anyModified = true;
-                        if (!anyModified && deviceManager_.isModified())
-                                anyModified = true;
-                        if (!anyModified && bkpSramDebugger_.isModified())
-                                anyModified = true;
-                        if (!anyModified) {
-                                for (const auto &panel : sdkPanels_) {
-                                        if (panel->isModified()) {
-                                                anyModified = true;
-                                                break;
-                                        }
-                                }
-                        }
+                        const bool anyModified = hasSessionChanges();
                         LOG_I("Quit dirty check: modified=%d firstSave=%d", (int)anyModified, (int)isFirstSave_);
                         if (anyModified) {
                                 glfwSetWindowShouldClose(window_, GLFW_FALSE);
@@ -1705,68 +2570,90 @@ Gui::loop()
                         }
                 }
 
+                updateAppearance();
+                // Apply outside a frame, after all window/menu style stacks are closed.
+                if (platformStyleDirty_) {
+                        ui::ApplyAppStyle(colorScheme_,
+                                          uiScale_,
+                                          ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable,
+                                          appearanceDark_);
+                        ui::ApplyPlotStyle(appearanceDark_);
+#ifdef _WIN32
+                        native_appearance::applyWindow(glfwGetWin32Window(window_), appearanceDark_);
+#endif
+                        platformStyleDirty_ = false;
+                }
                 ImGui_ImplOpenGL3_NewFrame();
                 ImGui_ImplGlfw_NewFrame();
+                ui::interaction::beginFrame();
                 ImGui::NewFrame();
 
                 drawBar();
+                drawStartupSessionPicker();
 
-                if (const ImGuiIO &io = ImGui::GetIO(); !io.WantTextInput) {
-                        if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-                                g_monitorPaused.store(!g_monitorPaused.load());
-                        }
-
-                        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false)) {
-                                saveSession();
-                                saveToastAlpha_ = 2.0f;
-                                LOG_I("Session saved via Ctrl+S");
-                        }
-
-                        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_L, false)) {
-                                JLinkPort::instance().connectAsync(); // off the GUI thread
-                                LOG_I("J-Link connect requested via Ctrl+L");
-                        }
-
-                        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_R, false)) {
-                                Monitor::clearAll();
-                                bkpSramDebugger_.requestClearData();
-                                LOG_I("Clear data triggered via Ctrl+R");
-                        }
-
-                        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_C, false)) {
-                                JLinkPort::instance().disconnectAsync();
-                                LOG_I("J-Link disconnect requested via Ctrl+C");
+                drawWorkspaceChrome();
+                {
+                        const auto                &io = ImGui::GetIO();
+                        const ui::AppShortcutInput input{
+                            io.KeyCtrl,
+                            io.KeyShift,
+                            io.KeyAlt,
+                            io.KeySuper,
+                            io.WantTextInput,
+                            ImGui::IsAnyItemActive() || ImGui::GetCurrentContext()->NavActivateId != 0,
+                            ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel),
+                            ImGui::IsKeyPressed(ImGuiKey_S, false),
+                            ImGui::IsKeyPressed(ImGuiKey_O, false),
+                            ImGui::IsKeyPressed(ImGuiKey_K, false),
+                            ImGui::IsKeyPressed(ImGuiKey_L, false),
+                            ImGui::IsKeyPressed(ImGuiKey_D, false),
+                            ImGui::IsKeyPressed(ImGuiKey_Space, false),
+                            ImGui::IsKeyPressed(ImGuiKey_Delete, false)};
+                        switch (ui::ResolveAppShortcut(input)) {
+                                case ui::AppShortcut::FreezeDisplay:
+                                        pendingCommand_ = AppCommand::FreezeDisplay;
+                                        break;
+                                case ui::AppShortcut::ClearData: {
+                                        std::lock_guard lock(mtxMonitors_);
+                                        Monitor::clearAll();
+                                        break;
+                                }
+                                case ui::AppShortcut::Save:
+                                        pendingCommand_ = AppCommand::Save;
+                                        break;
+                                case ui::AppShortcut::SaveAs:
+                                        pendingCommand_ = AppCommand::SaveAs;
+                                        break;
+                                case ui::AppShortcut::Open:
+                                        pendingCommand_ = AppCommand::Open;
+                                        break;
+                                case ui::AppShortcut::Commands:
+                                        pendingCommand_ = AppCommand::Commands;
+                                        break;
+                                case ui::AppShortcut::Connect:
+                                        pendingCommand_ = AppCommand::Connect;
+                                        break;
+                                case ui::AppShortcut::Disconnect:
+                                        pendingCommand_ = AppCommand::Disconnect;
+                                        break;
+                                default:
+                                        break;
                         }
                 }
 
-                if (saveToastAlpha_ > 0.0f) {
-                        saveToastAlpha_ -= ImGui::GetIO().DeltaTime;
-                        ImGui::SetNextWindowPos(
-                            ImVec2(ImGui::GetIO().DisplaySize.x / 2.0f, ImGui::GetIO().DisplaySize.y - 50.0f),
-                            ImGuiCond_Always,
-                            ImVec2(0.5f, 0.5f));
-                        ImGui::SetNextWindowBgAlpha(std::min(1.0f, saveToastAlpha_) * 0.8f);
-                        if (ImGui::Begin("##save_toast",
-                                         nullptr,
-                                         ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
-                                             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
-                                             ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove)) {
-                                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, std::min(1.0f, saveToastAlpha_)),
-                                                   "%s",
-                                                   tr("Session Saved Successfully!", "会话保存成功！"));
-                        }
-                        ImGui::End();
-                }
-
-                ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+                workspaceDock_ = ui::IslandDockSpace(ImGui::GetMainViewport());
+                drawHome();
 
                 // Dockable J-Link tool windows must be submitted after their host
-                // dockspace. drawBar() only renders the toolbar controls.
+                // dockspace. drawBar() only renders the toolbar controls
                 JLinkPort::instance().drawWindows();
                 bkpSramDebugger_.draw();
+                flashTool_.draw();
+                if (flashTool_.consumeModified())
+                        isModified_ = true;
 
                 // Kick off a one-time update check shortly after launch (throttled to
-                // once every 6h so repeated launches don't trip GitHub's rate limit).
+                // once every 6h so repeated launches don't hammer the internal file server)
                 if (!updateCheckStarted_) {
                         updateCheckStarted_ = true;
                         if (shouldAutoCheckUpdate()) {
@@ -1783,9 +2670,10 @@ Gui::loop()
                 {
                         std::lock_guard lk(mtxMonitors_);
                         for (auto it = monitors_.begin(); it != monitors_.end();) {
-                                if (it->second->isPendingDelete())
-                                        it = monitors_.erase(it);
-                                else {
+                                if (it->second->isPendingDelete()) {
+                                        it          = monitors_.erase(it);
+                                        isModified_ = true;
+                                } else {
                                         it->second->updateDisplay();
                                         ++it;
                                 }
@@ -1804,14 +2692,33 @@ Gui::loop()
                                 if (!opened)
                                         LOG_W("LOCAL variable '%s' was not found in Variable Manager", bindVariable.c_str());
                         }
+                        std::unordered_map<std::string, u32> localMonitorRates;
+                        {
+                                std::lock_guard lk(mtxMonitors_);
+                                for (const auto &m : monitors_ | std::views::values) {
+                                        if (m->isSamplingPaused())
+                                                continue;
+                                        const u32 hz = static_cast<u32>(std::max(1, m->maxSampleHz_));
+                                        for (const auto &s : m->getScopes() | std::views::values)
+                                                for (const auto &[cn, ch] : s->getChannels()) {
+                                                        if (ch->getDevice() != "LOCAL")
+                                                                continue;
+                                                        const std::string &key =
+                                                            ch->getSymbolName().empty() ? cn : ch->getSymbolName();
+                                                        localMonitorRates[key] = std::max(localMonitorRates[key], hz);
+                                                }
+                                }
+                        }
                         for (auto it = vars_.begin(); it != vars_.end();) {
                                 if (it->second->isPendingDelete()) {
                                         it          = vars_.erase(it);
                                         isModified_ = true;
                                 } else {
+                                        it->second->setLocalMonitorSampleRates(localMonitorRates);
                                         it->second->updateDisplay();
                                         if (it->second->consumeElfReloaded()) {
                                                 syncSymbolAddresses(it->second.get());
+                                                it->second->completeElfReload();
                                         }
                                         if (it->second->consumePropertiesChanged()) {
                                                 syncVariableProperties(it->second.get());
@@ -1821,11 +2728,11 @@ Gui::loop()
                         }
                 }
 
-                // Feed LOCAL variable data into matching monitor scope channels.
-                // JLINK/SHM channels are sampled by the dedicated sampler thread, but
-                // LOCAL data lives only in each Variable's localBufs_ (written by the
-                // SDK/sequence panels). Resample it here each frame and push to any
-                // scope channel named "<var>" / "<var>.<field>" (device == LOCAL).
+                // Feed LOCAL variable data into matching monitor scope chs
+                // JLINK/SHM chs are sampled by the dedicated sampler thread, but
+                // Manual/sequence LOCAL values use the configured cadence. SDK
+                // sources supply timestamped events below, so a cached buffer is
+                // never mistaken for a newly acquired sample after disconnect.
                 {
                         std::vector<std::pair<std::string, double>> localWrites;
                         {
@@ -1835,28 +2742,36 @@ Gui::loop()
                                                 for (auto &[cn, ch] : s->getChannels()) {
                                                         if (ch->getDevice() != "LOCAL" || !ch->isWritable())
                                                                 continue;
-                                                        float value = 0.0f;
-                                                        if (!ch->consumeWValDirty(value))
+                                                        float val = 0.0f;
+                                                        if (!ch->consumeWValDirty(val))
                                                                 continue;
                                                         const std::string &key =
                                                             ch->getSymbolName().empty() ? cn : ch->getSymbolName();
-                                                        localWrites.emplace_back(key, value);
+                                                        localWrites.emplace_back(key, val);
                                                 }
                         }
-                        for (const auto &[name, value] : localWrites)
+                        for (const auto &[name, val] : localWrites)
                                 for (auto &vw : vars_ | std::views::values)
-                                        if (vw->writeLocalScalarFromMonitor(name, value))
+                                        if (vw->writeLocalScalarFromMonitor(name, val))
                                                 break;
 
-                        std::unordered_map<std::string, float> localVals;
+                        std::unordered_map<std::string, float>               localVals;
+                        std::unordered_map<std::string, Variable::RawSample> localRaw;
                         for (auto &vw : vars_ | std::views::values)
-                                for (auto &[chName, val] : vw->collectLocalChannelValues())
+                                for (auto &[chName, val] : vw->collectLocalChannelValues()) {
                                         localVals[chName] = val;
+                                        Variable::RawSample raw;
+                                        if (vw->readLocalChannelBytes(chName, raw))
+                                                localRaw[chName] = raw;
+                                }
 
                         if (!localVals.empty()) {
                                 const double    ts = sessionTimeSec();
                                 std::lock_guard lk(mtxMonitors_);
-                                for (auto &m : monitors_ | std::views::values)
+                                for (auto &m : monitors_ | std::views::values) {
+                                        if (m->isSamplingPaused() || !m->consumeLocalSampleDue(ts))
+                                                continue;
+                                        u64 pushed = 0;
                                         for (auto &s : m->getScopes() | std::views::values)
                                                 for (auto &[cn, ch] : s->getChannels()) {
                                                         if (ch->getDevice() != "LOCAL")
@@ -1868,14 +2783,55 @@ Gui::loop()
                                                                 continue;
                                                         float v = it->second;
                                                         ch->pushBatch(&v, &ts, 1);
+                                                        if (const auto raw = localRaw.find(key); raw != localRaw.end())
+                                                                ch->setLatestRawBytes(raw->second.bytes.data(),
+                                                                                      raw->second.size);
                                                         ch->publishSnapshot();
+                                                        ++pushed;
                                                 }
+                                        m->addPoints(pushed);
+                                }
+                        }
+                        // SDK buffers are snapshots, not continuously sampled local
+                        // signals. Only successful fresh reads produce these batches.
+                        std::lock_guard lock(mtxMonitors_);
+                        for (auto &variable : vars_ | std::views::values) {
+                                const auto batches = variable->drainLocalSamples();
+                                if (batches.empty())
+                                        continue;
+                                for (auto &m : monitors_ | std::views::values) {
+                                        if (m->isSamplingPaused())
+                                                continue;
+                                        u64 pushed = 0;
+                                        for (auto &scope : m->getScopes() | std::views::values) {
+                                                if (scope->isPaused())
+                                                        continue;
+                                                for (auto &[name, ch] : scope->getChannels()) {
+                                                        if (ch->getDevice() != "LOCAL" || ch->isPendingDelete())
+                                                                continue;
+                                                        const auto &key =
+                                                            ch->getSymbolName().empty() ? name : ch->getSymbolName();
+                                                        const auto it = batches.find(key);
+                                                        if (it == batches.end())
+                                                                continue;
+                                                        const auto &batch = it->second;
+                                                        ch->pushBatch(
+                                                            batch.values.data(), batch.times.data(), batch.values.size());
+                                                        if (!batch.values.empty())
+                                                                ch->setLatestRawBytes(batch.raw.bytes.data(), batch.raw.size);
+                                                        if (!g_monitorPaused.load())
+                                                                ch->publishSnapshot();
+                                                        pushed += batch.values.size();
+                                                }
+                                        }
+                                        m->addPoints(pushed);
+                                }
                         }
                 }
 
-                // Feed AUDIO variables into matching monitor channels. Audio capture
+                // Feed AUDIO variables into matching monitor chs. Audio capture
                 // runs in WaveIn callbacks; the GUI drains complete sample batches and
-                // pushes them through the same MonitorChannel store used by J-Link/LOCAL.
+                // pushes them through the same MonitorChannel store used by J-Link/LOCAL
                 {
                         std::unordered_map<std::string, int> audioVars;
                         for (auto &vw : vars_ | std::views::values) {
@@ -1935,7 +2891,7 @@ Gui::loop()
                                                                 vals.reserve(bit->second.size());
                                                                 ts.reserve(bit->second.size());
                                                                 for (const auto &sample : bit->second) {
-                                                                        vals.push_back(sample.value);
+                                                                        vals.push_back(sample.val);
                                                                         ts.push_back(sample.ts);
                                                                 }
                                                                 ch->pushBatch(vals.data(), ts.data(), vals.size());
@@ -1947,7 +2903,7 @@ Gui::loop()
                 }
 
                 // Mirror symbols dropped from a symbol browser onto a monitor back into the
-                // originating Variable's watch list (requests queued by MonitorScope::dropTarget).
+                // originating Variable's watch list (requests queued by MonitorScope::dropTarget)
                 if (auto &mirrorQ = watchMirrorQueue(); !mirrorQ.empty()) {
                         for (const auto &req : mirrorQ)
                                 for (auto &v : vars_ | std::views::values)
@@ -1958,24 +2914,60 @@ Gui::loop()
                         mirrorQ.clear();
                 }
 
-                bode_.updateDisplay();
+                bode_.updateDisplay(vars_);
+                inverterSimulator_.draw();
                 asmViewer_.draw(this);
                 seqEditor_.draw();
+                if (deviceManager_.isOpen()) {
+                        std::vector<DeviceManager::SdkCatalogEntry> catalog;
+                        for (const auto &panel : sdkPanels_)
+                                if (panel->open_ && (panel->libraryPath()[0] || panel->headerPath()[0]))
+                                        catalog.push_back({panel->getWinId(),
+                                                           panel->displayName(),
+                                                           panel->libraryPath(),
+                                                           panel->headerPath(),
+                                                           panel->isLibraryLoaded(),
+                                                           panel->functionCount()});
+                        deviceManager_.setSdkCatalog(std::move(catalog));
+                }
                 deviceManager_.draw();
                 if (deviceManager_.consumeModified())
                         isModified_ = true;
+                motorControl_.onJlinkSymbols = [this] {
+                        std::vector<motor_jlink::Symbol> result;
+                        for (const auto &[name, variable] : vars_) {
+                                auto symbols = motor_jlink::symbols(variable->getDwarfInfo(), variable->getElfPath());
+                                result.insert(result.end(), symbols.begin(), symbols.end());
+                        }
+                        return result;
+                };
+                motorControl_.draw();
+                faultDecoder().draw(vars_);
+                dsoScope_.setOpen(std::any_of(
+                    sdkPanels_.begin(), sdkPanels_.end(), [](const auto &panel) { return panel->isDsoGuiActive(); }));
+                dsoScope_.tick();
+                if (dsoScope_.consumeModified())
+                        isModified_ = true;
+                if (motorControl_.consumeModified())
+                        isModified_ = true;
+                drawElevationPrompt();
                 midiTool_.draw();
                 if (midiTool_.consumeModified())
                         isModified_ = true;
 
-                // Draw SDK windows; prune closed ones.
+                // Draw SDK windows; prune closed ones
                 for (auto &sp : sdkPanels_)
                         sp->draw();
+                const auto sdkCount = sdkPanels_.size();
                 sdkPanels_.erase(std::remove_if(sdkPanels_.begin(),
                                                 sdkPanels_.end(),
                                                 [](const std::shared_ptr<SdkPanel> &p) { return !p->open_; }),
                                  sdkPanels_.end());
+                if (sdkPanels_.size() != sdkCount)
+                        isModified_ = true;
 
+                ui::DrawDockCorners();
+                ui::DrawShortcutManual();
                 TutorialGuide::instance().draw();
 
                 processPendingCsvImports();
@@ -1992,7 +2984,7 @@ Gui::loop()
                                                     lowerFile.ends_with(".hh") || lowerFile.ends_with(".hxx");
 
                         if (lowerFile.ends_with(".ava")) {
-                                loadSession(file);
+                                requestSessionChange(SessionChange::Open, file);
                         } else if (lowerFile.ends_with(".mid") || lowerFile.ends_with(".midi")) {
                                 midiTool_.loadFile(file);
                         } else if (isNativeLibrary || isNativeHeader) {
@@ -2027,7 +3019,7 @@ Gui::loop()
                                 importAudioAsync(file, monName);
                         } else if (lowerFile.ends_with(".elf") || lowerFile.ends_with(".axf") || lowerFile.ends_with(".out") ||
                                    lowerFile.ends_with(".json") || lowerFile.ends_with(".bin")) {
-                                // Variable Manager consumes these from the same drop list.
+                                // Variable Manager consumes these from the same drop list
                         } else {
                                 unsupportedFiles_.push_back(file);
                                 showUnsupportedFilePopup_ = true;
@@ -2037,6 +3029,11 @@ Gui::loop()
                 sDroppedFiles_.clear();
                 drawCsvImportDialog();
                 drawUnsupportedFilePopup();
+                drawCloseChoicePopup();
+                drawCommands();
+                ui::interaction::process();
+                executeCommand();
+                drawSessionChangePrompt();
                 if (showQuitModal_) {
                         ImGui::OpenPopup("###Quit");
                         if (ImGui::BeginPopupModal(
@@ -2044,17 +3041,15 @@ Gui::loop()
                                 ImGui::Text("%s", tr("Save changes to session before quitting?", "退出前保存会话更改吗？"));
                                 ImGui::Separator();
                                 if (ui::Button(tr("Save", "保存"), ui::BtnStyle::Success, ImVec2(120, 0))) {
-                                        bool saved;
-                                        if (isFirstSave_) {
-                                                saved = saveSessionAs();
-                                        } else {
-                                                saveSession();
-                                                saved = true;
-                                        }
-                                        showQuitModal_ = false;
+                                        const bool saved = saveSession();
+                                        showQuitModal_   = false;
                                         ImGui::CloseCurrentPopup();
                                         if (saved)
                                                 wantsToQuit_ = true;
+                                        else {
+                                                exitRequested_ = false;
+                                                glfwSetWindowShouldClose(window_, GLFW_FALSE);
+                                        }
                                         // If user cancelled the native dialog, saved==false: stay in app
                                 }
                                 ImGui::SetItemDefaultFocus();
@@ -2068,6 +3063,8 @@ Gui::loop()
                                 ImGui::SameLine();
                                 if (ImGui::Button(tr("Cancel", "取消"), ImVec2(120, 0))) {
                                         showQuitModal_ = false;
+                                        exitRequested_ = false;
+                                        glfwSetWindowShouldClose(window_, GLFW_FALSE);
                                         ImGui::CloseCurrentPopup();
                                 }
                                 ImGui::EndPopup();
@@ -2078,7 +3075,21 @@ Gui::loop()
                         break;
                 }
 
+                ui::UnitConversionEndFrame();
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, ImGui::GetStyle().PopupRounding);
+                ImGui::RenderNotifications();
+                ImGui::PopStyleVar();
+                dock_close::draw();
+                dockSession_.afterWindows();
+                if (sessionLayoutSettle_ > 0 && --sessionLayoutSettle_ == 0)
+                        sessionLayoutBaseline_ = ImGui::SaveIniSettingsToMemory();
                 ImGui::Render();
+                updatePlatformWindows();
+                if (inTray_) {
+                        // Continue data/platform updates while skipping GPU drawing
+                        glfwWaitEventsTimeout(0.033);
+                        continue;
+                }
                 i32 display_w, display_h;
                 glfwGetFramebufferSize(window_, &display_w, &display_h);
                 glViewport(0, 0, display_w, display_h);
@@ -2088,11 +3099,11 @@ Gui::loop()
 
                 if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) {
                         GLFWwindow *backupCurrentContext = glfwGetCurrentContext();
-                        ImGui::UpdatePlatformWindows();
                         ImGui::RenderPlatformWindowsDefault();
                         glfwMakeContextCurrent(backupCurrentContext);
                 }
 
+                captureRenderedFrame(display_w, display_h);
                 glfwSwapBuffers(window_);
         }
 }
@@ -2105,7 +3116,7 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
         std::lock_guard lk(mtxMonitors_);
 
         // Build a symbol map from EVERY loaded ELF (not just the reloaded one) so a
-        // symbol provided by another open ELF isn't falsely flagged as missing.
+        // symbol provided by another open ELF isn't falsely flagged as missing
         struct SymbolSyncInfo {
                 u64      addr{0};
                 u64      typeOff{0};
@@ -2126,7 +3137,7 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
                         for (auto &cpair : spair.second->getChannels()) {
                                 MonitorChannel *ch = cpair.second.get();
                                 if (ch->getSymbolName().empty())
-                                        continue; // manual / CSV channel — no symbol to resolve
+                                        continue; // manual / CSV ch — no symbol to resolve
 
                                 auto it = symMap.find(ch->getSymbolName());
                                 if (it != symMap.end()) {
@@ -2137,12 +3148,12 @@ Gui::syncSymbolAddresses(Variable *reloadedVar)
                                         ch->setAddrUnknown(false);
                                         count++;
                                 } else {
-                                        // Symbol no longer exists in any loaded ELF → mark unknown.
+                                        // Symbol no longer exists in any loaded ELF → mark unknown
                                         ch->setAddrUnknown(true);
                                         unknown++;
                                 }
                                 // Refresh enum entries from the reloaded ELF +
-                                // any user overrides on the owning VarEntry.
+                                // any user overrides on the owning VarEntry
                                 if (reloadedVar->refreshChannelEnums(ch))
                                         enumCount++;
                         }
@@ -2228,7 +3239,7 @@ Gui::syncVariableProperties(Variable *var)
 
                                         // Apply explicit sub-variable properties after the
                                         // ELF-derived defaults, while retaining the canonical
-                                        // symbol path for future address re-resolution.
+                                        // symbol path for future address re-resolution
                                         if (auto ovIt = v.memberOverrides.find(symbol); ovIt != v.memberOverrides.end()) {
                                                 const auto &ov = ovIt->second;
                                                 if (!ov.alias.empty())
@@ -2264,7 +3275,7 @@ Gui::syncVariableProperties(Variable *var)
                                                 ch->setShmRegionName(v.shm.name);
                                                 MonitorScope::shmInit(*ch);
                                         } else if (v.port == PortType::AUDIO) {
-                                                ch->setType("F32");
+                                                ch->setType("f32");
                                                 ch->setAddr(static_cast<usize>(std::max(0, v.audio.deviceIndex)));
                                                 ch->setBitOffset(0);
                                                 ch->setBitSize(0);
@@ -2280,7 +3291,7 @@ Gui::syncVariableProperties(Variable *var)
 void
 Gui::drawCalculator()
 {
-        if (!ImGui::Begin(tr("Motor Parameter Calculator###MotorCalc", "电机参数计算器###MotorCalc"), &showCalculator_)) {
+        if (!dock_close::begin(tr("Motor Parameter Calculator###MotorCalc", "电机参数计算器###MotorCalc"), &showCalculator_)) {
                 ImGui::End();
                 return;
         }
@@ -2336,7 +3347,7 @@ Gui::drawCalculator()
                 ImGui::Separator();
                 MotorProfile &mp = motorProfiles_[currentMotorProfile_];
 
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Input Parameters ---", "--- 输入参数 ---"));
+                ui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Input Parameters ---", "--- 输入参数 ---"));
                 ImGui::SetNextItemWidth(150.0f);
                 ImGui::InputText("##MotorModel", mp.modelName, sizeof(mp.modelName));
                 if (ImGui::IsItemHovered())
@@ -2363,7 +3374,7 @@ Gui::drawCalculator()
                         ImGui::SetTooltip("Kt (Nm/A)");
 
                 ImGui::Separator();
-                ImGui::TextColored(
+                ui::TextColored(
                     ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Back-EMF Measurement ---", "--- 反电动势测量 ---"));
                 ImGui::SetNextItemWidth(150.0f);
                 ImGui::InputFloat("##MotorBackEmfFreq", &mp.backEmfFreq, 0.0f, 0.0f, "%.3f");
@@ -2385,7 +3396,7 @@ Gui::drawCalculator()
                 f32       kv    = (120.0f * mp.backEmfFreq) / (static_cast<f32>(mp.polePairs) * mp.backEmfVpp);
 
                 ImGui::Separator();
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Calculated Results ---", "--- 计算结果 ---"));
+                ui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("--- Calculated Results ---", "--- 计算结果 ---"));
                 ImGui::Text(tr("Flux Linkage (Psi_m): %.6f Wb", "磁链 (Psi_m): %.6f Wb"), static_cast<f64>(psi_m));
                 ImGui::Text(tr("KV value: %.2f RPM/V", "KV 值: %.2f RPM/V"), static_cast<f64>(kv));
                 ImGui::Text(tr("Calculated Kt (Ref): %.6f Nm/A", "计算 Kt (参考): %.6f Nm/A"), static_cast<f64>(kt));
@@ -2402,14 +3413,14 @@ Gui::drawCalculator()
                 static float effSpeed   = 1000.0f;
                 static float effVoltage = 48.0f;
                 static float effCurrent = 1.0f;
-                // Unit dropdowns and channel links delegate to s_eff (saved with session)
+                // Unit dropdowns and ch links delegate to s_eff (saved with session)
                 auto               &effTorqueUnit    = s_eff.torqueUnit;
                 auto               &effSpeedUnit     = s_eff.speedUnit;
-                auto               &effVoltageUnit   = s_eff.voltageUnit;
+                auto               &effVoltageUnit   = s_eff.volUnit;
                 auto               &effCurrentUnit   = s_eff.currentUnit;
                 auto               &effTorqueLink    = s_eff.torqueLink;
                 auto               &effSpeedLink     = s_eff.speedLink;
-                auto               &effVoltageLink   = s_eff.voltageLink;
+                auto               &effVoltageLink   = s_eff.volLink;
                 auto               &effCurrentLink   = s_eff.currentLink;
                 static std::string *pendingVarLink   = nullptr;
                 static bool         doOpenVarPick    = false;
@@ -2429,14 +3440,14 @@ Gui::drawCalculator()
                 const float kVoltToV[]     = {1.0f, 0.001f, 1000.0f};
                 const float kCurrToA[]     = {1.0f, 0.001f};
 
-                // Read current value from a linked key.
-                // Monitor channel key: "@monName@scopeName@chName"  → getDispVal()
+                // Read current value from a linked key
+                // Monitor ch key: "@monName@scopeName@chName"  → getDispVal()
                 // Variable key:        "winKey::varName"             → valueStr
-                //                      "winKey::varName.field"       → struct field
+                // "winKey::varName.field"       → struct field
                 auto getVarVal = [&](const std::string &key, float fallback) -> float {
                         if (key.empty())
                                 return fallback;
-                        // ── Monitor channel path ─────────────────────────────
+                        // ── Monitor ch path ─────────────────────────────
                         if (key[0] == '@') {
                                 auto p1 = key.find('@', 1);
                                 if (p1 == std::string::npos)
@@ -2469,12 +3480,8 @@ Gui::drawCalculator()
                         if (dot == std::string::npos) {
                                 // Scalar top-level variable
                                 for (const auto &ve : wit->second->vars_) {
-                                        if (ve.name == rest && !ve.valueStr.empty()) {
-                                                try {
-                                                        return std::stof(ve.valueStr);
-                                                } catch (...) {
-                                                }
-                                        }
+                                        if (ve.name == rest && ve.displayNumericValue)
+                                                return static_cast<float>(*ve.displayNumericValue);
                                 }
                                 return fallback;
                         }
@@ -2496,7 +3503,7 @@ Gui::drawCalculator()
                         return fallback;
                 };
 
-                // Pull linked Monitor channel values at the selected refresh interval
+                // Pull linked Monitor ch values at the selected refresh interval
                 bool effRefreshFired = false;
                 {
                         u64 nowMs = static_cast<u64>(ImGui::GetTime() * 1000.0);
@@ -2569,10 +3576,10 @@ Gui::drawCalculator()
                         ImGui::SetNextItemWidth(-FLT_MIN);
                         if (!link.empty()) {
                                 ImGui::BeginDisabled(true);
-                                ImGui::Combo(unitId, &unitIdx, units);
+                                ui::Choice(unitId, &unitIdx, units);
                                 ImGui::EndDisabled();
                         } else {
-                                ImGui::Combo(unitId, &unitIdx, units);
+                                ui::Choice(unitId, &unitIdx, units);
                         }
 
                         ImGui::TableSetColumnIndex(3);
@@ -2592,7 +3599,7 @@ Gui::drawCalculator()
                 };
 
                 // ── Mechanical Power input ──────────────────────────────────
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("Mechanical Power", "机械功率"));
+                ui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("Mechanical Power", "机械功率"));
                 if (ImGui::BeginTable("##effMech", 4, tfl)) {
                         ImGui::TableSetupColumn("##l", ImGuiTableColumnFlags_WidthFixed, col1);
                         ImGui::TableSetupColumn("##v", ImGuiTableColumnFlags_WidthFixed, col2);
@@ -2631,7 +3638,7 @@ Gui::drawCalculator()
 
                 // ── DC Bus Power input ──────────────────────────────────────
                 ImGui::Spacing();
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("DC Bus Power", "直流母线功率"));
+                ui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("DC Bus Power", "直流母线功率"));
                 if (ImGui::BeginTable("##effElec", 4, tfl)) {
                         ImGui::TableSetupColumn("##l", ImGuiTableColumnFlags_WidthFixed, col1);
                         ImGui::TableSetupColumn("##v", ImGuiTableColumnFlags_WidthFixed, col2);
@@ -2704,7 +3711,7 @@ Gui::drawCalculator()
                                 ImGui::CloseCurrentPopup();
                         }
 
-                        // ── Monitor channels (primary / recommended) ────────
+                        // ── Monitor chs (primary / recommended) ────────
                         bool anyMonCh = false;
                         for (auto &[mname, mon] : monitors_) {
                                 for (auto &[sname, scope] : mon->getScopes()) {
@@ -2732,7 +3739,7 @@ Gui::drawCalculator()
                                 }
                         }
                         if (!anyMonCh)
-                                ImGui::TextDisabled("%s", tr("(no monitor channels)", "(无监视器通道)"));
+                                ImGui::TextDisabled("%s", tr("(no monitor chs)", "(无监视器通道)"));
 
                         ImGui::EndPopup();
                 }
@@ -2740,16 +3747,16 @@ Gui::drawCalculator()
                 // ── Calculations ────────────────────────────────────────────
                 float torque_Nm  = effTorque * kTorqueToNm[effTorqueUnit];
                 float speed_rads = effSpeed * kSpeedToRadS[effSpeedUnit];
-                float voltage_V  = effVoltage * kVoltToV[effVoltageUnit];
+                float vol_V      = effVoltage * kVoltToV[effVoltageUnit];
                 float current_A  = effCurrent * kCurrToA[effCurrentUnit];
 
                 float P_mech    = torque_Nm * speed_rads;
-                float P_elec    = voltage_V * current_A;
+                float P_elec    = vol_V * current_A;
                 float P_elec_ab = std::abs(P_elec);
                 float eta       = (P_elec_ab > 1e-9f) ? (std::abs(P_mech) / P_elec_ab * 100.0f) : 0.0f;
 
                 // ── Efficiency map recording ─────────────────────────────────
-                // Every refresh cycle appends a new scatter point.
+                // Every refresh cycle appends a new scatter point
                 if (effMapRec && effRefreshFired && eta > 0.f && eta <= 100.f) {
                         float spdRpm = speed_rads * (30.f / 3.14159265f);
                         s_eff.rawData.push_back({spdRpm, torque_Nm, eta});
@@ -2758,7 +3765,7 @@ Gui::drawCalculator()
                 // ── Results ─────────────────────────────────────────────────
                 ImGui::Spacing();
                 ImGui::Separator();
-                ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("Results", "计算结果"));
+                ui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "%s", tr("Results", "计算结果"));
 
                 if (ImGui::BeginTable("##effRes", 2, ImGuiTableFlags_SizingFixedFit)) {
                         ImGui::TableSetupColumn("##rl", ImGuiTableColumnFlags_WidthFixed, 200.0f);
@@ -2777,7 +3784,7 @@ Gui::drawCalculator()
                         row(tr("Torque (Nm)", "扭矩 (Nm)"), "%.4f Nm", torque_Nm);
                         row(tr("Speed (rad/s)", "转速 (rad/s)"), "%.3f rad/s", speed_rads);
                         row(tr("Mech. Power", "机械功率"), "%.3f W", P_mech);
-                        row(tr("Bus Voltage (V)", "母线电压 (V)"), "%.4f V", voltage_V);
+                        row(tr("Bus Voltage (V)", "母线电压 (V)"), "%.4f V", vol_V);
                         row(tr("Bus Current (A)", "母线电流 (A)"), "%.4f A", current_A);
                         row(tr("Elec. Power", "电气功率"), "%.3f W", P_elec);
                         ImGui::EndTable();
@@ -2788,7 +3795,7 @@ Gui::drawCalculator()
                 ImVec4 etaColor = (eta >= 90.0f)   ? ImVec4(0.2f, 1.0f, 0.3f, 1.0f)
                                   : (eta >= 70.0f) ? ImVec4(1.0f, 0.85f, 0.1f, 1.0f)
                                                    : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
-                ImGui::TextColored(etaColor, tr("Efficiency:  %.2f %%", "效率：  %.2f %%"), eta);
+                ui::TextColored(etaColor, tr("Efficiency:  %.2f %%", "效率：  %.2f %%"), eta);
                 float barW = ImGui::GetContentRegionAvail().x;
                 float frac = std::min(std::max(eta / 100.0f, 0.0f), 1.0f);
                 ImGui::PushStyleColor(ImGuiCol_PlotHistogram, etaColor);
@@ -2796,9 +3803,7 @@ Gui::drawCalculator()
                 ImGui::PopStyleColor();
 
                 if (eta > 100.0f)
-                        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.1f, 1.0f),
-                                           "%s",
-                                           tr("! Efficiency > 100%% — check inputs.", "! 效率 > 100%%，请检查输入。"));
+                        ui::ErrorText("%s", tr("! Efficiency > 100%% — check inputs.", "! 效率 > 100%%，请检查输入。"));
 
                 // ── Efficiency Map ───────────────────────────────────────────
                 ImGui::Spacing();
@@ -2952,9 +3957,12 @@ void
 Gui::startCsvImport(const std::string &path, int timeColumn, int timeUnit)
 {
         std::error_code   absEc;
-        const std::string importPath = std::filesystem::absolute(std::filesystem::path(path), absEc).string();
-        std::string       stem       = std::filesystem::path(path).stem().string();
-        std::string       monName;
+        const auto        absPath    = std::filesystem::absolute(std::filesystem::u8path(path), absEc);
+        const std::string importPath = absEc ? path : pathToUtf8(absPath);
+        std::string       stem       = utf8Stem(path);
+        if (stem.empty())
+                stem = "csv_import";
+        std::string monName;
         {
                 std::lock_guard lk(mtxMonitors_);
                 monName = stem;
@@ -2963,7 +3971,7 @@ Gui::startCsvImport(const std::string &path, int timeColumn, int timeUnit)
                         monName = stem + "_" + std::to_string(idx++);
                 auto mon = std::make_shared<Monitor>(monName);
                 mon->csvLoading_.store(true, std::memory_order_release);
-                mon->importSourcePath_            = absEc ? path : importPath;
+                mon->importSourcePath_            = importPath;
                 mon->importSourceType_            = "csv";
                 mon->importTimeColumn_            = timeColumn;
                 mon->importTimeUnit_              = timeUnit;
@@ -2974,37 +3982,6 @@ Gui::startCsvImport(const std::string &path, int timeColumn, int timeUnit)
         importCsvAsync(path, monName, timeColumn, timeUnit);
 }
 
-static std::string
-formatUnixTimestamp(double seconds)
-{
-        if (!std::isfinite(seconds) || seconds < 0.0)
-                return {};
-        const auto whole = static_cast<std::time_t>(std::floor(seconds));
-        std::tm    local{};
-#ifdef _WIN32
-        if (localtime_s(&local, &whole) != 0)
-                return {};
-#else
-        if (!localtime_r(&whole, &local))
-                return {};
-#endif
-        int micros = static_cast<int>(std::llround((seconds - std::floor(seconds)) * 1000000.0));
-        if (micros >= 1000000)
-                micros = 999999;
-        char buffer[64]{};
-        snprintf(buffer,
-                 sizeof(buffer),
-                 "%04d-%02d-%02d %02d:%02d:%02d.%06d",
-                 local.tm_year + 1900,
-                 local.tm_mon + 1,
-                 local.tm_mday,
-                 local.tm_hour,
-                 local.tm_min,
-                 local.tm_sec,
-                 micros);
-        return buffer;
-}
-
 void
 Gui::beginCsvImport(const std::string &path)
 {
@@ -3012,10 +3989,10 @@ Gui::beginCsvImport(const std::string &path)
                 csvImportQueue_.push_back(path);
                 return;
         }
-        std::ifstream file(path);
+        std::ifstream file(std::filesystem::u8path(path));
         std::string   line;
         if (!file.is_open() || !std::getline(file, line)) {
-                // Preserve the existing asynchronous error handling for unreadable files.
+                // Preserve the existing asynchronous error handling for unreadable files
                 startCsvImport(path, -2, 0);
                 return;
         }
@@ -3035,8 +4012,8 @@ Gui::beginCsvImport(const std::string &path)
         };
 
         auto headers = splitHeader(line);
-        // Native exports already carry one Time column per channel and do not use
-        // a shared X-axis column, so keep their lossless automatic path.
+        // Native exports already carry one Time column per ch and do not use
+        // a shared X-axis column, so keep their lossless automatic path
         bool native = !headers.empty();
         for (const auto &header : headers) {
                 const size_t kindSplit = header.rfind("::");
@@ -3066,8 +4043,7 @@ Gui::beginCsvImport(const std::string &path)
                 std::string lower = csvImportDialog_.headers[i];
                 std::ranges::transform(
                     lower, lower.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (lower == "t" || lower == "time" || lower == "ts" || lower == "timestamp" || lower == "index" ||
-                    lower == "x") {
+                if (lower == "t" || lower == "time" || lower == "ts" || lower == "ts" || lower == "index" || lower == "x") {
                         csvImportDialog_.timeColumn = i;
                         break;
                 }
@@ -3090,9 +4066,10 @@ Gui::drawCsvImportDialog()
                 tr("CSV Import###CsvImportOptions", "导入 CSV###CsvImportOptions"), nullptr, ImGuiWindowFlags_AlwaysAutoResize))
                 return;
 
-        ImGui::TextUnformatted(std::filesystem::path(csvImportDialog_.path).filename().string().c_str());
+        const std::string displayName = utf8Filename(csvImportDialog_.path);
+        ImGui::TextUnformatted(displayName.c_str());
         ImGui::Separator();
-        ImGui::Text("%s", tr("X axis / timestamp", "X 轴 / 时间戳"));
+        ImGui::Text("%s", tr("X axis / ts", "X 轴 / 时间戳"));
         ImGui::SameLine();
         ImGui::SetNextItemWidth(280.0f);
         const char *preview = csvImportDialog_.timeColumn < 0 ? tr("Row number", "行号")
@@ -3112,11 +4089,11 @@ Gui::drawCsvImportDialog()
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(280.0f);
                 const char *const *unitNames = g_lang == Lang::ZH ? unitNamesZh : unitNamesEn;
-                ImGui::Combo("##csvTimeUnit", &csvImportDialog_.timeUnit, unitNames, IM_ARRAYSIZE(unitNamesEn));
+                ui::Choice("##csvTimeUnit", &csvImportDialog_.timeUnit, unitNames, IM_ARRAYSIZE(unitNamesEn));
         }
         ImGui::TextDisabled("%s",
-                            tr("The selected column is converted to relative seconds; its first sample becomes X=0.",
-                               "所选列将换算为相对秒，首个数据点作为 X=0。"));
+                            tr("The original time origin is retained and displayed as HH:MM:SS.ffffff.",
+                               "保留原始时间原点，并按 时:分:秒.毫秒微秒 显示。"));
         ImGui::Separator();
         if (ui::Button(tr("Import", "导入"), ui::BtnStyle::Success, ImVec2(120, 0))) {
                 const std::string path       = csvImportDialog_.path;
@@ -3145,16 +4122,16 @@ Gui::drawEmptyImportPopup()
                                     ImGuiWindowFlags_AlwaysAutoResize))
                 return;
 
-        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
-                           "%s",
-                           emptyImportIsCsv_ ? tr("CSV data is empty.", "CSV 数据为空。")
-                                             : tr("Imported data is empty.", "导入的数据为空。"));
+        ui::ErrorText("%s",
+                      emptyImportIsCsv_ ? tr("CSV data is empty.", "CSV 数据为空。")
+                                        : tr("Imported data is empty.", "导入的数据为空。"));
         if (!emptyImportFile_.empty()) {
-                ImGui::TextDisabled("%s", std::filesystem::path(emptyImportFile_).filename().string().c_str());
+                const std::string displayName = utf8Filename(emptyImportFile_);
+                ImGui::TextDisabled("%s", displayName.c_str());
         }
         ImGui::TextWrapped("%s",
                            emptyImportIsCsv_ ? tr("No importable numeric data rows were found. Please check the file contents "
-                                                  "and the selected timestamp column.",
+                                                  "and the selected ts column.",
                                                   "没有找到可导入的数值数据行，请检查文件内容和所选时间戳列。")
                                              : tr("No importable data was found. Please check the source file.",
                                                   "没有找到可导入的数据，请检查源文件。"));
@@ -3177,15 +4154,16 @@ Gui::drawUnsupportedFilePopup()
                                     ImGuiWindowFlags_AlwaysAutoResize))
                 return;
 
-        ImGui::TextColored(
+        ui::TextColored(
             ImVec4(1.0f, 0.45f, 0.35f, 1.0f), "%s", tr("Parsing this file format is not supported.", "不支持解析该格式文件。"));
         ImGui::Separator();
         for (const auto &file : unsupportedFiles_) {
-                const std::filesystem::path path(file);
-                std::string                 extension = path.extension().string();
+                const std::filesystem::path path      = std::filesystem::u8path(file);
+                std::string                 extension = pathToUtf8(path.extension());
                 if (extension.empty())
                         extension = tr("no extension", "无后缀");
-                ImGui::BulletText("%s  (%s)", path.filename().string().c_str(), extension.c_str());
+                const std::string filename = pathToUtf8(path.filename());
+                ImGui::BulletText("%s  (%s)", filename.c_str(), extension.c_str());
         }
         ImGui::Separator();
         if (ui::Button(tr("OK", "确定"), ui::BtnStyle::Primary, ImVec2(120, 0))) {
@@ -3212,255 +4190,279 @@ Gui::importCsvAsync(const std::string &path, const std::string &monitorName, int
                         publishResult(std::move(result));
                 };
 
-                std::ifstream f(path);
-                if (!f.is_open()) {
-                        LOG_E("CSV import: cannot open %s", path.c_str());
-                        publishEmpty();
-                        return;
-                }
-
-                // Split a CSV line into trimmed fields (empty fields preserved).
-                auto splitCsv = [](const std::string &s) {
-                        std::vector<std::string> out;
-                        std::istringstream       ss(s);
-                        std::string              tok;
-                        while (std::getline(ss, tok, ',')) {
-                                while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' '))
-                                        tok.pop_back();
-                                while (!tok.empty() && tok.front() == ' ')
-                                        tok.erase(tok.begin());
-                                out.push_back(tok);
+                try {
+                        std::ifstream f(std::filesystem::u8path(path));
+                        if (!f.is_open()) {
+                                LOG_E("CSV import: cannot open %s", path.c_str());
+                                publishEmpty();
+                                return;
                         }
-                        return out;
-                };
 
-                // --- Parse header row ---
-                std::string line;
-                if (!std::getline(f, line)) {
-                        LOG_E("CSV import: empty file %s", path.c_str());
-                        publishEmpty();
-                        return;
-                }
-
-                std::vector<std::string> headers = splitCsv(line);
-                if (headers.empty()) {
-                        LOG_E("CSV import: no columns in %s", path.c_str());
-                        publishEmpty();
-                        return;
-                }
-
-                // Recognise this tool's own export format: every column is a
-                // "<scope>::<channel>::Time" / "<scope>::<channel>::Value" pair.
-                // scope/channel may contain '_' but never "::", so the split is
-                // unambiguous (channel takes everything after the first "::").
-                auto parseNative =
-                    [](const std::string &h, std::string &scope, std::string &channel, std::string &kind) -> bool {
-                        auto pK = h.rfind("::");
-                        if (pK == std::string::npos)
-                                return false;
-                        kind = h.substr(pK + 2);
-                        if (kind != "Time" && kind != "Value")
-                                return false;
-                        const std::string rest = h.substr(0, pK);
-                        auto              pS   = rest.find("::");
-                        if (pS == std::string::npos)
-                                return false;
-                        scope   = rest.substr(0, pS);
-                        channel = rest.substr(pS + 2);
-                        return !scope.empty() && !channel.empty();
-                };
-
-                bool isNative = true;
-                for (const auto &h : headers) {
-                        std::string s, c, k;
-                        if (!parseNative(h, s, c, k)) {
-                                isNative = false;
-                                break;
-                        }
-                }
-
-                std::vector<CsvChannelImport> outChannels;
-                std::string                   timeOriginText;
-
-                if (isNative) {
-                        // Map each column to its channel slot; preserve first-seen order.
-                        std::vector<std::string> keys; // "<scope>\x1f<channel>"
-                        std::vector<int>         timeCol, valCol;
-                        auto                     slotFor = [&](const std::string &scope, const std::string &channel) {
-                                const std::string key = scope + '\x1f' + channel;
-                                for (size_t i = 0; i < keys.size(); ++i)
-                                        if (keys[i] == key)
-                                                return static_cast<int>(i);
-                                keys.push_back(key);
-                                timeCol.push_back(-1);
-                                valCol.push_back(-1);
-                                CsvChannelImport ci;
-                                ci.scope   = scope;
-                                ci.channel = channel;
-                                outChannels.push_back(std::move(ci));
-                                return static_cast<int>(keys.size() - 1);
+                        // Split a CSV line into trimmed fields (empty fields preserved)
+                        auto splitCsv = [](const std::string &s) {
+                                std::vector<std::string> out;
+                                std::istringstream       ss(s);
+                                std::string              tok;
+                                while (std::getline(ss, tok, ',')) {
+                                        while (!tok.empty() && (tok.back() == '\r' || tok.back() == ' '))
+                                                tok.pop_back();
+                                        while (!tok.empty() && tok.front() == ' ')
+                                                tok.erase(tok.begin());
+                                        out.push_back(tok);
+                                }
+                                return out;
                         };
-                        for (int i = 0; i < static_cast<int>(headers.size()); ++i) {
+
+                        // --- Parse header row ---
+                        std::string line;
+                        if (!std::getline(f, line)) {
+                                LOG_E("CSV import: empty file %s", path.c_str());
+                                publishEmpty();
+                                return;
+                        }
+
+                        std::vector<std::string> headers = splitCsv(line);
+                        if (headers.empty()) {
+                                LOG_E("CSV import: no columns in %s", path.c_str());
+                                publishEmpty();
+                                return;
+                        }
+
+                        // Recognise this tool's own export format: every column is a
+                        // "<scope>::<ch>::Time" / "<scope>::<ch>::Value" pair
+                        // scope/ch may contain '_' but never "::", so the split is
+                        // unambiguous (ch takes everything after the first "::")
+                        auto parseNative =
+                            [](const std::string &h, std::string &scope, std::string &ch, std::string &kind) -> bool {
+                                auto pK = h.rfind("::");
+                                if (pK == std::string::npos)
+                                        return false;
+                                kind = h.substr(pK + 2);
+                                if (kind != "Time" && kind != "Value")
+                                        return false;
+                                const std::string rest = h.substr(0, pK);
+                                auto              pS   = rest.find("::");
+                                if (pS == std::string::npos)
+                                        return false;
+                                scope = rest.substr(0, pS);
+                                ch    = rest.substr(pS + 2);
+                                return !scope.empty() && !ch.empty();
+                        };
+
+                        bool isNative = true;
+                        for (const auto &h : headers) {
                                 std::string s, c, k;
-                                parseNative(headers[i], s, c, k);
-                                const int slot                         = slotFor(s, c);
-                                (k == "Time" ? timeCol : valCol)[slot] = i;
-                        }
-
-                        // Each channel carries its own Time/Value columns; a row whose
-                        // Time+Value cells are both empty means that channel has no sample
-                        // there (channels may differ in length), so it is simply skipped.
-                        while (std::getline(f, line)) {
-                                if (line.empty() || line[0] == '#')
-                                        continue;
-                                std::vector<std::string> toks = splitCsv(line);
-                                toks.resize(headers.size());
-
-                                for (size_t ch = 0; ch < outChannels.size(); ++ch) {
-                                        const int tc = timeCol[ch], vc = valCol[ch];
-                                        if (tc < 0 || vc < 0)
-                                                continue;
-                                        const std::string &tt = toks[tc];
-                                        const std::string &vt = toks[vc];
-                                        if (tt.empty() && vt.empty())
-                                                continue;
-                                        double tv = 0.0, vv = 0.0;
-                                        std::from_chars(tt.data(), tt.data() + tt.size(), tv);
-                                        std::from_chars(vt.data(), vt.data() + vt.size(), vv);
-                                        outChannels[ch].timestamps.push_back(tv);
-                                        outChannels[ch].values.push_back(static_cast<float>(vv));
+                                if (!parseNative(h, s, c, k)) {
+                                        isNative = false;
+                                        break;
                                 }
                         }
-                } else {
-                        // Generic CSV: the X axis can be any explicitly selected
-                        // column. -1 keeps the legacy row-number mode; -2 auto-detects
-                        // common timestamp header names for old saved sessions.
-                        int timeCol = selectedTimeColumn;
-                        if (timeCol == -2) {
-                                timeCol = -1;
+
+                        std::vector<CsvChannelImport> outChannels;
+                        bool                          formatTimeOfDay   = false;
+                        double                        timeOriginSeconds = 0.0;
+
+                        if (isNative) {
+                                formatTimeOfDay = true;
+                                // Map each column to its ch slot; preserve first-seen order
+                                std::vector<std::string> keys; // "<scope>\x1f<ch>"
+                                std::vector<int>         timeCol, valCol;
+                                auto                     slotFor = [&](const std::string &scope, const std::string &ch) {
+                                        const std::string key = scope + '\x1f' + ch;
+                                        for (size_t i = 0; i < keys.size(); ++i)
+                                                if (keys[i] == key)
+                                                        return static_cast<int>(i);
+                                        keys.push_back(key);
+                                        timeCol.push_back(-1);
+                                        valCol.push_back(-1);
+                                        CsvChannelImport ci;
+                                        ci.scope = scope;
+                                        ci.ch    = ch;
+                                        outChannels.push_back(std::move(ci));
+                                        return static_cast<int>(keys.size() - 1);
+                                };
                                 for (int i = 0; i < static_cast<int>(headers.size()); ++i) {
-                                        std::string h = headers[i];
-                                        for (auto &c : h)
-                                                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                                        if (h == "t" || h == "time" || h == "ts" || h == "timestamp" || h == "index" ||
-                                            h == "x") {
-                                                timeCol = i;
-                                                break;
-                                        }
+                                        std::string s, c, k;
+                                        parseNative(headers[i], s, c, k);
+                                        const int slot                         = slotFor(s, c);
+                                        (k == "Time" ? timeCol : valCol)[slot] = i;
                                 }
-                        }
-                        if (timeCol < -1 || timeCol >= static_cast<int>(headers.size()))
-                                timeCol = -1;
 
-                        std::vector<int>         dataCols;
-                        std::vector<std::string> dataHeaders;
-                        for (int i = 0; i < static_cast<int>(headers.size()); ++i) {
-                                if (i == timeCol)
-                                        continue;
-                                dataCols.push_back(i);
-                                dataHeaders.push_back(headers[i]);
-                        }
-                        const int nCols = static_cast<int>(dataCols.size());
-                        if (nCols == 0) {
-                                LOG_E("CSV import: no data columns in %s", path.c_str());
-                                publishEmpty();
-                                return;
-                        }
-
-                        std::vector<double>             timestamps;
-                        std::vector<std::vector<float>> columns(nCols);
-
-                        double rowIdx = 0.0;
-                        while (std::getline(f, line)) {
-                                if (line.empty() || line[0] == '#')
-                                        continue;
-                                std::vector<std::string> toks = splitCsv(line);
-                                toks.resize(headers.size());
-
-                                double rawTime = rowIdx;
-                                if (timeCol >= 0) {
-                                        const std::string &token = toks[timeCol];
-                                        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), rawTime);
-                                        if (token.empty() || parsed.ec != std::errc{} ||
-                                            parsed.ptr != token.data() + token.size())
+                                // Each ch carries its own Time/Value columns; a row whose
+                                // Time+Value cells are both empty means that ch has no sample
+                                // there (chs may differ in length), so it is simply skipped
+                                while (std::getline(f, line)) {
+                                        if (line.empty() || line[0] == '#')
                                                 continue;
-                                }
+                                        std::vector<std::string> toks = splitCsv(line);
+                                        toks.resize(headers.size());
 
-                                std::vector<float> rowData(nCols, 0.0f);
-                                bool               hasNumericData = false;
-                                for (int c = 0; c < nCols; ++c) {
-                                        const std::string &token = toks[dataCols[c]];
-                                        double             value = 0.0;
-                                        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), value);
-                                        if (!token.empty() && parsed.ec == std::errc{} &&
-                                            parsed.ptr == token.data() + token.size()) {
-                                                rowData[c]     = static_cast<float>(value);
-                                                hasNumericData = true;
+                                        for (size_t ch = 0; ch < outChannels.size(); ++ch) {
+                                                const int tc = timeCol[ch], vc = valCol[ch];
+                                                if (tc < 0 || vc < 0)
+                                                        continue;
+                                                const std::string &tt = toks[tc];
+                                                const std::string &vt = toks[vc];
+                                                if (tt.empty() && vt.empty())
+                                                        continue;
+                                                double tv = 0.0, vv = 0.0;
+                                                std::from_chars(tt.data(), tt.data() + tt.size(), tv);
+                                                std::from_chars(vt.data(), vt.data() + vt.size(), vv);
+                                                outChannels[ch].tss.push_back(tv);
+                                                outChannels[ch].values.push_back(static_cast<float>(vv));
                                         }
                                 }
-                                if (!hasNumericData)
-                                        continue;
+                                double firstTimestamp = std::numeric_limits<double>::infinity();
+                                for (const auto &ch : outChannels)
+                                        if (!ch.tss.empty())
+                                                firstTimestamp = std::min(firstTimestamp, ch.tss.front());
+                                if (std::isfinite(firstTimestamp)) {
+                                        if (std::abs(firstTimestamp) >= 1.0e8)
+                                                timeOriginSeconds = firstTimestamp;
+                                        for (auto &ch : outChannels) {
+                                                for (double &ts : ch.tss)
+                                                        ts -= firstTimestamp;
+                                                if (!ch.tss.empty())
+                                                        ch.tss.front() = 0.0;
+                                        }
+                                }
+                        } else {
+                                // Generic CSV: the X axis can be any explicitly selected
+                                // column. -1 keeps the legacy row-number mode; -2 auto-detects
+                                // common ts header names for old saved sessions
+                                int timeCol = selectedTimeColumn;
+                                if (timeCol == -2) {
+                                        timeCol = -1;
+                                        for (int i = 0; i < static_cast<int>(headers.size()); ++i) {
+                                                std::string h = headers[i];
+                                                for (auto &c : h)
+                                                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                                                if (h == "t" || h == "time" || h == "ts" || h == "ts" || h == "index" ||
+                                                    h == "x") {
+                                                        timeCol = i;
+                                                        break;
+                                                }
+                                        }
+                                }
+                                if (timeCol < -1 || timeCol >= static_cast<int>(headers.size()))
+                                        timeCol = -1;
 
-                                timestamps.push_back(rawTime);
-                                for (int c = 0; c < nCols; ++c)
-                                        columns[c].push_back(rowData[c]);
-                                rowIdx += 1.0;
+                                std::vector<int>         dataCols;
+                                std::vector<std::string> dataHeaders;
+                                for (int i = 0; i < static_cast<int>(headers.size()); ++i) {
+                                        if (i == timeCol)
+                                                continue;
+                                        dataCols.push_back(i);
+                                        dataHeaders.push_back(headers[i]);
+                                }
+                                const int nCols = static_cast<int>(dataCols.size());
+                                if (nCols == 0) {
+                                        LOG_E("CSV import: no data columns in %s", path.c_str());
+                                        publishEmpty();
+                                        return;
+                                }
+
+                                std::vector<double>             tss;
+                                std::vector<std::vector<float>> columns(nCols);
+
+                                double rowIdx = 0.0;
+                                while (std::getline(f, line)) {
+                                        if (line.empty() || line[0] == '#')
+                                                continue;
+                                        std::vector<std::string> toks = splitCsv(line);
+                                        toks.resize(headers.size());
+
+                                        double rawTime = rowIdx;
+                                        if (timeCol >= 0) {
+                                                const std::string &token = toks[timeCol];
+                                                const auto         parsed =
+                                                    std::from_chars(token.data(), token.data() + token.size(), rawTime);
+                                                if (token.empty() || parsed.ec != std::errc{} ||
+                                                    parsed.ptr != token.data() + token.size())
+                                                        continue;
+                                        }
+
+                                        std::vector<float> rowData(nCols, 0.0f);
+                                        bool               hasNumericData = false;
+                                        for (int c = 0; c < nCols; ++c) {
+                                                const std::string &token = toks[dataCols[c]];
+                                                double             val   = 0.0;
+                                                const auto         parsed =
+                                                    std::from_chars(token.data(), token.data() + token.size(), val);
+                                                if (!token.empty() && parsed.ec == std::errc{} &&
+                                                    parsed.ptr == token.data() + token.size()) {
+                                                        rowData[c]     = static_cast<float>(val);
+                                                        hasNumericData = true;
+                                                }
+                                        }
+                                        if (!hasNumericData)
+                                                continue;
+
+                                        tss.push_back(rawTime);
+                                        for (int c = 0; c < nCols; ++c)
+                                                columns[c].push_back(rowData[c]);
+                                        rowIdx += 1.0;
+                                }
+
+                                if (tss.empty()) {
+                                        LOG_E("CSV import: no data rows in %s", path.c_str());
+                                        publishEmpty();
+                                        return;
+                                }
+
+                                if (timeCol >= 0) {
+                                        int unit        = std::clamp(selectedTimeUnit, 0, 3);
+                                        formatTimeOfDay = true;
+                                        if (unit == 0) {
+                                                const double magnitude = std::abs(tss.front());
+                                                if (magnitude >= 1.0e14)
+                                                        unit = 3; // Unix microseconds
+                                                else if (magnitude >= 1.0e11)
+                                                        unit = 2; // Unix milliseconds
+                                                else
+                                                        unit = 1; // seconds, including already-relative tss
+                                        }
+                                        const double scale          = unit == 3 ? 1.0e-6 : (unit == 2 ? 1.0e-3 : 1.0);
+                                        const double firstTimestamp = tss.front() * scale;
+                                        if (std::abs(firstTimestamp) >= 1.0e8)
+                                                timeOriginSeconds = firstTimestamp;
+                                        for (double &ts : tss)
+                                                ts = ts * scale - firstTimestamp;
+                                        tss.front() = 0.0;
+                                }
+
+                                for (int c = 0; c < nCols; ++c) {
+                                        CsvChannelImport ci;
+                                        ci.scope  = "scope_0";
+                                        ci.ch     = dataHeaders[c];
+                                        ci.tss    = tss;
+                                        ci.values = std::move(columns[c]);
+                                        outChannels.push_back(std::move(ci));
+                                }
                         }
 
-                        if (timestamps.empty()) {
-                                LOG_E("CSV import: no data rows in %s", path.c_str());
+                        if (outChannels.empty()) {
+                                LOG_E("CSV import: no data in %s", path.c_str());
                                 publishEmpty();
                                 return;
                         }
 
-                        if (timeCol >= 0) {
-                                int unit = std::clamp(selectedTimeUnit, 0, 3);
-                                if (unit == 0) {
-                                        const double magnitude = std::abs(timestamps.front());
-                                        if (magnitude >= 1.0e14)
-                                                unit = 3; // Unix microseconds
-                                        else if (magnitude >= 1.0e11)
-                                                unit = 2; // Unix milliseconds
-                                        else
-                                                unit = 1; // seconds, including already-relative timestamps
-                                }
-                                const double scale         = unit == 3 ? 1.0e-6 : (unit == 2 ? 1.0e-3 : 1.0);
-                                const double originRaw     = timestamps.front();
-                                const double originSeconds = originRaw * scale;
-                                // Epoch timestamps are rendered as local calendar time;
-                                // small relative timestamps intentionally have no date label.
-                                if (std::abs(originSeconds) >= 1.0e8)
-                                        timeOriginText = formatUnixTimestamp(originSeconds);
-                                for (double &timestamp : timestamps)
-                                        timestamp = (timestamp - originRaw) * scale;
-                                if (!timestamps.empty())
-                                        timestamps.front() = 0.0;
-                        }
+                        LOG_I("CSV import done: %s  native=%d  chs=%zu", path.c_str(), isNative ? 1 : 0, outChannels.size());
 
-                        for (int c = 0; c < nCols; ++c) {
-                                CsvChannelImport ci;
-                                ci.scope      = "scope_0";
-                                ci.channel    = dataHeaders[c];
-                                ci.timestamps = timestamps;
-                                ci.values     = std::move(columns[c]);
-                                outChannels.push_back(std::move(ci));
-                        }
-                }
+                        CsvImportPending result;
+                        result.monitorName       = monitorName;
+                        result.chs               = std::move(outChannels);
+                        result.formatTimeOfDay   = formatTimeOfDay;
+                        result.timeOriginSeconds = timeOriginSeconds;
 
-                if (outChannels.empty()) {
-                        LOG_E("CSV import: no data in %s", path.c_str());
+                        publishResult(std::move(result));
+                } catch (const std::exception &e) {
+                        LOG_E("CSV import failed for %s: %s", path.c_str(), e.what());
                         publishEmpty();
-                        return;
+                } catch (...) {
+                        LOG_E("CSV import failed for %s: unknown exception", path.c_str());
+                        publishEmpty();
                 }
-
-                LOG_I("CSV import done: %s  native=%d  channels=%zu", path.c_str(), isNative ? 1 : 0, outChannels.size());
-
-                CsvImportPending result;
-                result.monitorName    = monitorName;
-                result.channels       = std::move(outChannels);
-                result.timeOriginText = std::move(timeOriginText);
-
-                publishResult(std::move(result));
         }).detach();
 }
 
@@ -3560,17 +4562,17 @@ Gui::importAudioAsync(const std::string &path, const std::string &monitorName)
 
                 GUID subtype = requestedSubtype;
                 actualType->GetGUID(MF_MT_SUBTYPE, &subtype);
-                const UINT32 channels = MFGetAttributeUINT32(actualType.Get(), MF_MT_AUDIO_NUM_CHANNELS, 1);
-                const UINT32 rate     = MFGetAttributeUINT32(actualType.Get(), MF_MT_AUDIO_SAMPLES_PER_SECOND, 44100);
-                const UINT32 bits     = MFGetAttributeUINT32(
+                const UINT32 chs  = MFGetAttributeUINT32(actualType.Get(), MF_MT_AUDIO_NUM_CHANNELS, 1);
+                const UINT32 rate = MFGetAttributeUINT32(actualType.Get(), MF_MT_AUDIO_SAMPLES_PER_SECOND, 44100);
+                const UINT32 bits = MFGetAttributeUINT32(
                     actualType.Get(), MF_MT_AUDIO_BITS_PER_SAMPLE, subtype == MFAudioFormat_Float ? 32 : 16);
                 const UINT32 bytesPerSample = std::max<UINT32>(1, bits / 8);
-                const UINT32 frameBytes     = std::max<UINT32>(1, channels * bytesPerSample);
+                const UINT32 frameBytes     = std::max<UINT32>(1, chs * bytesPerSample);
                 const bool   isFloat        = (subtype == MFAudioFormat_Float);
 
                 CsvChannelImport ch;
-                ch.scope   = "scope_0";
-                ch.channel = "audio";
+                ch.scope = "scope_0";
+                ch.ch    = "audio";
 
                 uint64_t sampleIndex = 0;
                 for (;;) {
@@ -3601,12 +4603,12 @@ Gui::importAudioAsync(const std::string &path, const std::string &monitorName)
                                 continue;
 
                         const UINT32 frames = curLen / frameBytes;
-                        ch.timestamps.reserve(ch.timestamps.size() + frames);
+                        ch.tss.reserve(ch.tss.size() + frames);
                         ch.values.reserve(ch.values.size() + frames);
 
                         for (UINT32 f = 0; f < frames; ++f) {
                                 double mono = 0.0;
-                                for (UINT32 c = 0; c < channels; ++c) {
+                                for (UINT32 c = 0; c < chs; ++c) {
                                         const BYTE *p = data + static_cast<size_t>(f) * frameBytes +
                                                         static_cast<size_t>(c) * bytesPerSample;
                                         double v = 0.0;
@@ -3633,8 +4635,8 @@ Gui::importAudioAsync(const std::string &path, const std::string &monitorName)
                                         }
                                         mono += v;
                                 }
-                                mono /= static_cast<double>(std::max<UINT32>(1, channels));
-                                ch.timestamps.push_back(static_cast<double>(sampleIndex) / static_cast<double>(rate));
+                                mono /= static_cast<double>(std::max<UINT32>(1, chs));
+                                ch.tss.push_back(static_cast<double>(sampleIndex) / static_cast<double>(rate));
                                 ch.values.push_back(static_cast<float>(std::clamp(mono, -1.0, 1.0)));
                                 ++sampleIndex;
                         }
@@ -3646,12 +4648,12 @@ Gui::importAudioAsync(const std::string &path, const std::string &monitorName)
                         CoUninitialize();
 
                 if (!ch.values.empty()) {
-                        result.channels.push_back(std::move(ch));
+                        result.chs.push_back(std::move(ch));
                         LOG_I("Audio import finished: %s (%zu samples, %u Hz, %u ch)",
                               path.c_str(),
-                              result.channels.front().values.size(),
+                              result.chs.front().values.size(),
                               rate,
-                              channels);
+                              chs);
                 } else {
                         LOG_E("Audio import: no samples decoded from %s", path.c_str());
                 }
@@ -3680,9 +4682,8 @@ Gui::processPendingCsvImports()
                 // Find the monitor that was created immediately on file drop
                 auto       it      = monitors_.find(imp.monitorName);
                 Monitor   *monitor = (it != monitors_.end()) ? it->second.get() : nullptr;
-                const bool hasData = std::ranges::any_of(imp.channels, [](const CsvChannelImport &channel) {
-                        return !channel.values.empty() && !channel.timestamps.empty();
-                });
+                const bool hasData = std::ranges::any_of(
+                    imp.chs, [](const CsvChannelImport &ch) { return !ch.values.empty() && !ch.tss.empty(); });
                 if (!hasData) {
                         emptyImportFile_  = monitor ? monitor->importSourcePath_ : imp.monitorName;
                         emptyImportIsCsv_ = !monitor || monitor->importSourceType_ != "audio";
@@ -3705,31 +4706,31 @@ Gui::processPendingCsvImports()
                 double spanMin = 0.0, spanMax = 0.0;
                 usize  totalPts = 0;
 
-                for (auto &cd : imp.channels) {
-                        // Restore the originating scope (no-op if already present).
+                for (auto &cd : imp.chs) {
+                        // Restore the originating scope (no-op if already present)
                         monitor->addScope(cd.scope);
                         MonitorScope *scope = monitor->getScopes()[cd.scope].get();
                         if (!scope)
                                 continue;
 
-                        scope->addChannel(cd.channel);
-                        MonitorChannel *ch = scope->findChannel(cd.channel);
+                        scope->addChannel(cd.ch);
+                        MonitorChannel *ch = scope->findChannel(cd.ch);
                         if (!ch)
                                 continue;
 
                         ch->historySeconds_   = 0.0f; // static data — no time-based pruning
                         ch->maxDisplayPoints_ = 5000;
 
-                        const usize nPts = std::min(cd.values.size(), cd.timestamps.size());
+                        const usize nPts = std::min(cd.values.size(), cd.tss.size());
                         if (nPts == 0)
                                 continue;
-                        ch->pushBatch(cd.values.data(), cd.timestamps.data(), nPts);
+                        ch->pushBatch(cd.values.data(), cd.tss.data(), nPts);
                         ch->publishSnapshot();
                         totalPts += nPts;
 
-                        if (!cd.timestamps.empty()) {
-                                const double lo = cd.timestamps.front();
-                                const double hi = cd.timestamps.back();
+                        if (!cd.tss.empty()) {
+                                const double lo = cd.tss.front();
+                                const double hi = cd.tss.back();
                                 if (!haveSpan) {
                                         spanMin  = lo;
                                         spanMax  = hi;
@@ -3746,9 +4747,10 @@ Gui::processPendingCsvImports()
                         monitor->linkXMin_      = spanMin;
                         monitor->linkXMax_      = spanMax;
                         monitor->dataStartTime_ = spanMin;
-                        monitor->lastNow_       = spanMax;
+                        monitor->prevNow_       = spanMax;
                 }
-                monitor->importTimeOriginText_ = std::move(imp.timeOriginText);
+                monitor->importFormatTimeOfDay_   = imp.formatTimeOfDay;
+                monitor->importTimeOriginSeconds_ = imp.timeOriginSeconds;
 
                 // Clear loading flag — monitor will show data on the next frame
                 monitor->csvLoading_.store(false, std::memory_order_release);
@@ -3757,7 +4759,7 @@ Gui::processPendingCsvImports()
                         monitor->maximizeWhenImportCompletes_ = false;
                 }
 
-                LOG_I("CSV import: monitor '%s' ready: %zu channels, %zu points", name.c_str(), imp.channels.size(), totalPts);
+                LOG_I("CSV import: monitor '%s' ready: %zu chs, %zu points", name.c_str(), imp.chs.size(), totalPts);
         }
 }
 
@@ -3770,10 +4772,11 @@ Gui::drawUpdateUI()
 {
         const Updater::Info info = updater_.get();
 
-        // When a check finishes, open the appropriate popup exactly once.
+        // When a check finishes, open the appropriate popup exactly once
         if (updatePendingResult_ && !updater_.isChecking() && info.checked) {
-                updatePendingResult_ = false;
-                if (info.available)
+                updatePendingResult_   = false;
+                updateSelectedVersion_ = 0;
+                if (info.available || (updateManualCheck_ && !info.installers.empty()))
                         ImGui::OpenPopup("###UpdateAvailable");
                 else if (updateManualCheck_)
                         ImGui::OpenPopup("###UpdateStatus");
@@ -3791,13 +4794,14 @@ Gui::drawUpdateUI()
         }
 
         // --- Update available ---
-        if (ImGui::BeginPopupModal(tr("Update Available###UpdateAvailable", "有可用更新###UpdateAvailable"),
+        if (ImGui::BeginPopupModal(tr("Install Application Version###UpdateAvailable", "安装应用版本###UpdateAvailable"),
                                    nullptr,
                                    ImGuiWindowFlags_AlwaysAutoResize)) {
-                ImGui::Text("%s", tr("A new version of ava_tool is available.", "ava_tool 有新版本可用。"));
+                ImGui::Text("%s", tr("Choose a version to install.", "选择要安装的版本。"));
                 ImGui::Separator();
                 ImGui::Text(tr("Current: %s", "当前版本: %s"), info.currentVersion.c_str());
                 ImGui::Text(tr("Latest:  %s", "最新版本: %s"), info.latestVersion.c_str());
+                ImGui::TextWrapped(tr("Update URL: %s", "更新地址：%s"), info.sourceUrl.c_str());
                 if (!info.notes.empty()) {
                         ImGui::Spacing();
                         ImGui::TextDisabled("%s", tr("Release notes:", "更新说明："));
@@ -3807,14 +4811,41 @@ Gui::drawUpdateUI()
                 }
                 ImGui::Spacing();
 
-                const bool canAutoUpdate = !info.assetUrl.empty();
+                const bool canAutoUpdate = !info.installers.empty();
                 if (canAutoUpdate) {
-                        if (ui::Button(tr("Upgrade Now", "立即升级"), ui::BtnStyle::Success, ImVec2(130, 0))) {
+                        updateSelectedVersion_ =
+                            std::clamp(updateSelectedVersion_, 0, static_cast<int>(info.installers.size()) - 1);
+                        const auto &selected = info.installers[updateSelectedVersion_];
+                        ImGui::SetNextItemWidth(240);
+                        if (ImGui::BeginCombo(tr("Version", "版本"), selected.version.c_str())) {
+                                for (int i = 0; i < static_cast<int>(info.installers.size()); ++i) {
+                                        const auto       &installer = info.installers[i];
+                                        const std::string label =
+                                            installer.version + (i == 0 ? tr(" (latest)", "（最新）") : "");
+                                        if (ImGui::Selectable(label.c_str(), updateSelectedVersion_ == i))
+                                                updateSelectedVersion_ = i;
+                                        if (updateSelectedVersion_ == i)
+                                                ImGui::SetItemDefaultFocus();
+                                }
+                                ImGui::EndCombo();
+                        }
+                        const auto &install    = info.installers[updateSelectedVersion_];
+                        const int   comparison = Updater::compareVersions(install.version, info.currentVersion);
+                        if (comparison < 0)
+                                ImGui::TextDisabled("%s", tr("This will install an older version.", "将安装旧版本。"));
+                        else if (comparison == 0)
+                                ImGui::TextDisabled("%s",
+                                                    tr("This will reinstall the current version.", "将重新安装当前版本。"));
+                        ImGui::BeginDisabled(dlState == Updater::DownloadState::Downloading);
+                        if (ui::Button(tr("Download and Install", "下载并安装"), ui::BtnStyle::Success, ImVec2(150, 0))) {
                                 // Start background download — don't exit the app
-                                updater_.downloadAsync(info.assetUrl);
+                                updater_.resetDownload();
+                                updateDownloadVersion_ = install.version;
+                                updater_.downloadAsync(install.url);
                                 showDownloadDonePopup_ = false; // reset so we detect completion
                                 ImGui::CloseCurrentPopup();
                         }
+                        ImGui::EndDisabled();
                         ImGui::SameLine();
                 } else if (!info.releaseUrl.empty()) {
                         if (ImGui::Button(tr("Open Release Page", "打开发布页面"), ImVec2(160, 0))) {
@@ -3834,14 +4865,15 @@ Gui::drawUpdateUI()
         if (ImGui::BeginPopupModal(
                 tr("Update Ready###UpdateReady", "更新就绪###UpdateReady"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
                 ImGui::Text("%s", tr("Update has been downloaded successfully.", "更新已下载完成。"));
+                if (!updateDownloadVersion_.empty())
+                        ImGui::Text(tr("Version: %s", "版本：%s"), updateDownloadVersion_.c_str());
                 ImGui::Text("%s", tr("Restart the application to install the update?", "重启程序以安装更新？"));
                 ImGui::Spacing();
                 ImGui::Separator();
                 ImGui::Spacing();
                 if (ui::Button(tr("Restart Now", "立即重启"), ui::BtnStyle::Warning, ImVec2(130, 0))) {
                         const std::string setupPath = updater_.getDownloadedPath();
-                        if (updater_.launchInstaller(setupPath)) {
-                                saveSession();
+                        if ((!hasSessionChanges() || saveSession()) && updater_.launchInstaller(setupPath)) {
                                 glfwSetWindowShouldClose(window_, GLFW_TRUE);
                                 wantsToQuit_ = true;
                         }
@@ -3859,10 +4891,10 @@ Gui::drawUpdateUI()
                                    nullptr,
                                    ImGuiWindowFlags_AlwaysAutoResize)) {
                 const std::string dlErr = updater_.getDownloadError();
-                ImGui::Text("%s", tr("Failed to download the update.", "更新下载失败。"));
+                ui::ErrorText("%s", tr("Failed to download the update.", "更新下载失败。"));
                 if (!dlErr.empty()) {
                         ImGui::Spacing();
-                        ImGui::TextWrapped(tr("Error: %s", "错误: %s"), dlErr.c_str());
+                        ui::ErrorTextWrapped(tr("Error: %s", "错误: %s"), dlErr.c_str());
                 }
                 ImGui::Spacing();
                 if (ImGui::Button("OK", ImVec2(120, 0))) {
@@ -3876,8 +4908,9 @@ Gui::drawUpdateUI()
         // --- Manual "check finished" status ---
         if (ImGui::BeginPopupModal(
                 tr("Update Status###UpdateStatus", "更新状态###UpdateStatus"), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+                ImGui::TextWrapped(tr("Update URL: %s", "更新地址：%s"), info.sourceUrl.c_str());
                 if (!info.error.empty())
-                        ImGui::TextWrapped("%s", info.error.c_str());
+                        ui::ErrorTextWrapped("%s", info.error.c_str());
                 else
                         ImGui::Text(tr("You're up to date (version %s).", "已是最新版本（版本 %s）。"),
                                     info.currentVersion.c_str());
@@ -3888,7 +4921,9 @@ Gui::drawUpdateUI()
         }
 }
 
-// Map a parser CType to the variable manager's DataType (for "+"-created LOCAL vars).
+/**
+ * @brief Map a parser CType to the variable manager's DataType (for "+"-created LOCAL vars)
+ */
 static DataType
 ctypeToVarDataType(CType t)
 {
@@ -3925,9 +4960,15 @@ Gui::newSdkPanel()
 {
         auto sp = std::make_shared<SdkPanel>();
         sp->setWindowId(nextSdkWinId_++);
-        // LOCAL Variable buffer lookup — search all Variable windows for the named entry.
+        sp->onDrawDsoGui_ = [this] {
+                dsoScope_.setOpen(true);
+                dsoScope_.drawEmbedded();
+        };
+        // LOCAL Variable buffer lookup — search all Variable windows for the named entry
         sp->onGetVarBuf_ = [this](const std::string &varName) -> void * {
-                std::lock_guard<std::mutex> lk(mtxMonitors_);
+                std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                if (!s_monitorMutexOwnedBySessionLoad)
+                        lk.lock();
                 for (auto &[_, vw] : vars_) {
                         for (const auto &ve : vw->vars_) {
                                 if (ve.port == PortType::LOCAL && ve.name == varName)
@@ -3936,15 +4977,20 @@ Gui::newSdkPanel()
                 }
                 return nullptr;
         };
-        // LOCAL Variable value read — for "$var" value substitution in arguments.
+        // LOCAL Variable value read — for "$var" value substitution in arguments
         sp->onReadLocalVar_ = [this](const std::string &varName, double &out) -> bool {
-                std::lock_guard<std::mutex> lk(mtxMonitors_);
+                std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                if (!s_monitorMutexOwnedBySessionLoad)
+                        lk.lock();
                 for (auto &[_, vw] : vars_)
                         if (vw->readLocalScalar(varName, out))
                                 return true;
                 return false;
         };
         sp->onVarWritten_ = [this](const std::string &varName) {
+                std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                if (!s_monitorMutexOwnedBySessionLoad)
+                        lk.lock();
                 for (auto &[_, vw] : vars_) {
                         for (const auto &ve : vw->vars_) {
                                 if (ve.port == PortType::LOCAL && ve.name == varName) {
@@ -3955,32 +5001,76 @@ Gui::newSdkPanel()
                 }
         };
         sp->onListLocalVars_ = [this]() -> std::vector<std::string> {
-                std::vector<std::string>    names;
-                std::lock_guard<std::mutex> lk(mtxMonitors_);
+                std::vector<std::string> names;
+                std::unique_lock         lk(mtxMonitors_, std::defer_lock);
+                if (!s_monitorMutexOwnedBySessionLoad)
+                        lk.lock();
                 for (auto &[_, vw] : vars_)
                         for (const auto &ve : vw->vars_)
                                 if (ve.port == PortType::LOCAL)
                                         names.push_back(ve.name);
                 return names;
         };
+        sp->onSnapshotLocalBuffers_ = [this]() {
+                std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                if (!s_monitorMutexOwnedBySessionLoad)
+                        lk.lock();
+                SdkPanel::LocalBuffers buffers;
+                for (const auto &[_, variable] : vars_) {
+                        auto snapshot = variable->snapshotLocalBuffers();
+                        buffers.insert(std::make_move_iterator(snapshot.begin()), std::make_move_iterator(snapshot.end()));
+                }
+                return buffers;
+        };
+        sp->onLocalSampleSource_ = [this](const std::string &name) {
+                std::unique_lock lock(mtxMonitors_, std::defer_lock);
+                if (!s_monitorMutexOwnedBySessionLoad)
+                        lock.lock();
+                for (auto &variable : vars_ | std::views::values)
+                        variable->markLocalSampleSource(name);
+        };
+        sp->onLocalSample_ = [this](const std::string &name, const std::vector<uint8_t> &bytes, double time) {
+                std::unique_lock lock(mtxMonitors_, std::defer_lock);
+                if (!s_monitorMutexOwnedBySessionLoad)
+                        lock.lock();
+                for (auto &variable : vars_ | std::views::values)
+                        variable->publishLocalSample(name, bytes, time);
+        };
+        sp->onCompareExchangeLocalBuffer_ =
+            [this](const std::string &name, const std::vector<uint8_t> &expected, const std::vector<uint8_t> &desired) {
+                    std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                    if (!s_monitorMutexOwnedBySessionLoad)
+                            lk.lock();
+                    for (const auto &[_, variable] : vars_)
+                            for (const auto &entry : variable->vars_)
+                                    if (entry.port == PortType::LOCAL && entry.name == name)
+                                            return variable->compareExchangeLocalBuffer(name, expected, desired);
+                    return false;
+            };
 
         // Store a call's return value into an EXISTING LOCAL variable (the one the user
-        // created via the "+" button). Never creates — a no-op if no such variable exists.
-        // It plots only if the user also adds it to a monitor (LOCAL→monitor feed).
-        sp->onWriteLocalScalar_ = [this](const std::string &name, double value, bool /*isFloat*/) {
-                std::lock_guard<std::mutex> lk(mtxMonitors_);
+        // created via the "+" button). Never creates — a no-op if no such variable exists
+        // It plots only if the user also adds it to a monitor (LOCAL→monitor feed)
+        // isFloat
+        sp->onWriteLocalScalar_ = [this](const std::string &name, double val, bool) {
+                std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                if (!s_monitorMutexOwnedBySessionLoad)
+                        lk.lock();
                 for (auto &[_, vw] : vars_)
                         for (const auto &ve : vw->vars_)
                                 if (ve.name == name) {
-                                        vw->setLocalScalar(name, value);
+                                        vw->setLocalScalar(name, val);
+                                        vw->notifyLocalWrite(name);
                                         return;
                                 }
         };
         // Create a LOCAL variable in the variable manager (the "+" buttons). Scalar when
         // structDecl is null, otherwise a struct variable with the decl's fields. Creates
-        // a Variable manager window if none is open. No-op if the name already exists.
+        // a Variable manager window if none is open. No-op if the name already exists
         sp->onCreateLocalVar_ = [this](const std::string &name, CType scalarType, const CStructDecl *sd) {
-                std::lock_guard<std::mutex> lk(mtxMonitors_);
+                std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                if (!s_monitorMutexOwnedBySessionLoad)
+                        lk.lock();
                 if (vars_.empty()) {
                         std::string key = "变量管理器_" + std::to_string(vars_.size());
                         while (vars_.count(key))
@@ -3992,6 +5082,9 @@ Gui::newSdkPanel()
                 if (sd) {
                         std::vector<VarEntry::StructField> fields;
                         for (const auto &f : sd->fields) {
+                                if (f.name == "reserved" || f.name.rfind("reserved.", 0) == 0 ||
+                                    f.name.find(".reserved") != std::string::npos)
+                                        continue;
                                 auto emit = [&](const std::string &fname, CType ct, size_t off) {
                                         VarEntry::StructField vf{};
                                         strncpy(vf.name, fname.c_str(), sizeof(vf.name) - 1);
@@ -4013,11 +5106,39 @@ Gui::newSdkPanel()
                 } else {
                         target->addLocalVar(name, ctypeToVarDataType(scalarType), 8);
                 }
+                for (auto &variable : vars_ | std::views::values)
+                        variable->markLocalSampleSource(name);
         };
-        // Wire sequence editor LOCAL variable lookup (same lambda as SdkPanel).
+        // Publish the SDK header's enum definitions onto the LOCAL variable's members
+        // and into any ch already plotted from them, so editing an enum in the
+        // header reaches the monitor without re-dragging the field
+        sp->onPublishLocalEnums_ = [this](const std::string                                                  &varName,
+                                          const std::vector<std::pair<std::string, std::vector<CEnumValue>>> &memberEnums) {
+                std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                if (!s_monitorMutexOwnedBySessionLoad)
+                        lk.lock();
+                std::unordered_map<std::string, std::vector<VarEntry::EnumDef>> defs;
+                for (const auto &[path, values] : memberEnums) {
+                        auto &slot = defs[path];
+                        slot.reserve(values.size());
+                        for (const auto &ev : values)
+                                slot.push_back({ev.name, ev.val});
+                }
+                for (auto &[_, vw] : vars_) {
+                        if (!vw->setLocalMemberEnums(varName, defs))
+                                continue;
+                        for (auto &mp : monitors_)
+                                for (auto &spair : mp.second->getScopes())
+                                        for (auto &cpair : spair.second->getChannels())
+                                                vw->refreshLocalChannelEnums(varName, cpair.second.get());
+                }
+        };
+        // Wire sequence editor LOCAL variable lookup (same lambda as SdkPanel)
         if (!seqEditor_.onGetLocalBuf_) {
                 seqEditor_.onGetLocalBuf_ = [this](const std::string &varName) -> void * {
-                        std::lock_guard<std::mutex> lk(mtxMonitors_);
+                        std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                        if (!s_monitorMutexOwnedBySessionLoad)
+                                lk.lock();
                         for (auto &[_, vw] : vars_) {
                                 for (const auto &ve : vw->vars_) {
                                         if (ve.port == PortType::LOCAL && ve.name == varName)
@@ -4029,7 +5150,9 @@ Gui::newSdkPanel()
         }
         if (!seqEditor_.onGetLocalVarDataType_) {
                 seqEditor_.onGetLocalVarDataType_ = [this](const std::string &varName) -> DataType {
-                        std::lock_guard<std::mutex> lk(mtxMonitors_);
+                        std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                        if (!s_monitorMutexOwnedBySessionLoad)
+                                lk.lock();
                         for (auto &[_, vw] : vars_) {
                                 for (const auto &ve : vw->vars_) {
                                         if (ve.port == PortType::LOCAL && ve.name == varName)
@@ -4051,10 +5174,12 @@ Gui::newSdkPanel()
                         }
                 };
         }
-        // Wire sequence editor LOCAL variable creation (for "→ Create output vars" button).
+        // Wire sequence editor LOCAL variable creation (for "→ Create output vars" button)
         if (!seqEditor_.onAddLocalVar_) {
                 seqEditor_.onAddLocalVar_ = [this](const std::string &name, DataType type, size_t bufSize) {
-                        std::lock_guard<std::mutex> lk(mtxMonitors_);
+                        std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                        if (!s_monitorMutexOwnedBySessionLoad)
+                                lk.lock();
                         if (vars_.empty())
                                 return;
                         vars_.begin()->second->addLocalVar(name, type, bufSize);
@@ -4063,7 +5188,9 @@ Gui::newSdkPanel()
         if (!seqEditor_.onAddLocalStructVar_) {
                 seqEditor_.onAddLocalStructVar_ =
                     [this](const std::string &name, const std::vector<SeqStructField> &fields, size_t totalSize) {
-                            std::lock_guard<std::mutex> lk(mtxMonitors_);
+                            std::unique_lock lk(mtxMonitors_, std::defer_lock);
+                            if (!s_monitorMutexOwnedBySessionLoad)
+                                    lk.lock();
                             if (vars_.empty())
                                     return;
                             std::vector<VarEntry::StructField> vfs;

@@ -8,7 +8,7 @@
 
 struct AudioSample {
         double ts{0.0};
-        float  value{0.0f};
+        float  val{0.0f};
 };
 
 class AudioInput
@@ -31,7 +31,7 @@ class AudioInput
         void        setActiveDevices(const std::vector<int> &indices);
         bool        drainSamples(int deviceIndex, std::vector<AudioSample> &out);
         bool        latestSample(int deviceIndex, AudioSample &out) const;
-        std::string lastError(int deviceIndex) const;
+        std::string prevError(int deviceIndex) const;
 
       private:
         AudioInput();

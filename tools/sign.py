@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Authenticode-sign one or more files with signtool (SHA-256 + timestamp).
+Authenticode-sign one or more files with signtool (SHA-256 + ts).
 
 Removes the Windows "Unknown Publisher" warning. Requires a code-signing
 certificate. Configure it one of two ways:
@@ -53,13 +53,13 @@ def main():
     parser.add_argument("--pfx", default=None, help="PFX certificate path")
     parser.add_argument("--password", default=None, help="PFX password")
     parser.add_argument("--sha1", default=None, help="Certificate thumbprint (store/EV)")
-    parser.add_argument("--timestamp", default=None, help="Timestamp server URL")
+    parser.add_argument("--ts", default=None, help="Timestamp server URL")
     args = parser.parse_args()
 
     pfx = args.pfx or os.environ.get("AVA_SIGN_PFX", "")
     password = args.password or os.environ.get("AVA_SIGN_PASS", "")
     sha1 = args.sha1 or os.environ.get("AVA_SIGN_SHA1", "")
-    timestamp = args.timestamp or os.environ.get("AVA_SIGN_TS", "http://timestamp.digicert.com")
+    ts = args.ts or os.environ.get("AVA_SIGN_TS", "http://ts.digicert.com")
 
     if not pfx and not sha1:
         print("[sign] No certificate configured (set AVA_SIGN_PFX/AVA_SIGN_PASS or AVA_SIGN_SHA1) - skipping signing.")
@@ -70,7 +70,7 @@ def main():
         print("ERROR: signtool.exe not found. Install the Windows SDK (or add signtool to PATH).", file=sys.stderr)
         sys.exit(1)
 
-    cmd_base = [signtool, "sign", "/fd", "SHA256", "/tr", timestamp, "/td", "SHA256"]
+    cmd_base = [signtool, "sign", "/fd", "SHA256", "/tr", ts, "/td", "SHA256"]
     if pfx:
         cmd_base += ["/f", pfx]
         if password:

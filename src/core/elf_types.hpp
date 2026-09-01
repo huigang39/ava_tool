@@ -1,7 +1,7 @@
 #ifndef ELF_TYPES_HPP
 #define ELF_TYPES_HPP
 
-#include "module.h"
+#include "ckit.h"
 #include <string>
 #include <vector>
 

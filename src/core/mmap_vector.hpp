@@ -2,7 +2,7 @@
 #define MMAP_VECTOR_HPP
 
 #include "app_log.hpp"
-#include "module.h"
+#include "ckit.h"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
@@ -18,9 +18,11 @@
 #include <unistd.h>
 #endif
 
-// Global counter shared across ALL MmapVector<T> instantiations.
-// Must NOT live inside the template — otherwise each T gets its own
-// counter starting from 0, causing filename collisions (ERROR_SHARING_VIOLATION).
+/**
+ * @brief Global counter shared across ALL MmapVector<T> instantiations
+ *        Must NOT live inside the template — otherwise each T gets its own
+ *        counter starting from 0, causing filename collisions (ERROR_SHARING_VIOLATION)
+ */
 inline u64
 mmapVectorNextId()
 {
@@ -28,8 +30,10 @@ mmapVectorNextId()
         return counter.fetch_add(1);
 }
 
-// User-configurable base directory for the disk cache. Empty => system temp.
-// Set once at startup (before heavy sampling) via mmapVectorSetCacheDir().
+/**
+ * @brief User-configurable base directory for the disk cache. Empty => system temp
+ *        Set once at startup (before heavy sampling) via mmapVectorSetCacheDir()
+ */
 inline std::string &
 mmapVectorCacheDirRaw()
 {
@@ -47,7 +51,9 @@ mmapVectorCacheDir()
         return mmapVectorCacheDirRaw();
 }
 
-// Resolve (and create) the directory that holds the ".tmp" cache files.
+/**
+ * @brief Resolve (and create) the directory that holds the ".tmp" cache files
+ */
 inline std::string
 mmapVectorCacheRoot()
 {
@@ -74,8 +80,10 @@ mmapVectorCacheRoot()
 #endif
 }
 
-// Clean up stale mmap files from previous runs (e.g. after a crash).
-// Called once on first MmapVector construction.
+/**
+ * @brief Clean up stale mmap files from prev runs (e.g. after a crash)
+ *        Called once on first MmapVector construction
+ */
 inline void
 mmapVectorCleanupStale()
 {
@@ -116,7 +124,7 @@ template <typename T> class MmapVector
         static std::string generateTempPath()
         {
                 // Built from std::string (not a fixed buffer) so a long, user-chosen
-                // cache directory can't truncate the path.
+                // cache directory can't truncate the path
                 const std::string dir = mmapVectorCacheRoot();
 #ifdef _WIN32
                 return dir + "\\ava_tool_mmap_" + std::to_string(GetCurrentProcessId()) + "_" +
@@ -167,9 +175,11 @@ template <typename T> class MmapVector
 #endif
         }
 
-        // Shift live elements [head_, tail_) down to the front so head_ becomes 0.
-        // Reclaims the dead "head space" left by pop_front without freeing the
-        // backing file — that's what makes the underlying file size stable.
+        /**
+         * @brief Shift live elements [head_, tail_) down to the front so head_ becomes 0
+         *        Reclaims the dead "head space" left by pop_front without freeing the
+         *        backing file — that's what makes the underlying file size stable
+         */
         void compact_()
         {
                 if (head_ == 0 || !data_)
@@ -181,9 +191,11 @@ template <typename T> class MmapVector
                 head_ = 0;
         }
 
-        // Poison the buffer: live data is unrecoverable, but every accessor stays
-        // safe (size()==0, empty()==true, operator[]/front/back return a sentinel).
-        // Used as graceful degradation when an OS call inside grow() fails.
+        /**
+         * @brief Poison the buffer: live data is unrecoverable, but every accessor stays
+         *        safe (size()==0, empty()==true, operator[]/front/back return a sentinel)
+         *        Used as graceful degradation when an OS call inside grow() fails
+         */
         void poison_()
         {
                 head_     = 0;
@@ -329,7 +341,7 @@ template <typename T> class MmapVector
         {
                 if (tail_ >= capacity_) {
                         // Reclaim dead head space first — for a steady-state ring this
-                        // usually keeps tail_ bounded and avoids ever calling grow() again.
+                        // usually keeps tail_ bounded and avoids ever calling grow() again
                         if (head_ > 0)
                                 compact_();
                         if (tail_ >= capacity_) {
@@ -348,7 +360,7 @@ template <typename T> class MmapVector
                         ++head_;
                         // Amortized-O(1) compaction: when half the buffer is dead space
                         // we memmove it down. Without this, tail_ grows unboundedly even
-                        // though size() stays bounded — eventually filling the disk.
+                        // though size() stays bounded — eventually filling the disk
                         if (capacity_ > 0 && head_ >= capacity_ / 2)
                                 compact_();
                 }
@@ -360,13 +372,33 @@ template <typename T> class MmapVector
                 tail_ = 0;
         }
 
+        /**
+         * @brief Remove a half-open range of live elements without reallocating the
+         *        file-backed store. The surviving elements keep their exact bytes
+         */
+        usize eraseRange(usize first, usize last)
+        {
+                const usize n = size();
+                first         = std::min(first, n);
+                last          = std::min(last, n);
+                if (first >= last)
+                        return 0;
+                const usize removed = last - first;
+                if (last < n)
+                        memmove(data_ + head_ + first, data_ + head_ + last, (n - last) * sizeof(T));
+                tail_ -= removed;
+                return removed;
+        }
+
         usize size() const { return tail_ - head_; }
         bool  empty() const { return head_ == tail_; }
 
-        // Accessors return a zero-initialized sentinel when the backing store has
-        // been poisoned (grow() failed). Callers that already check empty() never
-        // hit this path; the guard exists to keep the process alive instead of
-        // segfaulting on a stale read after an OS allocation failure.
+        /**
+         * @brief Accessors return a zero-initialized sentinel when the backing store has
+         *        been poisoned (grow() failed). Callers that already check empty() never
+         *        hit this path; the guard exists to keep the process alive instead of
+         *        segfaulting on a stale read after an OS allocation failure
+         */
         const T &operator[](usize i) const
         {
                 static const T sentinel{};

@@ -21,7 +21,7 @@ int main(int argc, char **argv)
                     : dyn200_open_ex(argv[1], baud, address, 1000, stop_bits))) {
                 fprintf(stderr, "open: %s\n", dyn200_last_error()); return 1;
         }
-        /* Change these if the sensor's display parameters are different. */
+        // Change these if the sensor's display parameters are different
         dyn200_set_decimals(2, 0, 0);
         printf("Reading continuously; press Ctrl+C to stop.\n");
         for (;;) {

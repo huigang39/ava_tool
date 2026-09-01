@@ -56,7 +56,7 @@ class BkpSramDebugger
                 std::uint32_t tick{0};
                 std::uint32_t raw{0};
                 double        plotTick{0.0};
-                double        value{0.0};
+                double        val{0.0};
                 double        hostTimeSec{0.0};
         };
         struct ChannelRuntime {
@@ -73,7 +73,7 @@ class BkpSramDebugger
                 bool               generationKnown{false};
                 bool               preserveHistoryOnReacquire{false};
                 bool               plotTickKnown{false};
-                std::uint32_t      lastRawTick{0};
+                std::uint32_t      prevRawTick{0};
                 double             plotTickOffset{0.0};
                 bool               active{false};
                 ValueType          displayType{ValueType::F32};
@@ -81,6 +81,8 @@ class BkpSramDebugger
                 TimeSeriesBuffer   display{};
         };
         struct ProtocolLayout {
+                std::uint64_t accessEpoch{0};
+                std::uint64_t symbolEpoch{0};
                 std::uint32_t control{0};
                 std::uint32_t data{0};
                 std::uint32_t seq{0};
@@ -89,10 +91,10 @@ class BkpSramDebugger
                 std::uint32_t sampleDiv{0};
                 std::uint32_t status{0};
                 std::uint32_t errorChannel{0};
-                std::uint32_t channelBase{0};
-                std::uint32_t channelStride{8};
-                std::uint32_t channelAddressOffset{0};
-                std::uint32_t channelTypeOffset{4};
+                std::uint32_t chBase{0};
+                std::uint32_t chStride{8};
+                std::uint32_t chAddressOffset{0};
+                std::uint32_t chTypeOffset{4};
                 std::uint32_t stateBase{0};
                 std::uint32_t dataSize{0};
                 std::uint32_t stateStride{32};
@@ -110,7 +112,7 @@ class BkpSramDebugger
         mutable std::mutex                                        configMtx_{};
         mutable std::mutex                                        dataMtx_{};
         mutable std::mutex                                        statusMtx_{};
-        std::vector<ChannelConfig>                                channels_{};
+        std::vector<ChannelConfig>                                chs_{};
         std::array<ChannelRuntime, kMaxChannels>                  runtime_{};
         std::array<std::vector<Point>, kMaxChannels>              plotCache_{};
         std::thread                                               worker_{};

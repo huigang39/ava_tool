@@ -1,4 +1,7 @@
 #include "gui/device_manager.hpp"
+#include "gui/choice_control.hpp"
+#include "gui/dock_close.hpp"
+#include "gui/search_results.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -22,6 +25,9 @@
 #include "gui/i18n.hpp"
 #include "gui/monitor.hpp"
 #include "gui/monitor_types.hpp"
+#include "gui/table_text.hpp"
+#include "gui/ui_icons.hpp"
+#include "gui/ui_theme.hpp"
 #include "imgui.h"
 #include "platform/native_dlg.hpp"
 
@@ -60,8 +66,8 @@ trimCopy(const std::string &text)
         const size_t first = text.find_first_not_of(" \t\r\n");
         if (first == std::string::npos)
                 return {};
-        const size_t last = text.find_last_not_of(" \t\r\n");
-        return text.substr(first, last - first + 1);
+        const size_t prev = text.find_last_not_of(" \t\r\n");
+        return text.substr(first, prev - first + 1);
 }
 
 std::string
@@ -135,7 +141,7 @@ stableTypeFromName(const std::string &name)
                 if (key == choice.name)
                         return choice.type;
 
-        // Accept ctypeLabel spellings for early development files.
+        // Accept ctypeLabel spellings for early development files
         if (key == "int8")
                 return CType::I8;
         if (key == "int16")
@@ -163,23 +169,23 @@ template <typename T>
 T
 readScalar(const std::array<uint8_t, 16> &data)
 {
-        T value{};
+        T val{};
         static_assert(sizeof(T) <= 16);
-        std::memcpy(&value, data.data(), sizeof(T));
-        return value;
+        std::memcpy(&val, data.data(), sizeof(T));
+        return val;
 }
 
 template <typename T>
 void
-writeScalar(std::array<uint8_t, 16> &data, T value)
+writeScalar(std::array<uint8_t, 16> &data, T val)
 {
         static_assert(sizeof(T) <= 16);
         data.fill(0);
-        std::memcpy(data.data(), &value, sizeof(T));
+        std::memcpy(data.data(), &val, sizeof(T));
 }
 
 bool
-parseSigned(const std::string &text, int64_t minimum, int64_t maximum, int64_t &value)
+parseSigned(const std::string &text, int64_t minimum, int64_t maximum, int64_t &val)
 {
         const std::string cleaned = trimCopy(text);
         if (cleaned.empty())
@@ -191,12 +197,12 @@ parseSigned(const std::string &text, int64_t minimum, int64_t maximum, int64_t &
                 return false;
         if (parsed < minimum || parsed > maximum)
                 return false;
-        value = static_cast<int64_t>(parsed);
+        val = static_cast<int64_t>(parsed);
         return true;
 }
 
 bool
-parseUnsigned(const std::string &text, uint64_t maximum, uint64_t &value)
+parseUnsigned(const std::string &text, uint64_t maximum, uint64_t &val)
 {
         const std::string cleaned = trimCopy(text);
         if (cleaned.empty() || cleaned.front() == '-')
@@ -206,12 +212,12 @@ parseUnsigned(const std::string &text, uint64_t maximum, uint64_t &value)
         const unsigned long long parsed = std::strtoull(cleaned.c_str(), &end, 0);
         if (errno == ERANGE || !end || end == cleaned.c_str() || *end != '\0' || parsed > maximum)
                 return false;
-        value = static_cast<uint64_t>(parsed);
+        val = static_cast<uint64_t>(parsed);
         return true;
 }
 
 bool
-parseFloat32(const std::string &text, float &value)
+parseFloat32(const std::string &text, float &val)
 {
         const std::string cleaned = trimCopy(text);
         if (cleaned.empty())
@@ -221,12 +227,12 @@ parseFloat32(const std::string &text, float &value)
         const float parsed = std::strtof(cleaned.c_str(), &end);
         if (errno == ERANGE || !end || end == cleaned.c_str() || *end != '\0' || !std::isfinite(parsed))
                 return false;
-        value = parsed;
+        val = parsed;
         return true;
 }
 
 bool
-parseFloat64(const std::string &text, double &value)
+parseFloat64(const std::string &text, double &val)
 {
         const std::string cleaned = trimCopy(text);
         if (cleaned.empty())
@@ -236,20 +242,20 @@ parseFloat64(const std::string &text, double &value)
         const double parsed = std::strtod(cleaned.c_str(), &end);
         if (errno == ERANGE || !end || end == cleaned.c_str() || *end != '\0' || !std::isfinite(parsed))
                 return false;
-        value = parsed;
+        val = parsed;
         return true;
 }
 
 bool
-parseBool(const std::string &text, bool &value)
+parseBool(const std::string &text, bool &val)
 {
         const std::string cleaned = lowerCopy(trimCopy(text));
         if (cleaned == "true" || cleaned == "1") {
-                value = true;
+                val = true;
                 return true;
         }
         if (cleaned == "false" || cleaned == "0") {
-                value = false;
+                val = false;
                 return true;
         }
         return false;
@@ -441,6 +447,12 @@ bool
 inputTextString(const char *label, std::string &text, ImGuiInputTextFlags flags = 0)
 {
         flags |= ImGuiInputTextFlags_CallbackResize;
+        if (label[0] != '#') {
+                ImGui::TextWrapped("%s", label);
+                ImGui::SetNextItemWidth(-1.0f);
+                const std::string id = std::string("##") + label;
+                return ImGui::InputText(id.c_str(), text.data(), text.capacity() + 1, flags, resizeStringCallback, &text);
+        }
         return ImGui::InputText(label, text.data(), text.capacity() + 1, flags, resizeStringCallback, &text);
 }
 
@@ -542,6 +554,90 @@ hasExtension(const std::string &path, const std::vector<std::string> &extensions
         return false;
 }
 
+std::string
+deviceFileName(const std::string &path)
+{
+        const size_t slash = path.find_last_of("/\\");
+        return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+bool
+sameSdkPath(std::string a, std::string b)
+{
+        if (a.empty() || b.empty())
+                return false;
+        std::replace(a.begin(), a.end(), '\\', '/');
+        std::replace(b.begin(), b.end(), '\\', '/');
+#if defined(_WIN32)
+        a = lowerCopy(a);
+        b = lowerCopy(b);
+#endif
+        return a == b;
+}
+
+void
+deviceStatus(const char *text, ui::BtnStyle style)
+{
+        const auto color = ui::SemanticButtonPalette(style, ImGui::GetStyle()).text;
+        ImGui::PushStyleColor(ImGuiCol_Text, color);
+        ImGui::TextWrapped("%s", text);
+        ImGui::PopStyleColor();
+}
+
+// A wrapping navigation row keeps complete device names visible at large fonts.
+bool
+deviceNavigationCard(const char *id, const std::string &name, const std::string &subtitle, ui::Icon icon, bool selected)
+{
+        const float font        = ImGui::GetFontSize();
+        const float width       = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+        const float padding     = ImGui::GetStyle().FramePadding.x + font * 0.25f;
+        const float inset       = font * 1.7f + padding;
+        const float textWidth   = std::max(font, width - inset - padding);
+        const float titleHeight = ImGui::CalcTextSize(name.c_str(), nullptr, false, textWidth).y;
+        const float subtitleHeight =
+            subtitle.empty() ? 0.0f : ImGui::CalcTextSize(subtitle.c_str(), nullptr, false, textWidth).y;
+        const ImVec2 start  = ImGui::GetCursorScreenPos();
+        const float  height = std::max(font * 2.8f, titleHeight + subtitleHeight + padding * 2.0f + (subtitle.empty() ? 0 : 3));
+        const bool   pressed = ImGui::InvisibleButton(id, ImVec2(width, height), ImGuiButtonFlags_EnableNav);
+        auto        *draw    = ImGui::GetWindowDrawList();
+        if (selected || ImGui::IsItemHovered() || ImGui::IsItemActive()) {
+                draw->AddRectFilled(start,
+                                    ImVec2(start.x + width, start.y + height),
+                                    ImGui::GetColorU32(selected ? ImGuiCol_Header : ImGuiCol_HeaderHovered),
+                                    ImGui::GetStyle().FrameRounding);
+        }
+        if (ImGui::IsItemFocused())
+                draw->AddRect(start,
+                              ImVec2(start.x + width, start.y + height),
+                              ImGui::GetColorU32(ImGuiCol_NavCursor),
+                              ImGui::GetStyle().FrameRounding,
+                              0,
+                              2.0f);
+        const ImU32 foreground = ImGui::GetColorU32(ImGuiCol_Text);
+        ui::DrawIcon(draw, icon, ImVec2(start.x + padding, start.y + padding), font * 1.1f, foreground);
+        draw->AddText(nullptr, 0, ImVec2(start.x + inset, start.y + padding), foreground, name.c_str(), nullptr, textWidth);
+        if (!subtitle.empty())
+                draw->AddText(nullptr,
+                              0,
+                              ImVec2(start.x + inset, start.y + padding + titleHeight + 3),
+                              ImGui::GetColorU32(ImGuiCol_TextDisabled),
+                              subtitle.c_str(),
+                              nullptr,
+                              textWidth);
+        return pressed;
+}
+
+void
+deviceNextAction(const char *label, ui::Icon icon)
+{
+        const float needed =
+            ImGui::CalcTextSize(label, nullptr, true).x + ImGui::GetFontSize() * 1.7f + ImGui::GetStyle().FramePadding.x * 2.0f;
+        const float right = ImGui::GetCursorScreenPos().x + ImGui::GetContentRegionAvail().x;
+        if (ImGui::GetItemRectMax().x + needed + ImGui::GetStyle().ItemSpacing.x < right)
+                ImGui::SameLine();
+        (void)icon;
+}
+
 } // namespace
 
 DeviceManager::~DeviceManager()
@@ -576,8 +672,8 @@ DeviceManager::startPollThread()
                                                         std::array<uint8_t, 8> current{};
                                                         ok = request.bitOffset < 64u &&
                                                              request.bitSize <= 64u - request.bitOffset &&
-                                                             JLinkPort::instance().readMem(
-                                                                 request.address, request.size, current.data());
+                                                             JLinkPort::instance().readMemAtEpoch(
+                                                                 request.epoch, request.address, request.size, current.data());
                                                         if (ok) {
                                                                 uint64_t oldRaw = 0;
                                                                 uint64_t newRaw = 0;
@@ -597,8 +693,8 @@ DeviceManager::startPollThread()
                                                         ok = true;
                                                 }
                                                 if (ok)
-                                                        ok = JLinkPort::instance().writeMem(
-                                                            request.address, request.size, output.data());
+                                                        ok = JLinkPort::instance().writeMemAtEpoch(
+                                                            request.epoch, request.address, request.size, output.data());
                                         }
                                         std::lock_guard lock(state->mutex);
                                         state->writeResults[request.token] = ok;
@@ -608,13 +704,13 @@ DeviceManager::startPollThread()
                                         for (const PollReq &request : requests) {
                                                 if (!state->running.load(std::memory_order_acquire))
                                                         break;
-                                                PollVal value;
-                                                value.size = request.size;
-                                                value.ok   = request.size > 0u && request.size <= value.data.size() &&
-                                                           JLinkPort::instance().readMem(
-                                                               request.address, request.size, value.data.data());
+                                                PollVal val;
+                                                val.size = request.size;
+                                                val.ok   = request.size > 0u && request.size <= val.data.size() &&
+                                                         JLinkPort::instance().readMemAtEpoch(
+                                                             request.epoch, request.address, request.size, val.data.data());
                                                 std::lock_guard lock(state->mutex);
-                                                state->values[request.address] = value;
+                                                state->values[request.address] = val;
                                         }
                                 }
 
@@ -625,7 +721,7 @@ DeviceManager::startPollThread()
                                         std::this_thread::sleep_for(std::chrono::milliseconds(std::min(20u, interval - slept)));
                         }
                 } catch (...) {
-                        // A provider failure must never terminate the application.
+                        // A provider failure must never terminate the application
                 }
         });
 }
@@ -655,6 +751,10 @@ DeviceManager::clear()
         selectedDevice_          = -1;
         selectedInstance_        = -1;
         selectedFunction_        = -1;
+        showOverview_            = true;
+        compactLibrary_          = true;
+        requestedDetailTab_      = -1;
+        deviceSearch_[0]         = '\0';
         pendingDeleteTypeId_     = 0;
         pendingDeleteInstanceId_ = 0;
         pendingDeletePropertyId_ = 0;
@@ -674,8 +774,10 @@ DeviceManager::refreshJLinkProperties()
 
         const uint64_t nowMs = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-        if (symbolResolver_ && nowMs - lastSymbolResolveMs_ >= 1000u) {
-                lastSymbolResolveMs_ = nowMs;
+        if (symbolResolver_ &&
+            (nowMs - prevSymbolResolveMs_ >= 1000u || resolvedSymbolEpoch_ != JLinkPort::instance().symbolEpoch())) {
+                prevSymbolResolveMs_ = nowMs;
+                resolvedSymbolEpoch_ = JLinkPort::instance().symbolEpoch();
                 auto resolve         = [&](Property &property) {
                         if (property.source != PropertySource::JLink || property.symbol.empty())
                                 return;
@@ -712,7 +814,7 @@ DeviceManager::refreshJLinkProperties()
         std::vector<PollReq> requests;
         requests.reserve(sizes.size());
         for (const auto &[address, size] : sizes)
-                requests.push_back({address, size});
+                requests.push_back({JLinkPort::instance().targetEpoch(), address, size});
 
         std::unordered_map<uint32_t, PollVal> values;
         std::unordered_map<uint64_t, bool>    writeResults;
@@ -732,7 +834,7 @@ DeviceManager::refreshJLinkProperties()
                         const auto result = writeResults.find(property.writeToken);
                         if (result != writeResults.end()) {
                                 property.writePending = false;
-                                property.lastWriteOk  = result->second;
+                                property.prevWriteOk  = result->second;
                         }
                 }
                 if (!connected || property.address == 0u) {
@@ -743,21 +845,21 @@ DeviceManager::refreshJLinkProperties()
                 const auto found = values.find(property.address);
                 if (found == values.end())
                         return;
-                const PollVal &value    = found->second;
+                const PollVal &val      = found->second;
                 property.liveValueKnown = true;
-                property.liveReadOk     = value.ok;
+                property.liveReadOk     = val.ok;
                 const uint32_t size     = scalarTypeSize(property.type);
-                if (!value.ok || size == 0u || value.size < size || property.writePending)
+                if (!val.ok || size == 0u || val.size < size || property.writePending)
                         return;
 
                 if (property.bitSize == 0u) {
                         property.data.fill(0);
-                        std::memcpy(property.data.data(), value.data.data(), size);
+                        std::memcpy(property.data.data(), val.data.data(), size);
                         if (property.type == CType::Bool)
                                 writeScalar<uint8_t>(property.data, readScalar<uint8_t>(property.data) ? 1u : 0u);
                 } else if (property.bitOffset < 64u && property.bitSize <= 64u - property.bitOffset) {
                         uint64_t raw = 0;
-                        std::memcpy(&raw, value.data.data(), size);
+                        std::memcpy(&raw, val.data.data(), size);
                         const uint64_t mask  = property.bitSize == 64u ? std::numeric_limits<uint64_t>::max()
                                                                                : ((uint64_t{1} << property.bitSize) - 1u);
                         const uint64_t field = (raw >> property.bitOffset) & mask;
@@ -796,6 +898,7 @@ DeviceManager::queuePropertyWrite(Property &property)
         if (size == 0u || size > 8u)
                 return;
         WriteReq request;
+        request.epoch = JLinkPort::instance().targetEpoch();
         request.token = nextWriteToken_++;
         if (request.token == 0u)
                 request.token = nextWriteToken_++;
@@ -810,7 +913,7 @@ DeviceManager::queuePropertyWrite(Property &property)
         }
         property.writeToken   = request.token;
         property.writePending = true;
-        property.lastWriteOk  = true;
+        property.prevWriteOk  = true;
 }
 
 DeviceManager::Property *
@@ -918,85 +1021,82 @@ DeviceManager::propertyValueString(const Property &property)
 }
 
 bool
-DeviceManager::setPropertyValue(Property &property, const std::string &value)
+DeviceManager::setPropertyValue(Property &property, const std::string &val)
 {
         switch (property.type) {
                 case CType::Bool: {
                         bool parsed = false;
-                        if (!parseBool(value, parsed))
+                        if (!parseBool(val, parsed))
                                 return false;
                         writeScalar<uint8_t>(property.data, parsed ? 1 : 0);
                         return true;
                 }
                 case CType::I8: {
                         int64_t parsed = 0;
-                        if (!parseSigned(value, std::numeric_limits<int8_t>::min(), std::numeric_limits<int8_t>::max(), parsed))
+                        if (!parseSigned(val, std::numeric_limits<int8_t>::min(), std::numeric_limits<int8_t>::max(), parsed))
                                 return false;
                         writeScalar<int8_t>(property.data, static_cast<int8_t>(parsed));
                         return true;
                 }
                 case CType::I16: {
                         int64_t parsed = 0;
-                        if (!parseSigned(
-                                value, std::numeric_limits<int16_t>::min(), std::numeric_limits<int16_t>::max(), parsed))
+                        if (!parseSigned(val, std::numeric_limits<int16_t>::min(), std::numeric_limits<int16_t>::max(), parsed))
                                 return false;
                         writeScalar<int16_t>(property.data, static_cast<int16_t>(parsed));
                         return true;
                 }
                 case CType::I32: {
                         int64_t parsed = 0;
-                        if (!parseSigned(
-                                value, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max(), parsed))
+                        if (!parseSigned(val, std::numeric_limits<int32_t>::min(), std::numeric_limits<int32_t>::max(), parsed))
                                 return false;
                         writeScalar<int32_t>(property.data, static_cast<int32_t>(parsed));
                         return true;
                 }
                 case CType::I64: {
                         int64_t parsed = 0;
-                        if (!parseSigned(
-                                value, std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max(), parsed))
+                        if (!parseSigned(val, std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max(), parsed))
                                 return false;
                         writeScalar<int64_t>(property.data, parsed);
                         return true;
                 }
                 case CType::U8: {
                         uint64_t parsed = 0;
-                        if (!parseUnsigned(value, std::numeric_limits<uint8_t>::max(), parsed))
+                        if (!parseUnsigned(val, std::numeric_limits<uint8_t>::max(), parsed))
                                 return false;
                         writeScalar<uint8_t>(property.data, static_cast<uint8_t>(parsed));
                         return true;
                 }
                 case CType::U16: {
                         uint64_t parsed = 0;
-                        if (!parseUnsigned(value, std::numeric_limits<uint16_t>::max(), parsed))
+                        if (!parseUnsigned(val, std::numeric_limits<uint16_t>::max(), parsed))
                                 return false;
                         writeScalar<uint16_t>(property.data, static_cast<uint16_t>(parsed));
                         return true;
                 }
                 case CType::U32: {
                         uint64_t parsed = 0;
-                        if (!parseUnsigned(value, std::numeric_limits<uint32_t>::max(), parsed))
+                        if (!parseUnsigned(val, std::numeric_limits<uint32_t>::max(), parsed))
                                 return false;
                         writeScalar<uint32_t>(property.data, static_cast<uint32_t>(parsed));
                         return true;
                 }
                 case CType::U64: {
                         uint64_t parsed = 0;
-                        if (!parseUnsigned(value, std::numeric_limits<uint64_t>::max(), parsed))
+                        if (!parseUnsigned(val, std::numeric_limits<uint64_t>::max(), parsed))
                                 return false;
                         writeScalar<uint64_t>(property.data, parsed);
                         return true;
                 }
                 case CType::F32: {
                         float parsed = 0.0f;
-                        if (!parseFloat32(value, parsed))
+                        if (!parseFloat32(val, parsed))
                                 return false;
                         writeScalar<float>(property.data, parsed);
                         return true;
                 }
                 case CType::F64: {
                         double parsed = 0.0;
-                        if (!parseFloat64(value, parsed))
+                        if (!parseFloat64(val, parsed))
                                 return false;
                         writeScalar<double>(property.data, parsed);
                         return true;
@@ -1120,10 +1220,12 @@ DeviceManager::createInstance(Device &device, const std::string &requestedName)
                 property.liveValueKnown   = false;
                 property.liveReadOk       = false;
                 property.writePending     = false;
-                property.lastWriteOk      = true;
+                property.prevWriteOk      = true;
                 property.writeToken       = 0u;
         }
         device.instances.push_back(std::move(instance));
+        for (auto &method : device.methods)
+                method.prevResult.clear();
         selectedInstance_ = static_cast<int>(device.instances.size()) - 1;
         modified_         = true;
 }
@@ -1148,7 +1250,7 @@ DeviceManager::loadLibrary(Device &device)
                 return;
         }
         if (!device.loader.load(device.libraryPath)) {
-                device.status        = device.loader.lastError();
+                device.status        = device.loader.prevError();
                 device.statusIsError = true;
                 return;
         }
@@ -1233,36 +1335,36 @@ DeviceManager::bindFunction(Device &device, const CFuncDecl &function)
 void
 DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBinding &method)
 {
-        method.lastResult.clear();
-        method.lastResultOk = false;
+        method.prevResult.clear();
+        method.prevResultOk = false;
         if (method.kind == MethodKind::Instance && !instance) {
-                method.lastResult =
+                method.prevResult =
                     tr("Select a concrete device before calling this method.", "调用此方法前请选择一个具体设备。");
                 return;
         }
         if (!device.loader.isLoaded()) {
-                method.lastResult = tr("Dynamic library is not loaded.", "动态库未加载。");
+                method.prevResult = tr("Dynamic library is not loaded.", "动态库未加载。");
                 return;
         }
         const CFuncDecl *headerFunction = findFunction(device, method);
         if (!headerFunction) {
-                method.lastResult = tr("The bound header function/signature is unresolved.", "绑定的头文件函数/签名无法解析。");
+                method.prevResult = tr("The bound header function/signature is unresolved.", "绑定的头文件函数/签名无法解析。");
                 return;
         }
         if (headerFunction->retType == CType::Unknown) {
-                method.lastResult = tr("Unknown return type is not callable.", "未知返回类型不可调用。");
+                method.prevResult = tr("Unknown return type is not callable.", "未知返回类型不可调用。");
                 return;
         }
         if (method.kind == MethodKind::Discovery && headerFunction->retType != CType::I32) {
-                method.lastResult = tr("Discovery functions must return int.", "发现函数必须返回 int。");
+                method.prevResult = tr("Discovery functions must return int.", "发现函数必须返回 int。");
                 return;
         }
         if (headerFunction->isVariadic) {
-                method.lastResult = tr("Variadic functions are not callable.", "可变参数函数不可调用。");
+                method.prevResult = tr("Variadic functions are not callable.", "可变参数函数不可调用。");
                 return;
         }
         if (method.arguments.size() != headerFunction->params.size()) {
-                method.lastResult = tr("Saved argument count does not match the header.", "保存的参数数量与头文件不匹配。");
+                method.prevResult = tr("Saved argument count does not match the header.", "保存的参数数量与头文件不匹配。");
                 return;
         }
 
@@ -1276,7 +1378,7 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
                     method.discoveryBufferArg == method.discoveryCapacityArg ||
                     method.discoveryBufferArg >= static_cast<int>(headerFunction->params.size()) ||
                     method.discoveryCapacityArg >= static_cast<int>(headerFunction->params.size())) {
-                        method.lastResult = tr("Configure distinct JSON-buffer and capacity arguments.",
+                        method.prevResult = tr("Configure distinct JSON-buffer and capacity arguments.",
                                                "请配置不同的 JSON 缓冲区参数和容量参数。");
                         return;
                 }
@@ -1284,12 +1386,12 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
                 bool          bufferConst = false;
                 const auto    bufferType  = pointerPointeeType(bufferParam, bufferConst);
                 if (!bufferType || bufferConst || !isCharacterPointer(bufferParam)) {
-                        method.lastResult =
+                        method.prevResult =
                             tr("The discovery buffer must be a writable char pointer.", "发现缓冲区必须是可写 char 指针。");
                         return;
                 }
                 if (!isCapacityType(headerFunction->params[method.discoveryCapacityArg].type)) {
-                        method.lastResult =
+                        method.prevResult =
                             tr("The discovery capacity must be an integer scalar argument.", "发现容量必须是整数标量参数。");
                         return;
                 }
@@ -1302,11 +1404,11 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
         if (method.resultPropertyId != 0) {
                 resultProperty = propertyById(method.resultPropertyId);
                 if (!resultProperty) {
-                        method.lastResult = tr("Return target property no longer exists.", "返回值目标属性已不存在。");
+                        method.prevResult = tr("Return target property no longer exists.", "返回值目标属性已不存在。");
                         return;
                 }
                 if (!isScalarType(headerFunction->retType) || resultProperty->type != headerFunction->retType) {
-                        method.lastResult = tr("Return target type does not exactly match the function return type.",
+                        method.prevResult = tr("Return target type does not exactly match the function return type.",
                                                "返回值目标类型与函数返回类型不完全匹配。");
                         return;
                 }
@@ -1331,7 +1433,7 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
         };
 
         // First validate and create all scratch buffers. Nothing in the live property
-        // model is exposed to the DLL before every binding has passed validation.
+        // model is exposed to the DLL before every binding has passed validation
         for (size_t i = 0; i < headerFunction->params.size(); ++i) {
                 const CParam          &parameter = headerFunction->params[i];
                 const ArgumentBinding &binding   = method.arguments[i];
@@ -1344,12 +1446,12 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
                         continue;
                 }
                 if (method.kind == MethodKind::Discovery && binding.source == ArgSource::PropertyAddress) {
-                        method.lastResult = tr("Discovery methods cannot write type properties through pointer bindings.",
+                        method.prevResult = tr("Discovery methods cannot write type properties through pointer bindings.",
                                                "发现方法不能通过指针绑定写入类型属性。");
                         return;
                 }
                 if (parameter.type == CType::Unknown) {
-                        method.lastResult = std::string(tr("Unknown parameter type: ", "未知参数类型：")) +
+                        method.prevResult = std::string(tr("Unknown parameter type: ", "未知参数类型：")) +
                                             (parameter.name.empty() ? std::to_string(i) : parameter.name);
                         return;
                 }
@@ -1358,7 +1460,7 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
                                 Property parsed;
                                 parsed.type = parameter.type;
                                 if (!setPropertyValue(parsed, binding.literal)) {
-                                        method.lastResult =
+                                        method.prevResult =
                                             std::string(tr("Invalid literal for parameter: ", "参数常量无效：")) +
                                             (parameter.name.empty() ? std::to_string(i) : parameter.name);
                                         return;
@@ -1369,25 +1471,25 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
                         } else if (parameter.type == CType::Ptr) {
                                 const std::string literal = lowerCopy(trimCopy(binding.literal));
                                 if (!literal.empty() && literal != "0" && literal != "null" && literal != "nullptr") {
-                                        method.lastResult =
+                                        method.prevResult =
                                             tr("Pointer literals only accept null; bind a property address instead.",
                                                "指针常量只允许空指针；请改为绑定属性地址。");
                                         return;
                                 }
                                 arguments[i] = "0";
                         } else {
-                                method.lastResult =
+                                method.prevResult =
                                     tr("Unknown parameter types cannot be marshalled.", "未知参数类型无法封送。");
                                 return;
                         }
                 } else if (binding.source == ArgSource::PropertyValue) {
                         const Property *property = propertyById(binding.propertyId);
                         if (!property) {
-                                method.lastResult = tr("A value-bound property no longer exists.", "按值绑定的属性已不存在。");
+                                method.prevResult = tr("A value-bound property no longer exists.", "按值绑定的属性已不存在。");
                                 return;
                         }
                         if (!isScalarType(parameter.type) || parameter.type != property->type) {
-                                method.lastResult = tr("A value-bound property must exactly match the scalar parameter type.",
+                                method.prevResult = tr("A value-bound property must exactly match the scalar parameter type.",
                                                        "按值绑定的属性必须与标量参数类型完全匹配。");
                                 return;
                         }
@@ -1395,14 +1497,14 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
                 } else {
                         Property *property = propertyById(binding.propertyId);
                         if (!property) {
-                                method.lastResult =
+                                method.prevResult =
                                     tr("An address-bound property no longer exists.", "按地址绑定的属性已不存在。");
                                 return;
                         }
                         bool       pointeeConst = false;
                         const auto pointee      = pointerPointeeType(parameter, pointeeConst);
                         if (!pointee || pointeeConst || isCharacterPointer(parameter) || *pointee != property->type) {
-                                method.lastResult =
+                                method.prevResult =
                                     tr("PropertyAddress requires a writable, recognized scalar pointer of the exact same type.",
                                        "属性地址要求可写、可识别且类型完全相同的标量指针。");
                                 return;
@@ -1427,7 +1529,7 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
                 if (binding.source == ArgSource::PropertyAddress) {
                         const auto found = scratchByProperty.find(binding.propertyId);
                         if (found == scratchByProperty.end()) {
-                                method.lastResult = tr("Internal scratch binding error.", "内部临时缓冲绑定错误。");
+                                method.prevResult = tr("Internal scratch binding error.", "内部临时缓冲绑定错误。");
                                 return;
                         }
                         pointerOverrides[i] = scratch[found->second].data.data();
@@ -1439,28 +1541,28 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
         CFuncDecl callable = *headerFunction;
         callable.name      = trimCopy(method.exportSymbol);
         if (callable.name.empty()) {
-                method.lastResult = tr("Export symbol cannot be empty.", "导出符号不能为空。");
+                method.prevResult = tr("Export symbol cannot be empty.", "导出符号不能为空。");
                 return;
         }
         const CallResult result = device.loader.call(callable, arguments, pointerOverrides);
-        method.lastResult       = result.ok ? result.display : result.error;
-        method.lastResultOk     = result.ok;
+        method.prevResult       = result.ok ? result.display : result.error;
+        method.prevResultOk     = result.ok;
         if (!result.ok)
                 return;
 
         // A non-finite value cannot round-trip through the strict persisted-value
-        // parser. Reject the whole transaction before exposing any DLL writes.
+        // parser. Reject the whole transaction before exposing any DLL writes
         for (auto &entry : scratch) {
                 if (entry.type == CType::F32 && !std::isfinite(readScalar<float>(entry.data))) {
-                        method.lastResult   = tr("Call produced a non-finite float; no property was updated.",
+                        method.prevResult   = tr("Call produced a non-finite float; no property was updated.",
                                                "调用产生非有限 float；未更新任何属性。");
-                        method.lastResultOk = false;
+                        method.prevResultOk = false;
                         return;
                 }
                 if (entry.type == CType::F64 && !std::isfinite(readScalar<double>(entry.data))) {
-                        method.lastResult   = tr("Call produced a non-finite double; no property was updated.",
+                        method.prevResult   = tr("Call produced a non-finite double; no property was updated.",
                                                "调用产生非有限 double；未更新任何属性。");
-                        method.lastResultOk = false;
+                        method.prevResultOk = false;
                         return;
                 }
                 if (entry.type == CType::Bool)
@@ -1468,9 +1570,9 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
         }
         if (resultProperty && (headerFunction->retType == CType::F32 || headerFunction->retType == CType::F64) &&
             !std::isfinite(result.rawF64)) {
-                method.lastResult =
+                method.prevResult =
                     tr("Call returned a non-finite value; no property was updated.", "调用返回非有限值；未更新任何属性。");
-                method.lastResultOk = false;
+                method.prevResultOk = false;
                 return;
         }
 
@@ -1478,27 +1580,27 @@ DeviceManager::callMethod(Device &device, DeviceInstance *instance, MethodBindin
                 const bool signedReturn = headerFunction->retType == CType::I8 || headerFunction->retType == CType::I16 ||
                                           headerFunction->retType == CType::I32 || headerFunction->retType == CType::I64;
                 if (signedReturn && static_cast<int64_t>(result.rawU64) < 0) {
-                        method.lastResult =
+                        method.prevResult =
                             std::string(tr("Discovery function returned an error: ", "发现函数返回错误：")) + result.display;
-                        method.lastResultOk = false;
+                        method.prevResultOk = false;
                         return;
                 }
                 if (std::find(discoveryBuffer.begin(), discoveryBuffer.end(), '\0') == discoveryBuffer.end()) {
-                        method.lastResult   = tr("Discovery output was not NUL-terminated within the configured capacity.",
+                        method.prevResult   = tr("Discovery output was not NUL-terminated within the configured capacity.",
                                                "发现在配置容量内未输出 NUL 结尾的 JSON。");
-                        method.lastResultOk = false;
+                        method.prevResultOk = false;
                         return;
                 }
                 std::string    discoveryError;
                 bool           discoveryChanged = false;
                 const uint32_t expectedCount    = static_cast<uint32_t>(static_cast<int32_t>(result.rawU64));
                 if (!applyDiscoveryJson(device, discoveryBuffer.data(), expectedCount, discoveryError, discoveryChanged)) {
-                        method.lastResult   = discoveryError;
-                        method.lastResultOk = false;
+                        method.prevResult   = discoveryError;
+                        method.prevResultOk = false;
                         return;
                 }
-                method.lastResult   = discoveryError;
-                method.lastResultOk = true;
+                method.prevResult   = discoveryError;
+                method.prevResultOk = true;
                 modified_           = modified_ || discoveryChanged;
         }
 
@@ -1599,8 +1701,8 @@ DeviceManager::applyDiscoveryJson(Device &device, const char *json, uint32_t exp
                 }
                 if (cJSON_IsObject(values)) {
                         std::unordered_set<std::string> valueKeys;
-                        for (const cJSON *value = values->child; value; value = value->next) {
-                                const std::string valueKey = value->string ? value->string : "";
+                        for (const cJSON *val = values->child; val; val = val->next) {
+                                const std::string valueKey = val->string ? val->string : "";
                                 if (valueKey.empty() || !valueKeys.insert(valueKey).second ||
                                     propertyKeys.count(valueKey) == 0) {
                                         cJSON_Delete(root);
@@ -1611,15 +1713,15 @@ DeviceManager::applyDiscoveryJson(Device &device, const char *json, uint32_t exp
                                 }
                         }
                         for (auto &property : entry.properties) {
-                                const cJSON *value = cJSON_GetObjectItemCaseSensitive(values, property.discoveryKey.c_str());
-                                if (!value)
+                                const cJSON *val = cJSON_GetObjectItemCaseSensitive(values, property.discoveryKey.c_str());
+                                if (!val)
                                         continue;
                                 std::string text;
-                                if (cJSON_IsString(value) && value->valuestring) {
-                                        text = value->valuestring;
-                                } else if (cJSON_IsBool(value)) {
-                                        text = cJSON_IsTrue(value) ? "true" : "false";
-                                } else if (cJSON_IsNumber(value)) {
+                                if (cJSON_IsString(val) && val->valuestring) {
+                                        text = val->valuestring;
+                                } else if (cJSON_IsBool(val)) {
+                                        text = cJSON_IsTrue(val) ? "true" : "false";
+                                } else if (cJSON_IsNumber(val)) {
                                         if (property.type == CType::I64 || property.type == CType::U64) {
                                                 cJSON_Delete(root);
                                                 error = std::string(tr("64-bit discovered integers must be JSON strings: ",
@@ -1628,7 +1730,7 @@ DeviceManager::applyDiscoveryJson(Device &device, const char *json, uint32_t exp
                                                 return false;
                                         }
                                         char number[64];
-                                        std::snprintf(number, sizeof(number), "%.17g", value->valuedouble);
+                                        std::snprintf(number, sizeof(number), "%.17g", val->valuedouble);
                                         text = number;
                                 } else {
                                         cJSON_Delete(root);
@@ -1757,8 +1859,8 @@ DeviceManager::saveDevice(void *node, const Device &device, const std::string &b
                                                              : trimCopy(property.discoveryKey);
                 cJSON_AddStringToObject(item, "discoveryKey", propertyDiscoveryKey.c_str());
                 cJSON_AddStringToObject(item, "type", stableTypeName(property.type));
-                const std::string value = propertyValueString(property);
-                cJSON_AddStringToObject(item, "value", value.c_str());
+                const std::string val = propertyValueString(property);
+                cJSON_AddStringToObject(item, "value", val.c_str());
                 cJSON_AddStringToObject(item, "source", property.source == PropertySource::JLink ? "jlink" : "manual");
                 cJSON_AddStringToObject(item, "symbol", property.symbol.c_str());
                 cJSON_AddStringToObject(item, "address", hexAddress(property.address).c_str());
@@ -1811,17 +1913,17 @@ DeviceManager::saveDevice(void *node, const Device &device, const std::string &b
                 cJSON_AddBoolToObject(item, "customName", instance.customName);
                 cJSON *values = cJSON_CreateArray();
                 for (const auto &property : instance.properties) {
-                        cJSON *value = cJSON_CreateObject();
-                        addId(value, "propertyId", property.id);
+                        cJSON *val = cJSON_CreateObject();
+                        addId(val, "propertyId", property.id);
                         const std::string text = propertyValueString(property);
-                        cJSON_AddStringToObject(value, "value", text.c_str());
-                        cJSON_AddStringToObject(value, "source", property.source == PropertySource::JLink ? "jlink" : "manual");
-                        cJSON_AddStringToObject(value, "symbol", property.symbol.c_str());
-                        cJSON_AddStringToObject(value, "address", hexAddress(property.address).c_str());
-                        cJSON_AddBoolToObject(value, "writable", property.writable);
-                        cJSON_AddNumberToObject(value, "bitOffset", property.bitOffset);
-                        cJSON_AddNumberToObject(value, "bitSize", property.bitSize);
-                        cJSON_AddItemToArray(values, value);
+                        cJSON_AddStringToObject(val, "value", text.c_str());
+                        cJSON_AddStringToObject(val, "source", property.source == PropertySource::JLink ? "jlink" : "manual");
+                        cJSON_AddStringToObject(val, "symbol", property.symbol.c_str());
+                        cJSON_AddStringToObject(val, "address", hexAddress(property.address).c_str());
+                        cJSON_AddBoolToObject(val, "writable", property.writable);
+                        cJSON_AddNumberToObject(val, "bitOffset", property.bitOffset);
+                        cJSON_AddNumberToObject(val, "bitSize", property.bitSize);
+                        cJSON_AddItemToArray(values, val);
                 }
                 cJSON_AddItemToObject(item, "values", values);
                 cJSON_AddItemToArray(instances, item);
@@ -1910,14 +2012,14 @@ DeviceManager::loadDevice(const void *node, const std::string &baseDir, std::str
                         return false;
                 }
                 auto readU32 = [&](const char *key, uint32_t &destination) {
-                        const cJSON *value = cJSON_GetObjectItem(item, key);
-                        if (!value)
+                        const cJSON *val = cJSON_GetObjectItem(item, key);
+                        if (!val)
                                 return true;
-                        if (!cJSON_IsNumber(value) || !std::isfinite(value->valuedouble) || value->valuedouble < 0.0 ||
-                            value->valuedouble > static_cast<double>(std::numeric_limits<uint32_t>::max()) ||
-                            std::floor(value->valuedouble) != value->valuedouble)
+                        if (!cJSON_IsNumber(val) || !std::isfinite(val->valuedouble) || val->valuedouble < 0.0 ||
+                            val->valuedouble > static_cast<double>(std::numeric_limits<uint32_t>::max()) ||
+                            std::floor(val->valuedouble) != val->valuedouble)
                                 return false;
-                        destination = static_cast<uint32_t>(value->valuedouble);
+                        destination = static_cast<uint32_t>(val->valuedouble);
                         return true;
                 };
                 uint32_t       bitOffset = 0u;
@@ -1929,12 +2031,12 @@ DeviceManager::loadDevice(const void *node, const std::string &baseDir, std::str
                         return false;
                 }
                 bool writable = true;
-                if (const cJSON *value = cJSON_GetObjectItem(item, "writable"); value) {
-                        if (!cJSON_IsBool(value)) {
+                if (const cJSON *val = cJSON_GetObjectItem(item, "writable"); val) {
+                        if (!cJSON_IsBool(val)) {
                                 error = tr("Property writable flag must be boolean.", "属性 writable 必须是布尔值。");
                                 return false;
                         }
-                        writable = cJSON_IsTrue(value);
+                        writable = cJSON_IsTrue(val);
                 }
                 property.source         = PropertySource::JLink;
                 property.symbol         = trimCopy(symbol->valuestring);
@@ -1988,7 +2090,7 @@ DeviceManager::loadDevice(const void *node, const std::string &baseDir, std::str
                                 }
                                 property.discoveryKey = trimCopy(key->valuestring);
                         } else {
-                                // v1 migration: old discovery JSON used the editable property name.
+                                // v1 migration: old discovery JSON used the editable property name
                                 property.discoveryKey = property.name;
                         }
                         if (!propertyDiscoveryKeys.insert(property.discoveryKey).second) {
@@ -2026,10 +2128,10 @@ DeviceManager::loadDevice(const void *node, const std::string &baseDir, std::str
                                 return nullptr;
                         }
                         auto readNonEmpty = [&](const char *key, std::string &destination) {
-                                const cJSON *value = cJSON_GetObjectItem(item, key);
-                                if (!cJSON_IsString(value) || !value->valuestring || trimCopy(value->valuestring).empty())
+                                const cJSON *val = cJSON_GetObjectItem(item, key);
+                                if (!cJSON_IsString(val) || !val->valuestring || trimCopy(val->valuestring).empty())
                                         return false;
-                                destination = value->valuestring;
+                                destination = val->valuestring;
                                 return true;
                         };
                         if (!readNonEmpty("name", method.name) || !readNonEmpty("functionName", method.functionName) ||
@@ -2058,15 +2160,15 @@ DeviceManager::loadDevice(const void *node, const std::string &baseDir, std::str
                                 }
                         }
                         auto readOptionalInt = [&](const char *key, int &destination) {
-                                const cJSON *value = cJSON_GetObjectItem(item, key);
-                                if (!value)
+                                const cJSON *val = cJSON_GetObjectItem(item, key);
+                                if (!val)
                                         return true;
-                                if (!cJSON_IsNumber(value) || !std::isfinite(value->valuedouble) ||
-                                    value->valuedouble < static_cast<double>(std::numeric_limits<int>::min()) ||
-                                    value->valuedouble > static_cast<double>(std::numeric_limits<int>::max()) ||
-                                    std::floor(value->valuedouble) != value->valuedouble)
+                                if (!cJSON_IsNumber(val) || !std::isfinite(val->valuedouble) ||
+                                    val->valuedouble < static_cast<double>(std::numeric_limits<int>::min()) ||
+                                    val->valuedouble > static_cast<double>(std::numeric_limits<int>::max()) ||
+                                    std::floor(val->valuedouble) != val->valuedouble)
                                         return false;
-                                destination = static_cast<int>(value->valuedouble);
+                                destination = static_cast<int>(val->valuedouble);
                                 return true;
                         };
                         if (!readOptionalInt("discoveryBufferArg", method.discoveryBufferArg) ||
@@ -2122,7 +2224,7 @@ DeviceManager::loadDevice(const void *node, const std::string &baseDir, std::str
                 }
         }
 
-        // Validate all saved references after the property table is complete.
+        // Validate all saved references after the property table is complete
         for (const auto &method : device->methods) {
                 if (method.resultPropertyId != 0 && propertyIds.count(method.resultPropertyId) == 0) {
                         error = tr("Method contains a dangling return property reference.", "方法包含悬空的返回属性引用。");
@@ -2204,15 +2306,15 @@ DeviceManager::loadDevice(const void *node, const std::string &baseDir, std::str
                                 return nullptr;
                         }
                         std::unordered_set<uint64_t> valueIds;
-                        for (const cJSON *value = values->child; value; value = value->next) {
-                                if (!cJSON_IsObject(value)) {
+                        for (const cJSON *val = values->child; val; val = val->next) {
+                                if (!cJSON_IsObject(val)) {
                                         error = tr("Device instance contains an invalid property value.",
                                                    "具体设备包含无效的属性值。");
                                         return nullptr;
                                 }
                                 uint64_t     propertyId = 0;
-                                const cJSON *text       = cJSON_GetObjectItem(value, "value");
-                                if (!readId(value, "propertyId", propertyId) || propertyId == 0 ||
+                                const cJSON *text       = cJSON_GetObjectItem(val, "value");
+                                if (!readId(val, "propertyId", propertyId) || propertyId == 0 ||
                                     !valueIds.insert(propertyId).second || !cJSON_IsString(text) || !text->valuestring) {
                                         error = tr("Device instance contains an invalid property value.",
                                                    "具体设备包含无效的属性值。");
@@ -2224,7 +2326,7 @@ DeviceManager::loadDevice(const void *node, const std::string &baseDir, std::str
                                                    "具体设备属性值与其定义不匹配。");
                                         return nullptr;
                                 }
-                                if (!readPropertyBinding(value, *property))
+                                if (!readPropertyBinding(val, *property))
                                         return nullptr;
                                 property->editValue = propertyValueString(*property);
                         }
@@ -2527,72 +2629,324 @@ DeviceManager::pushDroppedFiles(const std::vector<std::string> &paths)
 void
 DeviceManager::drawDeviceList()
 {
-        ImGui::BeginChild("##device_list", ImVec2(sidebarWidth_, 0.0f), true);
-        ImGui::TextUnformatted(tr("Device Types and Devices", "设备类型与设备"));
+        ImGui::TextUnformatted(tr("Device library", "设备库"));
+        if (deviceNavigationCard("##device_overview",
+                                 tr("All devices", "全部设备"),
+                                 tr("SDKs, templates and device instances", "SDK、模板与设备实例"),
+                                 ui::Icon::Grid,
+                                 showOverview_)) {
+                showOverview_   = true;
+                compactLibrary_ = false;
+        }
+        ImGui::SetNextItemWidth(-1.0f);
+        ui::SearchInput("##device_search",
+                        tr("Search device, SDK or discovery key", "搜索设备、SDK 或发现键"),
+                        deviceSearch_,
+                        sizeof(deviceSearch_));
         ImGui::Separator();
+        const std::string query   = lowerCopy(trimCopy(deviceSearch_));
+        auto              matches = [&](const std::string &text) {
+                return query.empty() || lowerCopy(text).find(query) != std::string::npos;
+        };
+        if (ui::SearchOpen("##device_search")) {
+                std::vector<ui::SearchResult>    results;
+                std::vector<std::pair<int, int>> targets;
+                for (int i = 0; i < static_cast<int>(devices_.size()); ++i) {
+                        const auto &device  = devices_[i];
+                        const bool  matched = matches(device->name) || matches(device->libraryPath);
+                        if (matched) {
+                                results.push_back({device->name, device->libraryPath});
+                                targets.emplace_back(i, -1);
+                        }
+                        for (int j = 0; j < static_cast<int>(device->instances.size()); ++j) {
+                                const auto &instance = device->instances[j];
+                                if (matched || matches(instance.name) || matches(instance.discoveryKey)) {
+                                        results.push_back({device->name + " / " + instance.name, instance.discoveryKey});
+                                        targets.emplace_back(i, j);
+                                }
+                        }
+                }
+                const int result = ui::SearchResults("##device_search", results);
+                if (result >= 0) {
+                        selectDevice(targets[result].first, targets[result].second);
+                        deviceSearch_[0] = 0;
+                }
+        }
+        int visible = 0;
         for (int i = 0; i < static_cast<int>(devices_.size()); ++i) {
                 const auto &device = devices_[i];
+                ++visible;
                 ImGui::PushID(("device_type_" + std::to_string(device->id)).c_str());
-                std::string label         = device->name.empty() ? std::string(tr("Unnamed type", "未命名类型")) : device->name;
-                label                    += " (" + std::to_string(device->instances.size()) + ")";
-                label                    += "###type_node";
-                ImGuiTreeNodeFlags flags  = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
-                                           ImGuiTreeNodeFlags_SpanAvailWidth | ImGuiTreeNodeFlags_DefaultOpen;
-                if (selectedDevice_ == i && selectedInstance_ < 0)
-                        flags |= ImGuiTreeNodeFlags_Selected;
-                const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
-                if (ImGui::IsItemClicked(ImGuiMouseButton_Left) && !ImGui::IsItemToggledOpen()) {
-                        if (selectedDevice_ != i || selectedInstance_ != -1)
-                                for (auto &method : device->methods)
-                                        method.lastResult.clear();
-                        selectedDevice_   = i;
-                        selectedInstance_ = -1;
-                        selectedFunction_ = -1;
+                const std::string sdk =
+                    device->libraryPath.empty() ? tr("SDK not configured", "未配置 SDK") : deviceFileName(device->libraryPath);
+                if (deviceNavigationCard("###type_node",
+                                         device->name,
+                                         std::string(tr("Template  ", "模板  ")) + sdk,
+                                         ui::Icon::Library,
+                                         !showOverview_ && selectedDevice_ == i && selectedInstance_ < 0))
+                        selectDevice(i);
+                for (int j = 0; j < static_cast<int>(device->instances.size()); ++j) {
+                        const auto &instance = device->instances[j];
+
+                        ImGui::PushID(("instance_" + std::to_string(instance.id)).c_str());
+                        const char *state = instance.discoveryKey.empty() ? tr("Manual configuration", "手动配置")
+                                            : instance.online             ? tr("Discovered", "已发现")
+                                                                          : tr("Not rediscovered", "尚未重新发现");
+                        if (deviceNavigationCard("###instance_node",
+                                                 instance.name,
+                                                 state,
+                                                 ui::Icon::Device,
+                                                 !showOverview_ && selectedDevice_ == i && selectedInstance_ == j))
+                                selectDevice(i, j);
+                        ImGui::PopID();
                 }
-                if (open) {
-                        for (int j = 0; j < static_cast<int>(device->instances.size()); ++j) {
-                                const DeviceInstance &instance = device->instances[j];
-                                ImGui::PushID(("instance_" + std::to_string(instance.id)).c_str());
-                                std::string instanceLabel =
-                                    instance.name.empty() ? std::string(tr("Unnamed device", "未命名设备")) : instance.name;
-                                if (!instance.discoveryKey.empty() && !instance.online)
-                                        instanceLabel += tr(" (offline)", "（离线）");
-                                instanceLabel                    += "###instance_node";
-                                ImGuiTreeNodeFlags instanceFlags  = ImGuiTreeNodeFlags_Leaf |
-                                                                   ImGuiTreeNodeFlags_NoTreePushOnOpen |
-                                                                   ImGuiTreeNodeFlags_SpanAvailWidth;
-                                if (selectedDevice_ == i && selectedInstance_ == j)
-                                        instanceFlags |= ImGuiTreeNodeFlags_Selected;
-                                ImGui::TreeNodeEx(instanceLabel.c_str(), instanceFlags);
-                                if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-                                        if (selectedDevice_ != i || selectedInstance_ != j)
-                                                for (auto &method : device->methods)
-                                                        method.lastResult.clear();
-                                        selectedDevice_   = i;
-                                        selectedInstance_ = j;
-                                        selectedFunction_ = -1;
-                                }
-                                ImGui::PopID();
-                        }
-                        ImGui::TreePop();
-                }
+                ImGui::Spacing();
                 ImGui::PopID();
         }
-
+        if (!visible)
+                ImGui::TextWrapped("%s",
+                                   query.empty() ? tr("No device templates yet. Add one or use an SDK from the overview.",
+                                                      "还没有设备模板。可新建模板，或从总览中的 SDK 创建。")
+                                                 : tr("No matching devices. Try an SDK or device name.",
+                                                      "没有匹配设备，可尝试 SDK 或设备名称。"));
         ImGui::Separator();
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint(
-            "##new_device_name", tr("New device-type name", "新设备类型名称"), newDeviceName_, sizeof(newDeviceName_));
-        if (ImGui::Button(tr("New Device Type", "新建设备类型"), ImVec2(-1.0f, 0.0f)))
+            "##new_device_name", tr("New template name", "新模板名称"), newDeviceName_, sizeof(newDeviceName_));
+        if (ui::IconButton(tr("New template", "新建模板"), ui::Icon::Add, ui::BtnStyle::Primary, ImVec2(-1, 0))) {
                 createDevice(newDeviceName_);
-        const bool hasType = selectedDevice_ >= 0 && selectedDevice_ < static_cast<int>(devices_.size());
-        ImGui::BeginDisabled(!hasType);
-        if (ImGui::Button(tr("Add Device to Type", "向类型添加设备"), ImVec2(-1.0f, 0.0f)) && hasType)
-                createInstance(*devices_[selectedDevice_]);
-        ImGui::EndDisabled();
-        if (ImGui::Button(tr("Import .avadev", "导入 .avadev"), ImVec2(-1.0f, 0.0f)))
+                showOverview_       = false;
+                compactLibrary_     = false;
+                requestedDetailTab_ = 3;
+        }
+        if (ui::IconButton(tr("Import .avadev", "导入 .avadev"), ui::Icon::Open, ui::BtnStyle::Neutral, ImVec2(-1, 0))) {
                 importDevice();
-        ImGui::EndChild();
+                if (selectedDevice_ >= 0) {
+                        showOverview_   = false;
+                        compactLibrary_ = false;
+                }
+        }
+}
+
+void
+DeviceManager::selectDevice(int device, int instance)
+{
+        if (device < 0 || device >= static_cast<int>(devices_.size()))
+                return;
+        if (selectedDevice_ != device || selectedInstance_ != instance)
+                for (auto &method : devices_[device]->methods)
+                        method.prevResult.clear();
+        selectedDevice_     = device;
+        selectedInstance_   = instance;
+        selectedFunction_   = -1;
+        showOverview_       = false;
+        compactLibrary_     = false;
+        requestedDetailTab_ = 0;
+}
+
+void
+DeviceManager::createFromSdk(const SdkCatalogEntry &sdk)
+{
+        for (int i = 0; i < static_cast<int>(devices_.size()); ++i) {
+                if (sameSdkPath(devices_[i]->libraryPath, sdk.libraryPath) &&
+                    (sdk.headerPath.empty() || sameSdkPath(devices_[i]->headerPath, sdk.headerPath))) {
+                        selectDevice(i);
+                        return;
+                }
+        }
+        const size_t before = devices_.size();
+        createDevice(sdk.name.empty() ? deviceFileName(sdk.libraryPath) : sdk.name);
+        if (devices_.size() == before)
+                return;
+        Device &device     = *devices_.back();
+        device.libraryPath = sdk.libraryPath;
+        device.headerPath  = sdk.headerPath;
+        if (!device.headerPath.empty())
+                loadHeader(device);
+        showOverview_       = false;
+        compactLibrary_     = false;
+        requestedDetailTab_ = 0;
+}
+
+void
+DeviceManager::drawOverview()
+{
+        ImGui::TextUnformatted(tr("Your device workspace", "你的设备工作区"));
+        size_t instances = 0, discovered = 0;
+        for (const auto &device : devices_) {
+                instances  += device->instances.size();
+                discovered += std::count_if(
+                    device->instances.begin(), device->instances.end(), [](const auto &item) { return item.online; });
+        }
+        ImGui::TextWrapped(tr("%zu devices  %zu templates  %zu discovered  %zu SDK panels",
+                              "%zu 个设备  %zu 个模板  %zu 个已发现  %zu 个 SDK 面板"),
+                           instances,
+                           devices_.size(),
+                           discovered,
+                           sdkCatalog_.size());
+        if (!sdkCatalog_.empty()) {
+                ImGui::SeparatorText(tr("SDK devices", "SDK 设备"));
+                for (const auto &sdk : sdkCatalog_) {
+                        ImGui::PushID(sdk.id);
+                        ImGui::BeginChild(
+                            "##sdk_catalog_card", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+                        ImGui::TextWrapped("%s", sdk.name.empty() ? deviceFileName(sdk.libraryPath).c_str() : sdk.name.c_str());
+                        deviceStatus(sdk.loaded ? tr("SDK loaded in caller", "SDK 已在调用器加载")
+                                                : tr("SDK not loaded", "SDK 未加载"),
+                                     sdk.loaded ? ui::BtnStyle::Success : ui::BtnStyle::Muted);
+                        ImGui::TextWrapped(tr("%zu declared functions  %s", "%zu 个已声明函数  %s"),
+                                           sdk.functionCount,
+                                           sdk.libraryPath.empty() ? tr("Choose a library in the dynamic library caller",
+                                                                        "请在 动态库调用器中选择动态库")
+                                                                   : sdk.libraryPath.c_str());
+                        ImGui::BeginDisabled(!openSdk_);
+                        if (ui::IconButton(
+                                tr("Open SDK controls", "打开 SDK 控制台"), ui::Icon::Library, ui::BtnStyle::Primary) &&
+                            openSdk_)
+                                openSdk_(sdk.id);
+                        ImGui::EndDisabled();
+                        deviceNextAction(tr("Use as device template", "创建设备模板"), ui::Icon::Add);
+                        ImGui::BeginDisabled(sdk.libraryPath.empty());
+                        if (ui::IconButton(tr("Use as device template", "创建设备模板"), ui::Icon::Add))
+                                createFromSdk(sdk);
+                        ImGui::EndDisabled();
+                        ImGui::EndChild();
+                        ImGui::PopID();
+                }
+        }
+        ImGui::SeparatorText(tr("Device templates", "设备模板"));
+        if (devices_.empty()) {
+                ImGui::TextWrapped(
+                    "%s",
+                    tr("Start with an SDK above, import an .avadev template, or create a template in the device library. Then "
+                       "add a device or configure a discovery action.",
+                       "从上方 SDK 创建模板、导入 .avadev 模板，或在设备库中新建模板。然后添加设备，或配置发现操作。"));
+                return;
+        }
+        const int columns = ImGui::GetContentRegionAvail().x >= ImGui::GetFontSize() * 48 ? 2 : 1;
+        if (ImGui::BeginTable("##device_overview_grid", columns, ImGuiTableFlags_SizingStretchSame)) {
+                for (int i = 0; i < static_cast<int>(devices_.size()); ++i) {
+                        auto &device = *devices_[i];
+                        ImGui::TableNextColumn();
+                        ImGui::PushID(static_cast<int>(i));
+                        ImGui::BeginChild(
+                            "##template_card", ImVec2(0, 0), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+                        ImGui::TextWrapped("%s", device.name.c_str());
+                        ImGui::TextWrapped("SDK  %s",
+                                           device.libraryPath.empty() ? tr("Not configured", "未配置")
+                                                                      : deviceFileName(device.libraryPath).c_str());
+                        ImGui::TextWrapped(tr("%zu devices  %zu properties  %zu actions", "%zu 个设备  %zu 个属性  %zu 项操作"),
+                                           device.instances.size(),
+                                           device.properties.size(),
+                                           device.methods.size());
+                        if (ui::IconButton(tr("View template", "查看模板"), ui::Icon::Library))
+                                selectDevice(i);
+                        deviceNextAction(tr("Add device", "添加设备"), ui::Icon::Add);
+                        if (ui::IconButton(tr("Add device", "添加设备"), ui::Icon::Add, ui::BtnStyle::Primary)) {
+                                selectDevice(i);
+                                createInstance(device);
+                        }
+                        ImGui::EndChild();
+                        ImGui::PopID();
+                }
+                ImGui::EndTable();
+        }
+}
+
+void
+DeviceManager::drawSdkAssociation(Device &device)
+{
+        ImGui::TextWrapped("SDK  %s", device.libraryPath.empty() ? tr("Not configured", "未配置") : device.libraryPath.c_str());
+        deviceStatus(device.loader.isLoaded() ? tr("Device SDK loaded", "设备 SDK 已加载")
+                                              : tr("Device SDK not loaded", "设备 SDK 未加载"),
+                     device.loader.isLoaded() ? ui::BtnStyle::Success : ui::BtnStyle::Muted);
+        ImGui::TextWrapped(
+            "%s",
+            tr("Library readiness does not indicate a hardware connection. Connection behavior is defined by your SDK actions.",
+               "动态库就绪不代表硬件已连接。连接行为由你配置的 SDK 操作决定。"));
+        for (const auto &sdk : sdkCatalog_) {
+                if (!sameSdkPath(device.libraryPath, sdk.libraryPath))
+                        continue;
+                ImGui::PushID(sdk.id);
+                ImGui::TextWrapped("%s", sdk.name.c_str());
+                ImGui::BeginDisabled(!openSdk_);
+                if (ui::IconButton(tr("Open SDK controls", "打开 SDK 控制台"), ui::Icon::Library) && openSdk_)
+                        openSdk_(sdk.id);
+                ImGui::EndDisabled();
+                ImGui::PopID();
+        }
+}
+
+void
+DeviceManager::drawDeviceSummary(Device &device, DeviceInstance *instance)
+{
+        ImGui::SeparatorText(tr("Connection and SDK", "连接与 SDK"));
+        if (instance) {
+                const char *state = instance->discoveryKey.empty()
+                                        ? tr("Manual configuration  connection state unknown", "手动配置  连接状态未知")
+                                    : instance->online
+                                        ? tr("Present in the last discovery result", "最近一次发现结果中存在此设备")
+                                        : tr("Not rediscovered in this session", "本次会话尚未重新发现此设备");
+                deviceStatus(state, instance->online ? ui::BtnStyle::Success : ui::BtnStyle::Muted);
+                if (!instance->discoveryKey.empty())
+                        ImGui::TextWrapped("%s: %s", tr("Discovery key", "发现键"), instance->discoveryKey.c_str());
+        }
+        drawSdkAssociation(device);
+        const auto  &properties  = instance ? instance->properties : device.properties;
+        const size_t actionCount = std::count_if(device.methods.begin(), device.methods.end(), [&](const auto &method) {
+                return !instance || method.kind == MethodKind::Instance;
+        });
+        ImGui::SeparatorText(tr("At a glance", "设备概况"));
+        ImGui::TextWrapped(
+            tr("%zu properties  %zu configured actions", "%zu 个属性  %zu 项已配置操作"), properties.size(), actionCount);
+        if (ui::IconButton(tr("View properties", "查看属性"), ui::Icon::Properties))
+                requestedDetailTab_ = 1;
+        deviceNextAction(tr("Device actions", "设备操作"), ui::Icon::Play);
+        if (ui::IconButton(tr("Device actions", "设备操作"), ui::Icon::Play, ui::BtnStyle::Primary))
+                requestedDetailTab_ = 2;
+        if (properties.empty()) {
+                ImGui::TextWrapped("%s",
+                                   tr("Add properties in the template, or drop J-Link variables into the Properties tab. Each "
+                                      "device keeps its own values.",
+                                      "在模板中添加属性，或将 J-Link 变量拖入属性页。每个设备保存独立数值。"));
+        } else if (ImGui::BeginTable("##device_snapshot",
+                                     2,
+                                     ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                                         ImGuiTableFlags_SizingStretchSame)) {
+                ImGui::TableSetupColumn(tr("Property", "属性"));
+                ImGui::TableSetupColumn(tr("Current value", "当前值"));
+                ImGui::TableHeadersRow();
+                for (size_t i = 0; i < std::min(properties.size(), size_t(6)); ++i) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::TextWrapped("%s", properties[i].name.c_str());
+                        ImGui::TableNextColumn();
+                        const bool unavailable = properties[i].source == PropertySource::JLink &&
+                                                 (!properties[i].liveValueKnown || !properties[i].liveReadOk);
+                        ImGui::TextWrapped("%s",
+                                           unavailable ? tr("Awaiting live value", "等待实时数值")
+                                                       : propertyValueString(properties[i]).c_str());
+                }
+                ImGui::EndTable();
+        }
+        if (!instance) {
+                ImGui::SeparatorText(tr("Devices using this template", "使用此模板的设备"));
+                if (device.instances.empty())
+                        ImGui::TextWrapped("%s",
+                                           tr("Add a device to store its values, or bind a JSON discovery action in Actions.",
+                                              "添加设备以保存独立数值，或在操作页绑定 JSON 发现操作。"));
+                for (int i = 0; i < static_cast<int>(device.instances.size()); ++i) {
+                        ImGui::PushID(i);
+                        if (deviceNavigationCard("##summary_instance",
+                                                 device.instances[i].name,
+                                                 device.instances[i].online ? tr("Discovered", "已发现")
+                                                                            : tr("Device configuration", "设备配置"),
+                                                 ui::Icon::Device,
+                                                 false))
+                                selectDevice(selectedDevice_, i);
+                        ImGui::PopID();
+                }
+        }
 }
 
 bool
@@ -2742,20 +3096,20 @@ DeviceManager::acceptPropertyDrop(Device &device, DeviceInstance *instance)
                         if (source.srcScope && !source.isGroup) {
                                 const auto found = source.srcScope->getChannels().find(source.chName);
                                 if (found != source.srcScope->getChannels().end() && found->second) {
-                                        auto &channel = *found->second;
+                                        auto &ch = *found->second;
                                         addBoundProperty(device,
                                                          instance,
                                                          source.chName,
-                                                         channel.getAddr(),
-                                                         channel.getType().c_str(),
-                                                         channel.getDevice().c_str(),
-                                                         channel.isWritable(),
-                                                         channel.getBitOffset(),
-                                                         channel.getBitSize());
+                                                         ch.getAddr(),
+                                                         ch.getType().c_str(),
+                                                         ch.getDevice().c_str(),
+                                                         ch.isWritable(),
+                                                         ch.getBitOffset(),
+                                                         ch.getBitSize());
                                 }
                         } else {
-                                managerStatus_        = tr("Drop a scalar monitor channel, not a group.",
-                                                    "请拖入监视器中的标量通道，而不是变量组。");
+                                managerStatus_ =
+                                    tr("Drop a scalar monitor ch, not a group.", "请拖入监视器中的标量通道，而不是变量组。");
                                 managerStatusIsError_ = true;
                         }
                 }
@@ -2766,7 +3120,7 @@ DeviceManager::acceptPropertyDrop(Device &device, DeviceInstance *instance)
 void
 DeviceManager::drawProperties(Device &device)
 {
-        if (ImGui::Button(tr("Add Property", "添加属性"))) {
+        if (ui::IconButton(tr("Add Property", "添加属性"), ui::Icon::Add, ui::BtnStyle::Primary)) {
                 Property property;
                 property.id = takeStableId(device.nextPropertyId, [&](uint64_t id) {
                         return std::any_of(device.properties.begin(), device.properties.end(), [&](const Property &existing) {
@@ -2787,23 +3141,27 @@ DeviceManager::drawProperties(Device &device)
                         instance.properties.push_back(device.properties.back());
                 modified_ = true;
         }
-        ImGui::SameLine();
-        ImGui::TextDisabled(
+        ImGui::TextWrapped(
             "%s", tr("Drop J-Link variables here to create binding templates.", "将 J-Link 变量拖到这里可创建绑定模板。"));
 
         if (!ImGui::BeginTable("##properties",
                                8,
                                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
-                                   ImGuiTableFlags_SizingStretchProp))
+                                   ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollX,
+                               ImVec2(0, 0),
+                               std::max(ImGui::GetContentRegionAvail().x, ImGui::GetFontSize() * 76.0f)))
                 return;
-        ImGui::TableSetupColumn(tr("ID", "ID"), ImGuiTableColumnFlags_WidthFixed, 72.0f);
+        ImGui::TableSetupColumn(tr("ID", "ID"), ImGuiTableColumnFlags_WidthFixed, ui::TableColumnWidth("ID", "999999"));
         ImGui::TableSetupColumn(tr("Name", "名称"), ImGuiTableColumnFlags_WidthStretch, 1.2f);
         ImGui::TableSetupColumn(tr("Discovery Key", "发现字段键"), ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn(tr("Type", "类型"), ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn(
+            tr("Type", "类型"), ImGuiTableColumnFlags_WidthFixed, ui::TableColumnWidth(tr("Type", "类型"), "uint64_t"));
         ImGui::TableSetupColumn(tr("Source", "来源"), ImGuiTableColumnFlags_WidthStretch, 1.2f);
         ImGui::TableSetupColumn(tr("Default", "默认值"), ImGuiTableColumnFlags_WidthStretch, 1.4f);
-        ImGui::TableSetupColumn(tr("State", "状态"), ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 30.0f);
+        ImGui::TableSetupColumn(tr("State", "状态"),
+                                ImGuiTableColumnFlags_WidthFixed,
+                                ui::TableColumnWidth(tr("State", "状态"), tr("Invalid", "无效")));
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ui::TableColumnWidth("", "X", 2));
         ImGui::TableHeadersRow();
 
         int  eraseIndex         = -1;
@@ -2814,27 +3172,27 @@ DeviceManager::drawProperties(Device &device)
                 ImGui::PushID(id.c_str());
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                ImGui::TextUnformatted(id.c_str());
+                ui::TableText(id);
 
                 ImGui::TableSetColumnIndex(1);
                 ImGui::SetNextItemWidth(-1.0f);
                 if (inputTextString("##property_name", property.name)) {
                         for (auto &instance : device.instances)
-                                if (Property *value = findProperty(instance, property.id))
-                                        value->name = property.name;
+                                if (Property *val = findProperty(instance, property.id))
+                                        val->name = property.name;
                         modified_ = true;
                 }
                 if (ImGui::IsItemDeactivatedAfterEdit() && trimCopy(property.name).empty()) {
                         property.name = std::string(tr("Property", "属性")) + " " + id;
                         for (auto &instance : device.instances)
-                                if (Property *value = findProperty(instance, property.id))
-                                        value->name = property.name;
+                                if (Property *val = findProperty(instance, property.id))
+                                        val->name = property.name;
                         modified_ = true;
                 }
 
                 ImGui::TableSetColumnIndex(2);
                 ImGui::SetNextItemWidth(-1.0f);
-                const std::string previousDiscoveryKey = property.discoveryKey;
+                const std::string prevDiscoveryKey = property.discoveryKey;
                 if (inputTextString("##property_discovery_key", property.discoveryKey)) {
                         const std::string candidateKey = trimCopy(property.discoveryKey);
                         const bool        duplicate =
@@ -2843,14 +3201,14 @@ DeviceManager::drawProperties(Device &device)
                                     return other.id != property.id && other.discoveryKey == candidateKey;
                             });
                         if (duplicate) {
-                                property.discoveryKey = previousDiscoveryKey;
+                                property.discoveryKey = prevDiscoveryKey;
                                 device.status         = tr("Discovery keys must be unique within a device type.",
                                                    "同一设备类型内的发现字段键必须唯一。");
                                 device.statusIsError  = true;
                         } else {
                                 for (auto &instance : device.instances)
-                                        if (Property *value = findProperty(instance, property.id))
-                                                value->discoveryKey = property.discoveryKey;
+                                        if (Property *val = findProperty(instance, property.id))
+                                                val->discoveryKey = property.discoveryKey;
                                 modified_ = true;
                         }
                 }
@@ -2859,8 +3217,8 @@ DeviceManager::drawProperties(Device &device)
                         if (property.discoveryKey.empty())
                                 property.discoveryKey = "property_" + id;
                         for (auto &instance : device.instances)
-                                if (Property *value = findProperty(instance, property.id))
-                                        value->discoveryKey = property.discoveryKey;
+                                if (Property *val = findProperty(instance, property.id))
+                                        val->discoveryKey = property.discoveryKey;
                 }
 
                 ImGui::TableSetColumnIndex(3);
@@ -2880,16 +3238,16 @@ DeviceManager::drawProperties(Device &device)
                                         property.editValue        = propertyValueString(property);
                                         property.editValueInvalid = false;
                                         for (auto &instance : device.instances) {
-                                                if (Property *value = findProperty(instance, property.id)) {
-                                                        value->type   = property.type;
-                                                        value->source = PropertySource::Manual;
-                                                        value->symbol.clear();
-                                                        value->address   = 0u;
-                                                        value->bitOffset = 0u;
-                                                        value->bitSize   = 0u;
-                                                        value->data.fill(0);
-                                                        value->editValue        = propertyValueString(*value);
-                                                        value->editValueInvalid = false;
+                                                if (Property *val = findProperty(instance, property.id)) {
+                                                        val->type   = property.type;
+                                                        val->source = PropertySource::Manual;
+                                                        val->symbol.clear();
+                                                        val->address   = 0u;
+                                                        val->bitOffset = 0u;
+                                                        val->bitSize   = 0u;
+                                                        val->data.fill(0);
+                                                        val->editValue        = propertyValueString(*val);
+                                                        val->editValueInvalid = false;
                                                 }
                                         }
                                         for (auto &method : device.methods) {
@@ -2925,7 +3283,8 @@ DeviceManager::drawProperties(Device &device)
                         property.editValue = propertyValueString(property);
                 const bool valueWasInvalid = property.editValueInvalid;
                 if (valueWasInvalid)
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                              ui::SemanticButtonPalette(ui::BtnStyle::Danger, ImGui::GetStyle()).text);
                 ImGui::SetNextItemWidth(-1.0f);
                 if (inputTextString("##property_value", property.editValue)) {
                         Property parsed = property;
@@ -2942,12 +3301,12 @@ DeviceManager::drawProperties(Device &device)
 
                 ImGui::TableSetColumnIndex(6);
                 if (property.editValueInvalid)
-                        ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.35f, 1.0f), "%s", tr("Invalid", "无效"));
+                        ui::ErrorText("%s", tr("Invalid", "无效"));
                 else
-                        ImGui::TextColored(ImVec4(0.35f, 0.9f, 0.45f, 1.0f),
-                                           "%s",
-                                           property.source == PropertySource::JLink ? tr("Template", "模板")
-                                                                                    : tr("Valid", "有效"));
+                        ui::TextColored(ImVec4(0.35f, 0.9f, 0.45f, 1.0f),
+                                        "%s",
+                                        property.source == PropertySource::JLink ? tr("Template", "模板")
+                                                                                 : tr("Valid", "有效"));
 
                 ImGui::TableSetColumnIndex(7);
                 if (ImGui::SmallButton("X")) {
@@ -3016,6 +3375,16 @@ void
 DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
 {
         const auto &functions = device.declarations.functions;
+        if (std::none_of(device.methods.begin(), device.methods.end(), [&](const auto &method) {
+                    return !instance || method.kind == MethodKind::Instance;
+            }))
+                ImGui::TextWrapped(
+                    "%s",
+                    instance ? tr("No device actions are configured. Open the template's Actions tab to bind an SDK function.",
+                                  "尚未配置设备操作。请在模板的操作页绑定 SDK 函数。")
+                             : tr("Choose a declared function below to define an action. No function is called while browsing "
+                                  "or configuring.",
+                                  "选择下方已声明函数来定义操作。浏览与配置不会调用函数。"));
         if (!instance) {
                 const char *preview = tr("Select a top-level C function", "选择顶层 C 函数");
                 std::string selectedLabel;
@@ -3023,7 +3392,7 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                         selectedLabel = functionLabel(functions[selectedFunction_]);
                         preview       = selectedLabel.c_str();
                 }
-                ImGui::SetNextItemWidth(std::max(260.0f, ImGui::GetContentRegionAvail().x - 150.0f));
+                ImGui::SetNextItemWidth(-1.0f);
                 if (ImGui::BeginCombo("##header_function", preview)) {
                         for (int i = 0; i < static_cast<int>(functions.size()); ++i) {
                                 const std::string label    = functionLabel(functions[i]);
@@ -3035,7 +3404,6 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                         }
                         ImGui::EndCombo();
                 }
-                ImGui::SameLine();
                 const bool canBind = selectedFunction_ >= 0 && selectedFunction_ < static_cast<int>(functions.size());
                 const bool selectedHasUnknown =
                     canBind && (functions[selectedFunction_].retType == CType::Unknown ||
@@ -3045,24 +3413,24 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                 const bool selectedIsVariadic = canBind && functions[selectedFunction_].isVariadic;
                 const bool bindingSupported   = canBind && !selectedHasUnknown && !selectedIsVariadic;
                 ImGui::BeginDisabled(!bindingSupported);
-                if (ImGui::Button(tr("Bind Method", "绑定方法")) && bindingSupported)
+                if (ui::IconButton(tr("Bind action", "绑定操作"), ui::Icon::Add, ui::BtnStyle::Primary) && bindingSupported)
                         bindFunction(device, functions[selectedFunction_]);
                 ImGui::EndDisabled();
                 if (selectedHasUnknown)
-                        ImGui::TextColored(
+                        ui::TextColored(
                             ImVec4(1.0f, 0.4f, 0.35f, 1.0f),
                             "%s",
                             tr("Cannot bind: unknown parameter or return type.", "无法绑定：存在未知参数或返回类型。"));
                 else if (selectedIsVariadic)
-                        ImGui::TextColored(
+                        ui::TextColored(
                             ImVec4(1.0f, 0.4f, 0.35f, 1.0f),
                             "%s",
                             tr("Cannot bind: variadic functions are unsupported.", "无法绑定：不支持可变参数函数。"));
 
                 if (functions.empty())
-                        ImGui::TextDisabled("%s",
-                                            tr("Load a header containing top-level C declarations first.",
-                                               "请先加载含顶层 C 函数声明的头文件。"));
+                        ImGui::TextWrapped("%s",
+                                           tr("Load a header containing top-level C declarations first.",
+                                              "请先加载含顶层 C 函数声明的头文件。"));
         }
 
         int  eraseIndex         = -1;
@@ -3076,28 +3444,79 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                 const std::string header =
                     (method.name.empty() ? method.functionName : method.name) + "###bound_method_" + std::to_string(method.id);
                 const bool expanded = instance ? ImGui::CollapsingHeader(header.c_str(), ImGuiTreeNodeFlags_DefaultOpen)
-                                               : ImGui::CollapsingHeader(header.c_str(), &keep, ImGuiTreeNodeFlags_DefaultOpen);
+                                               : ImGui::CollapsingHeader(header.c_str(), &keep);
+                ui::ClippedTextTooltip(method.name.c_str(), ImGui::GetContentRegionAvail().x - ImGui::GetFontSize() * 3);
                 if (!keep) {
                         pendingDeleteMethodId_ = method.id;
                         requestDeletePopup     = true;
                 }
                 if (expanded && keep) {
                         const CFuncDecl *function = findFunction(device, method);
+                        if (instance) {
+                                ImGui::TextWrapped("%s", method.signature.c_str());
+                                if (function) {
+                                        for (size_t argument = 0;
+                                             argument < std::min(method.arguments.size(), function->params.size());
+                                             ++argument) {
+                                                const auto     &binding  = method.arguments[argument];
+                                                const Property *property = findProperty(*instance, binding.propertyId);
+                                                std::string     value    = binding.literal;
+                                                if (binding.source != ArgSource::Literal) {
+                                                        value =
+                                                            property
+                                                                ? property->name + " = " +
+                                                                      (binding.source == ArgSource::PropertyAddress
+                                                                           ? std::string(tr("property buffer", "属性缓冲区"))
+                                                                           : propertyValueString(*property))
+                                                                : tr("Missing property binding", "缺少属性绑定");
+                                                }
+                                                const auto &parameter = function->params[argument];
+                                                ImGui::TextWrapped("%s: %s",
+                                                                   parameter.name.empty() ? "arg" : parameter.name.c_str(),
+                                                                   value.c_str());
+                                        }
+                                }
+                                const bool callable =
+                                    function && device.loader.isLoaded() && function->retType != CType::Unknown &&
+                                    !function->isVariadic &&
+                                    std::none_of(function->params.begin(), function->params.end(), [](const CParam &parameter) {
+                                            return parameter.type == CType::Unknown;
+                                    });
+                                if (!function)
+                                        deviceStatus(
+                                            tr("Action is unresolved. Review its SDK header and binding in the template.",
+                                               "操作尚未解析。请在模板中检查 SDK 头文件与绑定。"),
+                                            ui::BtnStyle::Warning);
+                                else if (!device.loader.isLoaded())
+                                        ImGui::TextWrapped(
+                                            "%s",
+                                            tr("Load the device SDK in the template's SDK & settings tab to run this action.",
+                                               "请在模板的 SDK 与设置页加载设备 SDK，才能执行此操作。"));
+                                ImGui::BeginDisabled(!callable);
+                                if (ui::IconButton(tr("Run action", "执行操作"), ui::Icon::Play, ui::BtnStyle::Primary) &&
+                                    callable)
+                                        callMethod(device, instance, method);
+                                ImGui::EndDisabled();
+                                if (!method.prevResult.empty())
+                                        deviceStatus(method.prevResult.c_str(),
+                                                     method.prevResultOk ? ui::BtnStyle::Success : ui::BtnStyle::Danger);
+                                ImGui::PopID();
+                                continue;
+                        }
                         if (!function) {
-                                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.35f, 1.0f),
-                                                   "%s",
-                                                   tr("Unresolved: the function name/signature no longer matches the header.",
-                                                      "无法解析：函数名称/签名已与头文件不匹配。"));
+                                ui::ErrorText("%s",
+                                              tr("Unresolved: the function name/signature no longer matches the header.",
+                                                 "无法解析：函数名称/签名已与头文件不匹配。"));
                         } else if (function->isVariadic) {
-                                ImGui::TextColored(
+                                ui::TextColored(
                                     ImVec4(1.0f, 0.4f, 0.35f, 1.0f),
                                     "%s",
                                     tr("Variadic functions are intentionally blocked.", "可变参数函数已被主动禁止。"));
                         }
 
                         ImGui::TextDisabled("ID: %llu", static_cast<unsigned long long>(method.id));
-                        ImGui::Text("%s: %s", tr("Header function", "头文件函数"), method.functionName.c_str());
-                        ImGui::Text("%s: %s", tr("Signature", "签名"), method.signature.c_str());
+                        ImGui::TextWrapped("%s: %s", tr("Header function", "头文件函数"), method.functionName.c_str());
+                        ImGui::TextWrapped("%s: %s", tr("Signature", "签名"), method.signature.c_str());
 
                         if (!instance) {
                                 const char *kindLabels[] = {
@@ -3105,8 +3524,9 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                                     tr("Discovery (JSON)", "发现方法（JSON）"),
                                 };
                                 int kind = method.kind == MethodKind::Discovery ? 1 : 0;
+                                ImGui::TextUnformatted(tr("Action purpose", "操作用途"));
                                 ImGui::SetNextItemWidth(-1.0f);
-                                if (ImGui::Combo(tr("Method Purpose", "方法用途"), &kind, kindLabels, 2)) {
+                                if (ui::Choice("##method_purpose", &kind, kindLabels, 2)) {
                                         method.kind = kind == 1 ? MethodKind::Discovery : MethodKind::Instance;
                                         if (method.kind == MethodKind::Discovery)
                                                 method.resultPropertyId = 0;
@@ -3115,7 +3535,7 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
 
                                 if (method.kind == MethodKind::Discovery && function) {
                                         if (function->retType != CType::I32)
-                                                ImGui::TextColored(
+                                                ui::TextColored(
                                                     ImVec4(1.0f, 0.4f, 0.35f, 1.0f),
                                                     "%s",
                                                     tr("Discovery functions must return int.", "发现函数必须返回 int。"));
@@ -3127,8 +3547,10 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                                                                                               : parameter.name) +
                                                                       " (" + std::to_string(selected) + ")";
                                                 }
+                                                ImGui::TextWrapped("%s", label);
                                                 ImGui::SetNextItemWidth(-1.0f);
-                                                if (ImGui::BeginCombo(label, previewText.c_str())) {
+                                                if (ImGui::BeginCombo((std::string("##") + label).c_str(),
+                                                                      previewText.c_str())) {
                                                         for (int index = 0; index < static_cast<int>(function->params.size());
                                                              ++index) {
                                                                 const CParam &parameter =
@@ -3162,10 +3584,9 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                                             tr("JSON Buffer Argument", "JSON 缓冲区参数"), method.discoveryBufferArg, true);
                                         argumentCombo(tr("Capacity Argument", "容量参数"), method.discoveryCapacityArg, false);
                                         uint32_t bufferSize = method.discoveryBufferSize;
+                                        ImGui::TextUnformatted(tr("Buffer Size (bytes)", "缓冲区大小（字节）"));
                                         ImGui::SetNextItemWidth(-1.0f);
-                                        if (ImGui::InputScalar(tr("Buffer Size (bytes)", "缓冲区大小（字节）"),
-                                                               ImGuiDataType_U32,
-                                                               &bufferSize)) {
+                                        if (ImGui::InputScalar("##discovery_buffer_size", ImGuiDataType_U32, &bufferSize)) {
                                                 method.discoveryBufferSize = std::clamp(bufferSize, 1024u, 4u * 1024u * 1024u);
                                                 modified_                  = true;
                                         }
@@ -3204,9 +3625,9 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                                         ImGui::PushID(static_cast<int>(argumentIndex));
                                         const std::string parameterName =
                                             parameter.name.empty() ? "arg" + std::to_string(argumentIndex) : parameter.name;
-                                        ImGui::Text("%s  (%s)",
-                                                    parameterName.c_str(),
-                                                    normalizeTypeText(parameter.rawType, parameter.type).c_str());
+                                        ImGui::TextWrapped("%s  (%s)",
+                                                           parameterName.c_str(),
+                                                           normalizeTypeText(parameter.rawType, parameter.type).c_str());
 
                                         if (method.kind == MethodKind::Discovery &&
                                             static_cast<int>(argumentIndex) == method.discoveryBufferArg) {
@@ -3227,14 +3648,16 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                                             tr("Property Value", "属性值"),
                                             tr("Property Address", "属性地址"),
                                         };
-                                        int sourceIndex = static_cast<int>(binding.source);
-                                        ImGui::SetNextItemWidth(160.0f);
-                                        if (ImGui::Combo("##source", &sourceIndex, sourceLabels, 3)) {
+                                        int        sourceIndex  = static_cast<int>(binding.source);
+                                        const bool wideArgument = ImGui::GetContentRegionAvail().x > ImGui::GetFontSize() * 32;
+                                        ImGui::SetNextItemWidth(wideArgument ? ImGui::GetFontSize() * 10 : -1);
+                                        if (ui::Choice("##source", &sourceIndex, sourceLabels, 3)) {
                                                 binding.source     = static_cast<ArgSource>(sourceIndex);
                                                 binding.propertyId = 0;
                                                 modified_          = true;
                                         }
-                                        ImGui::SameLine();
+                                        if (wideArgument)
+                                                ImGui::SameLine();
                                         if (binding.source == ArgSource::Literal) {
                                                 ImGui::SetNextItemWidth(-1.0f);
                                                 if (inputTextString("##literal", binding.literal))
@@ -3273,7 +3696,7 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                                                 }
                                                 ImGui::EndDisabled();
                                                 if (!sourceSupported) {
-                                                        ImGui::TextColored(
+                                                        ui::TextColored(
                                                             ImVec4(1.0f, 0.4f, 0.35f, 1.0f),
                                                             "%s",
                                                             binding.source == ArgSource::PropertyAddress
@@ -3328,18 +3751,17 @@ DeviceManager::drawMethods(Device &device, DeviceInstance *instance)
                         const bool correctContext =
                             method.kind == MethodKind::Discovery ? instance == nullptr : instance != nullptr;
                         ImGui::BeginDisabled(!correctContext);
-                        if (ImGui::Button(method.kind == MethodKind::Discovery ? tr("Discover Devices", "发现设备")
-                                                                               : tr("Call", "调用")) &&
+                        if (ui::IconButton(method.kind == MethodKind::Discovery ? tr("Discover Devices", "发现设备")
+                                                                                : tr("Run on a device", "请在设备中执行"),
+                                           method.kind == MethodKind::Discovery ? ui::Icon::Search : ui::Icon::Play,
+                                           ui::BtnStyle::Primary) &&
                             callable && correctContext)
                                 callMethod(device, instance, method);
                         ImGui::EndDisabled();
                         ImGui::EndDisabled();
-                        if (!method.lastResult.empty()) {
-                                ImGui::SameLine();
-                                ImGui::TextColored(method.lastResultOk ? ImVec4(0.35f, 0.9f, 0.45f, 1.0f)
-                                                                       : ImVec4(1.0f, 0.4f, 0.35f, 1.0f),
-                                                   "%s",
-                                                   method.lastResult.c_str());
+                        if (!method.prevResult.empty()) {
+                                deviceStatus(method.prevResult.c_str(),
+                                             method.prevResultOk ? ui::BtnStyle::Success : ui::BtnStyle::Danger);
                         }
                 }
                 ImGui::PopID();
@@ -3379,18 +3801,26 @@ DeviceManager::drawInstanceProperties(Device &device, DeviceInstance &instance)
         if (!ImGui::BeginTable("##instance_properties",
                                6,
                                ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_Resizable |
-                                   ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate))
+                                   ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate | ImGuiTableFlags_ScrollX,
+                               ImVec2(0, 0),
+                               std::max(ImGui::GetContentRegionAvail().x, ImGui::GetFontSize() * 62.0f)))
                 return;
         // Keep the concrete-device view aligned with Monitor's TABLE mode. The final
-        // column contains binding operations rather than a wave generator.
-        ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"), ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn(tr("Value###col_value", "数值###col_value"), ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"), ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"), ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn(tr("Port###col_port", "端口###col_port"), ImGuiTableColumnFlags_WidthStretch);
+        // column contains binding operations rather than a wave generator
+        ImGui::TableSetupColumn(tr("Name###col_name", "名称###col_name"), ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn(tr("Value###col_value", "数值###col_value"), ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn(tr("Type###col_type", "类型###col_type"),
+                                ImGuiTableColumnFlags_WidthFixed,
+                                ui::TableColumnWidth(tr("Type", "类型"), "uint64_t"));
+        ImGui::TableSetupColumn(tr("Address###col_addr", "地址###col_addr"),
+                                ImGuiTableColumnFlags_WidthFixed,
+                                ui::TableColumnWidth(tr("Address", "地址"), "0xFFFFFFFF"));
+        ImGui::TableSetupColumn(tr("Port###col_port", "端口###col_port"),
+                                ImGuiTableColumnFlags_WidthFixed,
+                                ui::TableColumnWidth(tr("Port", "端口"), "J-Link"));
         ImGui::TableSetupColumn(tr("Binding###col_binding", "绑定###col_binding"),
                                 ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
-                                100.0f);
+                                ui::TableColumnWidth(tr("Binding", "绑定"), "..."));
         ImGui::TableHeadersRow();
 
         if (ImGuiTableSortSpecs *sort = ImGui::TableGetSortSpecs(); sort && sort->SpecsDirty) {
@@ -3453,7 +3883,7 @@ DeviceManager::drawInstanceProperties(Device &device, DeviceInstance &instance)
                                     return spec.SortDirection == ImGuiSortDirection_Ascending ? cmp < 0 : cmp > 0;
                             });
                         // SpecsDirty is also set on the first frame when ImGui restores
-                        // table state. Sorting is presentation state, not a user data edit.
+                        // table state. Sorting is presentation state, not a user data edit
                 }
                 sort->SpecsDirty = false;
         }
@@ -3474,12 +3904,13 @@ DeviceManager::drawInstanceProperties(Device &device, DeviceInstance &instance)
                         ImGui::Text(tr("Drag: %s", "拖动: %s"), property.name.c_str());
                         ImGui::EndDragDropSource();
                 }
-                if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("%s", tr("Drag to reorder", "拖动排序"));
+
                 ImGui::SameLine();
+                const float nameWidth = ImGui::GetContentRegionAvail().x;
                 ImGui::Selectable(property.name.empty() ? tr("Unnamed", "未命名") : property.name.c_str(),
                                   false,
                                   ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap);
+                ui::ClippedTextTooltip(property.name.c_str(), nameWidth);
                 if (ImGui::BeginDragDropTarget()) {
                         if (const ImGuiPayload *drop = ImGui::AcceptDragDropPayload("DND_DEVICE_PROPERTY_MOVE")) {
                                 if (drop->DataSize == sizeof(DevicePropertyMovePayload)) {
@@ -3524,7 +3955,8 @@ DeviceManager::drawInstanceProperties(Device &device, DeviceInstance &instance)
                         property.editValue = propertyValueString(property);
                 const bool valueWasInvalid = property.editValueInvalid;
                 if (valueWasInvalid)
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.35f, 0.35f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                                              ui::SemanticButtonPalette(ui::BtnStyle::Danger, ImGui::GetStyle()).text);
                 ImGui::BeginDisabled(property.source == PropertySource::JLink && !property.writable);
                 ImGui::SetNextItemWidth(-1.0f);
                 if (inputTextString("##value", property.editValue)) {
@@ -3546,7 +3978,7 @@ DeviceManager::drawInstanceProperties(Device &device, DeviceInstance &instance)
                         queuePropertyWrite(property);
 
                 ImGui::TableSetColumnIndex(2);
-                ImGui::TextUnformatted(stableTypeName(property.type));
+                ui::TableText(stableTypeName(property.type));
 
                 ImGui::TableSetColumnIndex(3);
                 if (property.source == PropertySource::JLink && property.address != 0)
@@ -3555,24 +3987,22 @@ DeviceManager::drawInstanceProperties(Device &device, DeviceInstance &instance)
                         ImGui::TextDisabled("%s", tr("UNKNOWN", "未知"));
 
                 ImGui::TableSetColumnIndex(4);
-                ImGui::TextUnformatted(property.source == PropertySource::JLink ? "J-Link" : "LOCAL");
+                ui::TableText(property.source == PropertySource::JLink ? "J-Link" : "LOCAL");
 
                 ImGui::TableSetColumnIndex(5);
-                const bool hasProblem = property.editValueInvalid || !property.lastWriteOk ||
+                const bool hasProblem = property.editValueInvalid || !property.prevWriteOk ||
                                         (property.source == PropertySource::JLink && !property.liveReadOk);
                 const bool isBusy = property.writePending;
-                if (hasProblem)
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.18f, 0.18f, 1.0f));
-                else if (isBusy)
-                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.48f, 0.12f, 1.0f));
-                if (ImGui::Button("...", ImVec2(-FLT_MIN, 0)))
+                if (ui::Button("...",
+                               hasProblem ? ui::BtnStyle::Danger
+                               : isBusy   ? ui::BtnStyle::Warning
+                                          : ui::BtnStyle::Neutral,
+                               ImVec2(-FLT_MIN, 0)))
                         ImGui::OpenPopup("##binding_menu");
-                if (hasProblem || isBusy)
-                        ImGui::PopStyleColor();
                 if (ImGui::IsItemHovered()) {
                         const char *state = property.editValueInvalid ? tr("Invalid value", "数值无效")
                                             : property.writePending   ? tr("Writing", "写入中")
-                                            : !property.lastWriteOk   ? tr("Write failed", "写入失败")
+                                            : !property.prevWriteOk   ? tr("Write failed", "写入失败")
                                             : (property.source == PropertySource::JLink && !property.liveReadOk)
                                                 ? (property.liveValueKnown ? tr("J-Link offline", "J-Link 离线")
                                                                            : tr("Waiting for data", "等待数据"))
@@ -3621,10 +4051,47 @@ DeviceManager::drawInstanceProperties(Device &device, DeviceInstance &instance)
 void
 DeviceManager::drawInstance(Device &device, DeviceInstance &instance)
 {
+        ImGui::TextWrapped("%s", instance.name.c_str());
+        ImGui::TextWrapped("%s: %s", tr("Device template", "设备模板"), device.name.c_str());
+        if (!device.status.empty())
+                deviceStatus(device.status.c_str(), device.statusIsError ? ui::BtnStyle::Danger : ui::BtnStyle::Success);
+        if (ImGui::BeginTabBar("##instance_tabs")) {
+                const int requested = requestedDetailTab_;
+                requestedDetailTab_ = -1;
+                auto flags = [&](int tab) { return requested == tab ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None; };
+                if (ImGui::BeginTabItem(tr("Overview", "总览"), nullptr, flags(0))) {
+                        drawDeviceSummary(device, &instance);
+                        ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem(tr("Properties", "属性"), nullptr, flags(1))) {
+                        if (instance.properties.empty())
+                                ImGui::TextWrapped("%s",
+                                                   tr("This device has no properties yet. Add them in its template or drop a "
+                                                      "J-Link variable below.",
+                                                      "此设备还没有属性。请在模板中添加，或将 J-Link 变量拖到下方。"));
+                        drawInstanceProperties(device, instance);
+                        ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem(tr("Actions", "操作"), nullptr, flags(2))) {
+                        drawMethods(device, &instance);
+                        ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem(tr("Settings", "设置"), nullptr, flags(3))) {
+                        drawInstanceSettings(device, instance);
+                        ImGui::EndTabItem();
+                }
+                ImGui::EndTabBar();
+        }
+}
+
+void
+DeviceManager::drawInstanceSettings(Device &device, DeviceInstance &instance)
+{
         ImGui::TextDisabled("%s ID: %llu", tr("Device", "设备"), static_cast<unsigned long long>(instance.id));
-        const std::string previousKey = instance.discoveryKey;
+        const std::string prevKey = instance.discoveryKey;
+        ImGui::TextUnformatted(tr("Discovery Key (optional)", "发现键（可选）"));
         ImGui::SetNextItemWidth(-1.0f);
-        if (inputTextString(tr("Discovery Key (optional)", "发现键（可选）"), instance.discoveryKey)) {
+        if (inputTextString("##instance_discovery_key", instance.discoveryKey)) {
                 const std::string candidateKey = trimCopy(instance.discoveryKey);
                 const bool        duplicate =
                     !candidateKey.empty() &&
@@ -3632,12 +4099,12 @@ DeviceManager::drawInstance(Device &device, DeviceInstance &instance)
                             return other.id != instance.id && other.discoveryKey == candidateKey;
                     });
                 if (duplicate) {
-                        instance.discoveryKey = previousKey;
+                        instance.discoveryKey = prevKey;
                         device.status =
                             tr("Discovery keys must be unique within a device type.", "同一设备类型内的设备发现键必须唯一。");
                         device.statusIsError = true;
                 } else {
-                        if (previousKey.empty() && !instance.discoveryKey.empty())
+                        if (prevKey.empty() && !instance.discoveryKey.empty())
                                 instance.customName = true;
                         instance.online = false;
                         modified_       = true;
@@ -3646,13 +4113,14 @@ DeviceManager::drawInstance(Device &device, DeviceInstance &instance)
         if (ImGui::IsItemDeactivatedAfterEdit())
                 instance.discoveryKey = trimCopy(instance.discoveryKey);
         if (!instance.discoveryKey.empty()) {
-                ImGui::TextColored(instance.online ? ImVec4(0.35f, 0.9f, 0.45f, 1.0f) : ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
-                                   "%s",
-                                   instance.online ? tr("Online", "在线")
-                                                   : tr("Offline / not rediscovered", "离线 / 尚未重新发现"));
+                ui::TextColored(instance.online ? ImVec4(0.35f, 0.9f, 0.45f, 1.0f) : ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
+                                "%s",
+                                instance.online ? tr("Online", "在线")
+                                                : tr("Offline / not rediscovered", "离线 / 尚未重新发现"));
         }
+        ImGui::TextUnformatted(tr("Device Name", "设备名称"));
         ImGui::SetNextItemWidth(-1.0f);
-        if (inputTextString(tr("Device Name", "设备名称"), instance.name)) {
+        if (inputTextString("##instance_name", instance.name)) {
                 if (!instance.discoveryKey.empty())
                         instance.customName = true;
                 modified_ = true;
@@ -3671,13 +4139,36 @@ DeviceManager::drawInstance(Device &device, DeviceInstance &instance)
                 }
         }
 
-        if (ImGui::BeginTabBar("##instance_tabs")) {
-                if (ImGui::BeginTabItem(tr("Properties", "属性"))) {
-                        drawInstanceProperties(device, instance);
+        ImGui::TextWrapped("%s",
+                           tr("The discovery key identifies the same physical device across scans. A custom display name does "
+                              "not alter its SDK bindings.",
+                              "发现键用于在多次扫描间识别同一物理设备。自定义显示名称不会改变 SDK 绑定。"));
+}
+
+void
+DeviceManager::drawDevice(Device &device)
+{
+        ImGui::TextWrapped("%s", device.name.c_str());
+        if (!device.status.empty())
+                deviceStatus(device.status.c_str(), device.statusIsError ? ui::BtnStyle::Danger : ui::BtnStyle::Success);
+        if (ImGui::BeginTabBar("##device_tabs")) {
+                const int requested = requestedDetailTab_;
+                requestedDetailTab_ = -1;
+                auto flags = [&](int tab) { return requested == tab ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None; };
+                if (ImGui::BeginTabItem(tr("Overview", "总览"), nullptr, flags(0))) {
+                        drawDeviceSummary(device, nullptr);
                         ImGui::EndTabItem();
                 }
-                if (ImGui::BeginTabItem(tr("Methods", "方法"))) {
-                        drawMethods(device, &instance);
+                if (ImGui::BeginTabItem(tr("Properties", "属性"), nullptr, flags(1))) {
+                        drawProperties(device);
+                        ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem(tr("Actions", "操作"), nullptr, flags(2))) {
+                        drawMethods(device);
+                        ImGui::EndTabItem();
+                }
+                if (ImGui::BeginTabItem(tr("SDK & settings", "SDK 与设置"), nullptr, flags(3))) {
+                        drawDeviceSettings(device);
                         ImGui::EndTabItem();
                 }
                 ImGui::EndTabBar();
@@ -3685,19 +4176,20 @@ DeviceManager::drawInstance(Device &device, DeviceInstance &instance)
 }
 
 void
-DeviceManager::drawDevice(Device &device)
+DeviceManager::drawDeviceSettings(Device &device)
 {
         ImGui::TextDisabled("ID: %llu", static_cast<unsigned long long>(device.id));
+        ImGui::TextUnformatted(tr("Device template name", "设备模板名称"));
         ImGui::SetNextItemWidth(-1.0f);
-        if (inputTextString(tr("Device Type Name", "设备类型名称"), device.name))
+        if (inputTextString("##template_name", device.name))
                 modified_ = true;
         if (ImGui::IsItemDeactivatedAfterEdit() && trimCopy(device.name).empty()) {
                 device.name = std::string(tr("Device Type", "设备类型")) + " " + std::to_string(device.id);
                 modified_   = true;
         }
 
-        ImGui::SeparatorText(tr("Files", "文件"));
-        if (ImGui::Button(tr("Browse Library", "浏览动态库"))) {
+        ImGui::SeparatorText(tr("SDK connection", "SDK 关联"));
+        if (ui::IconButton(tr("Browse Library", "浏览动态库"), ui::Icon::Open)) {
                 std::string path = nativeDlgOpen(tr("Select Dynamic Library", "选择动态库"),
 #if defined(_WIN32)
                                                  {
@@ -3718,16 +4210,16 @@ DeviceManager::drawDevice(Device &device)
                         modified_          = true;
                 }
         }
-        ImGui::SameLine();
+        deviceNextAction(tr("Unload", "卸载"), ui::Icon::Disconnect);
         if (device.loader.isLoaded()) {
-                if (ImGui::Button(tr("Unload", "卸载"))) {
+                if (ui::IconButton(tr("Unload", "卸载"), ui::Icon::Disconnect, ui::BtnStyle::Warning)) {
                         device.loader.unload();
                         device.status        = tr("Dynamic library unloaded.", "动态库已卸载。");
                         device.statusIsError = false;
                 }
         } else {
                 ImGui::BeginDisabled(device.libraryPath.empty());
-                if (ImGui::Button(tr("Load", "加载")))
+                if (ui::IconButton(tr("Load", "加载"), ui::Icon::Connect, ui::BtnStyle::Primary))
                         loadLibrary(device);
                 ImGui::EndDisabled();
         }
@@ -3735,7 +4227,7 @@ DeviceManager::drawDevice(Device &device)
                            tr("Library", "动态库"),
                            device.libraryPath.empty() ? tr("(not selected)", "（未选择）") : device.libraryPath.c_str());
 
-        if (ImGui::Button(tr("Browse Header", "浏览头文件"))) {
+        if (ui::IconButton(tr("Browse Header", "浏览头文件"), ui::Icon::Open)) {
                 std::string path = nativeDlgOpen(tr("Select C Header", "选择 C 头文件"),
                                                  {{"C/C++ Header", {"h", "hpp", "hh", "hxx"}}, {"All Files", {"*"}}});
                 if (!path.empty()) {
@@ -3746,33 +4238,18 @@ DeviceManager::drawDevice(Device &device)
                         loadHeader(device);
                 }
         }
-        ImGui::SameLine();
+        deviceNextAction(tr("Reparse", "重新解析"), ui::Icon::Properties);
         ImGui::BeginDisabled(device.headerPath.empty());
-        if (ImGui::Button(tr("Reparse", "重新解析")))
+        if (ui::IconButton(tr("Reparse", "重新解析"), ui::Icon::Properties))
                 loadHeader(device);
         ImGui::EndDisabled();
         ImGui::TextWrapped("%s: %s",
                            tr("Header", "头文件"),
                            device.headerPath.empty() ? tr("(not selected)", "（未选择）") : device.headerPath.c_str());
 
-        if (!device.status.empty()) {
-                ImGui::TextColored(device.statusIsError ? ImVec4(1.0f, 0.4f, 0.35f, 1.0f) : ImVec4(0.35f, 0.9f, 0.45f, 1.0f),
-                                   "%s",
-                                   device.status.c_str());
-        }
-
-        ImGui::Separator();
-        if (ImGui::BeginTabBar("##device_tabs")) {
-                if (ImGui::BeginTabItem(tr("Properties", "属性"))) {
-                        drawProperties(device);
-                        ImGui::EndTabItem();
-                }
-                if (ImGui::BeginTabItem(tr("Methods", "方法"))) {
-                        drawMethods(device);
-                        ImGui::EndTabItem();
-                }
-                ImGui::EndTabBar();
-        }
+        ImGui::TextWrapped("%s",
+                           tr("Drop a dynamic library or header on this window to assign it to the selected template.",
+                              "将动态库或头文件拖入此窗口，可关联到当前模板。"));
 }
 
 void
@@ -3787,7 +4264,7 @@ DeviceManager::draw()
         }
         refreshJLinkProperties();
         ImGui::SetNextWindowSize(ImVec2(1050.0f, 680.0f), ImGuiCond_FirstUseEver);
-        if (!ImGui::Begin(tr("Device Manager###DeviceManager", "设备管理器###DeviceManager"), &open_)) {
+        if (!dock_close::begin(tr("Device Manager###DeviceManager", "设备管理器###DeviceManager"), &open_)) {
                 pendingDropFiles_.clear();
                 ImGui::End();
                 return;
@@ -3797,7 +4274,7 @@ DeviceManager::draw()
                 const bool hovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows | ImGuiHoveredFlags_RootWindow);
                 if (!hovered) {
                         // Every interested tool receives the OS drop; only the hovered
-                        // window consumes it. Always clear to avoid a stale later apply.
+                        // window consumes it. Always clear to avoid a stale later apply
                 } else if (selectedDevice_ < 0 || selectedDevice_ >= static_cast<int>(devices_.size())) {
                         managerStatus_ =
                             tr("Create or select a device type before dropping files.", "拖入文件前请先新建或选择设备类型。");
@@ -3830,58 +4307,94 @@ DeviceManager::draw()
                 pendingDropFiles_.clear();
         }
 
-        if (!managerStatus_.empty()) {
-                ImGui::TextColored(managerStatusIsError_ ? ImVec4(1.0f, 0.4f, 0.35f, 1.0f) : ImVec4(0.35f, 0.9f, 0.45f, 1.0f),
-                                   "%s",
-                                   managerStatus_.c_str());
+        if (!managerStatus_.empty())
+                deviceStatus(managerStatus_.c_str(), managerStatusIsError_ ? ui::BtnStyle::Danger : ui::BtnStyle::Success);
+        const float font = ImGui::GetFontSize();
+        const bool  wide = ImGui::GetContentRegionAvail().x >= font * 55.0f;
+        if (!wide) {
+                if (ui::IconButton(compactLibrary_ ? tr("Overview", "设备总览") : tr("Device library", "设备库"),
+                                   compactLibrary_ ? ui::Icon::Grid : ui::Icon::Back)) {
+                        if (compactLibrary_) {
+                                showOverview_   = true;
+                                compactLibrary_ = false;
+                        } else {
+                                compactLibrary_ = true;
+                        }
+                }
                 ImGui::Separator();
         }
-
-        const ImVec2    available     = ImGui::GetContentRegionAvail();
-        constexpr float splitterWidth = 6.0f;
-        const float     maxSidebar    = std::max(100.0f, available.x - splitterWidth - 360.0f);
-        const float     minSidebar    = std::min(180.0f, maxSidebar);
-        sidebarWidth_                 = std::clamp(sidebarWidth_, minSidebar, maxSidebar);
-        drawDeviceList();
-        ImGui::SameLine(0.0f, 0.0f);
-        ImGui::InvisibleButton("##device_manager_splitter", ImVec2(splitterWidth, std::max(1.0f, available.y)));
-        const bool splitterHovered = ImGui::IsItemHovered();
-        const bool splitterActive  = ImGui::IsItemActive();
-        if (splitterHovered || splitterActive)
-                ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-        if (splitterActive) {
-                sidebarWidth_ = std::clamp(sidebarWidth_ + ImGui::GetIO().MouseDelta.x, minSidebar, maxSidebar);
-                modified_     = true;
+        const ImVec2 available     = ImGui::GetContentRegionAvail();
+        const float  splitterWidth = std::max(6.0f, font * 0.4f);
+        const float  maxSidebar    = std::max(font * 12.0f, available.x - splitterWidth - font * 30.0f);
+        const float  minSidebar    = std::min(font * 14.0f, maxSidebar);
+        sidebarWidth_              = std::clamp(sidebarWidth_, minSidebar, maxSidebar);
+        if (wide || compactLibrary_) {
+                ImGui::BeginChild("##device_list", ImVec2(wide ? sidebarWidth_ : 0, 0), ImGuiChildFlags_Borders);
+                drawDeviceList();
+                ImGui::EndChild();
+                if (!wide) {
+                        ImGui::End();
+                        return;
+                }
         }
-        if (splitterHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                sidebarWidth_ = std::clamp(260.0f, minSidebar, maxSidebar);
-                modified_     = true;
+        if (wide) {
+                ImGui::SameLine(0.0f, 0.0f);
+                ImGui::InvisibleButton("##device_manager_splitter", ImVec2(splitterWidth, std::max(1.0f, available.y)));
+                const bool splitterHovered = ImGui::IsItemHovered();
+                const bool splitterActive  = ImGui::IsItemActive();
+                if (splitterHovered || splitterActive)
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+                if (splitterActive) {
+                        sidebarWidth_ = std::clamp(sidebarWidth_ + ImGui::GetIO().MouseDelta.x, minSidebar, maxSidebar);
+                        modified_     = true;
+                }
+                if (splitterHovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                        sidebarWidth_ = std::clamp(260.0f, minSidebar, maxSidebar);
+                        modified_     = true;
+                }
+                const ImVec2 splitterMin   = ImGui::GetItemRectMin();
+                const ImVec2 splitterMax   = ImGui::GetItemRectMax();
+                const ImU32  splitterColor = ImGui::GetColorU32(splitterActive    ? ImGuiCol_SeparatorActive
+                                                               : splitterHovered ? ImGuiCol_SeparatorHovered
+                                                                                 : ImGuiCol_Separator);
+                const float  splitterX     = (splitterMin.x + splitterMax.x) * 0.5f;
+                ImGui::GetWindowDrawList()->AddLine(ImVec2(splitterX, splitterMin.y),
+                                                    ImVec2(splitterX, splitterMax.y),
+                                                    splitterColor,
+                                                    splitterActive ? 2.0f : 1.0f);
+                ImGui::SameLine(0.0f, 0.0f);
         }
-        const ImVec2 splitterMin   = ImGui::GetItemRectMin();
-        const ImVec2 splitterMax   = ImGui::GetItemRectMax();
-        const ImU32  splitterColor = ImGui::GetColorU32(splitterActive    ? ImGuiCol_SeparatorActive
-                                                       : splitterHovered ? ImGuiCol_SeparatorHovered
-                                                                         : ImGuiCol_Separator);
-        const float  splitterX     = (splitterMin.x + splitterMax.x) * 0.5f;
-        ImGui::GetWindowDrawList()->AddLine(
-            ImVec2(splitterX, splitterMin.y), ImVec2(splitterX, splitterMax.y), splitterColor, splitterActive ? 2.0f : 1.0f);
-        ImGui::SameLine(0.0f, 0.0f);
         ImGui::BeginChild("##device_detail", ImVec2(0.0f, 0.0f), true);
-        if (selectedDevice_ < 0 || selectedDevice_ >= static_cast<int>(devices_.size())) {
-                ImGui::TextDisabled("%s", tr("Create or select a device type.", "请新建或选择设备类型。"));
+        if (showOverview_ || selectedDevice_ < 0 || selectedDevice_ >= static_cast<int>(devices_.size())) {
+                drawOverview();
         } else {
                 Device &device = *devices_[selectedDevice_];
+                ImGui::PushID(("device_detail_" + std::to_string(device.id)).c_str());
                 if (selectedInstance_ >= static_cast<int>(device.instances.size()))
                         selectedInstance_ = -1;
                 if (selectedInstance_ >= 0) {
-                        if (ImGui::Button(tr("Delete Device", "删除设备"))) {
+                        if (ui::IconButton(tr("Device template", "设备模板"), ui::Icon::Back)) {
+                                selectedInstance_   = -1;
+                                requestedDetailTab_ = 0;
+                        }
+                        deviceNextAction(tr("More", "更多"), ui::Icon::More);
+                        if (ui::IconButton(tr("More", "更多"), ui::Icon::More))
+                                ImGui::OpenPopup("##instance_more");
+                        bool deleteRequested = false;
+                        if (ImGui::BeginPopup("##instance_more")) {
+                                if (ImGui::MenuItem(tr("Add another from this template", "从此模板再添加一个设备"))) {
+                                        createInstance(device);
+                                        requestedDetailTab_ = 3;
+                                }
+                                ImGui::Separator();
+                                deleteRequested = ImGui::MenuItem(tr("Delete Device", "删除设备"));
+                                ImGui::EndPopup();
+                        }
+                        if (deleteRequested && selectedInstance_ >= 0) {
                                 pendingDeleteInstanceId_ = device.instances[static_cast<size_t>(selectedInstance_)].id;
                                 ImGui::OpenPopup(
                                     tr("Delete Device?###ConfirmDeleteDevice", "删除设备？###ConfirmDeleteDevice"));
                         }
-                        ImGui::SameLine();
-                        if (ImGui::Button(tr("Back to Device Type", "返回设备类型")))
-                                selectedInstance_ = -1;
                         bool instanceDeleted = false;
                         if (ImGui::BeginPopupModal(
                                 tr("Delete Device?###ConfirmDeleteDevice", "删除设备？###ConfirmDeleteDevice"),
@@ -3890,7 +4403,7 @@ DeviceManager::draw()
                                 ImGui::TextWrapped("%s",
                                                    tr("Delete this concrete device and all of its property values?",
                                                       "确定删除这个具体设备及其全部属性值吗？"));
-                                if (ImGui::Button(tr("Delete", "删除"))) {
+                                if (ui::IconButton(tr("Delete", "删除"), ui::Icon::Delete, ui::BtnStyle::Danger)) {
                                         const auto found = std::find_if(device.instances.begin(),
                                                                         device.instances.end(),
                                                                         [&](const DeviceInstance &candidate) {
@@ -3913,16 +4426,29 @@ DeviceManager::draw()
                         }
                         ImGui::Separator();
                         if (!instanceDeleted && selectedInstance_ >= 0) {
+                                ImGui::PushID(("instance_detail_" +
+                                               std::to_string(device.instances[static_cast<size_t>(selectedInstance_)].id))
+                                                  .c_str());
                                 drawInstance(device, device.instances[static_cast<size_t>(selectedInstance_)]);
+                                ImGui::PopID();
                         }
                 } else {
-                        if (ImGui::Button(tr("Export Type .avadev", "导出类型 .avadev")))
-                                exportDevice(device);
-                        ImGui::SameLine();
-                        if (ImGui::Button(tr("Add Device", "添加设备")))
+                        if (ui::IconButton(tr("Add Device", "添加设备"), ui::Icon::Add, ui::BtnStyle::Primary)) {
                                 createInstance(device);
-                        ImGui::SameLine();
-                        if (ImGui::Button(tr("Delete Device Type", "删除设备类型"))) {
+                                requestedDetailTab_ = 0;
+                        }
+                        deviceNextAction(tr("More", "更多"), ui::Icon::More);
+                        if (ui::IconButton(tr("More", "更多"), ui::Icon::More))
+                                ImGui::OpenPopup("##template_more");
+                        bool deleteRequested = false;
+                        if (ImGui::BeginPopup("##template_more")) {
+                                if (ImGui::MenuItem(tr("Export template .avadev", "导出模板 .avadev")))
+                                        exportDevice(device);
+                                ImGui::Separator();
+                                deleteRequested = ImGui::MenuItem(tr("Delete template and devices", "删除模板及设备"));
+                                ImGui::EndPopup();
+                        }
+                        if (deleteRequested) {
                                 pendingDeleteTypeId_ = device.id;
                                 ImGui::OpenPopup(tr("Delete Device Type?###ConfirmDeleteDeviceType",
                                                     "删除设备类型？###ConfirmDeleteDeviceType"));
@@ -3935,7 +4461,7 @@ DeviceManager::draw()
                                 ImGui::TextWrapped(
                                     tr("Delete this device type, all concrete devices, properties, and method bindings?",
                                        "确定删除该设备类型以及其全部具体设备、属性和方法绑定吗？"));
-                                if (ImGui::Button(tr("Delete", "删除"))) {
+                                if (ui::IconButton(tr("Delete", "删除"), ui::Icon::Delete, ui::BtnStyle::Danger)) {
                                         const auto found =
                                             std::find_if(devices_.begin(), devices_.end(), [&](const auto &candidate) {
                                                     return candidate->id == pendingDeleteTypeId_;
@@ -3958,6 +4484,7 @@ DeviceManager::draw()
                         if (!typeDeleted)
                                 drawDevice(device);
                 }
+                ImGui::PopID();
         }
         ImGui::EndChild();
         ImGui::End();

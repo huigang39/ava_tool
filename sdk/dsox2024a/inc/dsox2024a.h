@@ -3,7 +3,9 @@
 
 #include <stddef.h>
 
-#if defined(_WIN32)
+#if defined(DSOX2024A_STATIC)
+#define DSOX2024A_API
+#elif defined(_WIN32)
 #if defined(DSOX2024A_BUILD)
 #define DSOX2024A_API __declspec(dllexport)
 #else
@@ -39,9 +41,9 @@ typedef struct Dsox2024aWaveformInfo {
         double y_reference;
 } Dsox2024aWaveformInfo;
 
-/* Connect to the oscilloscope's raw SCPI socket (normally TCP port 5025). */
+// Connect to the oscilloscope's raw SCPI socket (normally TCP port 5025)
 DSOX2024A_API int dsox2024a_open(const char *host, unsigned short port, int timeout_ms);
-/* Connect via USBTMC/VISA. NULL resource automatically finds a DSOX2024A. */
+// Connect via USBTMC/VISA. NULL resource automatically finds a DSOX2024A
 DSOX2024A_API int dsox2024a_open_usb(const char *resource, int timeout_ms);
 DSOX2024A_API int dsox2024a_close(void);
 DSOX2024A_API int dsox2024a_is_open(void);
@@ -52,12 +54,12 @@ DSOX2024A_API int dsox2024a_autoscale(void);
 DSOX2024A_API int dsox2024a_run(void);
 DSOX2024A_API int dsox2024a_stop(void);
 DSOX2024A_API int dsox2024a_single(void);
-DSOX2024A_API int dsox2024a_digitize(int channel); /* channel: 1..4 */
+DSOX2024A_API int dsox2024a_digitize(int channel); // channel: 1..4
 
 DSOX2024A_API int dsox2024a_set_channel_enabled(int channel, int enabled);
 DSOX2024A_API int dsox2024a_set_channel_scale(int channel, double volts_per_div);
 DSOX2024A_API int dsox2024a_set_channel_offset(int channel, double volts);
-DSOX2024A_API int dsox2024a_set_channel_coupling(int channel, const char *coupling); /* AC/DC */
+DSOX2024A_API int dsox2024a_set_channel_coupling(int channel, const char *coupling); // AC/DC
 DSOX2024A_API int dsox2024a_set_probe_ratio(int channel, double ratio);
 DSOX2024A_API int dsox2024a_set_timebase_scale(double seconds_per_div);
 DSOX2024A_API int dsox2024a_set_timebase_position(double seconds);
@@ -75,7 +77,7 @@ DSOX2024A_API int dsox2024a_measure_rms(int channel, double *volts);
 DSOX2024A_API int
 dsox2024a_read_waveform(int channel, size_t requested_points, double *samples, size_t capacity, Dsox2024aWaveformInfo *info);
 
-/* Low-level SCPI escape hatch. query reads one newline-terminated response. */
+// Low-level SCPI escape hatch. query reads one newline-terminated response
 DSOX2024A_API int dsox2024a_write(const char *command);
 DSOX2024A_API int dsox2024a_query(const char *command, char *response, size_t capacity);
 DSOX2024A_API int dsox2024a_check_error(char *response, size_t capacity);

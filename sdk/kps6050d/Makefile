@@ -24,6 +24,8 @@ endif
 ifndef _MSVC_REINVOKE
 PROJECT := kps6050d
 SRC := src/kps6050d.c
+PORTS_SRC := ../dyn200/src/dyn200_ports.c
+PORTS_HDR := ../dyn200/src/dyn200_ports.h
 HDR := inc/kps6050d.h
 EXAMPLE_SRCS := $(wildcard example/*.c)
 FSA_EXAMPLE_SRC := example/example_fsa_scope_cycle.c
@@ -32,6 +34,7 @@ REGULAR_SRCS := $(filter-out $(FSA_EXAMPLE_SRC),$(EXAMPLE_SRCS))
 ifeq ($(OS),Windows_NT)
 CC := cl.exe
 OBJ := build/win/$(PROJECT).obj
+PORTS_OBJ := build/win/serial_ports.obj
 LIBRARY := lib/win/$(PROJECT).dll
 IMPORT_LIB := lib/win/$(PROJECT).lib
 DSOX_LIB := ../dsox2024a/lib/win/dsox2024a.lib
@@ -53,13 +56,17 @@ ifeq ($(wildcard $(FSAV3_LIB)),)
 	@echo skipped example_fsa_scope_cycle: missing $(FSAV3_LIB)
 endif
 
-$(OBJ): $(SRC) $(HDR)
+$(OBJ): $(SRC) $(HDR) $(PORTS_HDR)
 	@if not exist "build\win" mkdir "build\win"
 	$(CC) $(CFLAGS) /DKPS6050D_BUILD $(SRC) /Fo:$@
 
-$(LIBRARY): $(OBJ)
+$(PORTS_OBJ): $(PORTS_SRC) $(PORTS_HDR)
+	@if not exist "build\win" mkdir "build\win"
+	$(CC) $(CFLAGS) $(PORTS_SRC) /Fo:$@
+
+$(LIBRARY): $(OBJ) $(PORTS_OBJ)
 	@if not exist "lib\win" mkdir "lib\win"
-	link.exe /nologo /DLL /OUT:$@ /IMPLIB:$(IMPORT_LIB) $(OBJ)
+	link.exe /nologo /DLL /OUT:$@ /IMPLIB:$(IMPORT_LIB) $(OBJ) $(PORTS_OBJ) advapi32.lib
 
 build/win/%.obj: example/%.c $(HDR)
 	@if not exist "build\win" mkdir "build\win"
@@ -72,6 +79,8 @@ build/win/%.exe: build/win/%.obj $(LIBRARY)
 ifneq ($(wildcard $(FSAV3_LIB)),)
 $(FSA_OBJ): ../fsav3/fsav3_c.cpp ../fsav3/fsav3_c.h ../fsav3/fsav3.h
 	cl.exe /nologo /c /std:c++20 /W4 /O2 /MD /EHsc /utf-8 /I../fsav3 ../fsav3/fsav3_c.cpp /Fo:$@
+
+build/win/example_fsa_scope_cycle.obj: ../fsav3/fsav3_c.h
 
 $(FSA_EXE): build/win/example_fsa_scope_cycle.obj $(FSA_OBJ) $(LIBRARY)
 	link.exe /nologo /OUT:$@ build/win/example_fsa_scope_cycle.obj $(FSA_OBJ) $(IMPORT_LIB) $(DSOX_LIB) $(FSAV3_LIB)
@@ -98,9 +107,9 @@ CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -O2 -fPIC -Iinc
 all: $(LIBRARY) $(EXAMPLES)
 	@echo built examples: $(EXAMPLES)
 
-$(LIBRARY): $(SRC) $(HDR)
+$(LIBRARY): $(SRC) $(HDR) $(PORTS_SRC) $(PORTS_HDR)
 	@mkdir -p lib/linux
-	$(CC) $(CFLAGS) -shared $(SRC) -lpthread -lm -o $@
+	$(CC) $(CFLAGS) -shared $(SRC) $(PORTS_SRC) -lpthread -lm -o $@
 
 build/linux/%: example/%.c $(LIBRARY)
 	@mkdir -p build/linux

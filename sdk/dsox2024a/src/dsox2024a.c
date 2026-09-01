@@ -352,7 +352,9 @@ done:
         unlock_sdk();
         return r;
 }
-/* close without locking; callers that already own g_lock use this helper */
+/**
+ * @brief close without locking; callers that already own g_lock use this helper
+ */
 static void
 close_u(void)
 {
@@ -621,6 +623,12 @@ dsox2024a_read_waveform(int ch, size_t req, double *s, size_t cap, Dsox2024aWave
                         goto done;
                 }
         }
+        if (!isfinite(p[2]) || p[2] < 1 || p[2] > 67108864 || floor(p[2]) != p[2] ||
+            !isfinite(p[4]) || p[4] <= 0 || !isfinite(p[5]) || !isfinite(p[6]) ||
+            !isfinite(p[7]) || !isfinite(p[8]) || !isfinite(p[9])) {
+                r = fail(DSOX2024A_ERR_PROTOCOL, "invalid waveform calibration or point count");
+                goto done;
+        }
         pts            = (size_t)p[2];
         i->points      = pts;
         i->x_increment = p[4];
@@ -646,6 +654,10 @@ dsox2024a_read_waveform(int ch, size_t req, double *s, size_t cap, Dsox2024aWave
         if ((r = recv_exact(len, (size_t)(digit - '0'))))
                 goto done;
         bytes = (size_t)strtoull(len, NULL, 10);
+        if (bytes != pts) {
+                r = fail(DSOX2024A_ERR_PROTOCOL, "waveform block length does not match preamble");
+                goto done;
+        }
         raw   = (unsigned char *)malloc(bytes);
         if (!raw) {
                 r = fail(DSOX2024A_ERR_PROTOCOL, "out of memory");

@@ -2,9 +2,9 @@
 #define SEQUENCE_EDITOR_HPP
 
 #include "cJSON.h"
+#include "ckit.h"
 #include "dwarf_parser.hpp"
 #include "jlink_port.hpp"
-#include "module.h"
 #include "monitor_types.hpp"
 #include "parser.hpp"
 #include "shm.h"
@@ -35,15 +35,15 @@ struct SequenceAction {
         std::vector<std::pair<i64, std::string>> enumDefs;
 };
 
-// One entry in the sequence editor's execution log.
+// One entry in the sequence editor's execution log
 struct SeqLogEntry {
-        std::string desc;  // e.g. "Write: target.voltage" or "SDK: Init" or "EXCEPTION"
-        std::string value; // e.g. "= 3.3" or "OK: 0" or "FAIL: timeout" or ex.what()
+        std::string desc; // e.g. "Write: target.vol" or "SDK: Init" or "EXCEPTION"
+        std::string val;  // e.g. "= 3.3" or "OK: 0" or "FAIL: timeout" or ex.what()
         bool        ok{true};
         uint64_t    tsMs{0}; // ms since epoch (wall-clock, for display)
 };
 
-// Payload for dragging a function/method out of an SDK Debug window.
+// Payload for dragging a function/method out of an SDK Debug window
 struct SdkDragPayload {
         int  panelWinId{-1};
         bool isCFunc{false};
@@ -54,7 +54,7 @@ struct SdkDragPayload {
         char pyName[128]{}; // Python function name (when isPython == true)
 };
 
-// SDK call step info.
+// SDK call step info
 struct SdkStepInfo {
         int                      panelWinId{-1};
         bool                     isCFunc{false};
@@ -70,11 +70,11 @@ struct SdkStepInfo {
 
 // Kept for backward compatibility: SdkCall is no longer a user-creatable step
 // kind. Old .seq files / sessions storing a standalone SdkCall step are converted
-// on load into a "do" (Action) step containing a single SDK operation.
+// on load into a "do" (Action) step containing a single SDK operation
 enum class SeqStepKind { Action, Sleep, If, While, For, Break, SdkCall };
 
-// A single operation inside a "do" (Action) step's execution body (动作).
-// The body is an ordered mix of variable writes and SDK function calls.
+// A single operation inside a "do" (Action) step's execution body (动作)
+// The body is an ordered mix of variable writes and SDK function calls
 enum class SeqOpKind { Write, Sdk };
 
 struct SeqOp {
@@ -105,7 +105,7 @@ struct SequenceStep {
         bool                      expanded{true};
 };
 
-// Struct field descriptor for LOCAL struct variables created by the sequence editor.
+// Struct field descriptor for LOCAL struct variables created by the sequence editor
 struct SeqStructField {
         std::string name;
         DataType    type{DataType::U32};
@@ -114,22 +114,25 @@ struct SeqStructField {
 
 class SequenceEditor
 {
+        friend struct SimSamplerTestAccess;
+
       public:
-        // Wired by Gui: read a LOCAL variable buffer for condition evaluation.
+        // Wired by Gui: read a LOCAL variable buffer for condition evaluation
         std::function<void *(const std::string &)> onGetLocalBuf_;
-        // Wired by Gui: return the DataType of a LOCAL variable (for type-aware write-back).
+        // Wired by Gui: return the DataType of a LOCAL variable (for type-aware write-back)
         std::function<DataType(const std::string &)> onGetLocalVarDataType_;
-        // Wired by Gui: notify the variable manager that a LOCAL variable's buffer was written.
+        // Wired by Gui: notify the variable manager that a LOCAL variable's buffer was written
         std::function<void(const std::string &)> onLocalVarWritten_;
-        // Wired by Gui: create a new LOCAL scalar variable in the variable manager.
+        // Wired by Gui: create a new LOCAL scalar variable in the variable manager
         std::function<void(const std::string &, DataType, size_t)> onAddLocalVar_;
-        // Wired by Gui: create a new LOCAL struct variable in the variable manager.
+        // Wired by Gui: create a new LOCAL struct variable in the variable manager
         std::function<void(const std::string &, const std::vector<SeqStructField> &, size_t)> onAddLocalStructVar_;
 
         SequenceEditor();
         ~SequenceEditor();
 
         void draw();
+        void stop();
 
         bool isOpen() const { return show_; }
         void setOpen(bool o) { show_ = o; }
@@ -162,28 +165,40 @@ class SequenceEditor
         void drawStepDetail(SequenceStep &step);
         void drawBodySteps(std::vector<SequenceStep> &steps, int depth);
         void drawSdkStepDetail(SdkStepInfo &sdk, std::shared_ptr<SdkPanel> panel);
-        // Renders a struct-pointer SDK argument as an expandable row (type / tree / editable
-        // fields), like the SDK caller. Binds the param to an auto-created LOCAL struct
-        // variable on first expand. Returns true if it handled the row (caller should
-        // `continue`); false when param `p` is not a struct (caller renders it normally).
+        /**
+         * @brief Renders a struct-pointer SDK argument as an expandable row (type / tree / editable
+         * fields), like the dynamic library caller. Binds the param to an auto-created LOCAL struct
+         * variable on first expand. Returns true if it handled the row (caller should
+         * `continue`); false when param `p` is not a struct (caller renders it normally)
+         */
         bool drawSdkStructArgRow(SdkPanel *panel, SdkStepInfo &sdk, int p, const std::string &pname, const std::string &ptype);
-        // Renders [+][v] buttons (SameLine) for an SDK argument so every parameter row —
-        // text, enum and struct — offers the same create/pick controls. "+" creates a LOCAL
-        // variable for the parameter; "v" picks an existing one and binds it as "&var"
-        // (pointer/reference) or "$var" (value).
+        /**
+         * @brief Renders [+][v] buttons (SameLine) for an SDK argument so every parameter row —
+         * text, enum and struct — offers the same create/pick controls. "+" creates a LOCAL
+         * variable for the parameter; "v" picks an existing one and binds it as "&var"
+         * (pointer/reference) or "$var" (value)
+         */
         void drawSdkArgButtons(
             SdkPanel *panel, SdkStepInfo &sdk, int p, const std::string &pname, const std::string &ptype, bool isPtr);
         void acceptSdkPayload(const void *data, int insertAfter);
-        // Build an SDK op from a drag payload; false if the source panel is gone.
+        /**
+         * @brief Build an SDK op from a drag payload; false if the source panel is gone
+         */
         bool makeSdkOp(const SdkDragPayload &pl, SeqOp &out);
-        // Inside an active drag-drop target: consume any SDK/variable payload and
-        // hand each resulting op to `sink`. Returns true if anything was added.
+        /**
+         * @brief Inside an active drag-drop target: consume any SDK/variable payload and
+         * hand each resulting op to `sink`. Returns true if anything was added
+         */
         bool          acceptOpDrops(const std::function<void(SeqOp)> &sink, bool noSdk = false);
         SequenceStep *selectedStepPtr();
-        // Run a single top-level step (by index) in the background, independent of
-        // the full-sequence run. No-op if a run is already in progress.
+        /**
+         * @brief Run a single top-level step (by index) in the background, independent of
+         * the full-sequence run. No-op if a run is already in progress
+         */
         void runSingleStep(int idx);
-        // Reorder a top-level step from `src` to `dst` (drag-and-drop).
+        /**
+         * @brief Reorder a top-level step from `src` to `dst` (drag-and-drop)
+         */
         void moveStep(int src, int dst);
 
         // Background execution

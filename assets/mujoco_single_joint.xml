@@ -1,0 +1,184 @@
+<mujoco model="single_joint_pendulum">
+
+    <compiler angle="radian" />
+
+    <option
+        timestep="0.001"
+        gravity="0 0 -9.81"
+        integrator="RK4" />
+
+    <visual>
+        <global
+            azimuth="135"
+            elevation="-15" />
+    </visual>
+
+    <worldbody>
+
+        <!-- =====================================================
+             Light
+        ====================================================== -->
+
+        <light
+            pos="0 -3 3"
+            dir="0 1 -1" />
+
+
+        <!-- =====================================================
+             Floor
+        ====================================================== -->
+
+        <geom
+            name="floor"
+            type="plane"
+            pos="0 0 -0.75"
+            size="3 3 0.1"
+            rgba="0.15 0.15 0.15 1" />
+
+
+        <!-- =====================================================
+             Table
+             
+             Top surface = z = 0
+             Front edge   = y = -0.60
+        ====================================================== -->
+
+        <geom
+            name="table"
+            type="box"
+            pos="0 0 -0.05"
+            size="0.90 0.60 0.05"
+            rgba="0.45 0.45 0.45 1"
+            contype="0"
+            conaffinity="0" />
+
+
+        <!-- =====================================================
+             Motor mounting bracket
+        ====================================================== -->
+
+        <geom
+            name="motor_mount"
+            type="box"
+            pos="0 -0.55 0.10"
+            size="0.15 0.12 0.10"
+            rgba="0.30 0.30 0.30 1"
+            contype="0"
+            conaffinity="0" />
+
+
+        <!-- =====================================================
+             Fixed motor
+             
+             Motor shaft direction: Y
+             Joint rotation axis:   Y
+             
+             Motor is mounted at front edge of table.
+        ====================================================== -->
+
+        <body
+            name="motor_base"
+            pos="0 -0.72 0.20">
+
+            <!-- Motor housing -->
+
+            <geom
+                name="motor_housing"
+                type="cylinder"
+                pos="0 0 0"
+                size="0.10 0.12"
+                quat="0.7071068 0.7071068 0 0"
+                rgba="0.18 0.18 0.18 1"
+                contype="0"
+                conaffinity="0" />
+
+
+            <!-- =================================================
+                 Rotating body
+            ================================================== -->
+
+            <body
+                name="pendulum"
+                pos="0 -0.13 0">
+
+                <joint
+                    name="joint1"
+                    type="hinge"
+                    pos="0 0 0"
+                    axis="0 1 0"
+                    limited="false"
+                    damping="0.10"
+                    armature="0.01" />
+
+
+                <!-- Output flange -->
+
+                <geom
+                    name="output_flange"
+                    type="cylinder"
+                    pos="0 0 0"
+                    size="0.065 0.025"
+                    quat="0.7071068 0.7071068 0 0"
+                    mass="0.25"
+                    rgba="0.65 0.65 0.65 1" />
+
+
+                <!-- Pendulum arm
+                     
+                     q = 0:
+                     
+                       O
+                       |
+                       |
+                       |
+                       ↓
+                -->
+
+                <geom
+                    name="arm"
+                    type="capsule"
+                    fromto="0 0 0 0 0 -0.60"
+                    size="0.025"
+                    mass="0.80"
+                    rgba="0.10 0.35 0.85 1" />
+
+
+                <!-- =================================================
+                     Heavy payload disk
+                     
+                     Axis along Y, same as motor shaft.
+                ================================================== -->
+
+                <geom
+                    name="payload_disk"
+                    type="cylinder"
+                    pos="0 0 -0.60"
+                    size="0.13 0.04"
+                    quat="0.7071068 0.7071068 0 0"
+                    mass="3.0"
+                    rgba="0.85 0.25 0.10 1" />
+
+            </body>
+
+        </body>
+
+    </worldbody>
+
+
+    <!-- =========================================================
+         Actuator
+         
+         ctrl directly represents joint torque because gear = 1
+    ========================================================== -->
+
+    <actuator>
+
+        <motor
+            name="joint_motor"
+            joint="joint1"
+            gear="1"
+            ctrllimited="false" />
+
+    </actuator>
+
+</mujoco>

@@ -5,8 +5,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "ckit.h"
 #include "core/elf_types.hpp"
-#include "module.h"
 
 namespace dwarf
 {
@@ -43,7 +43,7 @@ struct Type {
 
         struct Enumerator {
                 std::string name;
-                i64         value{0};
+                i64         val{0};
         };
         std::vector<Enumerator> enums{};
 };

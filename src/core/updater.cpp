@@ -2,12 +2,14 @@
 
 #include "app_log.hpp"
 #include "core/http_win.hpp"
+#include "core/remote_files.hpp"
 #include "version.hpp"
 
-#include "cJSON.h"
-
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <fstream>
+#include <regex>
 #include <thread>
 
 #ifdef _WIN32
@@ -18,7 +20,7 @@ int
 Updater::compareVersions(const std::string &a, const std::string &b)
 {
         // Parse up to three dotted numeric components, ignoring a leading 'v' and
-        // anything after a '-' (pre-release) or '+' (build metadata).
+        // anything after a '-' (pre-release) or '+' (build metadata)
         auto parse = [](const std::string &s, int out[3]) {
                 out[0] = out[1] = out[2] = 0;
                 size_t i                 = 0;
@@ -62,72 +64,70 @@ Updater::checkAsync()
         if (!running_.compare_exchange_strong(expected, true))
                 return; // already running
 
-        std::thread([this]() {
+        const auto config = remote::settings();
+        if (checkThread_.joinable())
+                checkThread_.join();
+        checkThread_ = std::thread([this, config]() {
                 Info result;
                 result.currentVersion = AVA_VERSION;
 
-                const std::string apiUrl = std::string("https://api.github.com/repos/") + AVA_GITHUB_OWNER + "/" +
-                                           AVA_GITHUB_REPO + "/releases/latest";
+                const auto &cfg     = config;
+                const auto &toolUrl = cfg.toolUrl;
+                result.sourceUrl    = toolUrl;
 
-                std::string body, err;
-                if (!http::get(apiUrl, body, &err)) {
+                if (toolUrl.empty()) {
                         result.checked = true;
-                        // 404 = no published release yet, or the repo is private and the
-                        // unauthenticated API can't see it. That's a normal state, not a
-                        // failure — report it gently rather than as an error.
-                        if (err.find("404") != std::string::npos)
-                                result.error = "No published release found yet (or the repository is private).";
-                        else if (err.find("403") != std::string::npos || err.find("429") != std::string::npos)
-                                result.error = "GitHub rate limit reached (60 checks/hour per IP). Please try again later.";
-                        else
-                                result.error = std::string("Update check failed: ") + (err.empty() ? "unknown error" : err);
+                        result.error   = "Configure the update address in Settings > Server > Remote servers.";
                         LOG_W("Update check: %s", result.error.c_str());
-                } else if (cJSON *root = cJSON_Parse(body.c_str())) {
-                        if (const cJSON *tag = cJSON_GetObjectItem(root, "tag_name"); cJSON_IsString(tag))
-                                result.latestVersion = tag->valuestring;
-                        if (const cJSON *html = cJSON_GetObjectItem(root, "html_url"); cJSON_IsString(html))
-                                result.releaseUrl = html->valuestring;
-                        if (const cJSON *notes = cJSON_GetObjectItem(root, "body"); cJSON_IsString(notes)) {
-                                result.notes = notes->valuestring;
-                                if (result.notes.size() > 1500)
-                                        result.notes.resize(1500);
-                        }
-                        // Prefer a Windows installer asset (.exe); fall back to the first asset.
-                        if (const cJSON *assets = cJSON_GetObjectItem(root, "assets"); cJSON_IsArray(assets)) {
-                                std::string firstUrl;
-                                for (const cJSON *a = assets->child; a; a = a->next) {
-                                        const cJSON *name = cJSON_GetObjectItem(a, "name");
-                                        const cJSON *url  = cJSON_GetObjectItem(a, "browser_download_url");
-                                        if (!cJSON_IsString(url))
+                } else {
+                        try {
+                                static const std::regex versionPattern(R"(ava_tool_setup_(\d+\.\d+\.\d+)\.exe)",
+                                                                       std::regex::icase);
+                                const auto              files = remote::list(toolUrl, cfg, {".exe"});
+
+                                for (const auto &file : files) {
+                                        std::smatch m;
+                                        if (!std::regex_match(file.name, m, versionPattern))
                                                 continue;
-                                        if (firstUrl.empty())
-                                                firstUrl = url->valuestring;
-                                        if (cJSON_IsString(name)) {
-                                                std::string n = name->valuestring;
-                                                if (n.size() > 4 && n.substr(n.size() - 4) == ".exe") {
-                                                        result.assetUrl = url->valuestring;
-                                                        break;
-                                                }
+                                        result.installers.push_back({m[1].str(), file.url});
+                                }
+                                std::sort(result.installers.begin(),
+                                          result.installers.end(),
+                                          [](const Installer &a, const Installer &b) {
+                                                  const int comparison = compareVersions(a.version, b.version);
+                                                  return comparison != 0 ? comparison > 0 : a.url < b.url;
+                                          });
+                                result.installers.erase(
+                                    std::unique(result.installers.begin(),
+                                                result.installers.end(),
+                                                [](const Installer &a, const Installer &b) { return a.version == b.version; }),
+                                    result.installers.end());
+
+                                result.checked = true;
+                                if (result.installers.empty()) {
+                                        result.error = "No installer found on the update server.";
+                                        LOG_W("Update check: %s", result.error.c_str());
+                                } else {
+                                        const auto &bestVersion = result.installers.front().version;
+                                        result.latestVersion    = bestVersion;
+                                        result.assetUrl         = result.installers.front().url;
+                                        result.releaseUrl       = toolUrl;
+                                        if (compareVersions(bestVersion, result.currentVersion) > 0) {
+                                                result.available = true;
+                                                LOG_I("Update available: %s -> %s",
+                                                      result.currentVersion.c_str(),
+                                                      result.latestVersion.c_str());
+                                        } else {
+                                                LOG_I("Up to date (current %s, latest %s)",
+                                                      result.currentVersion.c_str(),
+                                                      result.latestVersion.c_str());
                                         }
                                 }
-                                if (result.assetUrl.empty())
-                                        result.assetUrl = firstUrl;
+                        } catch (const std::exception &e) {
+                                result.checked = true;
+                                result.error   = std::string("Update check failed: ") + e.what();
+                                LOG_W("Update check: %s", result.error.c_str());
                         }
-                        cJSON_Delete(root);
-
-                        result.checked = true;
-                        if (!result.latestVersion.empty() && compareVersions(result.latestVersion, result.currentVersion) > 0) {
-                                result.available = true;
-                                LOG_I(
-                                    "Update available: %s -> %s", result.currentVersion.c_str(), result.latestVersion.c_str());
-                        } else {
-                                LOG_I("Up to date (current %s, latest %s)",
-                                      result.currentVersion.c_str(),
-                                      result.latestVersion.c_str());
-                        }
-                } else {
-                        result.checked = true;
-                        result.error   = "could not parse release info";
                 }
 
                 {
@@ -135,7 +135,7 @@ Updater::checkAsync()
                         info_ = std::move(result);
                 }
                 running_.store(false, std::memory_order_release);
-        }).detach();
+        });
 }
 
 Updater::Info
@@ -206,7 +206,10 @@ Updater::downloadAsync(const std::string &assetUrl)
 
         std::string url = assetUrl; // copy for the thread
 
-        std::thread([this, url]() {
+        const auto config = remote::settings();
+        if (downloadThread_.joinable())
+                downloadThread_.join();
+        downloadThread_ = std::thread([this, url, config]() {
 #ifdef _WIN32
                 char tmpDir[MAX_PATH] = {0};
                 GetTempPathA(MAX_PATH, tmpDir);
@@ -217,20 +220,45 @@ Updater::downloadAsync(const std::string &assetUrl)
 
                 LOG_I("Background download started: %s -> %s", url.c_str(), setupPath.c_str());
 
-                std::string err;
-                bool        ok = http::download(
-                    url,
-                    setupPath,
-                    [this](uint64_t received, uint64_t total) {
-                            if (total > 0) {
-                                    int pct = static_cast<int>((received * 100) / total);
-                                    if (pct > 100)
-                                            pct = 100;
-                                    dlProgress_.store(pct, std::memory_order_release);
-                            }
-                    },
-                    &err);
+                auto onProgress = [this](uint64_t received, uint64_t total) {
+                        if (total > 0) {
+                                int pct = static_cast<int>((received * 100) / total);
+                                if (pct > 100)
+                                        pct = 100;
+                                dlProgress_.store(pct, std::memory_order_release);
+                        }
+                };
 
+                std::string              err;
+                std::vector<std::string> headers{"Accept: application/octet-stream"};
+                // Public folder servers need no login endpoint. Authenticate only
+                // when the download actually requires credentials
+                bool ok            = http::download(url, setupPath, onProgress, &err, headers);
+                auto installerFile = [&] {
+                        std::ifstream installer(setupPath, std::ios::binary);
+                        char          magic[2]{};
+                        return static_cast<bool>(installer.read(magic, 2)) && magic[0] == 'M' && magic[1] == 'Z';
+                };
+                // Some authenticated servers redirect to a login page with HTTP
+                // 200 rather than returning 401. Preserve their cookie login too
+                const bool needsLogin = (ok && !installerFile()) ||
+                                        (!ok && (err.find("401") != std::string::npos || err.find("403") != std::string::npos));
+                if (needsLogin && !config.username.empty()) {
+                        // The internal file server requires a login — authenticate with the
+                        // configured credentials and retry once with the session cookie
+                        std::string loginErr;
+                        const auto  cookie = remote::login(url, config, &loginErr);
+                        if (!cookie.empty())
+                                ok = http::download(url, setupPath, onProgress, &err, {"Cookie: " + cookie});
+                        else if (!loginErr.empty())
+                                err = loginErr;
+                }
+
+                if (ok) {
+                        ok = installerFile();
+                        if (!ok)
+                                err = "The server did not return a Windows installer.";
+                }
                 {
                         std::lock_guard lk(dlMtx_);
                         if (ok) {
@@ -242,7 +270,7 @@ Updater::downloadAsync(const std::string &assetUrl)
                         }
                 }
                 dlState_.store(ok ? DownloadState::Done : DownloadState::Failed, std::memory_order_release);
-        }).detach();
+        });
 }
 
 std::string
@@ -295,4 +323,12 @@ Updater::launchInstaller(const std::string &setupPath)
         (void)setupPath;
         return false;
 #endif
+}
+
+Updater::~Updater()
+{
+        if (checkThread_.joinable())
+                checkThread_.join();
+        if (downloadThread_.joinable())
+                downloadThread_.join();
 }

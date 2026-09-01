@@ -5,6 +5,13 @@
 
 /**/.cache/
 
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
 # Build output directories (including build_verify, bin_debug, etc.)
 /**/build*/
 /**/bin*/
@@ -25,10 +32,12 @@
 *.res
 *.exe
 *.dll
+/thirdparty/ngspice/Spice64/
 *.so
 *.so.*
 *.dylib
 *.lib
+!/assets/spice/infineon_optimos_100v/OptiMOS5/OptiMOS5_100V_Halfbridges_LTSpice.lib
 *.a
 *.pdb
 *.ilk
@@ -54,3 +63,6 @@
 
 # Installer output
 /dist/
+
+# Local Android development signing key (keep stable for APK upgrades).
+/.local-signing/

@@ -1,54 +1,49 @@
-#ifndef TUTORIAL_GUIDE_HPP
-#define TUTORIAL_GUIDE_HPP
-
+#pragma once
+#include "gui/tutorial_content.hpp"
 #include "imgui.h"
+#include <array>
 #include <string>
-#include <vector>
+#include <unordered_map>
 
-// Lightweight first-run tutorial overlay for ImGui applications.
-// Usage:
-//   1. Call TutorialGuide::instance().draw() once per frame (after all widgets).
-//   2. After drawing each landmark widget, call TutorialGuide::instance().mark("id").
-//   3. On first launch the guide walks the user through each step.
 class TutorialGuide
 {
       public:
+        using Topic = ui::guide::Topic;
         static TutorialGuide &instance();
-
-        struct Step {
-                std::string id; // matches mark() calls
-        };
-
-        // Register the screen-rect of a widget that was just drawn.
-        // Call immediately after the ImGui widget call (uses GetItemRectMin/Max).
-        void mark(const char *id);
-
-        // Draw the overlay (highlight + tooltip). Call once at the end of the frame.
-        void draw();
-
-        // Is the tutorial currently active?
-        bool isActive() const { return active_ && step_ < (int)steps_.size(); }
-
-        // Start / restart the tutorial.
-        void start();
-
-        // Check & load persisted "done" flag from disk.
-        void loadState(const std::string &appDir);
-        void saveState(const std::string &appDir);
+        void                  mark(const char *id);
+        void                  markJLinkEntry();
+        void                  markDock(Topic topic);
+        void                  markKnownDock(const char *windowName);
+        void                  draw();
+        bool                  isActive() const { return active_; }
+        bool                  catalogOpen() const { return catalogOpen_; }
+        Topic                 topic() const { return topic_; }
+        int                   currentStep() const { return step_; }
+        bool                  completed(Topic topic) const { return completed_[static_cast<int>(topic)]; }
+        void                  start(Topic topic = Topic::Overview, bool resume = false);
+        void                  openCatalog();
+        void                  showForCurrentDock();
+        void                  dismiss();
+        void                  loadState(const std::string &appDir);
+        void                  saveState(const std::string &appDir);
 
       private:
-        TutorialGuide();
-
-        bool              active_ = false;
-        int               step_   = 0;
-        std::vector<Step> steps_;
-        std::string       appDir_;
-
-        // Per-frame transient: screen rect of the current step's target widget.
-        bool   targetFound_ = false;
-        ImVec2 targetMin_{};
-        ImVec2 targetMax_{};
-        float  pulseTime_ = 0.0f;
+        struct DockTarget {
+                Topic   topic{};
+                ImVec2  min{}, max{};
+                ImGuiID viewport{};
+                int     frame{-1};
+        };
+        bool                                             active_{}, catalogOpen_{}, targetFound_{};
+        int                                              step_{};
+        Topic                                            topic_{Topic::Overview};
+        std::array<int, static_cast<int>(Topic::Count)>  progress_{};
+        std::array<bool, static_cast<int>(Topic::Count)> completed_{};
+        std::unordered_map<ImGuiID, DockTarget>          docks_;
+        ImGuiID                                          lastDock_{}, owner_{}, targetViewport_{};
+        ImVec2                                           targetMin_{}, targetMax_{};
+        std::string                                      appDir_;
+        char                                             search_[128]{};
+        void                                             drawCatalog();
+        void                                             moveStep(int step);
 };
-
-#endif // TUTORIAL_GUIDE_HPP

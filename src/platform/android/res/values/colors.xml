@@ -1,0 +1,13 @@
+<resources>
+    <color name="surface">#F8FAFD</color>
+    <color name="surface_card">#EDF1F8</color>
+    <color name="text_primary">#191C20</color>
+    <color name="text_secondary">#44474E</color>
+    <color name="accent">#245FA6</color>
+    <color name="accent_container">#D6E3FF</color>
+    <color name="outline">#C4C6CF</color>
+    <color name="on_accent">#FFFFFF</color>
+    <color name="error">#B3261E</color>
+    <color name="stop_container">#FFE1A6</color>
+    <color name="on_stop_container">#583900</color>
+</resources>

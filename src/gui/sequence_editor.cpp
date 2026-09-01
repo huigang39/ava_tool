@@ -2,7 +2,10 @@
 #include "ImGuiNotify.hpp"
 #include "app_log.hpp"
 #include "cJSON.h"
+#include "gui/choice_control.hpp"
+#include "gui/dock_close.hpp"
 #include "gui/i18n.hpp"
+#include "gui/log_view.hpp"
 #include "gui/sdk_panel.hpp"
 #include "gui/ui_theme.hpp"
 #include "imgui.h"
@@ -79,9 +82,17 @@ SequenceEditor::SequenceEditor()
 
 SequenceEditor::~SequenceEditor()
 {
+        stop();
+}
+
+void
+SequenceEditor::stop()
+{
         seqStopReq_.store(true);
         if (seqThread_.joinable())
                 seqThread_.join();
+        seqRunning_.store(false);
+        seqDone_.store(false);
 }
 
 // ─── refreshSeqFiles ─────────────────────────────────────────────────────────
@@ -140,7 +151,7 @@ SequenceEditor::writeAction(const SequenceAction &action)
                         if (!found)
                                 valI = std::stoll(action.targetValue);
                 } else {
-                        if (action.type == DataType::F32 || action.type == DataType::F64)
+                        if (action.type == DataType::F16 || action.type == DataType::F32 || action.type == DataType::F64)
                                 valF = std::stod(action.targetValue);
                         else
                                 valI = std::stoll(action.targetValue);
@@ -157,7 +168,9 @@ SequenceEditor::writeAction(const SequenceAction &action)
                 currentVal |= ((valI << action.bitOffset) & mask);
                 std::memcpy(buf, &currentVal, sz);
         } else {
-                if (action.type == DataType::F32)
+                if (action.type == DataType::F16)
+                        *(u16 *)buf = fast_f32_to_f16((f32)valF);
+                else if (action.type == DataType::F32)
                         *(f32 *)buf = (f32)valF;
                 else if (action.type == DataType::F64)
                         *(f64 *)buf = valF;
@@ -190,17 +203,17 @@ SequenceEditor::writeAction(const SequenceAction &action)
 
         {
                 SeqLogEntry e;
-                e.tsMs  = nowStampMs();
-                e.desc  = "Write: " + action.name;
-                e.value = "= " + action.targetValue;
-                e.ok    = true;
+                e.tsMs = nowStampMs();
+                e.desc = "Write: " + action.name;
+                e.val  = "= " + action.targetValue;
+                e.ok   = true;
                 std::lock_guard<std::mutex> lk(seqMtx_);
                 seqLog_.push_back(std::move(e));
         }
 }
 
 // ─── execSdkOp ────────────────────────────────────────────────────────────────
-// Executes a single SDK-call operation from a "do" step's body (sampler/seq thread).
+// Executes a single SDK-call operation from a "do" step's body (sampler/seq thread)
 
 void
 SequenceEditor::execSdkOp(const SdkStepInfo &sdk)
@@ -215,10 +228,10 @@ SequenceEditor::execSdkOp(const SdkStepInfo &sdk)
         if (!panel) {
                 LOG_E("[SeqEditor] SdkOp: panel id=%d not found", sdk.panelWinId);
                 SeqLogEntry e;
-                e.tsMs  = nowStampMs();
-                e.desc  = "SDK: " + sdk.label;
-                e.value = "panel not found";
-                e.ok    = false;
+                e.tsMs = nowStampMs();
+                e.desc = "SDK: " + sdk.label;
+                e.val  = "panel not found";
+                e.ok   = false;
                 std::lock_guard<std::mutex> lk(seqMtx_);
                 seqLog_.push_back(std::move(e));
                 return;
@@ -250,12 +263,12 @@ SequenceEditor::execSdkOp(const SdkStepInfo &sdk)
                 LOG_I("[SeqEditor] SdkOp Py result ok=%d: %s", (int)r.ok, r.text.c_str());
                 writeResultVar(r.ok, r);
                 SeqLogEntry e;
-                e.tsMs  = nowStampMs();
-                e.desc  = "SDK: " + sdk.label;
-                e.ok    = r.ok;
-                e.value = r.ok ? "OK" : "FAIL";
+                e.tsMs = nowStampMs();
+                e.desc = "SDK: " + sdk.label;
+                e.ok   = r.ok;
+                e.val  = r.ok ? "OK" : "FAIL";
                 if (!r.text.empty())
-                        e.value += ": " + r.text;
+                        e.val += ": " + r.text;
                 std::lock_guard<std::mutex> lk(seqMtx_);
                 seqLog_.push_back(std::move(e));
         } else if (sdk.isCFunc) {
@@ -263,12 +276,12 @@ SequenceEditor::execSdkOp(const SdkStepInfo &sdk)
                 LOG_I("[SeqEditor] SdkOp C result ok=%d: %s", (int)r.ok, r.text.c_str());
                 writeResultVar(r.ok, r);
                 SeqLogEntry e;
-                e.tsMs  = nowStampMs();
-                e.desc  = "SDK: " + sdk.label;
-                e.ok    = r.ok;
-                e.value = r.ok ? "OK" : "FAIL";
+                e.tsMs = nowStampMs();
+                e.desc = "SDK: " + sdk.label;
+                e.ok   = r.ok;
+                e.val  = r.ok ? "OK" : "FAIL";
                 if (!r.text.empty())
-                        e.value += ": " + r.text;
+                        e.val += ": " + r.text;
                 std::lock_guard<std::mutex> lk(seqMtx_);
                 seqLog_.push_back(std::move(e));
         } else {
@@ -276,12 +289,12 @@ SequenceEditor::execSdkOp(const SdkStepInfo &sdk)
                 LOG_I("[SeqEditor] SdkOp C++ result ok=%d: %s", (int)r.ok, r.text.c_str());
                 writeResultVar(r.ok, r);
                 SeqLogEntry e;
-                e.tsMs  = nowStampMs();
-                e.desc  = "SDK: " + sdk.label;
-                e.ok    = r.ok;
-                e.value = r.ok ? "OK" : "FAIL";
+                e.tsMs = nowStampMs();
+                e.desc = "SDK: " + sdk.label;
+                e.ok   = r.ok;
+                e.val  = r.ok ? "OK" : "FAIL";
                 if (!r.text.empty())
-                        e.value += ": " + r.text;
+                        e.val += ": " + r.text;
                 std::lock_guard<std::mutex> lk(seqMtx_);
                 seqLog_.push_back(std::move(e));
         }
@@ -315,11 +328,13 @@ SequenceEditor::seqEvalCond(const SequenceStep &step)
         return true;
 }
 
-// Cap a free-spinning loop at ~1 kHz. Each While/For iteration checks its
-// condition via seqEvalCond() → onGetLocalBuf_(), which takes the GUI's
-// mtxMonitors_ lock; an unthrottled loop would acquire it at unbounded rate and
-// starve the render thread (which needs the same lock every frame), dragging
-// the GUI to a crawl. Iterations whose body already takes ≥1 ms are unaffected.
+/**
+ * @brief Cap a free-spinning loop at ~1 kHz. Each While/For iteration checks its
+ *        condition via seqEvalCond() → onGetLocalBuf_(), which takes the GUI's
+ *        mtxMonitors_ lock; an unthrottled loop would acquire it at unbounded rate and
+ *        starve the render thread (which needs the same lock every frame), dragging
+ *        the GUI to a crawl. Iterations whose body already takes ≥1 ms are unaffected
+ */
 static void
 throttleLoopIteration(std::chrono::steady_clock::time_point iterStart)
 {
@@ -433,7 +448,9 @@ SequenceEditor::selectedStepPtr()
         return &steps_[selectedStep_];
 }
 
-// Map a CType (from c_header_parser) to a DataType for LOCAL struct field storage.
+/**
+ * @brief Map a CType (from c_header_parser) to a DataType for LOCAL struct field storage
+ */
 static DataType
 ctypeToDataType(CType t, size_t sz)
 {
@@ -477,7 +494,9 @@ ctypeToDataType(CType t, size_t sz)
         }
 }
 
-// Build a SeqStructField list from a CStructDecl (flattens single-level arrays).
+/**
+ * @brief Build a SeqStructField list from a CStructDecl (flattens single-level arrays)
+ */
 static std::vector<SeqStructField>
 structDeclToFields(const CStructDecl &sd)
 {
@@ -504,7 +523,9 @@ structDeclToFields(const CStructDecl &sd)
         return out;
 }
 
-// Map a raw C ptr/ref parameter type string to a DataType for LOCAL var creation.
+/**
+ * @brief Map a raw C ptr/ref parameter type string to a DataType for LOCAL var creation
+ */
 static DataType
 ptrTypeFromRaw(const std::string &rawType)
 {
@@ -523,6 +544,8 @@ ptrTypeFromRaw(const std::string &rawType)
                         }
                 }
         }
+        if (t == "_Float16" || t == "__fp16" || t == "float16_t")
+                return DataType::F16;
         if (t == "float")
                 return DataType::F32;
         if (t == "double")
@@ -547,9 +570,9 @@ ptrTypeFromRaw(const std::string &rawType)
 }
 
 // ─── drawSdkStructArgRow ──────────────────────────────────────────────────────
-// Struct-pointer argument rendered like the SDK caller: an expandable tree whose
+// Struct-pointer argument rendered like the dynamic library caller: an expandable tree whose
 // editable fields are backed by an auto-created LOCAL struct variable (bound via
-// the "&varname" arg convention the executor already understands).
+// the "&varname" arg convention the executor already understands)
 
 bool
 SequenceEditor::drawSdkStructArgRow(
@@ -561,7 +584,7 @@ SequenceEditor::drawSdkStructArgRow(
         if (!sd)
                 return false;
 
-        // Name of the LOCAL struct variable this argument is bound to.
+        // Name of the LOCAL struct variable this argument is bound to
         std::string varName;
         if (!sdk.args[p].empty() && sdk.args[p][0] == '&')
                 varName = sdk.args[p].substr(1);
@@ -579,10 +602,11 @@ SequenceEditor::drawSdkStructArgRow(
 
         ImGui::TableSetColumnIndex(2);
         ImGui::TextDisabled("&%s", varName.c_str());
-        drawSdkArgButtons(panel, sdk, p, pname, ptype, /*isPtr=*/true);
+        // isPtr=
+        drawSdkArgButtons(panel, sdk, p, pname, ptype, true);
 
         if (open) {
-                // Bind to (and create) a LOCAL struct variable on first expand.
+                // Bind to (and create) a LOCAL struct variable on first expand
                 if (sdk.args[p].empty() || sdk.args[p][0] != '&') {
                         if (onAddLocalStructVar_)
                                 onAddLocalStructVar_(varName, structDeclToFields(*sd), sd->totalSize);
@@ -614,7 +638,7 @@ SequenceEditor::drawSdkArgButtons(
 {
         std::string pn = pname.empty() ? ("arg" + std::to_string(p)) : pname;
 
-        // "+" — create a LOCAL variable for this parameter.
+        // "+" — create a LOCAL variable for this parameter
         if (onAddLocalVar_) {
                 ImGui::SameLine(0, 2);
                 char id[24];
@@ -640,7 +664,7 @@ SequenceEditor::drawSdkArgButtons(
                         ImGui::SetTooltip("%s", tr("Add this parameter as a variable", "把该参数添加为变量"));
         }
 
-        // "v" — pick an existing LOCAL variable and bind it to this argument.
+        // "v" — pick an existing LOCAL variable and bind it to this argument
         if (panel && panel->onListLocalVars_) {
                 ImGui::SameLine(0, 2);
                 char btnId[24], popId[24];
@@ -665,7 +689,7 @@ SequenceEditor::drawSdkArgButtons(
 }
 
 // ─── drawBodySteps ────────────────────────────────────────────────────────────
-// Renders an inline editable list of steps (used for If/While/For bodies).
+// Renders an inline editable list of steps (used for If/While/For bodies)
 
 void
 SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
@@ -893,7 +917,8 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                                         ? panel->isCFuncParamPtrOrRef(op.sdk.methodIdx, p)
                                                                         : panel->isParamPtrOrRef(
                                                                               op.sdk.classIdx, op.sdk.methodIdx, p);
-                                                                // Struct param → expandable field editor (like the SDK caller).
+                                                                // Struct param → expandable field editor (like the dynamic
+                                                                // library caller)
                                                                 if (drawSdkStructArgRow(panel.get(), op.sdk, p, pname, ptype)) {
                                                                         ImGui::PopID();
                                                                         continue;
@@ -931,7 +956,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                                         const char *preview = ed->values[0].name.c_str();
                                                                         int         curIdx  = 0;
                                                                         for (int ei = 0; ei < (int)ed->values.size(); ++ei) {
-                                                                                if (ed->values[ei].value == curVal) {
+                                                                                if (ed->values[ei].val == curVal) {
                                                                                         preview = ed->values[ei].name.c_str();
                                                                                         curIdx  = ei;
                                                                                         break;
@@ -946,12 +971,11 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                                                      ++ei) {
                                                                                         bool sel2 = (ei == curIdx);
                                                                                         char evLbl[128];
-                                                                                        snprintf(
-                                                                                            evLbl,
-                                                                                            sizeof(evLbl),
-                                                                                            "%s (%lld)",
-                                                                                            ed->values[ei].name.c_str(),
-                                                                                            (long long)ed->values[ei].value);
+                                                                                        snprintf(evLbl,
+                                                                                                 sizeof(evLbl),
+                                                                                                 "%s (%lld)",
+                                                                                                 ed->values[ei].name.c_str(),
+                                                                                                 (long long)ed->values[ei].val);
                                                                                         if (ImGui::Selectable(evLbl, sel2)) {
                                                                                                 char numBuf[32];
                                                                                                 snprintf(
@@ -959,7 +983,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                                                                     sizeof(numBuf),
                                                                                                     "%lld",
                                                                                                     (long long)ed->values[ei]
-                                                                                                        .value);
+                                                                                                        .val);
                                                                                                 op.sdk.args[p] = numBuf;
                                                                                                 isModified_    = true;
                                                                                         }
@@ -1158,7 +1182,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                 ImGui::EndPopup();
                         }
                         ImGui::SameLine();
-                        ImGui::TextColored(badgeCol, "%d", i + 1);
+                        ui::TextColored(badgeCol, "%d", i + 1);
                         if (indent > 0.0f)
                                 ImGui::Unindent(indent);
 
@@ -1166,7 +1190,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                         ImGui::AlignTextToFramePadding();
                         if (indent > 0.0f)
                                 ImGui::Indent(indent);
-                        ImGui::TextColored(badgeCol, "%s", tr(kindLabel(s.kind), kindLabelCn(s.kind)));
+                        ui::TextColored(badgeCol, "%s", tr(kindLabel(s.kind), kindLabelCn(s.kind)));
                         if (indent > 0.0f)
                                 ImGui::Unindent(indent);
 
@@ -1192,7 +1216,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                                         break;
                                                 }
                                         ImGui::SetNextItemWidth(40.0f);
-                                        if (ImGui::Combo("##op", &opi, condOps, 6)) {
+                                        if (ui::Choice("##op", &opi, condOps, 6)) {
                                                 strncpy(s.condOp, condOps[opi], sizeof(s.condOp) - 1);
                                                 isModified_ = true;
                                         }
@@ -1265,7 +1289,7 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
                                         ImGui::TableNextRow();
                                         ImGui::TableSetColumnIndex(1);
                                         ImGui::Indent(subIndent);
-                                        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "%s", tr("else:", "否则:"));
+                                        ui::TextColored(ImVec4(1.0f, 0.85f, 0.4f, 1.0f), "%s", tr("else:", "否则:"));
                                         ImGui::Unindent(subIndent);
 
                                         drawBodySteps(s.elseBody, depth + 1);
@@ -1295,7 +1319,9 @@ SequenceEditor::drawBodySteps(std::vector<SequenceStep> &steps, int depth)
 
 // ─── acceptSdkPayload ─────────────────────────────────────────────────────────
 
-// Build a variable-write action from a single-channel drag payload.
+/**
+ * @brief Build a variable-write action from a single-ch drag payload
+ */
 static SequenceAction
 actionFromChannel(const ChannelDropPayload *p)
 {
@@ -1310,13 +1336,15 @@ actionFromChannel(const ChannelDropPayload *p)
         action.bitSize   = p->bitSize;
         action.isEnum    = (p->numEnums > 0);
         for (int e = 0; e < p->numEnums; ++e)
-                action.enumDefs.push_back({p->enums[e].value, p->enums[e].name});
+                action.enumDefs.push_back({p->enums[e].val, p->enums[e].name});
         action.targetValue = action.isEnum ? p->enums[0].name : "0";
         return action;
 }
 
-// Build an SDK-call op from a drag payload. Returns false if the source panel
-// has since closed.
+/**
+ * @brief Build an SDK-call op from a drag payload. Returns false if the source panel
+ *        has since closed
+ */
 bool
 SequenceEditor::makeSdkOp(const SdkDragPayload &pl, SeqOp &out)
 {
@@ -1343,9 +1371,11 @@ SequenceEditor::makeSdkOp(const SdkDragPayload &pl, SeqOp &out)
         return true;
 }
 
-// Within an active BeginDragDropTarget(): accept SDK functions / variables and
-// forward each resulting op to `sink`. Returns true if anything was consumed.
-// noSdk=true: only accept variable/channel drops (used by left sidebar).
+/**
+ * @brief Within an active BeginDragDropTarget(): accept SDK functions / variables and
+ *        forward each resulting op to `sink`. Returns true if anything was consumed
+ *        noSdk=true: only accept variable/ch drops (used by left sidebar)
+ */
 bool
 SequenceEditor::acceptOpDrops(const std::function<void(SeqOp)> &sink, bool noSdk)
 {
@@ -1381,7 +1411,7 @@ SequenceEditor::acceptOpDrops(const std::function<void(SeqOp)> &sink, bool noSdk
                         action.bitSize   = sp->entries[j].bitSize;
                         action.isEnum    = (sp->entries[j].numEnums > 0);
                         for (int e = 0; e < sp->entries[j].numEnums; ++e)
-                                action.enumDefs.push_back({sp->entries[j].enums[e].value, sp->entries[j].enums[e].name});
+                                action.enumDefs.push_back({sp->entries[j].enums[e].val, sp->entries[j].enums[e].name});
                         action.targetValue = action.isEnum ? sp->entries[j].enums[0].name : "0";
                         sink({SeqOpKind::Write, std::move(action), {}});
                 }
@@ -1402,7 +1432,7 @@ SequenceEditor::acceptOpDrops(const std::function<void(SeqOp)> &sink, bool noSdk
                         action.bitSize   = ch->getBitSize();
                         action.isEnum    = !ch->getEnums().empty();
                         for (const auto &e : ch->getEnums())
-                                action.enumDefs.push_back({e.value, e.name});
+                                action.enumDefs.push_back({e.val, e.name});
                         action.targetValue = action.isEnum ? ch->getEnums()[0].name : "0";
                         sink({SeqOpKind::Write, std::move(action), {}});
                         return true;
@@ -1411,8 +1441,10 @@ SequenceEditor::acceptOpDrops(const std::function<void(SeqOp)> &sink, bool noSdk
         return false;
 }
 
-// Append an op to a step body (used by If/While/For): extend the trailing "do"
-// step, or start a new one if the body is empty / ends with a non-"do" step.
+/**
+ * @brief Append an op to a step body (used by If/While/For): extend the trailing "do"
+ *        step, or start a new one if the body is empty / ends with a non-"do" step
+ */
 static void
 appendOpToBody(std::vector<SequenceStep> &body, SeqOp op)
 {
@@ -1421,10 +1453,12 @@ appendOpToBody(std::vector<SequenceStep> &body, SeqOp op)
         body.back().ops.push_back(std::move(op));
 }
 
-// Drop a dragged SDK function into a fresh or existing "do" step (used by the
-// window-background and trailing drop zones). If stepIdx points at a "do" step
-// the call is appended to it; otherwise it is wrapped in a new "do" step
-// (inserted after stepIdx, or at the end when stepIdx < 0).
+/**
+ * @brief Drop a dragged SDK function into a fresh or existing "do" step (used by the
+ *        window-background and trailing drop zones). If stepIdx points at a "do" step
+ *        the call is appended to it; otherwise it is wrapped in a new "do" step
+ *        (inserted after stepIdx, or at the end when stepIdx < 0)
+ */
 void
 SequenceEditor::acceptSdkPayload(const void *data, int stepIdx)
 {
@@ -1459,7 +1493,7 @@ SequenceEditor::moveStep(int src, int dst)
                 return;
         SequenceStep moved = std::move(steps_[src]);
         steps_.erase(steps_.begin() + src);
-        // After erase, indices above src shift down by one.
+        // After erase, indices above src shift down by one
         if (dst > src)
                 --dst;
         steps_.insert(steps_.begin() + dst, std::move(moved));
@@ -1493,10 +1527,10 @@ SequenceEditor::runSingleStep(int idx)
                 } catch (const std::exception &ex) {
                         LOG_E("[SeqEditor] single-step exception: %s", ex.what());
                         SeqLogEntry le;
-                        le.tsMs  = nowStampMs();
-                        le.desc  = "EXCEPTION";
-                        le.value = ex.what();
-                        le.ok    = false;
+                        le.tsMs = nowStampMs();
+                        le.desc = "EXCEPTION";
+                        le.val  = ex.what();
+                        le.ok   = false;
                         std::lock_guard<std::mutex> lk(seqMtx_);
                         seqLog_.push_back(std::move(le));
                 } catch (...) {
@@ -1512,7 +1546,7 @@ SequenceEditor::drawStepList()
 {
         bool running = seqRunning_.load();
 
-        // Deferred reorder: applied after the loop so we never mutate steps_ mid-iteration.
+        // Deferred reorder: applied after the loop so we never mutate steps_ mid-iteration
         int moveSrc = -1, moveDst = -1;
 
         for (int i = 0; i < (int)steps_.size(); ++i) {
@@ -1591,14 +1625,14 @@ SequenceEditor::drawStepList()
                 }
                 ImGui::PopStyleColor();
 
-                // Drag source: reorder this step by dragging it onto another.
+                // Drag source: reorder this step by dragging it onto another
                 if (!running && ImGui::BeginDragDropSource(ImGuiDragDropFlags_None)) {
                         ImGui::SetDragDropPayload("SEQ_STEP_MOVE", &i, sizeof(i));
                         ImGui::TextUnformatted(label);
                         ImGui::EndDragDropSource();
                 }
 
-                // Drop target on step item: reorder (SEQ_STEP_MOVE), else variable/SDK op drops.
+                // Drop target on step item: reorder (SEQ_STEP_MOVE), else variable/SDK op drops
                 if (!running && ImGui::BeginDragDropTarget()) {
                         if (const ImGuiPayload *mv = ImGui::AcceptDragDropPayload("SEQ_STEP_MOVE")) {
                                 if (mv->DataSize == (int)sizeof(int)) {
@@ -1621,7 +1655,7 @@ SequenceEditor::drawStepList()
                         ImGui::EndDragDropTarget();
                 }
 
-                // Per-step single-run button (right-aligned overlay on the selectable).
+                // Per-step single-run button (right-aligned overlay on the selectable)
                 if (!running) {
                         ImGui::SameLine();
                         float availW = ImGui::GetContentRegionAvail().x;
@@ -1674,7 +1708,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                 static const char *kindsCn[] = {"执行", "延时", "判断", "循环", "计数", "退出"};
                 int                ki        = (int)step.kind;
                 ImGui::SetNextItemWidth(100.0f);
-                if (ImGui::Combo(tr("Kind", "类型"), &ki, g_lang == Lang::ZH ? kindsCn : kinds, 6)) {
+                if (ui::Choice(tr("Kind", "类型"), &ki, g_lang == Lang::ZH ? kindsCn : kinds, 6)) {
                         step.kind   = (SeqStepKind)ki;
                         isModified_ = true;
                 }
@@ -1716,9 +1750,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                 ImGui::TextUnformatted(a.name.c_str());
                                                                 ImGui::EndDragDropSource();
                                                         }
-                                                        if (ImGui::IsItemHovered())
-                                                                ImGui::SetTooltip("%s",
-                                                                                  tr("Drag to reorder", "拖动以调整顺序"));
+
                                                         if (ImGui::BeginDragDropTarget()) {
                                                                 if (const ImGuiPayload *mv =
                                                                         ImGui::AcceptDragDropPayload("OP_ROW_MOVE"))
@@ -1799,9 +1831,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                 ImGui::TextUnformatted(op.sdk.label.c_str());
                                                                 ImGui::EndDragDropSource();
                                                         }
-                                                        if (ImGui::IsItemHovered())
-                                                                ImGui::SetTooltip("%s",
-                                                                                  tr("Drag to reorder", "拖动以调整顺序"));
+
                                                         if (ImGui::BeginDragDropTarget()) {
                                                                 if (const ImGuiPayload *mv =
                                                                         ImGui::AcceptDragDropPayload("OP_ROW_MOVE"))
@@ -1927,7 +1957,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                                        op.sdk.classIdx,
                                                                                                        op.sdk.methodIdx,
                                                                                                        p);
-                                                                                // Struct param → expandable field editor.
+                                                                                // Struct param → expandable field editor
                                                                                 if (drawSdkStructArgRow(
                                                                                         panel.get(), op.sdk, p, pname, ptype)) {
                                                                                         ImGui::PopID();
@@ -1980,7 +2010,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                         for (int ei = 0;
                                                                                              ei < (int)ed2->values.size();
                                                                                              ++ei) {
-                                                                                                if (ed2->values[ei].value ==
+                                                                                                if (ed2->values[ei].val ==
                                                                                                     curVal2) {
                                                                                                         preview2 =
                                                                                                             ed2->values[ei]
@@ -2012,7 +2042,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                                                 .name.c_str(),
                                                                                                             (long long)ed2
                                                                                                                 ->values[ei]
-                                                                                                                .value);
+                                                                                                                .val);
                                                                                                         if (ImGui::Selectable(
                                                                                                                 evLbl, sel2)) {
                                                                                                                 char numBuf[32];
@@ -2024,7 +2054,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                                                                                                     (long long)ed2
                                                                                                                         ->values
                                                                                                                             [ei]
-                                                                                                                        .value);
+                                                                                                                        .val);
                                                                                                                 op.sdk.args[p] =
                                                                                                                     numBuf;
                                                                                                                 isModified_ =
@@ -2264,7 +2294,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                 }
                         }
                         ImGui::EndChild();
-                        // The body child is a drop target for SDK functions and variables.
+                        // The body child is a drop target for SDK functions and variables
                         if (ImGui::BeginDragDropTarget()) {
                                 if (acceptOpDrops([&](SeqOp op) { step.ops.push_back(std::move(op)); }))
                                         isModified_ = true;
@@ -2299,7 +2329,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                         break;
                                 }
                         ImGui::SetNextItemWidth(56.0f);
-                        if (ImGui::Combo("##op", &opi, ops, 6)) {
+                        if (ui::Choice("##op", &opi, ops, 6)) {
                                 strncpy(step.condOp, ops[opi], sizeof(step.condOp) - 1);
                                 isModified_ = true;
                         }
@@ -2326,7 +2356,7 @@ SequenceEditor::drawStepDetail(SequenceStep &step)
                                 drawBodySteps(step.body, 0);
                         }
                         ImGui::EndChild();
-                        // Dropping a variable / SDK function here adds it as a nested "do" step.
+                        // Dropping a variable / SDK function here adds it as a nested "do" step
                         if (ImGui::BeginDragDropTarget()) {
                                 if (acceptOpDrops([&](SeqOp op) { appendOpToBody(step.body, std::move(op)); }))
                                         isModified_ = true;
@@ -2415,9 +2445,9 @@ SequenceEditor::draw()
         }
 
         ImGui::SetNextWindowSize(ImVec2(700, 500), ImGuiCond_FirstUseEver);
-        if (!ImGui::Begin(tr("Sequence Editor###SeqEditor", "序列编辑器###SeqEditor"),
-                          &show_,
-                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
+        if (!dock_close::begin(tr("Sequence Editor###SeqEditor", "序列编辑器###SeqEditor"),
+                               &show_,
+                               ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse)) {
                 if (seqRunning_.load())
                         seqStopReq_.store(true);
                 ImGui::End();
@@ -2453,19 +2483,19 @@ SequenceEditor::draw()
                                         } catch (const std::exception &ex) {
                                                 LOG_E("[SeqEditor] exception: %s", ex.what());
                                                 SeqLogEntry le;
-                                                le.tsMs  = nowStampMs();
-                                                le.desc  = "EXCEPTION";
-                                                le.value = ex.what();
-                                                le.ok    = false;
+                                                le.tsMs = nowStampMs();
+                                                le.desc = "EXCEPTION";
+                                                le.val  = ex.what();
+                                                le.ok   = false;
                                                 std::lock_guard<std::mutex> lk(seqMtx_);
                                                 seqLog_.push_back(std::move(le));
                                         } catch (...) {
                                                 LOG_E("[SeqEditor] unknown exception");
                                                 SeqLogEntry le;
-                                                le.tsMs  = nowStampMs();
-                                                le.desc  = "EXCEPTION";
-                                                le.value = "unknown";
-                                                le.ok    = false;
+                                                le.tsMs = nowStampMs();
+                                                le.desc = "EXCEPTION";
+                                                le.val  = "unknown";
+                                                le.ok   = false;
                                                 std::lock_guard<std::mutex> lk(seqMtx_);
                                                 seqLog_.push_back(std::move(le));
                                         }
@@ -2582,7 +2612,7 @@ SequenceEditor::draw()
         // ── Split view ────────────────────────────────────────────────────────
         // BeginTable's outer_size.y only clips rendering; inner BeginChild(0,0)
         // windows still fill remaining *window* space and won't respond to the
-        // table height.  Wrap in BeginChild instead — it enforces explicit height.
+        // table height.  Wrap in BeginChild instead — it enforces explicit height
         static ImGuiTableFlags splitFlags = ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV;
         const float            is         = ImGui::GetStyle().ItemSpacing.y;
         const float            logHeaderH = ImGui::GetFrameHeightWithSpacing(); // dynamic: frame + ItemSpacing
@@ -2602,7 +2632,7 @@ SequenceEditor::draw()
                         }
                         ImGui::EndChild();
 
-                        // Also accept variable drops on the entire left-column area (no SDK).
+                        // Also accept variable drops on the entire left-column area (no SDK)
                         if (!running && selectedStep_ >= 0 && selectedStep_ < (int)steps_.size() &&
                             ImGui::BeginDragDropTarget()) {
                                 SequenceStep &st  = steps_[selectedStep_];
@@ -2676,50 +2706,23 @@ SequenceEditor::draw()
                         logSnapshot = seqLog_;
                 }
 
-                if (ImGui::BeginChild("SeqLog", ImVec2(0, seqLogHeight_), true, ImGuiWindowFlags_HorizontalScrollbar)) {
-                        // Render newest-first using a clipper so only visible rows cost anything.
-                        ImGuiListClipper clipper;
-                        clipper.Begin((int)logSnapshot.size());
-                        while (clipper.Step()) {
-                                for (int ci = clipper.DisplayStart; ci < clipper.DisplayEnd; ++ci) {
-                                        // Reverse: ci=0 → last entry (newest)
-                                        const SeqLogEntry &e = logSnapshot[(int)logSnapshot.size() - 1 - ci];
-                                        {
-                                                std::time_t t   = (std::time_t)(e.tsMs / 1000);
-                                                struct tm   tm_ = {};
-                                                localtime_s(&tm_, &t);
-                                                char ts[32];
-                                                snprintf(ts,
-                                                         sizeof(ts),
-                                                         "[%04d-%02d-%02d %02d:%02d:%02d.%03d] ",
-                                                         tm_.tm_year + 1900,
-                                                         tm_.tm_mon + 1,
-                                                         tm_.tm_mday,
-                                                         tm_.tm_hour,
-                                                         tm_.tm_min,
-                                                         tm_.tm_sec,
-                                                         (int)(e.tsMs % 1000));
-                                                ImGui::TextDisabled("%s", ts);
-                                                ImGui::SameLine(0, 0);
-                                        }
-                                        ImGui::PushStyleColor(ImGuiCol_Text,
-                                                              e.ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f)
-                                                                   : ImVec4(1.f, 0.4f, 0.4f, 1.f));
-                                        ImGui::TextUnformatted(e.desc.c_str());
-                                        ImGui::PopStyleColor();
-                                        if (!e.value.empty()) {
-                                                ImGui::SameLine();
-                                                ImGui::PushStyleColor(ImGuiCol_Text,
-                                                                      e.ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f)
-                                                                           : ImVec4(1.f, 0.5f, 0.3f, 1.f));
-                                                ImGui::TextUnformatted(e.value.c_str());
-                                                ImGui::PopStyleColor();
-                                        }
-                                }
+                ui::LogText log;
+                for (auto it = logSnapshot.rbegin(); it != logSnapshot.rend(); ++it) {
+                        log.timestamp(it->tsMs);
+                        log.append(
+                            it->desc,
+                            ImGui::GetColorU32(it->ok ? ImVec4(0.85f, 0.85f, 0.85f, 1.f) : ImVec4(1.f, 0.4f, 0.4f, 1.f)));
+                        if (!it->val.empty()) {
+                                log.append(" ");
+                                log.append(
+                                    it->val,
+                                    ImGui::GetColorU32(it->ok ? ImVec4(0.3f, 1.f, 0.5f, 1.f) : ImVec4(1.f, 0.5f, 0.3f, 1.f)));
                         }
-                        clipper.End();
+                        log.append("\n");
                 }
-                ImGui::EndChild();
+                ImGui::SameLine();
+                ui::CopyLogButton(log.text);
+                ui::LogView("SeqLog", log, ImVec2(0, seqLogHeight_));
         }
 
         ImGui::End();
@@ -2761,7 +2764,9 @@ actionToObj(const SequenceAction &action)
         return obj;
 }
 
-// Serialize a single "do" step operation (variable write or SDK call).
+/**
+ * @brief Serialize a single "do" step operation (variable write or SDK call)
+ */
 static cJSON *
 saveOp(const SeqOp &op)
 {
@@ -2902,7 +2907,7 @@ loadStep(const cJSON *obj)
                 s.hasElse = cJSON_IsTrue(he);
 
         // Reads the SDK-call fields (object form for ops, or the legacy top-level
-        // standalone SdkCall step) into an SdkStepInfo.
+        // standalone SdkCall step) into an SdkStepInfo
         auto readSdk = [](const cJSON *o) {
                 SdkStepInfo sdk;
                 if (const cJSON *w = cJSON_GetObjectItem(o, "sdkWinId"); cJSON_IsNumber(w))
@@ -2930,7 +2935,7 @@ loadStep(const cJSON *obj)
                 return sdk;
         };
 
-        // Ops (current format): ordered mix of writes and SDK calls.
+        // Ops (current format): ordered mix of writes and SDK calls
         if (const cJSON *opsArr = cJSON_GetObjectItem(obj, "ops"); cJSON_IsArray(opsArr)) {
                 for (const cJSON *o = opsArr->child; o; o = o->next) {
                         SeqOp op;
@@ -2945,12 +2950,12 @@ loadStep(const cJSON *obj)
                         s.ops.push_back(std::move(op));
                 }
         } else {
-                // Legacy: a step held an "actions" array and/or was a standalone SdkCall.
+                // Legacy: a step held an "actions" array and/or was a standalone SdkCall
                 if (const cJSON *actArr = cJSON_GetObjectItem(obj, "actions"); cJSON_IsArray(actArr))
                         for (const cJSON *a = actArr->child; a; a = a->next)
                                 s.ops.push_back({SeqOpKind::Write, loadAction(a), {}});
                 if (s.kind == SeqStepKind::SdkCall) {
-                        // Convert the standalone SDK step into a "do" step with one SDK op.
+                        // Convert the standalone SDK step into a "do" step with one SDK op
                         s.ops.push_back({SeqOpKind::Sdk, {}, readSdk(obj)});
                         s.kind = SeqStepKind::Action;
                 }
@@ -2973,6 +2978,7 @@ loadStep(const cJSON *obj)
 void
 SequenceEditor::loadSession(cJSON *root)
 {
+        stop();
         steps_.clear();
         selectedStep_ = -1;
         isModified_   = false;

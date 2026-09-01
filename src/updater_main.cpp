@@ -12,7 +12,7 @@
 
 #include <windows.h>
 // <shellapi.h>/<commctrl.h> must be included after <windows.h> (keep the
-// blank-comment line so clang-format does not reorder them ahead of windows.h).
+// blank-comment line so clang-format does not reorder them ahead of windows.h)
 #include <commctrl.h>
 #include <shellapi.h>
 
@@ -98,7 +98,9 @@ WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-// Create a small fixed progress window centred on the primary monitor.
+/**
+ * @brief Create a small fixed progress window centred on the primary monitor
+ */
 HWND
 createProgressWindow(HINSTANCE hInst)
 {
@@ -157,10 +159,10 @@ WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
         const DWORD       parentId = (argc >= 3) ? (DWORD)_wtoi(argv[2]) : 0;
         LocalFree(argv);
 
-        // 1. Wait for the running app to close so its files can be replaced.
+        // 1. Wait for the running app to close so its files can be replaced
         waitForParent(parentId);
 
-        // 2. Show the progress window and download the installer to %TEMP%.
+        // 2. Show the progress window and download the installer to %TEMP%
         char tmpDir[MAX_PATH] = {0};
         GetTempPathA(MAX_PATH, tmpDir);
         const std::string setupPath = std::string(tmpDir) + "ava_tool_setup.exe";
@@ -200,7 +202,7 @@ WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int)
                 return 2;
         }
 
-        // 3. Run the installer silently; it closes/relaunches the app itself.
+        // 3. Run the installer silently; it closes/relaunches the app itself
         SHELLEXECUTEINFOA sei{};
         sei.cbSize       = sizeof(sei);
         sei.fMask        = SEE_MASK_NOCLOSEPROCESS;

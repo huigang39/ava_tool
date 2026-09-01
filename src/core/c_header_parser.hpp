@@ -29,7 +29,9 @@ struct CFuncDecl {
         bool                isVariadic{false};
 };
 
-// Parse a C header source string and return all function declarations found.
+/**
+ * @brief Parse a C header source string and return all function declarations found
+ */
 std::vector<CFuncDecl> parseHeader(const std::string &src);
 
 // ─── type layout helpers ──────────────────────────────────────────────────────
@@ -61,7 +63,7 @@ struct CStructDecl {
 
 struct CEnumValue {
         std::string name;
-        int64_t     value{0};
+        int64_t     val{0};
 };
 
 struct CEnumDecl {
@@ -91,12 +93,12 @@ struct CClassDecl {
         std::vector<CStructDecl> innerStructs;
         std::vector<CEnumDecl>   innerEnums;
         size_t                   instanceSize{4096}; // conservative allocation hint
-        // All data members in declaration order (public + private), with offsets.
-        // Used for inline constructor body emulation.
+        // All data members in declaration order (public + private), with offsets
+        // Used for inline constructor body emulation
         std::vector<CFieldDecl> allFields;
 };
 
-// Preprocessor macro definition extracted from a #define line.
+// Preprocessor macro definition extracted from a #define line
 struct MacroDef {
         bool                     isFunctionLike{false};
         std::vector<std::string> params; // parameter names (function-like only)
@@ -108,28 +110,36 @@ struct ParseResult {
         std::vector<CClassDecl>  classes;
         std::vector<CStructDecl> structs;
         std::vector<CEnumDecl>   enums;
-        // Macro table extracted from #define lines (populated by parseHeaderFull).
+        // Macro table extracted from #define lines (populated by parseHeaderFull)
         std::unordered_map<std::string, MacroDef> macros;
         // Constexpr/const aggregate variables: varName → {typeName, {initVal0, …}}
-        // Used to evaluate expressions like SDK_CONFIG.MIN_M4_VER.
+        // Used to evaluate expressions like SDK_CONFIG.MIN_M4_VER
         std::unordered_map<std::string, std::pair<std::string, std::vector<std::string>>> constexprVars;
 };
 
-// Parse a C/C++ header and return all declarations (classes, structs, enums, functions).
+/**
+ * @brief Parse a C/C++ header and return all declarations (classes, structs, enums, functions)
+ */
 ParseResult parseHeaderFull(const std::string &src);
 
-// Lookup helpers used by the panel.
+/**
+ * @brief Lookup helpers used by the panel
+ */
 const CStructDecl *findStruct(const ParseResult &pr, const std::string &name);
 const CEnumDecl   *findEnum(const ParseResult &pr, const std::string &name, const std::string &classFullName = "");
 
-// Evaluate a C integer expression using the macro table from ParseResult.
-// Handles decimal/hex literals, bitwise ops, shifts, casts, and macro expansion.
-// Returns false only on programmer error; sets result to 0 on parse failure.
+/**
+ * @brief Evaluate a C integer expression using the macro table from ParseResult
+ *        Handles decimal/hex literals, bitwise ops, shifts, casts, and macro expansion
+ *        Returns false only on programmer error; sets result to 0 on parse failure
+ */
 bool evalIntExpr(const std::string &expr, const std::unordered_map<std::string, MacroDef> &macros, int64_t &result);
 
-// Emulate an inline constructor or method by applying its body's simple
-// field-assignment statements to a pre-allocated object buffer.
-// Returns the number of fields successfully written.
+/**
+ * @brief Emulate an inline constructor or method by applying its body's simple
+ *        field-assignment statements to a pre-allocated object buffer
+ *        Returns the number of fields successfully written
+ */
 int applyInlineBody(void *buf, size_t bufSize, const CClassDecl &cls, const CMethodDecl &method, const ParseResult &pr);
 
 #endif // C_HEADER_PARSER_HPP

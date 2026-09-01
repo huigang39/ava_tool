@@ -2,6 +2,7 @@
 #define _DEFAULT_SOURCE
 #endif
 #include "kps6050d.h"
+#include "../../dyn200/src/dyn200_ports.h"
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -59,6 +60,11 @@ static int           g_error_code;
 static char          g_error[256] = "OK";
 static Kps6050dState g_state;
 static int           g_big_endian;
+static char          g_active_port[64];
+static uint32_t      g_active_baud, g_sample_count;
+static char          g_port_names[DYN200_PORT_LIST_MAX][DYN200_PORT_NAME_MAX];
+static char          g_port_descs[DYN200_PORT_LIST_MAX][DYN200_PORT_DESC_MAX];
+static uint32_t      g_port_count;
 
 static int
 set_error(int code, const char *text)
@@ -111,6 +117,8 @@ port_is_open(void)
 static void
 port_close(void)
 {
+        g_active_port[0] = 0;
+        g_active_baud = 0;
 #if defined(_WIN32)
         if (g_port != INVALID_HANDLE_VALUE)
                 CloseHandle(g_port);
@@ -275,7 +283,7 @@ write_unlocked(const Kps6050dState *s)
         return set_ok();
 }
 static int
-update_unlocked(int field, int value, float fvalue)
+update_unlocked(int field, int val, float fvalue)
 {
         Kps6050dState s;
         int           rc = read_unlocked(&s);
@@ -286,19 +294,18 @@ update_unlocked(int field, int value, float fvalue)
         else if (field == 1)
                 s.set_current = fvalue;
         else if (field == 2)
-                s.output_on = value != 0;
+                s.output_on = val != 0;
         else if (field == 3)
-                s.ocp_on = value != 0;
+                s.ocp_on = val != 0;
         else
-                s.remote_locked = value != 0;
+                s.remote_locked = val != 0;
         return write_unlocked(&s);
 }
 
-KPS_API int
-kps6050d_open(const char *port, int baud, int id)
+static int
+open_unlocked(const char *port, int baud, int id)
 {
         int rc;
-        lock_sdk();
         if (!port || !*port || id < 0 || id > 31 || (baud != 2400 && baud != 4800 && baud != 9600 && baud != 19200)) {
                 rc = set_error(-1, "invalid connection settings");
                 goto done;
@@ -367,7 +374,20 @@ kps6050d_open(const char *port, int baud, int id)
         rc   = read_unlocked(&g_state);
         if (rc)
                 port_close();
+        else {
+                snprintf(g_active_port, sizeof(g_active_port), "%s", port);
+                g_active_baud = (uint32_t)baud;
+                g_sample_count = 0;
+        }
 done:
+        return rc;
+}
+KPS_API int
+kps6050d_open(const char *port, int baud, int id)
+{
+        int rc;
+        lock_sdk();
+        rc = open_unlocked(port, baud, id);
         unlock_sdk();
         return rc;
 }
@@ -472,6 +492,213 @@ KPS_API const char *
 kps6050d_last_error(void)
 {
         return g_error;
+}
+
+static void
+scan_ports_unlocked(void)
+{
+        g_port_count = dyn200_ports_enumerate(g_port_names, g_port_descs, DYN200_PORT_LIST_MAX);
+        if (g_port_count > DYN200_PORT_LIST_MAX)
+                g_port_count = DYN200_PORT_LIST_MAX;
+}
+
+KPS_API uint32_t
+kps6050d_port_count(void)
+{
+        uint32_t count;
+        lock_sdk();
+        scan_ports_unlocked();
+        count = g_port_count;
+        unlock_sdk();
+        return count;
+}
+
+KPS_API int
+kps6050d_port_name(uint32_t index, char *name, size_t name_size, char *desc, size_t desc_size)
+{
+        int rc = 0;
+        lock_sdk();
+        if (!name || !name_size || !desc || !desc_size || index >= g_port_count)
+                rc = set_error(-1, "invalid port index or buffer");
+        else {
+                snprintf(name, name_size, "%s", g_port_names[index]);
+                snprintf(desc, desc_size, "%s", g_port_descs[index]);
+        }
+        unlock_sdk();
+        return rc;
+}
+
+KPS_API int
+kps6050d_read_port_param(kps6050d_port_param *p)
+{
+        int rc = 0;
+        uint32_t i;
+        lock_sdk();
+        if (!p) {
+                rc = set_error(-1, "port parameter pointer is null");
+                goto done_port;
+        }
+        p->port[sizeof(p->port) - 1] = 0;
+        if (!p->baud_rate) p->baud_rate = 2400;
+        switch (p->action) {
+        case KPS6050D_PORT_NONE:
+                break;
+        case KPS6050D_PORT_RESCAN:
+                scan_ports_unlocked();
+                i = 0;
+                if (p->port[0]) {
+                        for (; i < g_port_count; ++i)
+                                if (!strcmp(p->port, g_port_names[i])) break;
+                }
+                p->index = i;
+                /* Keep an unplugged selection by name, so a later scan cannot
+                 * silently switch to another power supply. */
+                p->name[0] = p->desc[0] = 0;
+                if (i < g_port_count) {
+                        snprintf(p->name, sizeof(p->name), "%s", g_port_names[i]);
+                        snprintf(p->port, sizeof(p->port), "%s", g_port_names[i]);
+                        snprintf(p->desc, sizeof(p->desc), "%s", g_port_descs[i]);
+                }
+                set_ok();
+                break;
+        case KPS6050D_PORT_CONNECT:
+                if (!p->port[0] && p->index < g_port_count)
+                        snprintf(p->port, sizeof(p->port), "%s", g_port_names[p->index]);
+                if (p->device_id > 31 || (p->baud_rate != 2400 && p->baud_rate != 4800 &&
+                    p->baud_rate != 9600 && p->baud_rate != 19200))
+                        rc = set_error(-1, "invalid connection settings");
+                else
+                        rc = open_unlocked(p->port, (int)p->baud_rate, (int)p->device_id);
+                break;
+        case KPS6050D_PORT_DISCONNECT:
+                port_close();
+                set_ok();
+                break;
+        default:
+                rc = set_error(-1, "invalid port action");
+                break;
+        }
+        p->action = KPS6050D_PORT_NONE;
+        p->count = g_port_count;
+        p->connected = (uint32_t)port_is_open();
+        snprintf(p->active_port, sizeof(p->active_port), "%s", g_active_port);
+        p->active_baud_rate = g_active_baud;
+        p->active_device_id = p->connected ? g_id : 0;
+        p->last_error_code = g_error_code;
+        snprintf(p->last_error, sizeof(p->last_error), "%s", g_error);
+done_port:
+        unlock_sdk();
+        return rc;
+}
+
+static void
+clear_write_gates(kps6050d_param *p)
+{
+        p->write_voltage = p->write_current = p->write_output = p->write_ocp = p->write_remote_lock = 0;
+}
+
+static void
+fill_param(kps6050d_param *p, const Kps6050dState *s)
+{
+        p->voltage.val = s->set_voltage;
+        p->current.val = s->set_current;
+        p->output.enabled = (uint32_t)s->output_on;
+        p->ocp.enabled = (uint32_t)s->ocp_on;
+        p->remote_lock.enabled = (uint32_t)s->remote_locked;
+        p->device = *s;
+}
+
+static void
+param_status(kps6050d_param *p)
+{
+        p->connected = (uint32_t)port_is_open();
+        p->last_error_code = g_error_code;
+        snprintf(p->last_error, sizeof(p->last_error), "%s", g_error);
+}
+
+KPS_API int
+kps6050d_read_param(kps6050d_param *p)
+{
+        Kps6050dState s;
+        int rc;
+        lock_sdk();
+        if (!p) rc = set_error(-1, "parameter pointer is null");
+        else {
+                clear_write_gates(p);
+                rc = read_unlocked(&s);
+                if (!rc) fill_param(p, &s);
+                param_status(p);
+        }
+        unlock_sdk();
+        return rc;
+}
+
+KPS_API int
+kps6050d_write_param(kps6050d_param *p)
+{
+        Kps6050dState s;
+        int rc = 0;
+        lock_sdk();
+        if (!p) {
+                rc = set_error(-1, "parameter pointer is null");
+                goto done_write;
+        }
+        if ((p->write_voltage && (!isfinite(p->voltage.val) || p->voltage.val < 0 || p->voltage.val > 60)) ||
+            (p->write_current && (!isfinite(p->current.val) || p->current.val < 0 || p->current.val > 50)) ||
+            (p->write_output && p->output.enabled > 1) || (p->write_ocp && p->ocp.enabled > 1) ||
+            (p->write_remote_lock && p->remote_lock.enabled > 1)) {
+                rc = set_error(-1, "invalid setting: voltage 0..60 V, current 0..50 A, switches 0 or 1");
+        } else if (p->write_voltage || p->write_current || p->write_output || p->write_ocp || p->write_remote_lock) {
+                rc = read_unlocked(&s);
+                if (!rc) {
+                        if (p->write_voltage) s.set_voltage = p->voltage.val;
+                        if (p->write_current) s.set_current = p->current.val;
+                        if (p->write_output) s.output_on = (int)p->output.enabled;
+                        if (p->write_ocp) s.ocp_on = (int)p->ocp.enabled;
+                        if (p->write_remote_lock) s.remote_locked = (int)p->remote_lock.enabled;
+                        rc = write_unlocked(&s);
+                        if (!rc) fill_param(p, &s);
+                }
+        } else set_ok();
+        clear_write_gates(p);
+        param_status(p);
+done_write:
+        unlock_sdk();
+        return rc;
+}
+
+KPS_API int
+kps6050d_read_rt(kps6050d_rt *rt)
+{
+        Kps6050dState s;
+        int rc;
+        lock_sdk();
+        if (!rt) rc = set_error(-1, "realtime pointer is null");
+        else {
+                rc = read_unlocked(&s);
+                if (!rc) {
+                        rt->voltage = s.voltage;
+                        rt->current = s.current;
+                        rt->power = s.voltage * s.current;
+                        rt->set_voltage = s.set_voltage;
+                        rt->set_current = s.set_current;
+                        rt->output_on = (uint32_t)s.output_on;
+                        rt->ocp_on = (uint32_t)s.ocp_on;
+                        rt->remote_locked = (uint32_t)s.remote_locked;
+                        rt->constant_current = (uint32_t)s.constant_current;
+                        rt->alarm = (uint32_t)s.alarm;
+                        ++g_sample_count;
+                } else {
+                        rt->voltage = rt->current = rt->power = NAN;
+                }
+                rt->sample_count = g_sample_count;
+                rt->fresh = rc == 0;
+                rt->connected = (uint32_t)port_is_open();
+                rt->last_error_code = g_error_code;
+                snprintf(rt->last_error, sizeof(rt->last_error), "%s", g_error);
+        }
+        unlock_sdk();
+        return rc;
 }
 
 

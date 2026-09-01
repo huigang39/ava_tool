@@ -2,12 +2,13 @@
  * @file  main.cpp
  * @brief Application entry point and logging initialisation.
  */
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
 
-#include "module.h"
+#include "ckit.h"
 
 #include "app_log.hpp"
 #include "core/jlink_port.hpp"
@@ -25,6 +26,8 @@
 #pragma comment(lib, "dbghelp.lib")
 #endif
 
+#include "platform/elevation.hpp"
+
 u64               cnt;
 std::atomic<bool> g_appRunning{true};
 
@@ -40,7 +43,7 @@ thread_local int g_log_idx = -1;
 
 // LogIdxReclaimer is thread-local and may run after namespace-scope objects
 // have already been destroyed by the CRT. Keep the shared index pool alive
-// until process termination so TLS cleanup can never lock a destroyed mutex.
+// until process termination so TLS cleanup can never lock a destroyed mutex
 struct LogIdxPool {
         std::mutex       mtx;
         std::vector<int> freeIndices;
@@ -105,20 +108,20 @@ module_init()
         static std::string logDirPerf = Gui::getAppDir() + "/log/perf";
 #endif
         log_cfg_t cfg_ops = {
-            .e_mode     = LOG_MODE_ASYNC,
-            .e_level    = LOG_LEVEL_INFO,
-            .e_format   = LOG_FORMAT_TXT,
-            .mempool    = &g_log_ops_mp,
-            .file_path  = logDirOps.c_str(),
-            .fd         = NULL,
-            .file_size  = SIZE_16MB,
-            .max_files  = 256,
-            .e_ring     = LOG_RING_ROTATE,
-            .chunk_size = SIZE_4KB,
-            .flush_cap  = SIZE_8KB,
-            .nproducers = 32,
-            .f_get_ts   = get_real_ts_ms,
-            .f_flush    = NULL,
+            .mode         = LOG_MODE_ASYNC,
+            .level        = LOG_LEVEL_INFO,
+            .fmt          = LOG_FMT_TXT,
+            .mempool      = &g_log_ops_mp,
+            .file_path    = logDirOps.c_str(),
+            .fd           = NULL,
+            .file_size    = SIZE_16MB,
+            .max_files    = 256,
+            .ring         = LOG_RING_ROTATE,
+            .chunk_size   = SIZE_4KB,
+            .flush_cap    = SIZE_8KB,
+            .producer_cnt = 32,
+            .get_ts       = get_real_ts_us,
+            .flush        = NULL,
         };
 
         log_init(&g_log_ops, cfg_ops);
@@ -136,15 +139,17 @@ module_init()
 
 static std::atomic<bool> g_flusherRunning{true};
 
-// Background thread that periodically drains the log MPSC queue into the
-// mmap'd file and tells the OS to write dirty pages to disk. Without this,
-// async-mode log data only reaches the file on log_deinit — so a crash
-// loses everything since session start. With this, crash loses at most
-// ~200ms of recent log lines.
+/**
+ * @brief Background thread that periodically drains the log MPSC queue into the
+ *        file stream and tells the OS to write buffered data to disk. Without this,
+ *        async-mode log data only reaches the file on log_deinit — so a crash
+ *        loses everything since session start. With this, crash loses at most
+ *        ~200ms of recent log lines
+ */
 static void
 log_flusher_func()
 {
-        // Demote flusher to low priority — it must never preempt the sampler.
+        // Demote flusher to low priority — it must never preempt the sampler
 #ifdef _WIN32
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 #elif defined(__linux__)
@@ -154,31 +159,25 @@ log_flusher_func()
         while (g_flusherRunning.load(std::memory_order_acquire)) {
                 log_flush(&g_log_ops);
                 log_flush(&g_log_perf);
-#ifdef _WIN32
-                if (g_log_ops.lo.mmap_ptr) {
-                        FlushViewOfFile(g_log_ops.lo.mmap_ptr, g_log_ops.lo.file_offset);
-                }
-                if (g_log_perf.lo.mmap_ptr) {
-                        FlushViewOfFile(g_log_perf.lo.mmap_ptr, g_log_perf.lo.file_offset);
-                }
-#endif
                 std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
         // Final drain after the stop signal so anything written between the
-        // last tick and shutdown reaches the file.
+        // prev tick and shutdown reaches the file
         log_flush(&g_log_ops);
         log_flush(&g_log_perf);
 }
 
 #ifdef _WIN32
 // Captured at startup; used by the crash handler since std::string and any
-// non-trivial code is unsafe to invoke after an access violation.
+// non-trivial code is unsafe to invoke after an access violation
 static char g_crashAppDir[MAX_PATH] = {0};
 
-// Top-level SEH handler — fires when no other __try block catches an exception
-// (access violation, stack overflow, illegal instruction, etc). MUST stay
-// crash-safe: no heap allocation, no C++ exceptions, no STL — just stack
-// buffers + Win32 APIs.
+/**
+ * @brief Top-level SEH handler — fires when no other __try block catches an exception
+ *        (access violation, stack overflow, illegal instruction, etc). MUST stay
+ *        crash-safe: no heap allocation, no C++ exceptions, no STL — just stack
+ *        buffers + Win32 APIs
+ */
 static LONG WINAPI
 crashHandler(EXCEPTION_POINTERS *ep)
 {
@@ -208,7 +207,7 @@ crashHandler(EXCEPTION_POINTERS *ep)
                 // Normal + indirectly-referenced memory = small (usually <1MB)
                 // but pulls in anything reachable from registers/stack, which
                 // is enough to see the crashing object and its referents in
-                // WinDbg. Avoid MiniDumpWithFullMemory — that's GB.
+                // WinDbg. Avoid MiniDumpWithFullMemory — that's GB
                 const MINIDUMP_TYPE type =
                     (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo);
                 MiniDumpWriteDump(GetCurrentProcess(), GetCurrentProcessId(), hf, type, &mei, NULL, NULL);
@@ -216,23 +215,19 @@ crashHandler(EXCEPTION_POINTERS *ep)
         }
 
         // Best-effort: shove the crash record into the ops log and force a
-        // sync flush so a debugger can correlate the .dmp with the last log
-        // line. LOG_E goes through the async queue → log_flush drains it →
-        // FlushViewOfFile pushes mmap'd pages to disk.
+        // sync flush so a debugger can correlate the .dmp with the prev log
+        // line. LOG_E goes through the async queue; log_flush drains it and
+        // commits the file stream to disk
         LOG_E("CRASH code=0x%08lx addr=%p dump=%s",
               ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0,
               ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : NULL,
               dumpPath);
         log_flush(&g_log_ops);
         log_flush(&g_log_perf);
-        if (g_log_ops.lo.mmap_ptr)
-                FlushViewOfFile(g_log_ops.lo.mmap_ptr, g_log_ops.lo.file_offset);
-        if (g_log_perf.lo.mmap_ptr)
-                FlushViewOfFile(g_log_perf.lo.mmap_ptr, g_log_perf.lo.file_offset);
 
         // Let Windows show the standard "app stopped working" dialog and
         // terminate. Returning EXCEPTION_CONTINUE_SEARCH would chain to any
-        // debugger; EXECUTE_HANDLER just kills us cleanly.
+        // debugger; EXECUTE_HANDLER just kills us cleanly
         return EXCEPTION_EXECUTE_HANDLER;
 }
 #endif
@@ -241,12 +236,33 @@ int
 main(int argc, char **argv)
 {
 #ifdef _WIN32
+        bool          elevatedRelaunch = false;
+        unsigned long previousProcess  = 0;
+        for (int i = 1; i < argc;) {
+                const std::string argument = argv[i];
+                if (argument == elevation::marker)
+                        elevatedRelaunch = true;
+                else if (argument.starts_with("--ava-wait-parent="))
+                        previousProcess = std::strtoul(argument.c_str() + 18, nullptr, 10);
+                else {
+                        ++i;
+                        continue;
+                }
+                for (int j = i; j < argc - 1; ++j)
+                        argv[j] = argv[j + 1];
+                argv[--argc] = nullptr;
+        }
+        if (elevatedRelaunch && (!elevation::isAdministrator() || !elevation::waitForPreviousInstance(previousProcess))) {
+                MessageBoxW(
+                    nullptr, L"管理员重启未完成，或原程序尚未退出。请稍后手动重启。", L"ava_tool", MB_OK | MB_ICONERROR);
+                return 1;
+        }
         char exePath[MAX_PATH];
         GetModuleFileNameA(NULL, exePath, MAX_PATH);
         PathRemoveFileSpecA(exePath);
         SetCurrentDirectoryA(exePath);
 
-        // Cache app dir for the crash handler (it can't call any C++ code).
+        // Cache app dir for the crash handler (it can't call any C++ code)
         snprintf(g_crashAppDir, sizeof(g_crashAppDir), "%s", exePath);
         SetUnhandledExceptionFilter(crashHandler);
 
@@ -263,11 +279,11 @@ main(int argc, char **argv)
         std::thread tFft(fftThreadFunc, gui.get());
 
         // ---- Core isolation: evict GUI + flusher from sampler core ----
-        // Wait until setupThread() has run (-1 is the uninitialised sentinel).
+        // Wait until setupThread() has run (-1 is the uninitialised sentinel)
         while (g_samplerBoundCore.load() == -1)
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
-        // Only CPUBound mode pins to a specific core; Low/Normal return -2.
+        // Only CPUBound mode pins to a specific core; Low/Normal return -2
         const int samplerCore = g_samplerBoundCore.load();
         if (samplerCore >= 0) {
 #ifdef _WIN32
@@ -329,8 +345,28 @@ main(int argc, char **argv)
 
 #ifdef _WIN32
 int WINAPI
-WinMain(HINSTANCE /*hInstance*/, HINSTANCE /*hPrevInstance*/, LPSTR /*lpCmdLine*/, int /*nShowCmd*/)
+// hInstance
+// hPrevInstance
+// lpCmdLine
+// nShowCmd
+WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
 {
-        return main(__argc, __argv);
+        int  count = 0;
+        auto wide  = CommandLineToArgvW(GetCommandLineW(), &count);
+        if (!wide)
+                return 1;
+        std::vector<std::string> arguments;
+        for (int i = 0; i < count; ++i) {
+                const int   size = WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, nullptr, 0, nullptr, nullptr);
+                std::string text(size, '\0');
+                WideCharToMultiByte(CP_UTF8, 0, wide[i], -1, text.data(), size, nullptr, nullptr);
+                arguments.push_back(std::move(text));
+        }
+        LocalFree(wide);
+        std::vector<char *> argv;
+        for (auto &argument : arguments)
+                argv.push_back(argument.data());
+        argv.push_back(nullptr);
+        return main(count, argv.data());
 }
 #endif
