@@ -66,8 +66,14 @@ def check_publish(version: str):
         return subprocess.run(["git", *args], cwd=PROJECT_ROOT, check=True,
                               capture_output=True, text=True).stdout.strip()
 
-    if git("status", "--porcelain", "--untracked-files=normal"):
-        raise ValueError("Commit your changes before publishing (including version changes).")
+    changes = git("status", "--porcelain", "--untracked-files=normal")
+    if changes:
+        raise ValueError(
+            "Commit your changes before publishing (including version changes).\n"
+            f"Uncommitted files:\n{changes}\n"
+            "Stage the intended files with git add <paths>, then git commit.\n"
+            f"Push your commit and tag v{version}, then rerun with --publish."
+        )
     remote = git("remote", "get-url", "origin")
     match = re.fullmatch(r"(?:git@github\.com:|https://github\.com/|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?/?", remote)
     if not match:

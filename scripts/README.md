@@ -21,6 +21,7 @@
 ```powershell
 python scripts/release.py 1.2.0
 git add src/version.hpp installer/ava_tool.iss
+git add scripts/release.py scripts/README.md
 git commit -m "Release v1.2.0"
 git tag v1.2.0
 git push origin HEAD
