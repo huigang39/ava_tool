@@ -466,8 +466,9 @@ $(UPDATER_EXE): $(UPDATER_OBJ) | $(OUTPUT_BIN_DIR)
 ISCC      ?= iscc
 ISCC_PF86 := C:\Program Files (x86)\Inno Setup 6\ISCC.exe
 ISCC_PF   := C:\Program Files\Inno Setup 6\ISCC.exe
+ISCC_USER := $(LOCALAPPDATA)\Programs\Inno Setup 6\ISCC.exe
 ifeq ($(ISCC),iscc)
-PACKAGE_RUN = if exist "$(ISCC_PF86)" ( "$(ISCC_PF86)" /DMyAppBinDir="$(abspath $(OUTPUT_BIN_DIR))" "installer\ava_tool.iss" ) else if exist "$(ISCC_PF)" ( "$(ISCC_PF)" /DMyAppBinDir="$(abspath $(OUTPUT_BIN_DIR))" "installer\ava_tool.iss" ) else ( where iscc >nul 2>nul && iscc /DMyAppBinDir="$(abspath $(OUTPUT_BIN_DIR))" "installer\ava_tool.iss" || ( echo. & echo ERROR: Inno Setup ISCC.exe not found. & echo   Install it from https://jrsoftware.org/isdl.php & echo   then re-run: make package    ^(or: make package ISCC=C:\path\to\ISCC.exe^) & exit 1 ) )
+PACKAGE_RUN = if exist "$(ISCC_PF86)" ( "$(ISCC_PF86)" /DMyAppBinDir="$(abspath $(OUTPUT_BIN_DIR))" "installer\ava_tool.iss" ) else if exist "$(ISCC_PF)" ( "$(ISCC_PF)" /DMyAppBinDir="$(abspath $(OUTPUT_BIN_DIR))" "installer\ava_tool.iss" ) else if exist "$(ISCC_USER)" ( "$(ISCC_USER)" /DMyAppBinDir="$(abspath $(OUTPUT_BIN_DIR))" "installer\ava_tool.iss" ) else ( where iscc >nul 2>nul && iscc /DMyAppBinDir="$(abspath $(OUTPUT_BIN_DIR))" "installer\ava_tool.iss" || ( echo. & echo ERROR: Inno Setup ISCC.exe not found. & echo   Install it from https://jrsoftware.org/isdl.php & echo   then re-run: make package    ^(or: make package ISCC=C:\path\to\ISCC.exe^) & exit 1 ) )
 else
 PACKAGE_RUN = "$(ISCC)" /DMyAppBinDir="$(abspath $(OUTPUT_BIN_DIR))" "installer\ava_tool.iss"
 endif
